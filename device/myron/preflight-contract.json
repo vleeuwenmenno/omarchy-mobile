@@ -27,10 +27,10 @@
     },
     "snapshot_contract": {
       "path": "device/myron/snapshot-contract.json",
-      "sha256": "aa13be36bef71ebbc10095c2f450a8093c6e4c592d6752ae6e55029ec6f98c24"
+      "sha256": "4dc53614992922b50cbfe7b59bfc10c473088c9d98058a9abec0933d345257ea"
     }
   },
-  "format_version": "0.1.0",
+  "format_version": "0.2.0",
   "kind": "myron-hardware-read-preflight-contract",
   "request": {
     "accepts_real_evidence": false,

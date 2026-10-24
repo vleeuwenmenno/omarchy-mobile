@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Build and verify a non-authorizing Myron snapshot candidate (v0.1)."""
+"""Build and verify a non-authorizing Myron snapshot candidate (v0.2)."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = Path(__file__).resolve().parent.parent
 DEPLOYMENT_TOOL = REPO / "tools/myron-deployment"
 SNAPSHOT_CONTRACT_PATH = "device/myron/snapshot-contract.json"
@@ -77,9 +77,9 @@ def deploy():
             loader.exec_module(module)
         except (OSError, SyntaxError) as error:
             raise SnapshotError(f"cannot load the deployment verifier: {error}") from error
-        if module.VERSION != "0.3.0":
+        if module.VERSION != "0.4.0":
             raise SnapshotError(
-                f"unsupported deployment verifier {module.VERSION}; expected 0.3.0"
+                f"unsupported deployment verifier {module.VERSION}; expected 0.4.0"
             )
         _deployment = module
     return _deployment

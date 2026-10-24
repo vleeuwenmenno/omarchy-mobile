@@ -20,7 +20,7 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = Path(__file__).resolve().parent.parent
 SNAPSHOT_TOOL = REPO / "tools/myron-snapshot"
 PREFLIGHT_CONTRACT_PATH = "device/myron/preflight-contract.json"
@@ -152,7 +152,7 @@ def snapshot():
             loader.exec_module(module)
         except (OSError, SyntaxError) as error:
             raise PreflightError(f"cannot load the snapshot verifier: {error}") from error
-        if module.VERSION != "0.1.0" or module.deploy().VERSION != "0.3.0":
+        if module.VERSION != "0.2.0" or module.deploy().VERSION != "0.4.0":
             raise PreflightError("unsupported snapshot or deployment verifier version")
         _snapshot = module
     return _snapshot

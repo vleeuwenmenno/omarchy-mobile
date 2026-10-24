@@ -240,7 +240,8 @@ assert by_name["beta"]["imports"][0]["provider"] == "module:alpha"
 assert by_name["beta"]["imports"][1]["bind"] == "weak"
 assert by_name["beta"]["exports"][0]["crc_status"] == "module-has-no-crc"
 assert by_name["beta"]["depends_on"] == ["alpha"]
-assert by_name["gamma-mod"]["versions"] == "present"
+assert by_name["gamma-mod"]["versions"] == "basic"
+assert by_name["gamma-mod"]["module_layout"] == "absent"
 assert by_name["gamma-mod"]["imports"][0]["crc_status"] == "match"
 assert by_name["gamma-mod"]["imports"][1]["namespace"] == "MYNS"
 assert by_name["gamma-mod"]["modinfo_name"] == "gamma_mod"
@@ -374,10 +375,335 @@ def overlap(buf):
     patch_named(".strtab", "offset", struct.unpack_from(f, buf, p)[0])(buf)
 elf_case("overlap", "overlaps", fix=overlap)
 elf_case("compressed section", "compressed", fix=patch_named(".modinfo", "flags", 0x802))
-elf_case("malformed RELA section", "relocation sections are unsupported",
+elf_case("malformed RELA section", "relocation section 3 is malformed",
          extra_sections=[(".rela.bad", 4, 0, b"x", 999, 999, 24)])
-elf_case("RELA targeting export evidence", "relocation sections are unsupported",
+elf_case("RELA without INFO_LINK", "relocation section 3 is malformed",
          extra_sections=[(".rela.___ksymtab+alpha_fn", 4, 0, bytes(24), 5, 2, 24)])
+
+def relocation_spec(kind="rela", records=None):
+    records = records or ([(0, 0, 257, 0), (4, 0, 261, 0), (8, 0, 261, 0)] if kind == "rela"
+                          else [(0, 0, 257), (4, 0, 261), (8, 0, 261)])
+    return [(f".{kind}.___ksymtab+alpha_fn", "___ksymtab+alpha_fn", kind, records)]
+
+def real_layout(spec, kind="rela"):
+    spec["modules"]["alpha"].update(
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        real_export_names=True, runtime_name_relocation_kind=kind)
+
+rejects_spec("allocated AArch64 REL relocation", "REL relocations for an allocated section",
+             lambda s: real_layout(s, "rel"))
+spec = default_spec()
+real_layout(spec, "rela")
+real_result = run(make(spec))
+real_alpha = next(row for row in real_result["modules"] if row["name"] == "alpha")
+assert real_alpha["exports"][0]["crc_status"] == "module-matches-symvers"
+
+spec = default_spec()
+spec["modules"]["alpha"].update(
+    exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001),
+             ("alpha_extra", "EXPORT_SYMBOL", 0x11110002)],
+    ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+    merged_exports=True, real_export_names=True)
+spec["extra_module_rows"].append(
+    row(0x11110002, "alpha_extra", "drivers/x/alpha"))
+merged_result = run(make(spec))
+merged_alpha = next(row for row in merged_result["modules"] if row["name"] == "alpha")
+assert [item["symbol"] for item in merged_alpha["exports"]] == ["alpha_extra", "alpha_fn"]
+assert all(item["crc_status"] == "module-matches-symvers"
+           for item in merged_alpha["exports"])
+
+def swapped_merged_crc_order(spec):
+    spec["modules"]["alpha"].update(
+        exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001),
+                 ("alpha_extra", "EXPORT_SYMBOL", 0x11110002)],
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        crc_symbol_offsets={"alpha_fn": 0, "alpha_extra": 4})
+    spec["extra_module_rows"] = [
+        row(0x11110002, "alpha_fn", "drivers/x/alpha")
+        if "\talpha_fn\t" in entry else entry
+        for entry in spec["extra_module_rows"]
+    ]
+    spec["extra_module_rows"].append(
+        row(0x11110001, "alpha_extra", "drivers/x/alpha"))
+    spec["modules"]["beta"]["versions"][0] = ("alpha_fn", 0x11110002)
+rejects_spec("merged CRC order differs from export order",
+             "merged CRC table does not match export-table order",
+             swapped_merged_crc_order)
+
+def partial_merged_crc_table(spec):
+    spec["modules"]["alpha"].update(
+        exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001),
+                 ("alpha_extra", "EXPORT_SYMBOL", None)],
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True)
+    spec["extra_module_rows"].append(
+        row(0x11110002, "alpha_extra", "drivers/x/alpha"))
+rejects_spec("merged CRC table omits an export",
+             "merged CRC table does not match export-table order",
+             partial_merged_crc_table)
+
+def unsorted_merged_export_table(spec):
+    spec["modules"]["alpha"].update(
+        exports=[("alpha_fn", "EXPORT_SYMBOL", None),
+                 ("alpha_extra", "EXPORT_SYMBOL", None)],
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, sort_merged_exports=False, real_export_names=True)
+    spec["extra_module_rows"].append(
+        row(0x11110002, "alpha_extra", "drivers/x/alpha"))
+rejects_spec("merged export table is not sorted",
+             "merged export table is not sorted by name",
+             unsorted_merged_export_table)
+
+def swapped_runtime_export_names(spec):
+    spec["modules"]["alpha"].update(
+        exports=[("alpha_extra", "EXPORT_SYMBOL", None),
+                 ("alpha_fn", "EXPORT_SYMBOL", None)],
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        export_name_targets={"alpha_extra": "alpha_fn", "alpha_fn": "alpha_extra"})
+    spec["extra_module_rows"].append(
+        row(0x11110002, "alpha_extra", "drivers/x/alpha"))
+rejects_spec("merged export runtime names are swapped",
+             "invalid runtime-name symbol", swapped_runtime_export_names)
+
+def changed_runtime_export_string(spec):
+    spec["modules"]["alpha"].update(
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        runtime_name_values={"alpha_fn": "alpha_other"})
+rejects_spec("merged export runtime string differs from label",
+             "export label and runtime name differ", changed_runtime_export_string)
+
+for export_entry_size in (12, 24):
+    rejects_spec(
+        f"{export_entry_size}-byte export runtime-name addend changes target",
+        "export label and runtime name differ",
+        lambda s, size=export_entry_size: s["modules"]["alpha"].update(
+            ksymtab_size=size, export_symbols="local-label", crc_layout="section",
+            merged_exports=True, real_export_names=True,
+            runtime_name_addends={"alpha_fn": 1}),
+    )
+
+    rejects_spec(
+        f"{export_entry_size}-byte export runtime namespace differs from symvers",
+        "has a different runtime namespace",
+        lambda s, size=export_entry_size: s["modules"]["alpha"].update(
+            ksymtab_size=size, export_symbols="local-label", crc_layout="section",
+            merged_exports=True, real_export_names=True,
+            export_namespaces={"alpha_fn": "WRONG_NS"}),
+    )
+
+    spec = default_spec()
+    spec["modules"]["alpha"].update(
+        ksymtab_size=export_entry_size, export_symbols="local-label",
+        crc_layout="section", merged_exports=True, real_export_names=True,
+        export_namespaces={"alpha_fn": "ALPHA_NS"})
+    spec["modules"]["beta"]["modinfo"] = [
+        "name=beta", f"vermagic={VERMAGIC}", "license=GPL",
+        "import_ns=ALPHA_NS",
+    ]
+    spec["extra_module_rows"] = [
+        row(0x11110001, "alpha_fn", "drivers/x/alpha", namespace="ALPHA_NS")
+        if "\talpha_fn\t" in entry else entry
+        for entry in spec["extra_module_rows"]
+    ]
+    namespace_result = run(make(spec))
+    namespace_alpha = next(
+        item for item in namespace_result["modules"] if item["name"] == "alpha")
+    assert namespace_alpha["exports"][0]["namespace"] == "ALPHA_NS"
+
+for export_entry_size in (12, 24):
+    def per_symbol_runtime_metadata(spec, size=export_entry_size, **options):
+        spec["modules"]["alpha"].update(
+            ksymtab_size=size, export_symbols="local-label", crc_layout="section",
+            merged_exports=False, real_export_names=True, **options)
+
+    rejects_spec(
+        f"per-symbol {export_entry_size}-byte runtime namespace differs from symvers",
+        "has a different runtime namespace",
+        lambda s, size=export_entry_size: per_symbol_runtime_metadata(
+            s, size, export_namespaces={"alpha_fn": "WRONG_NS"}),
+    )
+    rejects_spec(
+        f"per-symbol {export_entry_size}-byte runtime name differs from label",
+        "export label and runtime name differ",
+        lambda s, size=export_entry_size: per_symbol_runtime_metadata(
+            s, size, runtime_name_values={"alpha_fn": "alpha_other"}),
+    )
+    rejects_spec(
+        f"per-symbol {export_entry_size}-byte lacks runtime namespace relocation",
+        "no unambiguous runtime-namespace relocation",
+        lambda s, size=export_entry_size: per_symbol_runtime_metadata(
+            s, size, runtime_namespace_relocations=False),
+    )
+
+rejects_spec(
+    "merged export lacks runtime-namespace relocation",
+    "no unambiguous runtime-namespace relocation",
+    lambda s: s["modules"]["alpha"].update(
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        runtime_namespace_relocations=False),
+)
+rejects_spec(
+    "merged export has invalid runtime namespace",
+    "invalid runtime namespace",
+    lambda s: s["modules"]["alpha"].update(
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        export_namespaces={"alpha_fn": "bad namespace"}),
+)
+rejects_spec(
+    "overlapping relocation corrupts runtime-namespace field",
+    "no unambiguous runtime-namespace relocation",
+    lambda s: s["modules"]["alpha"].update(
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        relocations=[(".rela.overlap-runtime-namespace", "__ksymtab",
+                      "rela", [(9, 0, 259, 0)])]),
+)
+
+for export_entry_size in (12, 24):
+    def section_symbol_layout(spec, kind="rela", size=export_entry_size):
+        spec["modules"]["alpha"].update(
+            exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001),
+                     ("alpha_extra", "EXPORT_SYMBOL", 0x11110002)],
+            ksymtab_size=size, export_symbols="local-label", crc_layout="section",
+            merged_exports=True, real_export_names=True,
+            runtime_name_symbol_style="section", runtime_name_relocation_kind=kind)
+        spec["extra_module_rows"].append(
+            row(0x11110002, "alpha_extra", "drivers/x/alpha"))
+
+    rejects_spec(
+        f"{export_entry_size}-byte section-symbol runtime name uses allocated REL",
+        "REL relocations for an allocated section",
+        lambda s, size=export_entry_size: section_symbol_layout(s, "rel", size),
+    )
+    spec = default_spec()
+    section_symbol_layout(spec)
+    section_symbol_result = run(make(spec))
+    section_symbol_alpha = next(
+        item for item in section_symbol_result["modules"] if item["name"] == "alpha")
+    assert [item["symbol"] for item in section_symbol_alpha["exports"]] == [
+        "alpha_extra", "alpha_fn"]
+
+rejects_spec(
+    "relocation targets export runtime-name strings",
+    "targets literal metadata: __ksymtab_strings",
+    lambda s: s["modules"]["alpha"].update(
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        relocations=[(".rela.__ksymtab_strings", "__ksymtab_strings",
+                      "rela", [(0, 0, 258, 0)])]),
+)
+
+rejects_spec(
+    "overlapping relocation corrupts runtime-name field",
+    "no unambiguous runtime-name relocation",
+    lambda s: s["modules"]["alpha"].update(
+        ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+        merged_exports=True, real_export_names=True,
+        relocations=[(".rela.overlap-runtime-name", "__ksymtab",
+                      "rela", [(5, 0, 259, 0)])]),
+)
+
+rejects_spec("merged export lacks runtime-name relocation",
+             "no unambiguous runtime-name relocation",
+             lambda s: s["modules"]["alpha"].update(
+                 ksymtab_size=12, export_symbols="local-label",
+                 merged_exports=True))
+
+spec = default_spec()
+spec["modules"]["alpha"].update(
+    ksymtab_size=24, export_symbols="local-label", crc_layout="section",
+    merged_exports=True, real_export_names=True)
+classic_elf64_result = run(make(spec))
+classic_elf64_alpha = next(
+    row for row in classic_elf64_result["modules"] if row["name"] == "alpha")
+assert classic_elf64_alpha["exports"][0]["crc_status"] == "module-matches-symvers"
+
+spec = default_spec()
+spec["modules"]["beta"].update(
+    exports=[("beta_fn", "EXPORT_SYMBOL_GPL", 0x22220001)],
+    ksymtab_size=12, export_symbols="local-label", crc_layout="section",
+    real_export_names=True)
+gpl_crc_result = run(make(spec))
+gpl_beta = next(row for row in gpl_crc_result["modules"] if row["name"] == "beta")
+assert gpl_beta["exports"][0]["crc_status"] == "module-matches-symvers"
+
+rejects_spec("relocation bad symbol index", "bad symbol index",
+             lambda s: s["modules"]["alpha"].update(
+                 relocations=relocation_spec("rela", [(0, 999, 257, 0)])))
+rejects_spec("relocation out-of-range offset", "out-of-range offset",
+             lambda s: s["modules"]["alpha"].update(
+                 relocations=relocation_spec("rela", [(8, 0, 257, 0)])))
+for relocation_kind in ("rel", "rela"):
+    bad_extent = ([(7, 0, 257)] if relocation_kind == "rel"
+                  else [(7, 0, 257, 0)])
+    rejects_spec(f"{relocation_kind} relocation crosses target boundary", "out-of-range offset",
+                 lambda s, kind=relocation_kind, records=bad_extent:
+                 s["modules"]["alpha"].update(
+                     relocations=relocation_spec(kind, records)))
+    unknown = ([(0, 0, 0xFFFFFFFF)] if relocation_kind == "rel"
+               else [(0, 0, 0xFFFFFFFF, 0)])
+    rejects_spec(f"{relocation_kind} unknown relocation type", "unsupported AArch64 type",
+                 lambda s, kind=relocation_kind, records=unknown:
+                 s["modules"]["alpha"].update(
+                     relocations=relocation_spec(kind, records)))
+    byte_aligned_data = ([(1, 0, 258)] if relocation_kind == "rel"
+                         else [(1, 0, 258, 0)])
+    spec = default_spec()
+    spec["modules"]["alpha"].update(
+        relocations=relocation_spec(relocation_kind, byte_aligned_data))
+    if relocation_kind == "rel":
+        rejects_spec("byte-aligned allocated REL", "REL relocations for an allocated section",
+                     lambda s, records=byte_aligned_data: s["modules"]["alpha"].update(
+                         relocations=relocation_spec("rel", records)))
+    else:
+        assert run(make(spec))["status"] == "staged-set-consistent"
+    null_relocation = ([(0, 0, 256)] if relocation_kind == "rel"
+                       else [(0, 0, 256, 0)])
+    spec = default_spec()
+    spec["modules"]["alpha"].update(
+        relocations=relocation_spec(relocation_kind, null_relocation))
+    if relocation_kind == "rel":
+        rejects_spec("allocated REL with NONE entry", "REL relocations for an allocated section",
+                     lambda s, records=null_relocation: s["modules"]["alpha"].update(
+                         relocations=relocation_spec("rel", records)))
+    else:
+        assert run(make(spec))["status"] == "staged-set-consistent"
+rejects_spec("instruction relocation unaligned offset", "unaligned offset",
+             lambda s: s["modules"]["alpha"].update(
+                 relocations=relocation_spec("rela", [(1, 0, 263, 0)])))
+rejects_spec("relocation targets export CRC metadata", "targets literal metadata",
+             lambda s: s["modules"]["alpha"].update(
+                 crc_layout="section",
+                 relocations=[(".rela.___kcrctab+alpha_fn", "___kcrctab+alpha_fn",
+                               "rela", [(0, 0, 258, 0)])]))
+
+def relocate_extended_module_layout(spec):
+    spec["modules"]["alpha"].update(
+        versions=None,
+        extended_versions=[("printk", 0xAAAA0001),
+                           ("module_layout", 0xABCD0001)],
+        relocations=[(".rela.__version_ext_crcs", "__version_ext_crcs",
+                      "rela", [(4, 0, 258, 0)])])
+    spec["kernel_rows"].append(row(0xABCD0001, "module_layout", "vmlinux"))
+rejects_spec("relocation targets module_layout CRC metadata", "targets literal metadata",
+             relocate_extended_module_layout)
+rejects_spec("relocation wrong entsize", "relocation section",
+             lambda s: (s["modules"]["alpha"].update(relocations=relocation_spec()),
+                        s["elf_fix"].update(
+                            alpha=patch_named(".rela.___ksymtab+alpha_fn", "entsize", 16))))
+rejects_spec("relocation wrong link", "relocation section",
+             lambda s: (s["modules"]["alpha"].update(relocations=relocation_spec()),
+                        s["elf_fix"].update(
+                            alpha=patch_named(".rela.___ksymtab+alpha_fn", "link", 0))))
+rejects_spec("relocation wrong target", "relocation section",
+             lambda s: (s["modules"]["alpha"].update(relocations=relocation_spec()),
+                        s["elf_fix"].update(
+                            alpha=patch_named(".rela.___ksymtab+alpha_fn", "info", 0))))
 elf_case("modinfo wrong type", ".modinfo is not PROGBITS", fix=patch_named(".modinfo", "type", 8))
 elf_case("symtab entsize", ".symtab is malformed", fix=patch_named(".symtab", "entsize", 16))
 elf_case("symtab size", ".symtab is malformed", fix=patch_named(".symtab", "size", 25))
@@ -423,10 +749,14 @@ elf_case("export section not allocated", "unsupported export section",
          fix=patch_named("___ksymtab+alpha_fn", "flags", 0))
 elf_case("export section wrong size", "unsupported export section",
          fix=patch_named("___ksymtab+alpha_fn", "size", 0))
+elf_case("export section unsupported size", "unsupported export section",
+         ksymtab_size=16)
+elf_case("mixed export layouts", "mixes classic and PREL32 export layouts",
+         extra_sections=[("___ksymtab+other_fn", 1, 2, bytes(12), 0, 0, 0)])
 elf_case("export symbol offset out of bounds", "invalid ___ksymtab record",
          fix=patch_symbol(2, "value", 1))
 elf_case("export symbol wrong extent", "invalid ___ksymtab record",
-         fix=patch_symbol(2, "size", 0))
+         fix=patch_symbol(2, "size", 7))
 elf_case("export symbol weak binding", "invalid ___ksymtab record",
          fix=patch_symbol(2, "info", 0x21))
 elf_case("duplicate export section", "export section without exactly one export symbol",
@@ -438,6 +768,16 @@ elf_case("crc without export", "CRC record without an export",
 elf_case("crc too wide", "invalid CRC record", exports=[("alpha_fn", "EXPORT_SYMBOL", 1 << 33)])
 elf_case("crc wrong type", "invalid CRC record", fix=patch_symbol(3, "info", 0x11))
 elf_case("crc wrong size", "invalid CRC record", fix=patch_symbol(3, "size", 1))
+elf_case("mixed CRC layouts", "mixes absolute and section-backed CRC layouts",
+         crc_layout="section",
+         extra_symbols=[("__crc_stray", 0xFFF1, 0x10, 1)])
+elf_case("orphan CRC section", "CRC section without exactly one CRC symbol",
+         extra_sections=[("___kcrctab+stray", 1, 2, struct.pack("<I", 1), 0, 0, 0)])
+elf_case("CRC section type mismatch", "CRC section type differs from export type",
+         exports=[("alpha_fn", "EXPORT_SYMBOL", None)],
+         extra_sections=[("___kcrctab_gpl+alpha_fn", 1, 2,
+                          struct.pack("<I", 0x11110001), 0, 0, 0)],
+         extra_symbols=[("__crc_alpha_fn", 3, 0x10, 0)])
 elf_case("symbol visibility", "unsupported symbol visibility", fix=patch_symbol(2, "other", 1))
 elf_case("import wrong type", "unsupported symbol record", fix=patch_symbol(4, "info", 0x11))
 elf_case("duplicate export", "duplicate export",
@@ -495,11 +835,176 @@ rejects_spec("versions empty name", "malformed entry",
              lambda s: s["modules"]["alpha"].update(versions=[("", 1)]))
 rejects_spec("versions garbage after NUL", "malformed entry",
              lambda s: s["modules"]["alpha"].update(versions=[("pr\0intk", 0xAAAA0001)]))
-rejects_spec("modversions imports without versions", "imports without __versions",
+rejects_spec("modversions imports without versions", "without version metadata",
              lambda s: s["modules"]["alpha"].update(versions=None))
-rejects_spec("unsupported extended versions", "unsupported extended modversions",
+rejects_spec("one-sided extended versions", "only one extended modversions section",
              lambda s: s["modules"]["alpha"].update(
+                 versions=None,
                  extra_sections=[("__version_ext_names", 1, 2, b"printk\0", 0, 0, 0)]))
+rejects_spec("one-sided extended CRCs", "only one extended modversions section",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=None,
+                 extra_sections=[("__version_ext_crcs", 1, 2,
+                                  struct.pack("<I", 0xAAAA0001), 0, 0, 0)]))
+rejects_spec("basic versions section is not allocated", "__versions is not allocated PROGBITS",
+             lambda s: s["elf_fix"].update(
+                 alpha=patch_named("__versions", "flags", 0)))
+
+def nonallocated_extended_versions(spec, *section_names):
+    spec["modules"]["alpha"].update(
+        versions=None, extended_versions=[("printk", 0xAAAA0001)])
+    def clear_flags(buf):
+        for section_name in section_names:
+            patch_named(section_name, "flags", 0)(buf)
+    spec["elf_fix"]["alpha"] = clear_flags
+
+rejects_spec("extended names section is not allocated",
+             "extended modversions sections are not allocated PROGBITS",
+             lambda s: nonallocated_extended_versions(s, "__version_ext_names"))
+rejects_spec("extended CRC section is not allocated",
+             "extended modversions sections are not allocated PROGBITS",
+             lambda s: nonallocated_extended_versions(s, "__version_ext_crcs"))
+rejects_spec("both extended sections are not allocated",
+             "extended modversions sections are not allocated PROGBITS",
+             lambda s: nonallocated_extended_versions(
+                 s, "__version_ext_names", "__version_ext_crcs"))
+
+def add_module_layout(spec, crc=0xABCD0001):
+    spec["modules"]["alpha"]["versions"].append(("module_layout", crc))
+    spec["kernel_rows"].append(row(0xABCD0001, "module_layout", "vmlinux"))
+
+spec = default_spec()
+add_module_layout(spec)
+layout_result = run(make(spec))
+layout_alpha = next(row for row in layout_result["modules"] if row["name"] == "alpha")
+assert layout_alpha["module_layout"] == "kernel-crc-match"
+assert all(item["symbol"] != "module_layout" for item in layout_alpha["imports"])
+
+rejects_spec("module_layout missing from vmlinux symvers", "vmlinux.symvers lacks it",
+             lambda s: s["modules"]["alpha"]["versions"].append(
+                 ("module_layout", 0xABCD0001)))
+rejects_spec("module_layout CRC mismatch", "module_layout has a CRC mismatch",
+             lambda s: add_module_layout(s, 0xDEAD0001))
+
+spec = default_spec()
+spec["modules"]["alpha"].update(
+    versions=None, extended_versions=[("printk", 0xAAAA0001)])
+extended_result = run(make(spec))
+extended_alpha = next(row for row in extended_result["modules"] if row["name"] == "alpha")
+assert extended_alpha["versions"] == "extended"
+
+spec = default_spec()
+spec["modules"]["alpha"].update(
+    versions=None,
+    extended_versions=[("printk", 0xAAAA0001), ("module_layout", 0xABCD0001)])
+spec["kernel_rows"].append(row(0xABCD0001, "module_layout", "vmlinux"))
+extended_layout = run(make(spec))
+extended_alpha = next(row for row in extended_layout["modules"] if row["name"] == "alpha")
+assert extended_alpha["versions"] == "extended"
+assert extended_alpha["module_layout"] == "kernel-crc-match"
+
+spec = default_spec()
+spec["modules"]["alpha"].update(
+    extended_versions=[("printk", 0xAAAA0001)])
+combined_result = run(make(spec))
+combined_alpha = next(row for row in combined_result["modules"] if row["name"] == "alpha")
+assert combined_alpha["versions"] == "basic+extended"
+
+long_symbol = "rust_" + "x" * 100
+spec = default_spec()
+spec["modules"]["alpha"].update(
+    imports=[("printk", "global"), (long_symbol, "global")],
+    extended_versions=[("printk", 0xAAAA0001), (long_symbol, 0xABCD0002)])
+spec["kernel_rows"].append(row(0xABCD0002, long_symbol, "vmlinux"))
+long_result = run(make(spec))
+long_alpha = next(row for row in long_result["modules"] if row["name"] == "alpha")
+assert long_alpha["versions"] == "basic+extended"
+assert any(item["symbol"] == long_symbol for item in long_alpha["imports"])
+
+rejects_spec("basic and extended CRC conflict", "modversions disagree for printk",
+             lambda s: s["modules"]["alpha"].update(
+                 extended_versions=[("printk", 0xDEAD0001)]))
+rejects_spec("extended metadata misses import", "extended modversions entries differ",
+             lambda s: s["modules"]["alpha"].update(
+                 extended_versions=[("module_layout", 0xABCD0001)]))
+
+def extended_misses_layout(spec):
+    add_module_layout(spec)
+    spec["modules"]["alpha"]["extended_versions"] = [("printk", 0xAAAA0001)]
+rejects_spec("extended metadata misses basic module_layout",
+             "basic modversions entry is absent from extended metadata: module_layout",
+             extended_misses_layout)
+rejects_spec("extended versions count mismatch", "names and CRC counts differ",
+             lambda s: (s["modules"]["alpha"].update(
+                 versions=None,
+                 extended_versions=[("printk", 0xAAAA0001), ("other", 1)]),
+                 s["elf_fix"].update(
+                     alpha=patch_named("__version_ext_crcs", "size", 4))))
+rejects_spec("extended versions empty name", "empty name",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=None, extended_versions=[("", 1)]))
+rejects_spec("extended versions duplicate", "invalid or duplicate name",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=None,
+                 extended_versions=[("printk", 0xAAAA0001), ("printk", 0xAAAA0001)]))
+rejects_spec("extended names unterminated", "not NUL-terminated",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=None,
+                 extra_sections=[
+                     ("__version_ext_names", 1, 2, b"printk", 0, 0, 0),
+                     ("__version_ext_crcs", 1, 2, struct.pack("<I", 0xAAAA0001), 0, 0, 0),
+                 ]))
+rejects_spec("extended names interior empty", "empty name",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=None,
+                 extra_sections=[
+                     ("__version_ext_names", 1, 2, b"printk\0\0\0", 0, 0, 0),
+                     ("__version_ext_crcs", 1, 2,
+                      struct.pack("<II", 0xAAAA0001, 0xABCD0001), 0, 0, 0),
+                 ]))
+rejects_spec("extended names trailing garbage", "trailing data",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=None,
+                 extra_sections=[
+                     ("__version_ext_names", 1, 2, b"printk\0\0x\0", 0, 0, 0),
+                     ("__version_ext_crcs", 1, 2,
+                      struct.pack("<I", 0xAAAA0001), 0, 0, 0),
+                 ]))
+rejects_spec("extended section wrong type", "not allocated PROGBITS",
+             lambda s: (s["modules"]["alpha"].update(
+                 versions=None, extended_versions=[("printk", 0xAAAA0001)]),
+                 s["elf_fix"].update(
+                     alpha=patch_named("__version_ext_names", "type", 8))))
+
+conflict_elf = build_elf(
+    "conflict", imports=[("ccc", "global"), ("bbb", "global"), ("aaa", "global")],
+    versions=[("ccc", 1), ("bbb", 2), ("aaa", 3)],
+    extended_versions=[("ccc", 4), ("bbb", 5), ("aaa", 6)])
+conflict_path = work / "conflict.ko"
+conflict_path.write_bytes(conflict_elf)
+conflict_code = """
+import importlib.machinery, importlib.util, pathlib, sys
+loader = importlib.machinery.SourceFileLoader('myron_abi_seed', sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+try:
+    module.parse_module_elf(pathlib.Path(sys.argv[2]).read_bytes())
+except module.ContractError as error:
+    print(error)
+"""
+seed_runs = [
+    subprocess.run(
+        [sys.executable, "-s", "-c", conflict_code + "\nprint(hash('seed-probe'))",
+         str(bin_path), str(conflict_path)],
+        env={**os.environ, "PYTHONHASHSEED": seed}, check=True,
+        capture_output=True, text=True).stdout.strip().splitlines()
+    for seed in ("1", "2", "3")
+]
+assert {lines[0] for lines in seed_runs} == {
+    "basic and extended modversions disagree for aaa"
+}, seed_runs
+assert len({lines[1] for lines in seed_runs}) == 3, seed_runs
 
 # ---- resolution -----------------------------------------------------------------------------------
 rejects_spec("unresolved import", "unresolved import: nowhere",
@@ -590,7 +1095,7 @@ for where in ("vm", "mod"):
     symvers_case("uppercase crc", "invalid CRC", row(0xABCDEF01, "printk", "vmlinux").replace("0xabcdef01", "0xABCDEF01"), where)
     symvers_case("short crc", "invalid CRC", "0x1\tprintk\tvmlinux\tEXPORT_SYMBOL\t\n", where)
     symvers_case("bad symbol", "invalid symbol", "0x00000001\t1bad\tvmlinux\tEXPORT_SYMBOL\t\n", where)
-    symvers_case("long symbol", "invalid symbol", row(1, "a" * 56, "vmlinux"), where)
+    symvers_case("long symbol", "invalid symbol", row(1, "a" * 512, "vmlinux"), where)
     symvers_case("bad type", "invalid export type", "0x00000001\tx\tvmlinux\tEXPORT\t\n", where)
     symvers_case("bad namespace", "invalid namespace", "0x00000001\tx\tvmlinux\tEXPORT_SYMBOL\tn s\n", where)
     symvers_case("bad provider", "invalid provider", "0x00000001\tx\t\tEXPORT_SYMBOL\t\n", where)
@@ -645,5 +1150,5 @@ done
 "${cli[@]}" verify-abi --help | grep -q -- '--vmlinux-symvers' || fail "verify-abi help"
 pass "verify-abi CLI fails closed, prints nothing on error and runs no external tool"
 
-[[ $(cat version) == 0.3.0 ]] || fail "package version is not 0.3.0"
-pass "package version is 0.3.0"
+[[ $(cat version) == 0.4.0 ]] || fail "package version is not 0.4.0"
+pass "package version is 0.4.0"

@@ -29,6 +29,13 @@ parser handles a synthetic ELF layout only and is unqualified on real modules;
 vendor modules are `not-verified`, activation stays disabled and nothing is
 authorized.
 
+Kernel contract 0.4.0 (Phase 2.11) adds fail-closed support for standard
+AArch64/GKI RELA relocation with allocated-REL refusal, PREL32 export,
+section-backed CRC, allocated extended
+modversions, runtime export namespaces and `module_layout` shapes. Tests use synthetic ELF only. The
+parser remains unqualified on real owner bytes, the vendor inventory remains
+outside scope, and the blocker stays open.
+
 Phase 2.5 adds `device/myron/deployment-contract.json` and the laptop-only
 `tools/myron-deployment` (`show`, `stage-modules`, `assemble`, `verify`,
 `gate`). It stages the exact qualified module overlay (selector plus seven
@@ -58,17 +65,17 @@ disabled, all seven blockers stay unchanged, and the gate still refuses. No
 real archive or symvers pair has been bound.
 
 Phase 2.9 adds `device/myron/snapshot-contract.json` and the laptop-only
-`tools/myron-snapshot` 0.1.0. It re-verifies every deployment-kit input, then
+`tools/myron-snapshot` 0.2.0. It re-verifies every deployment-kit input, then
 binds only the kit identity, rootfs digest/manifest, archive hash, runtime
 summary and ABI summary into a deterministic five-file metadata artifact. Its
 read-only rollback rehearsal compares a candidate tree with the bound rootfs
-digest but always reports atomicity and rollback as unproven. Version 0.1.0
+digest but always reports atomicity and rollback as unproven. Version 0.2.0
 accepts only `not-captured` and `not-proven` evidence, preserves all seven
 blockers, copies no payload bytes and performs no capture, restore or deploy.
 See [SNAPSHOT-GATE.md](../../docs/myron/SNAPSHOT-GATE.md).
 
 Phase 2.10 adds `device/myron/preflight-contract.json` and
-`tools/myron-preflight` 0.1.0. It re-verifies a kit and snapshot and produces a
+`tools/myron-preflight` 0.2.0. It re-verifies a kit and snapshot and produces a
 five-file, metadata-only hardware-read approval request. Seven declarative read
 IDs carry strict byte bounds, emitted-field allowlists, identifier/private-byte
 redaction and stop conditions. The execution and evidence lists remain empty,

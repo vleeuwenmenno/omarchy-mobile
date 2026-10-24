@@ -53,6 +53,22 @@ conventions and is **unqualified on real modules**; vendor modules are
 `not-verified`. The deployment blocker stays until the real qualified archive,
 the exact symvers files and the full vendor module inventory are checked.
 
+Version 0.4.0 removes known parser-only blockers to reading standard AArch64
+GKI modules. Synthetic fixtures now cover bounded RELA sections with supported
+relocation types and complete writes, plus fail-closed refusal of allocated REL
+targets, legacy 8-byte, PREL32 12-byte,
+and non-PREL32 ELF64 24-byte export tables before and after final-link merging,
+classic and section-backed CRCs, allocated authoritative extended modversions, local
+assembler labels and `module_layout`. Merged runtime export-name relocations,
+including named-symbol and compiler-shaped section-symbol targets with RELA
+addends, table sorting, and CRC index order are checked. Relocations into
+literal evidence or runtime-name strings and overlapping runtime-name-field
+writes are rejected. Per-symbol and merged 12/24-byte runtime export namespaces
+are resolved from RELA and must match `Module.symvers`.
+This is layout support, not qualification: no real owner archive or symvers
+pair has been supplied to this port, vendor modules remain outside scope, and
+`module-abi-import-and-load-order-not-verified` remains open.
+
 | Input | Qualified SHA-256 |
 | --- | --- |
 | Raw `Image` | `9dc9d4a00544af130e04b534cb566e26329dbaa9b2f0e6596ad52c1e657d9e09` |

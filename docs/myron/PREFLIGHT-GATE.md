@@ -2,7 +2,7 @@
 # Myron hardware-read preflight gate (Phase 2.10)
 
 Status (2026-10-24): offline, deterministic, refusal-only.
-`tools/myron-preflight` 0.1.0 consumes a fully re-verified deployment kit and
+`tools/myron-preflight` 0.2.0 consumes a fully re-verified deployment kit and
 snapshot candidate and produces a bounded hardware-read **approval request**.
 It executes no operation, collects no evidence, contacts no phone, and grants
 no approval. No real request exists yet because no real kit or snapshot has
@@ -75,7 +75,7 @@ collector. These are identifiers and field allowlists, not shell commands:
 Every operation says read-only, uses the future transport name
 `approved-read-only-recovery-session`, and stops on identity mismatch,
 two-source disagreement, a bound overrun, unstable reads, or any write attempt.
-No collector is implemented in 0.1.0.
+No collector is implemented in 0.2.0.
 
 R7 rejects every unlisted command-line or bootconfig key. Its command-line
 allowlist is limited to `androidboot.slot_suffix` (`_a` or `_b`),
@@ -109,7 +109,7 @@ to read. Item 7 cannot be produced by this tool.
 
 ## Safety and publication
 
-The tool imports exact `myron-deployment` 0.3.0 and `myron-snapshot` 0.1.0
+The tool imports exact `myron-deployment` 0.4.0 and `myron-snapshot` 0.2.0
 implementations in-process. It reuses strict canonical JSON, stable bounded
 descriptor reads, no-follow tree walking, input collision/alias checks, and
 same-parent `renameat2(RENAME_NOREPLACE)` publication. It starts no process and

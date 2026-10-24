@@ -21,7 +21,7 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-snapshot-candidate-contract"
-assert value["format_version"] == "0.1.0"
+assert value["format_version"] == "0.2.0"
 assert len(value["blockers"]) == 7
 assert value["snapshot"]["capture_status"] == "not-captured"
 assert value["snapshot"]["quiescence"] == "not-proven"

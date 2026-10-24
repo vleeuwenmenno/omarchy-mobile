@@ -76,7 +76,7 @@ omamobile-myron-kernel-verify verify-stage \
   extra owned files, any other `.ko`, the forbidden paths above, and a bind
   mount inside the tree. Staged files are hashed, never executed.
 
-## ABI, import and load-order check (0.3.0)
+## ABI, import and load-order check (0.4.0)
 
 ```text
 omamobile-myron-kernel-verify verify-abi \
@@ -97,9 +97,27 @@ It checks:
   equivalent) and one `vermagic` that starts with the kernel release and is
   identical across the set; GPL-only imports require a compatible `license`;
   ELF class, byte order, type and machine;
-- undefined global/weak symbols are the imports; `__versions` (when present)
-  lists exactly those imports with 32-bit CRCs, and is required for imports
-  when vermagic enables `modversions`;
+- undefined global/weak symbols are the imports; basic `__versions` and paired
+  extended-modversions sections list exactly those imports plus optional
+  `module_layout`, whose CRC is checked against `vmlinux.symvers`. When both
+  formats exist, the loader-authoritative extended table must cover every
+  import and every basic entry must match it;
+- relocation sections have bounded ELF64 REL/RELA records, valid symbol-table
+  and target links, supported AArch64 types, complete write extents,
+  instruction alignment, and cannot target literal metadata or runtime export
+  strings used as evidence. Allocated AArch64 targets require RELA; REL is
+  structurally inspected and refused because the Android 16 loader rejects it;
+- exports accept one consistent legacy two-PREL32-field 8-byte, standard
+  AArch64 PREL32 12-byte, or non-PREL32 ELF64 24-byte layout per module,
+  including final-linked merged `__ksymtab*` and
+  `__kcrctab*` tables with exact entry coverage and loader-required export-name
+  sorting. Runtime names resolve named-symbol or compiler-shaped section-symbol
+  relocations with explicit RELA addends; overlapping
+  writes are rejected. Per-symbol and merged 12/24-byte runtime namespace
+  fields are resolved the same way and must equal `Module.symvers`; CRC evidence may be classic
+  absolute or modern section-backed;
+  merged CRC entries must match export count and table order because the
+  kernel resolves them by export index;
 - each import resolves to the kernel (`vmlinux.symvers`) or to exactly one
   staged module (`Module.symvers` provider), with CRC and namespace
   (`import_ns`) checks; unresolved imports, imports from modules outside the
@@ -114,14 +132,14 @@ The output is deterministic JSON with `scope: staged-set-only`,
 hashes, the declared and resolved order and per-module imports, exports,
 providers and CRC status. It carries no deployment, boot or flash claim.
 
-**Unqualified on real modules.** The ELF reader supports one deterministic,
-synthetic representation shaped after Linux conventions (one `.symtab`, `.modinfo`,
-`___ksymtab[_gpl]+NAME` sections with `__ksymtab_NAME` symbols, absolute
-`__crc_NAME` symbols, a `__versions` table of 64-byte records). It has never
-been run on the real qualified archive: real layouts it does not model, such as
-a `module_layout` record in `__versions`, relocation sections or extended
-modversions sections, fail with a deterministic error and are not guessed at. A pass proves
-consistency of the staged set only. It does
+**Unqualified on real modules.** Version 0.4.0 synthetically covers standard
+Linux AArch64/GKI RELA sections, fail-closed allocated-REL refusal,
+final-linked 12-byte PREL32 and 24-byte
+ELF64 export tables, legacy 8-byte tables, classic and section-backed CRCs,
+allocated basic and extended modversions, and `module_layout`.
+It has still never been run on the real qualified archive. Unsupported or
+malformed layouts fail deterministically. A pass proves consistency of the
+staged set only; it does
 not clear the deployment blocker, which stays until the real qualified
 archive, the exact symvers files and the full vendor module inventory have
 been checked.

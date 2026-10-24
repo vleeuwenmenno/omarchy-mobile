@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: MIT -->
-# Myron deployment gate (Phase 2.5, runtime binding 2.7, ABI binding 2.8)
+# Myron deployment gate (Phase 2.5, runtime 2.7, ABI 2.8/2.11)
 
 Status (2026-10-24): laptop-only, offline, deterministic. `tools/myron-deployment`
 builds and verifies a **deployment-candidate kit** and then **always refuses to
@@ -9,10 +9,10 @@ authorization. No kit has been built from the real qualified archive: `out/repo`
 is empty and the archive and private runtime assets are external. As of
 `myron-deployment` 0.2.0 the tool can bind a runtime-asset closure by hashes
 only, but **no real runtime tree has been bound**; every real run so far, if any,
-would be `not-bound`. Version 0.3.0 can also bind the existing staged-set ABI
+would be `not-bound`. Version 0.4.0 can also bind the staged-set ABI
 verifier report from the exact archive and two exact symvers files. No real
-archive or symvers pair has been bound, and the parser remains unqualified on
-real modules.
+archive or symvers pair has been bound. Standard AArch64/GKI layouts have
+synthetic coverage, but the parser remains unqualified on real modules.
 
 ## What it binds
 
@@ -120,7 +120,7 @@ not clear `private-runtime-asset-bytes-not-bound-to-kit` or reorder any blocker,
 and the gate still refuses. The gate reports `runtime_status`,
 `runtime_asset_count` and `runtime_digest`.
 
-## Staged-set ABI binding (0.3.0)
+## Staged-set ABI binding (0.4.0)
 
 `--vmlinux-symvers` and `--module-symvers` are required by `assemble`, `verify`
 and `gate`. They must both be the literal `none`, or both be canonical absolute
@@ -140,9 +140,10 @@ paths and full import/export tables are not copied into the kit. `verify` and
 `gate` must receive the same mode: a bound kit requires both files and
 recomputes equal evidence; a not-bound kit requires both literals `none`.
 
-This proves only consistency of the staged synthetic-parser module set.
+This proves only consistency of the staged module set under a parser whose
+standard AArch64/GKI layouts are covered by synthetic fixtures only.
 `vendor_modules` remains `not-verified`, the parser remains
-`synthetic-offline-unqualified-on-real-modules`, activation remains disabled,
+`linux-gki-layouts-offline-unqualified-on-real-modules`, activation remains disabled,
 the overlay order remains `unverified`, and
 `module-abi-import-and-load-order-not-verified` remains in the unchanged
 seven-item blocker list. The gate reports `abi_status`, `abi_scope`,

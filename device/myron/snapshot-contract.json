@@ -19,7 +19,7 @@
   },
   "deployment_authorized": false,
   "flashable": false,
-  "format_version": "0.1.0",
+  "format_version": "0.2.0",
   "hardware_qualified": false,
   "image_ready": false,
   "kind": "myron-snapshot-candidate-contract",

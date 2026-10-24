@@ -114,6 +114,14 @@ Implemented in the metadata-only contract package:
   the real qualified archive, exact symvers and the full vendor module
   inventory are checked.
 
+- (0.4.0, Phase 2.11) the verifier accepts structurally validated ELF64
+  RELA sections and refuses allocated REL targets, plus legacy 8-byte,
+  AArch64 PREL32 12-byte, and non-PREL32
+  ELF64 24-byte export layouts, classic and section-backed CRCs, basic and
+  extended modversions, runtime export namespaces, and `module_layout`.
+  Coverage remains synthetic and explicitly unqualified on real modules; no
+  blocker or authority state changes.
+
 Phase 2.5 (laptop-only, done): `device/myron/deployment-contract.json` and
 `tools/myron-deployment` stage the module overlay writer-side and assemble a
 deterministic deployment-candidate kit bound to the rootfs stage, kernel
@@ -144,17 +152,17 @@ unverified overlay order, all seven blockers and gate refusal remain unchanged
 ([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)).
 
 Phase 2.9 (laptop-only, mechanism done): `device/myron/snapshot-contract.json`
-and `tools/myron-snapshot` 0.1.0 bind a fully re-verified deployment kit to its
+and `tools/myron-snapshot` 0.2.0 bind a fully re-verified deployment kit to its
 pre-deployment rootfs digest in a deterministic, metadata-only snapshot
 candidate. A read-only rollback rehearsal accepts only the same version-1 tree
 digest while still reporting `atomicity_proven: false` and
-`rollback_proven: false`. Version 0.1.0 permits only `not-captured`,
+`rollback_proven: false`. Version 0.2.0 permits only `not-captured`,
 `not-proven` quiescence and `not-proven` rollback states; it performs no
 capture or restore, clears no blocker and authorizes nothing
 ([SNAPSHOT-GATE.md](SNAPSHOT-GATE.md)).
 
 Phase 2.10 (laptop-only, mechanism done):
-`device/myron/preflight-contract.json` and `tools/myron-preflight` 0.1.0 bind a
+`device/myron/preflight-contract.json` and `tools/myron-preflight` 0.2.0 bind a
 re-verified kit and snapshot into a refusal-only hardware-read approval
 request. The request maps all seven open blockers to their real evidence
 producer and declares seven bounded, redacted future read operations, but its
@@ -162,9 +170,17 @@ execution and collected-evidence lists are empty and every authority flag is
 false. It contacts no phone and is not approval
 ([PREFLIGHT-GATE.md](PREFLIGHT-GATE.md)).
 
-Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
-host-key revalidation before another live read, and translation of the vendor
-module boot order. The generic rootfs builder remains blocked because its
+Phase 2.11 (laptop-only, mechanism done): kernel-contract and deployment tool
+0.4.0 add synthetic coverage for standard AArch64/GKI module layouts so real
+owner bytes are no longer guaranteed to fail on RELA, PREL32 exports,
+section-backed CRCs, `module_layout`, or allocated extended modversions. Snapshot and
+preflight tools 0.2.0 pin the new evidence format. Real-module qualification,
+full vendor inventory and every live/deployment gate remain open.
+
+Remaining Phase 2 gates are a clean reproducible source build, qualification
+against the exact owner archive and symvers pair, a bounded evidence collector,
+a trusted SSH host-key revalidation before another live read, and translation
+of the vendor module boot order. The generic rootfs builder remains blocked because its
 `/usr/lib/modules` model is incompatible with Myron's notes-keyed module sets.
 
 ## Phase 3: Arch Linux ARM rootfs

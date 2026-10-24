@@ -1460,7 +1460,7 @@ _, bound_data = snapshot(bound_a)
 bound_document = json.loads(bound_data["kit.json"])
 assert bound_document["runtime_assets"] == expected_evidence(), bound_document["runtime_assets"]
 assert result["runtime_digest"] == expected_evidence()["digest"]
-assert bound_document["format_version"] == "0.3.0" == T.VERSION
+assert bound_document["format_version"] == "0.4.0" == T.VERSION
 assert bound_document["runtime_assets"]["bytes_copied_into_kit"] is False
 assert "runtime_assets" not in json.loads(bound_data["status.json"])
 assert "runtime_assets" not in bound_document["status"]
@@ -2008,7 +2008,7 @@ assert snapshot(runtime_a) == runtime_before and RT_MANIFEST.read_bytes() == rt_
 assert (rootfs_before, rootfs_data) == snapshot(rootfs)
 ok("runtime binding spawns no process and mutates no input")
 
-# ---- staged-set ABI evidence binding (0.3.0): synthetic ELF and symvers only -------
+# ---- staged-set ABI evidence binding (0.4.0): synthetic ELF and symvers only -------
 abi_fx = make_fixture(abi=True)
 abi_root, abi_archive = abi_fx["root"], abi_fx["archive"]
 abi_rootfs, abi_manifest = make_rootfs(abi_fx)
@@ -2053,7 +2053,7 @@ assert abi_result["abi_status"] == "staged-set-consistent"
 assert abi_evidence["status"] == "staged-set-consistent"
 assert abi_evidence["scope"] == "staged-set-only"
 assert abi_evidence["vendor_modules"] == "not-verified"
-assert abi_evidence["parser"] == "synthetic-offline-unqualified-on-real-modules"
+assert abi_evidence["parser"] == "linux-gki-layouts-offline-unqualified-on-real-modules"
 assert abi_evidence["activation"] == "disabled"
 assert abi_evidence["deployment_blocker"] == "unchanged"
 assert abi_evidence["blocker"] == "module-abi-import-and-load-order-not-verified"

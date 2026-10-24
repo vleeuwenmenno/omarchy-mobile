@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Laptop-only, non-flashable Myron deployment-candidate kit (v0.3).
+"""Laptop-only, non-flashable Myron deployment-candidate kit (v0.4).
 
 Stages the exact qualified external module overlay and binds a rootfs stage,
 the kernel contract, the GPU profile and the private runtime-asset manifest
@@ -14,7 +14,7 @@ it never clears a blocker. Since 0.3.0 a kit also records abi evidence: either
 kernel verifier's staged-set-only ABI/import/load-order result over the exact
 archive bytes and two exact symvers files, kept as hashes and a fixed summary
 (the symvers files are never copied). It is not source reproduction, vendor
-module verification, a qualified parser or full ABI proof, and it never clears
+module verification, a real-module-qualified parser or full ABI proof, and it never clears
 a blocker. The tool never authorizes deployment: the gate
 prints the permanent blockers and refuses. Nothing here is bootable, flashable,
 an image, an atomic-snapshot proof, or hardware-qualified.
@@ -49,7 +49,7 @@ from typing import NamedTuple
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 REPO = Path(__file__).resolve().parent.parent
 KERNEL_VERIFIER = REPO / "packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify"
 GPU_VERIFIER = REPO / "packages/omamobile-myron-gpu-profile/bin/omamobile-myron-gpu-profile"
@@ -74,7 +74,7 @@ ABI_NONE = "none"
 ABI_DIGEST_ALGORITHM = "myron-abi-evidence-v1-sha256"
 ABI_BLOCKER = "module-abi-import-and-load-order-not-verified"
 ABI_SCOPE = "staged-set-only"
-ABI_PARSER = "synthetic-offline-unqualified-on-real-modules"
+ABI_PARSER = "linux-gki-layouts-offline-unqualified-on-real-modules"
 MODE_TEXT = re.compile(r"[0-7]{4}")
 KIT_KIND = "myron-deployment-candidate-kit"
 CONTRACT_KIND = "myron-deployment-candidate-contract"

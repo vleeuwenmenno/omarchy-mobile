@@ -2,7 +2,7 @@
 # Myron snapshot candidate gate (Phase 2.9)
 
 Status (2026-10-24): laptop-only, offline, deterministic, and deliberately
-non-authorizing. `tools/myron-snapshot` 0.1.0 binds a fully re-verified Myron
+non-authorizing. `tools/myron-snapshot` 0.2.0 binds a fully re-verified Myron
 deployment kit to the pre-deployment rootfs-stage digest. It also defines a
 read-only rollback acceptance check. It does not capture, copy, freeze, restore,
 mount, boot, flash, deploy, or contact a phone.
@@ -16,7 +16,7 @@ remain unchanged, including `atomic-snapshot-and-rollback-not-proven`.
 
 `device/myron/snapshot-contract.json` is a canonical derivative of the current
 deployment contract. It pins that contract's SHA-256, the snapshot and rollback
-algorithms, the only accepted 0.1.0 refusal states, the unchanged blocker list,
+algorithms, the only accepted 0.2.0 refusal states, the unchanged blocker list,
 and false authority flags.
 
 | Command | Effect |
@@ -84,7 +84,7 @@ capture must use a revised algorithm or separately bind those properties.
 
 ## Publication and safety
 
-The tool imports `tools/myron-deployment` in-process and requires version 0.3.0.
+The tool imports `tools/myron-deployment` in-process and requires version 0.4.0.
 It reuses its strict JSON, trusted ancestry, stable bounded reads, tree digest,
 input-alias checks, and same-parent `renameat2(RENAME_NOREPLACE)` publication.
 No external process is started. Output must not exist, lie under an input tree,

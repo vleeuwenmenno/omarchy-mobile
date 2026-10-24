@@ -996,10 +996,10 @@ def load_reference() -> dict:
 
 # --- staged-set-only module ABI, import and load-order verification ----------
 #
-# Offline and metadata-only. The ELF reader below supports one deterministic,
-# synthetic representation of a Linux AArch64 relocatable module. It has not
-# been qualified against any real vendor or GKI module: an unsupported real
-# layout fails with a deterministic error instead of being guessed at.
+# Offline and metadata-only. The ELF reader below recognizes standard Linux
+# AArch64/GKI relocatable-module layouts, but those layouts are covered only by
+# synthetic fixtures. It has not been qualified against a real vendor or GKI
+# module: an unsupported layout fails instead of being guessed at.
 
 MAX_SYMVERS_BYTES = 32 * 1024 * 1024
 MAX_SYMVERS_ROWS = 400_000
@@ -1011,20 +1011,27 @@ MAX_ELF_STRTAB_BYTES = 4 * 1024 * 1024
 MAX_MODINFO_BYTES = 64 * 1024
 MAX_MODINFO_ENTRIES = 512
 MAX_VERSIONS_ENTRIES = 16_384
+MAX_VERSION_NAMES_BYTES = MAX_VERSIONS_ENTRIES * 512
+MAX_ELF_RELOCATIONS = 1_000_000
 ELF_HEADER_SIZE = 64
 ELF_SECTION_SIZE = 64
 ELF_SYMBOL_SIZE = 24
 MODVERSION_ENTRY_SIZE = 64
 MODVERSION_NAME_SIZE = 56
+MODULE_LAYOUT = "module_layout"
 EM_AARCH64 = 183
 ET_REL = 1
 SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB = 0, 1, 2, 3
 SHT_RELA, SHT_NOBITS, SHT_REL = 4, 8, 9
-SHF_ALLOC, SHF_COMPRESSED = 0x2, 0x800
-KSYMTAB_ENTRY_SIZE = 8
+SHF_ALLOC, SHF_INFO_LINK, SHF_COMPRESSED = 0x2, 0x40, 0x800
+# 8 is the legacy two-PREL32-field representation retained for older inputs;
+# current ELF64 uses either three PREL32 fields (12) or three pointers (24).
+KSYMTAB_ENTRY_SIZES = (8, 12, 24)
+KCRC_ENTRY_SIZE = 4
+REL_ENTRY_SIZE, RELA_ENTRY_SIZE = 16, 24
 SHN_UNDEF, SHN_LORESERVE, SHN_ABS = 0, 0xFF00, 0xFFF1
-SYMBOL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,54}")
-LOCAL_SYMBOL_NAME = re.compile(r"[\x21-\x7e]{1,255}")
+SYMBOL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,510}")
+LOCAL_SYMBOL_NAME = re.compile(r"[\x21-\x7e]{1,511}")
 SYMVERS_CRC = re.compile(r"0x[0-9a-f]{8}")
 SYMVERS_PROVIDER = re.compile(r"[A-Za-z0-9_./+-]{1,255}")
 SYMVERS_NAMESPACE = re.compile(r"[A-Za-z0-9_.-]{0,255}")
@@ -1046,6 +1053,32 @@ KSYMTAB_SECTIONS = {
     "___ksymtab_unused": "EXPORT_UNUSED_SYMBOL",
     "___ksymtab_unused_gpl": "EXPORT_UNUSED_SYMBOL_GPL",
 }
+KCRCTAB_SECTIONS = {
+    "___kcrctab": "EXPORT_SYMBOL",
+    "___kcrctab_gpl": "EXPORT_SYMBOL_GPL",
+    "___kcrctab_unused": "EXPORT_UNUSED_SYMBOL",
+    "___kcrctab_unused_gpl": "EXPORT_UNUSED_SYMBOL_GPL",
+}
+MERGED_KSYMTAB_SECTIONS = {
+    name.replace("___", "__", 1): export_type
+    for name, export_type in KSYMTAB_SECTIONS.items()
+}
+MERGED_KCRCTAB_SECTIONS = {
+    name.replace("___", "__", 1): export_type
+    for name, export_type in KCRCTAB_SECTIONS.items()
+}
+# Relocations accepted by the Android 16 AArch64 module loader. Values map to
+# (bytes written, required offset alignment). R_AARCH64_NONE writes nothing.
+AARCH64_RELOCATION_SHAPES = {
+    0: (0, 1), 256: (0, 1),
+    257: (8, 1), 258: (4, 1), 259: (2, 1),
+    260: (8, 1), 261: (4, 1), 262: (2, 1),
+    **{number: (4, 4) for number in (*range(263, 281), *range(282, 294), 299)},
+}
+LITERAL_METADATA_SECTIONS = {
+    ".modinfo", "__versions", "__version_ext_names", "__version_ext_crcs",
+    "__ksymtab_strings",
+}
 MODINFO_KEY = re.compile(r"[a-z][a-z0-9_]{0,31}")
 MODINFO_NAME = re.compile(r"[A-Za-z0-9_]{1,55}")
 VERMAGIC_TOKEN = re.compile(r"[\x21-\x7e]+")
@@ -1064,8 +1097,10 @@ class ModuleElf(NamedTuple):
     license: str | None
     import_namespaces: tuple
     imports: dict      # symbol -> "global" | "weak"
-    exports: dict      # symbol -> (export type, CRC or None)
-    versions: dict | None  # symbol -> CRC, None without a __versions section
+    exports: dict      # symbol -> (export type, CRC or None, runtime namespace)
+    versions: dict | None  # imported symbol -> CRC, None without version metadata
+    module_layout_crc: int | None
+    versions_format: str   # absent | basic | extended | basic+extended
 
 
 class ElfSection(NamedTuple):
@@ -1077,6 +1112,16 @@ class ElfSection(NamedTuple):
     link: int
     info: int
     entsize: int
+
+
+class ElfRelocation(NamedTuple):
+    offset: int
+    relocation_type: int
+    symbol_index: int
+    width: int
+    # RELA carries an explicit signed addend. REL stores the addend in the
+    # target field, so None means that it must be decoded from target bytes.
+    addend: int | None
 
 
 def normalize_module_name(name: str) -> str:
@@ -1225,6 +1270,41 @@ def parse_versions(data: bytes) -> dict[str, int]:
     return result
 
 
+def parse_extended_versions(names_data: bytes, crcs_data: bytes) -> dict[str, int]:
+    if not names_data or len(names_data) > MAX_VERSION_NAMES_BYTES or names_data[-1] != 0:
+        raise ContractError("__version_ext_names is empty, oversized or not NUL-terminated")
+    if not crcs_data or len(crcs_data) % 4:
+        raise ContractError("__version_ext_crcs size is not a positive multiple of 4")
+    count = len(crcs_data) // 4
+    if count > MAX_VERSIONS_ENTRIES:
+        raise ContractError("extended modversions has too many entries")
+    raw_names = []
+    position = 0
+    for _ in range(count):
+        end = names_data.find(b"\x00", position)
+        if end < 0:
+            raise ContractError("extended modversions names and CRC counts differ")
+        raw_names.append(names_data[position:end])
+        position = end + 1
+    # modpost emits explicit NULs inside concatenated C string literals. The
+    # compiler adds one final terminator to the resulting character array.
+    if names_data[position:] != b"\x00":
+        raise ContractError("extended modversions names and CRC counts differ or have trailing data")
+    result: dict[str, int] = {}
+    crcs = struct.iter_unpack("<I", crcs_data)
+    for raw, (crc,) in zip(raw_names, crcs):
+        if not raw:
+            raise ContractError("__version_ext_names has an empty name")
+        try:
+            name = raw.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ContractError("__version_ext_names name is not ASCII") from error
+        if not SYMBOL_NAME.fullmatch(name) or name in result:
+            raise ContractError("__version_ext_names has an invalid or duplicate name")
+        result[name] = crc
+    return result
+
+
 def parse_module_elf(data: bytes) -> ModuleElf:
     size = len(data)
     if size > MAX_MODULE_BYTES:
@@ -1264,12 +1344,10 @@ def parse_module_elf(data: bytes) -> ModuleElf:
         raise ContractError("module section 0 is not the null section")
     ranges = [(e_shoff, table_end, "section header table")]
     for index, (_, kind, flags, _, offset, length, *_rest) in enumerate(raw_sections):
-        if kind in (SHT_REL, SHT_RELA):
-            raise ContractError("module relocation sections are unsupported")
-        if kind in (SHT_NULL, SHT_NOBITS) or length == 0:
-            continue
         if flags & SHF_COMPRESSED:
             raise ContractError(f"module section {index} is compressed")
+        if kind in (SHT_NULL, SHT_NOBITS) or length == 0:
+            continue
         if offset < ELF_HEADER_SIZE or offset + length > size:
             raise ContractError(f"module section {index} is out of bounds")
         ranges.append((offset, offset + length, f"section {index}"))
@@ -1295,22 +1373,87 @@ def parse_module_elf(data: bytes) -> ModuleElf:
     by_name: dict[str, list[int]] = {}
     for index, section in enumerate(sections):
         by_name.setdefault(section.name, []).append(index)
-    export_sections: dict[int, tuple[str, str]] = {}
+    # section index -> (required symbol for a per-symbol input section, export
+    # type, possible entry sizes). Final module links merge the input sections,
+    # so merged tables use None for the required symbol.
+    export_sections: dict[int, tuple[str | None, str, tuple[int, ...]]] = {}
+    crc_sections: dict[int, tuple[str | None, str]] = {}
+    merged_export_sections: dict[str, int] = {}
+    merged_crc_sections: dict[str, int] = {}
     for index, section in enumerate(sections):
-        if not section.name.startswith("___ksymtab"):
-            continue
-        prefix, plus, symbol = section.name.partition("+")
-        if (
-            not plus
-            or prefix not in KSYMTAB_SECTIONS
-            or not SYMBOL_NAME.fullmatch(symbol)
-            or section.kind != SHT_PROGBITS
-            or not section.flags & SHF_ALLOC
-            or section.size != KSYMTAB_ENTRY_SIZE
-        ):
-            raise ContractError(f"module has an unsupported export section: {section.name}")
-        export_sections[index] = (symbol, KSYMTAB_SECTIONS[prefix])
-    for special in (".modinfo", ".symtab", "__versions"):
+        if section.name in MERGED_KSYMTAB_SECTIONS:
+            export_type = MERGED_KSYMTAB_SECTIONS[section.name]
+            candidates = tuple(
+                entry_size for entry_size in KSYMTAB_ENTRY_SIZES
+                if section.size > 0
+                and section.size % entry_size == 0
+                and section.entsize in (0, entry_size)
+            )
+            if (
+                section.kind != SHT_PROGBITS
+                or not section.flags & SHF_ALLOC
+                or not candidates
+            ):
+                raise ContractError(f"module has an unsupported export section: {section.name}")
+            if export_type in merged_export_sections:
+                raise ContractError(f"module has a duplicate merged export section: {section.name}")
+            merged_export_sections[export_type] = index
+            export_sections[index] = (None, export_type, candidates)
+        elif section.name.startswith("___ksymtab"):
+            prefix, plus, symbol = section.name.partition("+")
+            if (
+                not plus
+                or prefix not in KSYMTAB_SECTIONS
+                or not SYMBOL_NAME.fullmatch(symbol)
+                or section.kind != SHT_PROGBITS
+                or not section.flags & SHF_ALLOC
+                or section.size not in KSYMTAB_ENTRY_SIZES
+                or section.entsize not in (0, section.size)
+            ):
+                raise ContractError(f"module has an unsupported export section: {section.name}")
+            export_sections[index] = (
+                symbol, KSYMTAB_SECTIONS[prefix], (section.size,)
+            )
+        elif section.name in MERGED_KCRCTAB_SECTIONS:
+            crc_type = MERGED_KCRCTAB_SECTIONS[section.name]
+            if (
+                section.kind != SHT_PROGBITS
+                or not section.flags & SHF_ALLOC
+                or section.size == 0
+                or section.size % KCRC_ENTRY_SIZE
+                or section.entsize not in (0, KCRC_ENTRY_SIZE)
+            ):
+                raise ContractError(f"module has an unsupported CRC section: {section.name}")
+            if crc_type in merged_crc_sections:
+                raise ContractError(f"module has a duplicate merged CRC section: {section.name}")
+            merged_crc_sections[crc_type] = index
+            crc_sections[index] = (None, crc_type)
+        elif section.name.startswith("___kcrctab"):
+            prefix, plus, symbol = section.name.partition("+")
+            if (
+                not plus
+                or prefix not in KCRCTAB_SECTIONS
+                or not SYMBOL_NAME.fullmatch(symbol)
+                or section.kind != SHT_PROGBITS
+                or not section.flags & SHF_ALLOC
+                or section.size != KCRC_ENTRY_SIZE
+                or section.entsize not in (0, KCRC_ENTRY_SIZE)
+            ):
+                raise ContractError(f"module has an unsupported CRC section: {section.name}")
+            crc_sections[index] = (symbol, KCRCTAB_SECTIONS[prefix])
+        elif section.name.startswith("___kflagstab"):
+            raise ContractError("module uses unsupported export flags sections")
+    fixed_export_sizes = {
+        candidates[0]
+        for required, _export_type, candidates in export_sections.values()
+        if required is not None
+    }
+    if len(fixed_export_sizes) > 1:
+        raise ContractError("module mixes classic and PREL32 export layouts")
+    for special in (
+        ".modinfo", ".symtab", "__versions",
+        "__version_ext_names", "__version_ext_crcs",
+    ):
         if len(by_name.get(special, ())) > 1:
             raise ContractError(f"module has duplicate {special}")
     if ".modinfo" not in by_name:
@@ -1320,8 +1463,6 @@ def parse_module_elf(data: bytes) -> ModuleElf:
     symtabs = [index for index, section in enumerate(sections) if section.kind == SHT_SYMTAB]
     if symtabs != [by_name[".symtab"][0]]:
         raise ContractError("module must contain exactly one SHT_SYMTAB named .symtab")
-    if "__version_ext_names" in by_name or "__version_ext_crcs" in by_name:
-        raise ContractError("module uses unsupported extended modversions sections")
     modinfo = sections[by_name[".modinfo"][0]]
     if modinfo.kind != SHT_PROGBITS:
         raise ContractError(".modinfo is not PROGBITS")
@@ -1343,10 +1484,75 @@ def parse_module_elf(data: bytes) -> ModuleElf:
     if strtab[0] != 0 or strtab[-1] != 0:
         raise ContractError("symbol string table is malformed")
 
+    relocation_count = 0
+    relocations_by_target: dict[int, list[ElfRelocation]] = {}
+    symtab_index = by_name[".symtab"][0]
+    for index, section in enumerate(sections):
+        if section.kind not in (SHT_REL, SHT_RELA):
+            continue
+        entry_size = REL_ENTRY_SIZE if section.kind == SHT_REL else RELA_ENTRY_SIZE
+        if (
+            not section.flags & SHF_INFO_LINK
+            or section.entsize != entry_size
+            or section.size == 0
+            or section.size % entry_size
+            or section.link != symtab_index
+            or section.info == 0
+            or section.info >= e_shnum
+        ):
+            raise ContractError(f"module relocation section {index} is malformed")
+        target = sections[section.info]
+        if target.kind in (SHT_NULL, SHT_SYMTAB, SHT_STRTAB, SHT_REL, SHT_RELA):
+            raise ContractError(f"module relocation section {index} has an invalid target")
+        if section.info in crc_sections or target.name in LITERAL_METADATA_SECTIONS:
+            raise ContractError(
+                f"module relocation section {index} targets literal metadata: {target.name}"
+            )
+        records = section.size // entry_size
+        relocation_count += records
+        if relocation_count > MAX_ELF_RELOCATIONS:
+            raise ContractError("module has too many relocation records")
+        layout = "<QQ" if section.kind == SHT_REL else "<QQq"
+        for record in struct.iter_unpack(layout, contents(section)):
+            r_offset, r_info = record[:2]
+            if r_info >> 32 >= count:
+                raise ContractError(f"module relocation section {index} has a bad symbol index")
+            relocation_type = r_info & 0xFFFFFFFF
+            shape = AARCH64_RELOCATION_SHAPES.get(relocation_type)
+            if shape is None:
+                raise ContractError(
+                    f"module relocation section {index} uses unsupported AArch64 type "
+                    f"{relocation_type}"
+                )
+            width, alignment = shape
+            if r_offset >= target.size or r_offset + width > target.size:
+                raise ContractError(f"module relocation section {index} has an out-of-range offset")
+            if r_offset % alignment:
+                raise ContractError(f"module relocation section {index} has an unaligned offset")
+            relocations_by_target.setdefault(section.info, []).append(ElfRelocation(
+                r_offset, relocation_type, r_info >> 32, width,
+                None if section.kind == SHT_REL else record[2],
+            ))
+        # Android 16 AArch64 selects RELA. Its REL handler returns -ENOEXEC;
+        # accepting an allocated REL target would therefore validate a module
+        # the runtime loader rejects. Non-allocated debug relocations are not
+        # applied by the loader and remain structurally checked above.
+        if section.kind == SHT_REL and target.flags & SHF_ALLOC:
+            raise ContractError("module has REL relocations for an allocated section")
+
     imports: dict[str, str] = {}
-    export_symbols: dict[str, tuple[str, int]] = {}
+    export_symbols: dict[str, tuple[str, int, str]] = {}
     export_crcs: dict[str, int] = {}
-    referenced_export_sections: set[int] = set()
+    export_records: dict[int, list[tuple[str, int, int, int, int]]] = {
+        index: [] for index in export_sections
+    }
+    crc_records: dict[int, list[tuple[str, int, int, int, int]]] = {
+        index: [] for index in crc_sections
+    }
+    seen_exports: set[str] = set()
+    seen_crcs: set[str] = set()
+    crc_layouts: set[str] = set()
+    symbol_records: list[tuple[str, int, int, int, int, int] | None] = [None] * count
     for index, (st_name, st_info, st_other, st_shndx, st_value, st_size) in enumerate(
         struct.iter_unpack("<IBBHQQ", contents(symtab))
     ):
@@ -1354,6 +1560,7 @@ def parse_module_elf(data: bytes) -> ModuleElf:
         if index == 0:
             if (st_name, st_info, st_other, st_shndx, st_value, st_size) != (0,) * 6:
                 raise ContractError("symbol 0 is not the null symbol")
+            symbol_records[index] = ("", 0, 0, 0, 0, 0)
             continue
         if kind > 4 or bind > 2:
             raise ContractError("module has an unsupported symbol type or binding")
@@ -1370,6 +1577,7 @@ def parse_module_elf(data: bytes) -> ModuleElf:
             raise ContractError("module has an unsupported symbol section index")
         if st_shndx < SHN_LORESERVE and st_shndx >= e_shnum:
             raise ContractError("module symbol section index is out of bounds")
+        symbol_records[index] = (symbol, bind, kind, st_shndx, st_value, st_size)
         if st_shndx == SHN_UNDEF:
             if bind == 0:
                 raise ContractError("module has an undefined local symbol")
@@ -1379,6 +1587,8 @@ def parse_module_elf(data: bytes) -> ModuleElf:
                 raise ContractError(f"module import has an invalid name: {symbol}")
             if kind != 0 or st_value != 0 or st_size != 0:
                 raise ContractError(f"module import has an unsupported symbol record: {symbol}")
+            if symbol == MODULE_LAYOUT:
+                raise ContractError("module_layout is version metadata, not an undefined import")
             if symbol in imports:
                 raise ContractError(f"module has duplicate import: {symbol}")
             imports[symbol] = "weak" if bind == 2 else "global"
@@ -1387,50 +1597,269 @@ def parse_module_elf(data: bytes) -> ModuleElf:
             if not SYMBOL_NAME.fullmatch(exported) or st_shndx == SHN_ABS:
                 raise ContractError(f"module has an invalid export record: {symbol}")
             export_section = export_sections.get(st_shndx)
-            if export_section is None or export_section[0] != exported:
+            if export_section is None or (
+                export_section[0] is not None and export_section[0] != exported
+            ):
                 raise ContractError(f"module export {exported} is not in its ___ksymtab section")
             if (
-                bind != 1
-                or kind != 1
-                or st_size != KSYMTAB_ENTRY_SIZE
-                or st_value > sections[st_shndx].size - st_size
+                bind not in (0, 1)
+                or kind not in (0, 1)
+                or st_size not in (0, *export_section[2])
+                or st_value >= sections[st_shndx].size
             ):
                 raise ContractError(f"module export {exported} has an invalid ___ksymtab record")
-            if exported in export_symbols:
+            if exported in seen_exports:
                 raise ContractError(f"module has duplicate export: {exported}")
-            referenced_export_sections.add(st_shndx)
-            export_symbols[exported] = (export_section[1], 0)
+            seen_exports.add(exported)
+            export_records[st_shndx].append((exported, bind, kind, st_value, st_size))
         elif symbol.startswith("__crc_"):
             exported = symbol[len("__crc_"):]
-            if (
-                not SYMBOL_NAME.fullmatch(exported) or st_shndx != SHN_ABS
-                or bind != 1 or kind != 0 or st_size != 0
-                or st_value > 0xFFFFFFFF or exported in export_crcs
-            ):
+            if not SYMBOL_NAME.fullmatch(exported) or exported in seen_crcs:
                 raise ContractError(f"module has an invalid CRC record: {symbol}")
-            export_crcs[exported] = st_value
-    if referenced_export_sections != set(export_sections):
-        raise ContractError("module has an export section without exactly one export symbol")
+            seen_crcs.add(exported)
+            if st_shndx == SHN_ABS:
+                if bind not in (0, 1) or kind != 0 or st_size != 0 or st_value > 0xFFFFFFFF:
+                    raise ContractError(f"module has an invalid CRC record: {symbol}")
+                crc_layouts.add("absolute")
+                export_crcs[exported] = st_value
+            else:
+                crc_section = crc_sections.get(st_shndx)
+                if (
+                    crc_section is None
+                    or (crc_section[0] is not None and crc_section[0] != exported)
+                    or bind not in (0, 1)
+                    or kind not in (0, 1)
+                    or st_size not in (0, KCRC_ENTRY_SIZE)
+                    or st_value >= sections[st_shndx].size
+                ):
+                    raise ContractError(f"module has an invalid CRC record: {symbol}")
+                crc_layouts.add("section")
+                crc_records[st_shndx].append((exported, bind, kind, st_value, st_size))
+
+    def resolve_runtime_export_string(
+        section_index: int, field_offset: int, relocation_type: int,
+        exported: str, symbol_prefix: str, field_name: str,
+    ) -> str:
+        field_width = AARCH64_RELOCATION_SHAPES[relocation_type][0]
+        field_end = field_offset + field_width
+        matches = [
+            record for record in relocations_by_target.get(section_index, ())
+            if record.width
+            and record.offset < field_end
+            and record.offset + record.width > field_offset
+        ]
+        if (
+            len(matches) != 1
+            or matches[0].offset != field_offset
+            or matches[0].relocation_type != relocation_type
+            or matches[0].width != field_width
+        ):
+            raise ContractError(
+                f"module export {exported} has no unambiguous {field_name} relocation"
+            )
+        relocation = matches[0]
+        target = symbol_records[relocation.symbol_index]
+        if target is None:
+            raise ContractError(f"module export {exported} has an invalid {field_name} symbol")
+        target_name, bind, kind, shndx, value, target_size = target
+        named_target = (
+            target_name == f"{symbol_prefix}{exported}"
+            and bind in (0, 1)
+            and kind in (0, 1)
+        )
+        section_target = (
+            not target_name and bind == 0 and kind == 3
+            and value == 0 and target_size == 0
+        )
+        if (
+            not (named_target or section_target)
+            or shndx in (SHN_UNDEF, SHN_ABS)
+            or shndx >= e_shnum
+        ):
+            raise ContractError(f"module export {exported} has an invalid {field_name} symbol")
+        string_section = sections[shndx]
+        if (
+            string_section.name != "__ksymtab_strings"
+            or string_section.kind != SHT_PROGBITS
+            or not string_section.flags & SHF_ALLOC
+        ):
+            raise ContractError(f"module export {exported} has an invalid {field_name} section")
+        if relocation.addend is None:
+            addend_format = "<q" if relocation_type == 257 else "<i"
+            addend = struct.unpack_from(
+                addend_format, contents(sections[section_index]), field_offset
+            )[0]
+        else:
+            addend = relocation.addend
+        runtime_string_offset = value + addend
+        if runtime_string_offset < 0 or runtime_string_offset >= string_section.size:
+            raise ContractError(f"module export {exported} has an invalid {field_name} offset")
+        return elf_cstring(
+            contents(string_section), runtime_string_offset,
+            f"export {field_name}",
+        )
+
+    def validate_runtime_export_metadata(
+        section_index: int, entry_offset: int, entry_size: int, exported: str
+    ) -> str:
+        name_delta, relocation_type = (
+            (8, 257) if entry_size == 24 else (4, 261)
+        )
+        runtime_name = resolve_runtime_export_string(
+            section_index, entry_offset + name_delta, relocation_type,
+            exported, "__kstrtab_", "runtime-name",
+        )
+        if runtime_name != exported:
+            raise ContractError(
+                f"module export label and runtime name differ: {exported} != {runtime_name}"
+            )
+        if entry_size == 8:
+            return ""
+        namespace_delta = 16 if entry_size == 24 else 8
+        namespace = resolve_runtime_export_string(
+            section_index, entry_offset + namespace_delta, relocation_type,
+            exported, "__kstrtabns_", "runtime-namespace",
+        )
+        if not SYMVERS_NAMESPACE.fullmatch(namespace):
+            raise ContractError(f"module export {exported} has an invalid runtime namespace")
+        return namespace
+
+    export_sizes: set[int] = set()
+    for section_index, (required, export_type, candidates) in export_sections.items():
+        section = sections[section_index]
+        records = export_records[section_index]
+        if not records or (required is not None and len(records) != 1):
+            raise ContractError("module has an export section without exactly one export symbol")
+        layouts = [
+            entry_size for entry_size in candidates
+            if len(records) * entry_size == section.size
+            and sorted(record[3] for record in records) == list(
+                range(0, section.size, entry_size)
+            )
+            and all(record[4] in (0, entry_size) for record in records)
+        ]
+        if len(layouts) != 1:
+            raise ContractError("module export has an invalid ___ksymtab record")
+        entry_size = layouts[0]
+        export_sizes.add(entry_size)
+        ordered_records = sorted(records, key=lambda item: item[3])
+        runtime_namespaces = {record[0]: "" for record in ordered_records}
+        if required is None or entry_size in (12, 24):
+            for exported, _bind, _kind, value, _size in ordered_records:
+                runtime_namespaces[exported] = validate_runtime_export_metadata(
+                    section_index, value, entry_size, exported
+                )
+        if required is None:
+            ordered_names = [record[0] for record in ordered_records]
+            if ordered_names != sorted(ordered_names):
+                raise ContractError(
+                    f"module merged export table is not sorted by name: {export_type}"
+                )
+        for exported, _bind, _kind, _value, _size in ordered_records:
+            export_symbols[exported] = (
+                export_type, entry_size, runtime_namespaces[exported]
+            )
+    if len(export_sizes) > 1:
+        raise ContractError("module mixes classic and PREL32 export layouts")
+
+    for section_index, (required, crc_type) in crc_sections.items():
+        section = sections[section_index]
+        records = crc_records[section_index]
+        if not records or (required is not None and len(records) != 1):
+            raise ContractError("module has a CRC section without exactly one CRC symbol")
+        if (
+            len(records) * KCRC_ENTRY_SIZE != section.size
+            or sorted(record[3] for record in records)
+            != list(range(0, section.size, KCRC_ENTRY_SIZE))
+            or any(record[4] not in (0, KCRC_ENTRY_SIZE) for record in records)
+        ):
+            raise ContractError("module has an invalid CRC record")
+        section_data = contents(section)
+        for exported, _bind, _kind, value, _size in records:
+            export_crcs[exported] = struct.unpack_from("<I", section_data, value)[0]
+            if exported in export_symbols and crc_type != export_symbols[exported][0]:
+                raise ContractError(
+                    f"module CRC section type differs from export type: {exported}"
+                )
+    for export_type, crc_index in merged_crc_sections.items():
+        export_index = merged_export_sections.get(export_type)
+        if export_index is None:
+            raise ContractError("module has a merged CRC table without its export table")
+        export_order = [
+            record[0] for record in sorted(export_records[export_index], key=lambda item: item[3])
+        ]
+        crc_order = [
+            record[0] for record in sorted(crc_records[crc_index], key=lambda item: item[3])
+        ]
+        if crc_order != export_order:
+            raise ContractError(
+                f"module merged CRC table does not match export-table order: {export_type}"
+            )
+    if len(crc_layouts) > 1:
+        raise ContractError("module mixes absolute and section-backed CRC layouts")
     if set(export_crcs) - set(export_symbols):
         raise ContractError("module has a CRC record without an export")
     exports = {
-        symbol: (record[0], export_crcs.get(symbol))
+        symbol: (record[0], export_crcs.get(symbol), record[2])
         for symbol, record in export_symbols.items()
     }
     if set(exports) & set(imports):
         raise ContractError("module imports a symbol it exports")
 
     versions = None
-    if "__versions" in by_name:
+    module_layout_crc = None
+    versions_format = "absent"
+    basic = "__versions" in by_name
+    extended_names = "__version_ext_names" in by_name
+    extended_crcs = "__version_ext_crcs" in by_name
+    if extended_names != extended_crcs:
+        raise ContractError("module has only one extended modversions section")
+    basic_versions = None
+    extended_versions = None
+    if basic:
         section = sections[by_name["__versions"][0]]
-        if section.kind != SHT_PROGBITS:
-            raise ContractError("__versions is not PROGBITS")
-        versions = parse_versions(contents(section))
+        if section.kind != SHT_PROGBITS or not section.flags & SHF_ALLOC:
+            raise ContractError("__versions is not allocated PROGBITS")
+        basic_versions = parse_versions(contents(section))
+        versions = basic_versions
+        versions_format = "basic"
+    if extended_names:
+        names_section = sections[by_name["__version_ext_names"][0]]
+        crcs_section = sections[by_name["__version_ext_crcs"][0]]
+        if (
+            names_section.kind != SHT_PROGBITS
+            or crcs_section.kind != SHT_PROGBITS
+            or not names_section.flags & SHF_ALLOC
+            or not crcs_section.flags & SHF_ALLOC
+        ):
+            raise ContractError("extended modversions sections are not allocated PROGBITS")
+        extended_versions = parse_extended_versions(contents(names_section), contents(crcs_section))
+        extended_imports = set(extended_versions) - {MODULE_LAYOUT}
+        if extended_imports != set(imports):
+            raise ContractError("extended modversions entries differ from the undefined imports")
+        if basic_versions is None:
+            versions = dict(extended_versions)
+            versions_format = "extended"
+        else:
+            for symbol in sorted(basic_versions):
+                if symbol not in extended_versions:
+                    raise ContractError(
+                        f"basic modversions entry is absent from extended metadata: {symbol}"
+                    )
+                if basic_versions[symbol] != extended_versions[symbol]:
+                    raise ContractError(f"basic and extended modversions disagree for {symbol}")
+            versions = dict(extended_versions)
+            versions_format = "basic+extended"
+    if versions is not None:
+        module_layout_crc = versions.pop(MODULE_LAYOUT, None)
         if set(versions) != set(imports):
-            raise ContractError("__versions entries differ from the undefined imports")
+            raise ContractError("modversions entries differ from the undefined imports")
     if imports and "modversions" in vermagic.split() and versions is None:
-        raise ContractError("module enables modversions but has imports without __versions")
-    return ModuleElf(name, vermagic, license_name, namespaces, imports, exports, versions)
+        raise ContractError("module enables modversions but has imports without version metadata")
+    return ModuleElf(
+        name, vermagic, license_name, namespaces, imports, exports, versions,
+        module_layout_crc, versions_format,
+    )
 
 
 def verify_abi_bytes(
@@ -1499,13 +1928,21 @@ def verify_abi_bytes(
     vermagics = {module.vermagic for module in parsed.values()}
     if len(vermagics) != 1:
         raise ContractError("staged modules disagree on vermagic")
+    for name, module in parsed.items():
+        if module.module_layout_crc is None:
+            continue
+        row = kernel_rows.get(MODULE_LAYOUT)
+        if row is None:
+            raise ContractError(f"{name} declares module_layout but vmlinux.symvers lacks it")
+        if module.module_layout_crc != row.crc:
+            raise ContractError(f"{name} module_layout has a CRC mismatch")
 
     providers: dict[str, str] = {}
     for name, stem in zip(declared, stems):
         module = parsed[name]
         rows = staged_rows[stem]
         for symbol in sorted(module.exports):
-            export_type, crc = module.exports[symbol]
+            export_type, crc, runtime_namespace = module.exports[symbol]
             if symbol in kernel_rows:
                 raise ContractError(f"duplicate provider for {symbol}: vmlinux and {name}")
             if symbol in providers:
@@ -1518,6 +1955,10 @@ def verify_abi_bytes(
                 raise ContractError(f"export {symbol} of {name} has a different export type")
             if crc is not None and crc != row.crc:
                 raise ContractError(f"export {symbol} of {name} has a different CRC")
+            if row.namespace != runtime_namespace:
+                raise ContractError(
+                    f"export {symbol} of {name} has a different runtime namespace"
+                )
         for symbol in sorted(set(rows) - set(module.exports)):
             raise ContractError(f"Module.symvers lists {symbol} for {name} but the module does not export it")
 
@@ -1568,6 +2009,7 @@ def verify_abi_bytes(
                 "crc": None if module.exports[symbol][1] is None else f"0x{module.exports[symbol][1]:08x}",
                 "crc_status": "module-matches-symvers" if module.exports[symbol][1] is not None else "module-has-no-crc",
                 "export_type": module.exports[symbol][0],
+                "namespace": module.exports[symbol][2],
                 "symbol": symbol,
             }
             for symbol in sorted(module.exports)
@@ -1581,7 +2023,10 @@ def verify_abi_bytes(
             "modinfo_name": module.name,
             "name": name,
             "sha256": sha256_bytes(payload[f"modules/{name}.ko"]),
-            "versions": "present" if module.versions is not None else "absent",
+            "module_layout": (
+                "absent" if module.module_layout_crc is None else "kernel-crc-match"
+            ),
+            "versions": module.versions_format,
         })
 
     position = {name: index for index, name in enumerate(declared)}
@@ -1611,7 +2056,7 @@ def verify_abi_bytes(
         "scope": "staged-set-only",
         "vendor_modules": "not-verified",
         "activation": reference["activation"]["mode"],
-        "parser": "synthetic-offline-unqualified-on-real-modules",
+        "parser": "linux-gki-layouts-offline-unqualified-on-real-modules",
         "deployment_blocker": "unchanged",
         "device": reference["device"]["codename"],
         "kernel_release": kernel_ref["release"],

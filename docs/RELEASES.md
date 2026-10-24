@@ -115,7 +115,11 @@ the exact archive and symvers pair into `kit.json`; it copies no symvers or full
 symbol table, leaves vendor modules and order unverified, preserves all seven
 blockers, and still always refuses deployment. No real archive/symvers set has
 been bound.
-`tools/myron-snapshot` 0.1.0 (Phase 2.9) builds a separate deterministic
+Kernel-contract and deployment 0.4.0 (Phase 2.11) synthetically cover standard
+AArch64/GKI RELA with allocated-REL refusal, PREL32 exports, section-backed CRCs, allocated extended
+modversions, runtime export namespaces and `module_layout`. The parser remains unqualified on real owner
+bytes, vendor modules remain unverified, and all blockers remain.
+`tools/myron-snapshot` 0.2.0 (Phase 2.9) builds a separate deterministic
 five-file metadata candidate only after re-verifying the complete kit. It binds
 the kit identity and pre-deployment rootfs digest and provides a read-only
 digest rehearsal for a candidate rollback tree. Capture stays `not-captured`;
@@ -123,7 +127,7 @@ quiescence, atomicity and rollback stay `not-proven`; all authority flags stay
 false and all seven blockers remain. It is not a filesystem snapshot or
 restore mechanism and copies no payload bytes
 ([SNAPSHOT-GATE](myron/SNAPSHOT-GATE.md)).
-`tools/myron-preflight` 0.1.0 (Phase 2.10) adds the final offline refusal
+`tools/myron-preflight` 0.2.0 (Phase 2.10) adds the final offline refusal
 artifact before a hardware-read approval boundary. It re-verifies the kit and
 snapshot, binds their identities, maps every blocker to its future evidence,
 and declares seven bounded/redacted read IDs. It executes none of them,

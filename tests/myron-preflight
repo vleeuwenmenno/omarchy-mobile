@@ -21,7 +21,7 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-hardware-read-preflight-contract"
-assert value["format_version"] == "0.1.0"
+assert value["format_version"] == "0.2.0"
 assert value["capture_schema"] == "myron-capture-evidence-v1"
 assert len(value["blockers"]) == 7
 assert value["request"] == {
@@ -396,11 +396,11 @@ finally:
     unsafe_parent.chmod(0o700)
 ok("changed inputs and unsafe publication paths are rejected")
 
-# No 0.1.0 option can submit evidence or authorize a read.
+# No 0.2.0 option can submit evidence or authorize a read.
 code, out, err = invoke("assess", *common_args(), "--evidence", work / "evidence",
                         "--out", work / "never")
 assert code != 0 and not os.path.lexists(work / "never")
-ok("real evidence input is unavailable in 0.1.0")
+ok("real evidence input is unavailable in 0.2.0")
 
 # Process-spawn primitives remain unused even if present in the interpreter.
 def boom(*args, **kwargs):
