@@ -60,6 +60,17 @@ done
 [[ $DEVICE =~ ^[a-z0-9]+$ ]] || alarm_die "DEVICE must be a codename"
 conf=device/$DEVICE/device.conf
 [[ -f $conf ]] || alarm_die "no $conf"
+if grep -q '^BOOT_METHOD=' "$conf"; then
+  BOOT_METHOD=$(sed -n \
+    -e 's/^BOOT_METHOD=\([a-z0-9][a-z0-9-]*\)$/\1/p' \
+    -e 's/^BOOT_METHOD="\([a-z0-9][a-z0-9-]*\)"$/\1/p' "$conf")
+  [[ -n $BOOT_METHOD && $BOOT_METHOD != *$'\n'* ]] ||
+    alarm_die "$conf: invalid BOOT_METHOD"
+else
+  BOOT_METHOD=android-v4
+fi
+[[ $BOOT_METHOD == android-v4 ]] ||
+  alarm_die "$conf: unsupported BOOT_METHOD=$BOOT_METHOD; rootfs builds require a supported kernel/module integration"
 DEVICE_PACKAGE=$(sed -n 's/^PACKAGE=\([a-z0-9-]*\)$/\1/p' "$conf")
 [[ -n $DEVICE_PACKAGE ]] || alarm_die "$conf has no PACKAGE"
 ROOTFS_PACKAGES=$(sed -n 's/^ROOTFS_PACKAGES="\(.*\)"$/\1/p' "$conf")

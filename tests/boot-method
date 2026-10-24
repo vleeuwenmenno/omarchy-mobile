@@ -4,9 +4,11 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
-mkdir -p "$t/repo/bin" "$t/repo/tools" "$t/repo/device/probe" "$t/bin" "$t/bundle/images"
+mkdir -p "$t/repo/bin" "$t/repo/tools/lib" "$t/repo/device/probe" "$t/bin" "$t/bundle/images"
 cp bin/omamobile "$t/repo/bin/"
 cp tools/install-phone "$t/repo/tools/"
+cp tools/build-rootfs "$t/repo/tools/"
+cp tools/lib/alarm.sh "$t/repo/tools/lib/"
 cp tools/install-phone "$t/bundle/install"
 # shellcheck disable=SC2016 # fixture evaluated by the child, not this test
 printf 'DEVICE=${DEVICE:-probe}\nSRC_DIR=/no-sources-needed\n' > "$t/repo/omamobile.conf"
@@ -18,10 +20,10 @@ for cmd in fastboot ssh docker; do
 done
 export PATH="$t/bin:$PATH" CALLS="$t/calls"
 fail() { echo "not ok - $*" >&2; cat "$t/log" >&2; exit 1; }
-for method in ram-only uboot-ext4 unknown ''; do
+for method in ram-only external-android uboot-ext4 unknown ''; do
   printf 'CODENAME=probe\nBOOT_METHOD="%s"\nBOOT_IMAGES=""\nUFS_RW=""\n' "$method" > "$t/repo/device/probe/device.conf"
   cp "$t/repo/device/probe/device.conf" "$t/bundle/device.conf"
-  for cmd in images flash push; do
+  for cmd in images flash push modules-push kexec fastboot; do
     if DEVICE=probe "$t/repo/bin/omamobile" "$cmd" > "$t/log" 2>&1; then fail "$cmd accepts $method"; fi
     grep -q "unsupported BOOT_METHOD=$method;" "$t/log" || fail "$cmd fails for the wrong reason"
   done
@@ -31,8 +33,18 @@ for method in ram-only uboot-ext4 unknown ''; do
       grep -q "unsupported BOOT_METHOD=$method;" "$t/log" || fail "installer fails for the wrong reason"
     done
   done
+  if DEVICE=probe "$t/repo/tools/build-rootfs" --version refusal-test > "$t/log" 2>&1; then
+    fail "rootfs builder accepts $method"
+  fi
+  if [[ -n $method ]]; then
+    grep -q "unsupported BOOT_METHOD=$method;" "$t/log" \
+      || fail "rootfs builder fails for the wrong reason"
+  else
+    grep -q 'invalid BOOT_METHOD' "$t/log" \
+      || fail "rootfs builder accepts an empty method"
+  fi
   [[ ! -e $t/calls && ! -e $t/work ]] || fail "unsupported method accessed phone or prepared image"
-  echo "ok - BOOT_METHOD='${method}' refused by images/flash/push and both installer modes before phone access"
+  echo "ok - BOOT_METHOD='${method}' refused by rootfs/images/flash/push and both installer modes before external access"
 done
 # The shipped flame descriptor must remain outside all persistent paths too.
 mkdir -p "$t/repo/device/flame"
@@ -40,3 +52,27 @@ cp device/flame/device.conf "$t/repo/device/flame/"
 if "$t/repo/tools/install-phone" --device flame > "$t/log" 2>&1; then fail "flame installs"; fi
 grep -q 'unsupported BOOT_METHOD=ram-only;' "$t/log" || fail "flame fails for the wrong reason"
 echo 'ok - the shipped flame descriptor has no persistent installer path'
+
+# Myron reuses a downstream Android kernel and a non-Pixel slot arrangement.
+# Its reference descriptor must remain outside every generic persistent path.
+mkdir -p "$t/repo/device/myron"
+cp device/myron/device.conf "$t/repo/device/myron/"
+if "$t/repo/tools/install-phone" --device myron > "$t/log" 2>&1; then fail "myron installs"; fi
+grep -q 'unsupported BOOT_METHOD=external-android;' "$t/log" \
+  || fail "myron fails for the wrong reason"
+for cmd in images flash push modules-push kexec fastboot; do
+  if DEVICE=myron "$t/repo/bin/omamobile" "$cmd" > "$t/log" 2>&1; then fail "myron $cmd succeeds"; fi
+  grep -q 'unsupported BOOT_METHOD=external-android;' "$t/log" \
+    || fail "myron $cmd fails for the wrong reason"
+done
+[[ ! -e $t/calls && ! -e $t/work ]] || fail "myron refusal accessed a phone or prepared an image"
+echo 'ok - the shipped myron descriptor has no persistent image or installer path'
+
+rm -f "$t/calls"
+if DEVICE=myron "$t/repo/tools/build-rootfs" --version refusal-test > "$t/log" 2>&1; then
+  fail "myron rootfs build succeeds without a supported kernel/module integration"
+fi
+grep -q 'unsupported BOOT_METHOD=external-android; rootfs builds require a supported kernel/module integration' "$t/log" \
+  || fail "myron rootfs build fails for the wrong reason"
+[[ ! -e $t/calls ]] || fail "myron rootfs refusal started a container"
+echo 'ok - the shipped myron descriptor cannot build a rootfs with Pixel kernel/module inputs'

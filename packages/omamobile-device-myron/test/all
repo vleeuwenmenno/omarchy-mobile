@@ -1,0 +1,42 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the deliberately inert Myron device package.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+bash -n install || fail "install parses"
+pass "scripts parse"
+
+if [[ -f ../../device/myron/device.conf ]]; then
+  cmp -s device.conf ../../device/myron/device.conf \
+    || fail "device.conf drifted from the repository descriptor"
+fi
+pass "package descriptor matches device descriptor"
+
+grep -qx 'BOOT_METHOD=external-android' device.conf \
+  || fail "descriptor does not fail closed on the external Android boot chain"
+grep -qx 'BOOT_IMAGES=""' device.conf || fail "descriptor names boot images"
+grep -qx 'UFS_RW=""' device.conf || fail "descriptor names writable partitions"
+if grep -Eq '^(DTB|SOC_IDS|DTBO_|VENDOR_|OS_VERSION|OS_PATCH_LEVEL|SIMPLEFB_TRIG_CON|BRINGUP_PROBE)=' device.conf; then
+  fail "descriptor invents an unverified boot or register value"
+fi
+if grep -Ei '^(SOC|COMPATIBLE|DTB|SOC_IDS|DTBO_|VENDOR_).*=(.*google|.*exynos|.*gs20|.*cheetah|.*felix)' device.conf; then
+  fail "descriptor carries a Pixel assignment"
+fi
+pass "descriptor exposes no image or partition write path"
+
+./install "$tmp/root"
+printf '%s\n' \
+  usr/share/doc/omamobile-device-myron/README.md \
+  usr/share/licenses/omamobile-device-myron/LICENSE \
+  usr/share/omamobile/device-myron/version \
+  usr/share/omamobile/device.conf > "$tmp/expected-files"
+(cd "$tmp/root" && find . -type f -print | sed 's#^\./##' | sort) > "$tmp/actual-files"
+cmp -s "$tmp/expected-files" "$tmp/actual-files" \
+  || { diff -u "$tmp/expected-files" "$tmp/actual-files" >&2 || true; fail "package stages unexpected files"; }
+pass "package stages metadata only"

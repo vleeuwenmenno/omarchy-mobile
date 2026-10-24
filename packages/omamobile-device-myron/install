@@ -1,0 +1,19 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stage inert Myron reference metadata into DESTDIR. This package deliberately
+# contains no service, firmware, kernel, boot image, partition writer, hook, or
+# hardware activation path.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+destination=${1:?Usage: ./install DESTDIR}
+[[ $destination == /* && $destination != "/" ]] || {
+  echo "Use an absolute staging directory" >&2
+  exit 1
+}
+
+install -Dm644 device.conf "$destination/usr/share/omamobile/device.conf"
+install -Dm644 README.md \
+  "$destination/usr/share/doc/omamobile-device-myron/README.md"
+install -Dm644 LICENSE \
+  "$destination/usr/share/licenses/omamobile-device-myron/LICENSE"
+install -Dm644 version "$destination/usr/share/omamobile/device-myron/version"

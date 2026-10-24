@@ -214,6 +214,7 @@ cmd_modules() {
 
 cmd_modules_push() {
   local rel tarball ssh="$ROOT/tools/phone-ssh" running
+  load_device
   rel=$(kernel_release)
   tarball="$KERNEL_OUT/modules-$rel.tar.zst"
   [[ -f "$tarball" ]] || die "missing $tarball (run: omamobile modules)"
@@ -494,6 +495,7 @@ cmd_images() {
 
 cmd_kexec() {
   local boot="$KERNEL_OUT/arch/arm64/boot" stage="$KERNEL_OUT/initramfs" ssh="$ROOT/tools/phone-ssh"
+  load_device
   [[ -f "$boot/Image" && -f "$KERNEL_OUT/initramfs.cpio.lz4" ]] || die "build the kernel and initramfs first"
   "$ssh" true || die "phone not reachable at 172.16.42.1"
 
@@ -542,6 +544,7 @@ fastboot_serial() {
 
 cmd_fastboot() {
   local ssh="$ROOT/tools/phone-ssh" i
+  load_device
   in_fastboot && { say "Already in fastboot"; return 0; }
   for i in $(seq 1 12); do
     if adb get-state 2>/dev/null | grep -q device; then
