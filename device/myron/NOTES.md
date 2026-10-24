@@ -84,6 +84,14 @@ contacts no phone. It is the offline artifact needed before requesting a
 separate read-only session, not permission for that session or for deployment.
 See [PREFLIGHT-GATE.md](../../docs/myron/PREFLIGHT-GATE.md).
 
+Phase 2.12 adds `device/myron/capture-contract.json` and `tools/myron-collect`
+0.1.0. The collector validates a local, trusted, **pre-captured fixture** tree
+(`capture.json` plus `operations/R1`..`R7` JSON) against one preflight request
+and writes a five-file, structure-only evidence artifact. It is not live
+evidence, not approval, and clears no blocker; it has no live transport and
+contacts no phone. All seven blockers stay missing and every authority flag
+stays false. See [CAPTURE-GATE.md](../../docs/myron/CAPTURE-GATE.md).
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,

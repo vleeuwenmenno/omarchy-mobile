@@ -1,0 +1,829 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the bounded Myron pre-captured fixture collector.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+python3 -m py_compile tools/myron-collect || fail "tool parses"
+grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http|ctypes|ssl|requests)|os\.(system|popen|exec|spawn|fork)|posix_spawn' tools/myron-collect \
+  && fail "tool references process, network, or broad-copy facilities"
+grep -Eqi '\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b' tools/myron-collect \
+  && fail "tool names a live transport command"
+grep -q 'external-precaptured-fixture' tools/myron-collect || fail "tool lacks the fixture transport"
+pass "tool parses and has no process, network, broad-copy, or live-transport facility"
+
+tools/myron-collect show > "$tmp/show.json" || fail "repository capture contract failed"
+python3 - "$tmp/show.json" <<'PY' || exit 1
+import hashlib, json, sys
+value = json.load(open(sys.argv[1]))
+assert value["kind"] == "myron-capture-collector-contract"
+assert value["format_version"] == "0.1.0"
+assert value["pinned_versions"] == {
+    "deployment": "0.4.0", "preflight": "0.2.0", "snapshot": "0.2.0",
+}
+assert value["transport"] == "external-precaptured-fixture"
+assert value["capture_schema"] == "myron-capture-evidence-v1"
+assert len(value["blockers"]) == 7
+assert len(value["authority"]) == 9 and all(v is False for v in value["authority"].values())
+assert value["evidence"]["level"] == "artifact-structure-only"
+assert value["evidence"]["live"] is False and value["evidence"]["executes"] is False
+assert value["evidence"]["kit_snapshot_reverified"] is False
+assert value["evidence"]["remote_commands"] == []
+pinned = value["components"]["preflight_contract"]
+assert pinned["path"] == "device/myron/preflight-contract.json"
+assert pinned["sha256"] == hashlib.sha256(
+    open("device/myron/preflight-contract.json", "rb").read()
+).hexdigest()
+preflight = json.load(open("device/myron/preflight-contract.json"))
+assert "capture-contract" not in json.dumps(preflight), "pin must be one-way"
+PY
+pass "repository contract is canonical, one-way pinned, and authorizes nothing"
+
+mkdir "$tmp/fixture"
+MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
+  || { cat "$tmp/snapshot-suite.log" >&2; fail "snapshot fixture export"; }
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+C = load("collect_tool_test", repo / "tools/myron-collect")
+P = C.preflight()
+S = P.snapshot()
+D = P.deploy()
+paths = {key: Path(value) for key, value in json.loads(
+    (work / "fixture/paths.json").read_text()
+).items()}
+contracts_root = paths["contracts_root"]
+contracts = D.load_contracts(contracts_root)
+_, snapshot_contract_bytes, snapshot_contract_sha256 = S.load_snapshot_contract(
+    contracts_root, contracts
+)
+preflight_contract = P.expected_preflight_contract(contracts, snapshot_contract_sha256)
+preflight_bytes = D.render_json(preflight_contract)
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).parent.mkdir(parents=True, exist_ok=True)
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes)
+capture_contract = C.expected_capture_contract(D.sha256_bytes(preflight_bytes))
+capture_contract_bytes = D.render_json(capture_contract)
+(contracts_root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes)
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+counter = [0]
+
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{name}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+def invoke(*arguments, root=None):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = C.main([str(value) for value in arguments], contracts_root=root or contracts_root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def expect_ok(*arguments, **kwargs):
+    code, out, err = invoke(*arguments, **kwargs)
+    assert code == 0, (arguments, err)
+    return json.loads(out), out
+
+
+def expect_fail(name, arguments, *outputs, **kwargs):
+    code, out, err = invoke(*arguments, **kwargs)
+    assert code != 0, f"{name}: accepted\n{out}"
+    for output in outputs:
+        assert not os.path.lexists(output), f"{name}: left output {output}"
+    ok(f"{name} is rejected")
+    return err
+
+
+def walk(path):
+    descriptor = D.open_canonical_dir(str(path), "test tree")
+    try:
+        tree = D.walk_tree(descriptor, D.STAGE_LIMITS, allow_symlinks=False, keep_data=True)
+    finally:
+        os.close(descriptor)
+    return tree.entries, tree.data
+
+
+# A real preflight request, built by the pinned preflight tool, is the only input.
+request = work / "request"
+with contextlib.redirect_stdout(io.StringIO()):
+    code = P.main(
+        ["assess", "--kit", str(paths["kit"]), "--snapshot", str(paths["snapshot"]),
+         "--rootfs-stage", str(paths["rootfs"]), "--rootfs-manifest", str(paths["manifest"]),
+         "--assets", str(paths["archive"]), "--runtime-assets", "none",
+         "--vmlinux-symvers", "none", "--module-symvers", "none", "--out", str(request)],
+        contracts_root=contracts_root,
+    )
+assert code == 0
+request_sums = (request / "SHA256SUMS").read_bytes()
+request_sha256 = digest(request_sums)
+request_document = json.loads((request / "request.json").read_text())
+READS = request_document["requested_reads"]
+OPERATION_IDS = [row["id"] for row in READS]
+
+# --- a valid capture fixture --------------------------------------------------
+
+PARTITIONS = [
+    ("boot_a", 100663296, True, "_a"), ("boot_b", 100663296, False, "_b"),
+    ("dtbo_a", 25165824, False, "_a"), ("init_boot_a", 8388608, False, "_a"),
+    ("pmos_root", 42949672960, False, ""),
+    ("recovery_a", 104857600, False, "_a"),
+    ("vendor_boot_a", 100663296, False, "_a"),
+]
+IMAGES = [
+    ("boot_a", False), ("dtbo_a", False), ("init_boot_a", False),
+    ("recovery_a", False), ("vendor_boot_a", False), ("vendor_kernel_boot_a", True),
+]
+
+
+def image_row(name, absent):
+    if absent:
+        return {
+            "partition_name": name, "absent": True, "header_version": None,
+            "page_size": None, "os_version": None, "component_sizes": [],
+            "component_offsets": [], "segment_count": 0, "header_sha256": None,
+        }
+    return {
+        "partition_name": name, "absent": False, "header_version": 4, "page_size": 4096,
+        "os_version": "16.0.0", "component_sizes": [4096, 8192],
+        "component_offsets": [4096, 8192], "segment_count": 2,
+        "header_sha256": digest(name.encode()),
+    }
+
+
+DATA = {
+    "R1-identity-and-slot": {
+        "codename": "myron", "soc": "sm8850", "compatible_prefix": "qcom,canoe-mtp",
+        "current_slot": "a", "slot_suffix": "_a", "verified_boot_state": "orange",
+        "sources_agree": True,
+    },
+    "R2-gpt-and-recovery-inventory": {
+        "partitions": [
+            {"partition_name": n, "size_bytes": s, "bootable_flag": b, "slot_suffix": x}
+            for n, s, b, x in PARTITIONS
+        ],
+        "recovery_present": True,
+    },
+    "R3-boot-image-headers": {"images": [image_row(n, a) for n, a in IMAGES]},
+    "R4-dtb-dtbo-selection": {
+        "dtb_count": 2, "selected_board_id": 7, "selected_board_revision": 1,
+        "dtbo_entry_count": 3, "compatible_prefix": "qcom,canoe-mtp",
+        "selection_source": "bootconfig",
+    },
+    "R5-module-load-order": {
+        "module_names": ["pwrseq_core", "bluetooth", "extra_mod", "btbcm", "btqca",
+                         "hci_uart", "rfkill", "rmnet"],
+        "load_order_index": list(range(8)),
+        "taint_flags": ["", "", "O", "", "", "", "", ""],
+        "order_matches_declared": True,
+    },
+    "R6-storage-and-mount-model": {
+        "root_source_gpt_name": "pmos_root", "filesystem_type": "ext4",
+        "mount_options": ["noatime", "rw"], "block_size": 4096,
+        "rounded_total_bytes": 42949672960, "rounded_free_bytes": 21474836480,
+    },
+    "R7-kernel-identity-revalidation": {
+        "kernel_release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k",
+        "notes_sha256": digest(b"notes"),
+        "allowlisted_cmdline": [{"key": "bootconfig", "value": "present"}],
+        "allowlisted_bootconfig_keys": [
+            {"key": "androidboot.hardware", "value": "myron"},
+            {"key": "androidboot.verifiedbootstate", "value": "orange"},
+        ],
+    },
+}
+
+
+def operation_document(operation_id, req_sha=None, data=None, **overrides):
+    value = {
+        "schema": 1, "kind": C.OPERATION_KIND, "id": operation_id,
+        "request_sha256": req_sha or request_sha256, "transport": C.TRANSPORT,
+        "read_only": True, "bytes_read": 4096,
+        "data": copy.deepcopy(data if data is not None else DATA[operation_id]),
+    }
+    value.update(overrides)
+    return value
+
+
+def write_capture(path, documents=None, raw=None, manifest_edit=None, req_sha=None):
+    """Write a capture tree; DOCUMENTS and RAW override per-operation content."""
+    documents = documents or {}
+    raw = raw or {}
+    (path / "operations").mkdir(parents=True)
+    files = {}
+    for operation_id in OPERATION_IDS:
+        name = f"operations/{operation_id}.json"
+        files[name] = raw.get(operation_id) or D.render_json(
+            documents.get(operation_id) or operation_document(operation_id, req_sha)
+        )
+        (path / name).write_bytes(files[name])
+        (path / name).chmod(0o644)
+    manifest = C.manifest_document(
+        envs, req_sha or request_sha256, request_document, files
+    )
+    if manifest_edit:
+        manifest_edit(manifest)
+    (path / "capture.json").write_bytes(D.render_json(manifest))
+    (path / "capture.json").chmod(0o644)
+    (path / "operations").chmod(0o755)
+    path.chmod(0o755)
+
+
+envs = C.load_environment(contracts_root)
+capture = fresh("capture") / "capture"
+write_capture(capture)
+args = lambda **extra: ["--request", request, "--capture", capture, *sum(([f"--{k}", v] for k, v in extra.items()), [])]
+
+# --- plan ---------------------------------------------------------------------
+
+plan_a, plan_text = expect_ok("plan", "--request", request)
+_, plan_text_b = expect_ok("plan", "--request", request)
+assert plan_text == plan_text_b
+assert plan_text.encode("ascii") == D.render_json(plan_a)
+assert plan_a["request_sha256"] == request_sha256
+assert plan_a["live"] is False and plan_a["executes"] is False
+assert plan_a["remote_commands"] == [] and plan_a["human_approval_required"] is True
+assert [row["id"] for row in plan_a["capture_tree"]["operations"]] == OPERATION_IDS
+assert plan_a["capture_tree"]["total_max_bytes"] == 4 * 1024 * 1024
+assert plan_a["evidence_files"] == [
+    "STATUS.txt", "SHA256SUMS", "contracts/capture-contract.json", "evidence.json", "status.json",
+]
+assert not any(key in plan_text for key in ("sm8850", "pmos_root", "capture_sha256"))
+plan_file = work / "plan.json"
+plan_file.write_text(plan_text)
+verified_plan, _ = expect_ok("verify-plan", "--request", request, "--plan", plan_file)
+assert verified_plan["status"] == "verified"
+bad_plan = work / "bad-plan.json"
+bad_plan.write_text(plan_text.replace('"live": false', '"live": true'))
+expect_fail("tampered plan", ["verify-plan", "--request", request, "--plan", bad_plan])
+noncanonical = work / "noncanonical-plan.json"
+noncanonical.write_text(json.dumps(plan_a))
+expect_fail("non-canonical plan", ["verify-plan", "--request", request, "--plan", noncanonical])
+ok("plan is deterministic, canonical, value-free, and recomputed by verify-plan")
+
+# --- collect and verify -------------------------------------------------------
+
+evidence_a = work / "evidence-a"
+evidence_b = work / "evidence-b"
+result, _ = expect_ok("collect", *args(), "--out", evidence_a)
+expect_ok("collect", *args(), "--out", evidence_b)
+assert walk(evidence_a) == walk(evidence_b)
+entries, data = walk(evidence_a)
+assert sorted(e.path for e in entries if e.kind == "file") == [
+    "SHA256SUMS", "STATUS.txt", "contracts/capture-contract.json", "evidence.json", "status.json",
+]
+assert {e.path for e in entries if e.kind == "dir"} == {".", "contracts"}
+assert data["contracts/capture-contract.json"] == capture_contract_bytes
+evidence = json.loads(data["evidence.json"])
+assert evidence["evidence_level"] == "artifact-structure-only"
+assert evidence["status"] == "fixture-evidence-recorded"
+assert evidence["live"] is False and evidence["executes"] is False
+assert evidence["kit_snapshot_reverified"] is False
+assert evidence["remote_commands"] == [] and evidence["human_approval_required"] is True
+assert evidence["transport"] == "external-precaptured-fixture"
+assert evidence["request_sha256"] == request_sha256
+assert [row["blocker"] for row in evidence["blockers"]] == D.BLOCKERS
+assert all(row == {"blocker": row["blocker"], "state": "missing"} for row in evidence["blockers"])
+assert "blocker_cleared" not in data["evidence.json"].decode()
+assert len(evidence["authority"]) == 9 and not any(evidence["authority"].values())
+assert [row["id"] for row in evidence["operations"]] == OPERATION_IDS
+assert json.loads(data["status.json"]) == {
+    "artifact": C.EVIDENCE_KIND, "blockers": D.BLOCKERS, **{f: False for f in P.AUTHORITY_FLAGS},
+}
+assert b"artifact-structure-only" in data["STATUS.txt"] and b"not live evidence" in data["STATUS.txt"]
+assert b"pmos_root" not in b"".join(data.values())
+assert data["SHA256SUMS"] == "".join(
+    f"{digest(data[p])}  {p}\n"
+    for p in sorted(("contracts/capture-contract.json", "evidence.json", "status.json", "STATUS.txt"))
+).encode()
+assert result["status"] == "collected" and result["evidence_sha256"] == digest(data["SHA256SUMS"])
+assert result["live"] is False and result["executes"] is False
+assert all(result[flag] is False for flag in P.AUTHORITY_FLAGS)
+verified, _ = expect_ok("verify-evidence", *args(), "--evidence", evidence_a)
+assert verified["status"] == "verified" and verified["blocker_count"] == 7
+ok("collect is deterministic, exact five files, and says structure-only with every blocker missing")
+
+
+def tampered_evidence(name, mutate_document=None, mutate_files=None):
+    clone = fresh("evidence-tamper") / "evidence"
+    shutil.copytree(evidence_a, clone)
+    if mutate_document:
+        value = json.loads((clone / "evidence.json").read_text())
+        mutate_document(value)
+        (clone / "evidence.json").write_bytes(D.render_json(value))
+    if mutate_files:
+        mutate_files(clone)
+    files = ["STATUS.txt", "contracts/capture-contract.json", "evidence.json", "status.json"]
+    (clone / "SHA256SUMS").write_text("".join(
+        f"{digest((clone / path).read_bytes())}  {path}\n" for path in files
+    ))
+    expect_fail(name, ["verify-evidence", *args(), "--evidence", clone])
+
+
+tampered_evidence("live claim", lambda v: v.update(live=True))
+tampered_evidence("execution claim", lambda v: v.update(executes=True))
+tampered_evidence("kit re-verification claim", lambda v: v.update(kit_snapshot_reverified=True))
+tampered_evidence("remote command entry", lambda v: v["remote_commands"].append("x"))
+tampered_evidence("evidence level upgrade", lambda v: v.update(evidence_level="live"))
+tampered_evidence("blocker cleared", lambda v: v["blockers"][0].update(blocker_cleared=True))
+tampered_evidence("blocker state", lambda v: v["blockers"][0].update(state="present"))
+tampered_evidence("removed blocker", lambda v: v["blockers"].pop())
+tampered_evidence("authority claim", lambda v: v["authority"].update(bootable=True))
+tampered_evidence("approval flag", lambda v: v.update(human_approval_required=False))
+tampered_evidence("operation hash", lambda v: v["operations"][0].update(sha256="0" * 64))
+tampered_evidence("unknown evidence field", lambda v: v.update(extra=1))
+tampered_evidence(
+    "status authority claim",
+    mutate_files=lambda c: (c / "status.json").write_bytes(D.render_json(
+        {**C.status_document(), "flashable": True})),
+)
+tampered_evidence("status text", mutate_files=lambda c: (c / "STATUS.txt").write_bytes(b"ok\n"))
+clone = fresh("evidence-sums") / "evidence"
+shutil.copytree(evidence_a, clone)
+(clone / "SHA256SUMS").write_text("0" * 64 + "  evidence.json\n")
+expect_fail("changed evidence checksums", ["verify-evidence", *args(), "--evidence", clone])
+clone = fresh("evidence-extra") / "evidence"
+shutil.copytree(evidence_a, clone)
+(clone / "extra.txt").write_text("x")
+expect_fail("extra evidence file", ["verify-evidence", *args(), "--evidence", clone])
+clone = fresh("evidence-contract") / "evidence"
+shutil.copytree(evidence_a, clone)
+(clone / "contracts/capture-contract.json").write_bytes(b"{}\n")
+expect_fail("evidence contract copy", ["verify-evidence", *args(), "--evidence", clone])
+for name, mutate in (
+    ("evidence symlink", lambda c: ((c / "status.json").unlink(),
+                                    (c / "status.json").symlink_to("evidence.json"))),
+    ("evidence hardlink", lambda c: ((c / "status.json").unlink(),
+                                     os.link(c / "evidence.json", c / "status.json"))),
+    ("evidence special file", lambda c: ((c / "status.json").unlink(), os.mkfifo(c / "status.json"))),
+):
+    clone = fresh("evidence-unsafe") / "evidence"
+    shutil.copytree(evidence_a, clone)
+    mutate(clone)
+    expect_fail(name, ["verify-evidence", *args(), "--evidence", clone])
+ok("verify-evidence recomputes and rejects semantic and structural tampering")
+
+# --- capture tamper: schemas, bounds, lists, strings, identifiers -------------
+
+
+def bad_capture(name, edit=None, *, raw=None, manifest_edit=None, req_sha=None, documents=None):
+    """Build a capture whose manifest is regenerated, so only validators can object."""
+    base = fresh("capture-tamper") / "capture"
+    docs = documents or {}
+    if edit:
+        for operation_id, mutate in edit.items():
+            document = operation_document(operation_id)
+            mutate(document)
+            docs[operation_id] = document
+    write_capture(base, docs, raw, manifest_edit, req_sha)
+    out = work / f"tamper-out-{counter[0]}"
+    expect_fail(name, ["collect", "--request", request, "--capture", base, "--out", out], out)
+    return base
+
+
+R1, R2, R3, R4, R5, R6, R7 = OPERATION_IDS
+bad_capture("unknown operation field", {R1: lambda d: d.update(extra=1)})
+bad_capture("unknown data field", {R1: lambda d: d["data"].update(extra=1)})
+bad_capture("missing data field", {R1: lambda d: d["data"].pop("soc")})
+bad_capture("operation schema bool", {R1: lambda d: d.update(schema=True)})
+bad_capture("wrong operation id", {R1: lambda d: d.update(id=R2)})
+bad_capture("wrong request binding", {R1: lambda d: d.update(request_sha256="0" * 64)})
+bad_capture("wrong transport", {R1: lambda d: d.update(transport="live-session")})
+bad_capture("read_only false", {R1: lambda d: d.update(read_only=False)})
+bad_capture("bytes_read zero", {R1: lambda d: d.update(bytes_read=0)})
+bad_capture("bytes_read over operation bound",
+            {R1: lambda d: d.update(bytes_read=READS[0]["max_bytes"] + 1)})
+bad_capture("bytes_read float", {R1: lambda d: d.update(bytes_read=1.5)})
+bad_capture("bytes_read bool", {R1: lambda d: d.update(bytes_read=True)})
+bad_capture("R1 wrong codename", {R1: lambda d: d["data"].update(codename="cheetah")})
+bad_capture("R1 sources disagree", {R1: lambda d: d["data"].update(sources_agree=False)})
+bad_capture("R1 slot mismatch", {R1: lambda d: d["data"].update(slot_suffix="_b")})
+bad_capture("R1 bad enum", {R1: lambda d: d["data"].update(verified_boot_state="purple")})
+bad_capture("R2 too many partitions", {R2: lambda d: d["data"].update(
+    partitions=[{"partition_name": f"p{i:03d}", "size_bytes": 1, "bootable_flag": False,
+                 "slot_suffix": ""} for i in range(129)])})
+bad_capture("R2 unsorted partitions", {R2: lambda d: d["data"]["partitions"].reverse()})
+bad_capture("R2 duplicate partition", {R2: lambda d: d["data"]["partitions"].append(
+    copy.deepcopy(d["data"]["partitions"][-1]))})
+bad_capture("R2 bad partition name", {R2: lambda d: d["data"]["partitions"][0].update(
+    partition_name="Boot A")})
+bad_capture("R2 negative size", {R2: lambda d: d["data"]["partitions"][0].update(size_bytes=-1)})
+bad_capture("R2 huge size", {R2: lambda d: d["data"]["partitions"][0].update(size_bytes=2**60)})
+bad_capture("R2 suffix mismatch", {R2: lambda d: d["data"]["partitions"][0].update(slot_suffix="_b")})
+bad_capture("R2 recovery flag mismatch", {R2: lambda d: d["data"].update(recovery_present=False)})
+bad_capture("R2 extra row field", {R2: lambda d: d["data"]["partitions"][0].update(guid="x")})
+bad_capture("R2 empty list", {R2: lambda d: d["data"].update(partitions=[])})
+bad_capture("R3 unknown image", {R3: lambda d: d["data"]["images"][0].update(partition_name="vbmeta_a")})
+bad_capture("R3 absent image with header", {R3: lambda d: d["data"]["images"][-1].update(header_version=4)})
+bad_capture("R3 header version", {R3: lambda d: d["data"]["images"][0].update(header_version=9)})
+bad_capture("R3 page size", {R3: lambda d: d["data"]["images"][0].update(page_size=1234)})
+bad_capture("R3 segment mismatch", {R3: lambda d: d["data"]["images"][0].update(segment_count=1)})
+bad_capture("R3 too many components", {R3: lambda d: d["data"]["images"][0].update(
+    component_sizes=[1] * 9, component_offsets=[1] * 9, segment_count=9)})
+bad_capture("R3 presence differs from R2", {R3: lambda d: d["data"]["images"][-1].update(
+    image_row("vendor_kernel_boot_a", False))})
+bad_capture("R3 os version", {R3: lambda d: d["data"]["images"][0].update(os_version="16.0")})
+bad_capture("R3 bad header hash", {R3: lambda d: d["data"]["images"][0].update(header_sha256="abc")})
+bad_capture("R4 half selection", {R4: lambda d: d["data"].update(selected_board_revision=None)})
+bad_capture("R4 dtb count", {R4: lambda d: d["data"].update(dtb_count=65)})
+bad_capture("R4 source", {R4: lambda d: d["data"].update(selection_source="adb")})
+bad_capture("R5 non-sequential order", {R5: lambda d: d["data"]["load_order_index"].reverse()})
+bad_capture("R5 duplicate module", {R5: lambda d: d["data"]["module_names"].__setitem__(2, "bluetooth")})
+bad_capture("R5 parallel list length", {R5: lambda d: d["data"]["taint_flags"].pop()})
+bad_capture("R5 order claim false lie", {R5: lambda d: d["data"].update(
+    module_names=list(reversed(d["data"]["module_names"])))})
+bad_capture("R5 too many modules", {R5: lambda d: d["data"].update(
+    module_names=[f"m{i}" for i in range(1025)], load_order_index=list(range(1025)),
+    taint_flags=[""] * 1025, order_matches_declared=False)})
+bad_capture("R5 module name", {R5: lambda d: d["data"]["module_names"].__setitem__(2, "bad name")})
+bad_capture("R5 taint flag", {R5: lambda d: d["data"]["taint_flags"].__setitem__(2, "lower")})
+bad_capture("R6 root not in inventory", {R6: lambda d: d["data"].update(root_source_gpt_name="other")})
+bad_capture("R6 filesystem", {R6: lambda d: d["data"].update(filesystem_type="ntfs")})
+bad_capture("R6 option", {R6: lambda d: d["data"].update(mount_options=["rw", "uid=1000"])})
+bad_capture("R6 unsorted options", {R6: lambda d: d["data"].update(mount_options=["rw", "noatime"])})
+bad_capture("R6 unrounded size", {R6: lambda d: d["data"].update(rounded_free_bytes=12345)})
+bad_capture("R6 free over total", {R6: lambda d: d["data"].update(
+    rounded_free_bytes=d["data"]["rounded_total_bytes"] + 1048576)})
+bad_capture("R6 block size", {R6: lambda d: d["data"].update(block_size=3000)})
+bad_capture("R7 unlisted command-line key", {R7: lambda d: d["data"]["allowlisted_cmdline"].append(
+    {"key": "androidboot.serialno", "value": "present"})})
+bad_capture("R7 unlisted bootconfig key", {R7: lambda d: d["data"]["allowlisted_bootconfig_keys"].append(
+    {"key": "androidboot.wifimac", "value": "x"})})
+bad_capture("R7 value outside allowlist", {R7: lambda d: d["data"]["allowlisted_bootconfig_keys"][0].update(
+    value="cheetah")})
+bad_capture("R7 duplicate key", {R7: lambda d: d["data"]["allowlisted_cmdline"].append(
+    {"key": "bootconfig", "value": "present"})})
+bad_capture("R7 unsorted keys", {R7: lambda d: d["data"]["allowlisted_bootconfig_keys"].reverse()})
+bad_capture("R7 extra entry field", {R7: lambda d: d["data"]["allowlisted_cmdline"][0].update(raw="x")})
+bad_capture("R7 slot disagrees with R1", {R7: lambda d: d["data"]["allowlisted_cmdline"].insert(
+    0, {"key": "androidboot.slot_suffix", "value": "_b"})})
+bad_capture("R7 verified boot disagrees with R1", {R7: lambda d: d["data"]["allowlisted_bootconfig_keys"].__setitem__(
+    1, {"key": "androidboot.verifiedbootstate", "value": "green"})})
+bad_capture("R7 kernel release", {R7: lambda d: d["data"].update(kernel_release="not a release")})
+bad_capture("R7 notes hash", {R7: lambda d: d["data"].update(notes_sha256="g" * 64)})
+bad_capture("R7 raw config key", {R7: lambda d: d["data"].update(config_sha256="0" * 64)})
+ok("operation schemas reject wrong types, ranges, lists, enums, and allowlist widening")
+
+bad_capture("MAC address string", {R7: lambda d: d["data"].update(
+    kernel_release="6.12.23-aa:bb:cc:dd:ee:ff")})
+bad_capture("UUID string", {R7: lambda d: d["data"].update(
+    kernel_release="6.12.23-123e4567-e89b-12d3-a456-426614174000")})
+bad_capture("long digit string (IMEI-shaped)", {R7: lambda d: d["data"].update(
+    kernel_release="6.12.23-123456789012345")})
+bad_capture("long hex string", {R7: lambda d: d["data"].update(
+    kernel_release="6.12.23-" + "a" * 32)})
+bad_capture("serial identifier key", {R1: lambda d: d["data"].update(serial="abc")})
+bad_capture("excluded word in value", {R2: lambda d: d["data"]["partitions"][0].update(
+    partition_name="serial")})
+bad_capture("non-ASCII string", {R7: lambda d: d["data"].update(kernel_release="6.12.23-é")})
+bad_capture("control character string", {R7: lambda d: d["data"].update(kernel_release="6.12.23\n")})
+bad_capture("oversized string", {R7: lambda d: d["data"].update(kernel_release="6.12.23-" + "x" * 200)})
+bad_capture("non-string identifier value", {R7: lambda d: d["data"].update(kernel_release=612)})
+ok("identifier-shaped, non-ASCII, control, and oversized strings are rejected")
+
+bad_capture("non-canonical operation", raw={R1: json.dumps(operation_document(R1)).encode()})
+bad_capture("operation duplicate key", raw={R1: b'{"schema": 1, "schema": 1}\n'})
+bad_capture("operation NaN", raw={R1: b'{"schema": NaN}\n'})
+bad_capture("operation not JSON", raw={R1: b"not json\n"})
+good_raw = D.render_json(operation_document(R1, bytes_read=100))
+try:
+    C.validate_operation(good_raw, {**READS[0], "max_bytes": len(good_raw) - 1}, request_sha256)
+except C.CollectError as error:
+    assert "byte bound" in str(error)
+else:
+    raise AssertionError("operation larger than its max_bytes was accepted")
+C.validate_operation(good_raw, {**READS[0], "max_bytes": len(good_raw)}, request_sha256)
+ok("operation larger than its own max_bytes is rejected")
+bad_capture("manifest wrong request", req_sha="1" * 64)
+bad_capture("manifest extra field", manifest_edit=lambda m: m.update(extra=1))
+bad_capture("manifest live claim", manifest_edit=lambda m: m.update(live=True))
+bad_capture("manifest operation hash", manifest_edit=lambda m: m["operations"][0].update(sha256="0" * 64))
+bad_capture("manifest operation order", manifest_edit=lambda m: m["operations"].reverse())
+bad_capture("manifest wrong contract", manifest_edit=lambda m: m.update(contract_sha256="0" * 64))
+bad_capture("manifest wrong transport", manifest_edit=lambda m: m.update(transport="live"))
+ok("manifest binds contract, request, transport, and exact operation hashes")
+
+# --- tree shape: extras, symlinks, hardlinks, FIFOs, roots, modes -------------
+
+
+def mutated_capture(name, mutate, parent_mode=None):
+    base = fresh("capture-shape") / "capture"
+    write_capture(base)
+    mutate(base)
+    out = work / f"shape-out-{counter[0]}"
+    expect_fail(name, ["collect", "--request", request, "--capture", base, "--out", out], out)
+
+
+mutated_capture("extra capture file", lambda c: (c / "notes.txt").write_text("x"))
+mutated_capture("extra operation file", lambda c: (c / "operations/R8.json").write_text("{}"))
+mutated_capture("extra nested directory", lambda c: (c / "operations/sub").mkdir())
+mutated_capture("missing operation", lambda c: (c / f"operations/{R3}.json").unlink())
+mutated_capture("missing manifest", lambda c: (c / "capture.json").unlink())
+mutated_capture("operation symlink", lambda c: (
+    (c / f"operations/{R2}.json").unlink(),
+    (c / f"operations/{R2}.json").symlink_to(f"{R1}.json")))
+mutated_capture("manifest symlink", lambda c: (
+    (c / "capture.json").rename(c / "operations/real.json"),
+    (c / "capture.json").symlink_to("operations/real.json")))
+mutated_capture("operations directory symlink", lambda c: (
+    (c / "operations").rename(c / "real-operations"),
+    (c / "operations").symlink_to("real-operations")))
+mutated_capture("operation hardlink", lambda c: (
+    (c / f"operations/{R2}.json").unlink(),
+    os.link(c / f"operations/{R1}.json", c / f"operations/{R2}.json")))
+mutated_capture("operation fifo", lambda c: (
+    (c / f"operations/{R2}.json").unlink(), os.mkfifo(c / f"operations/{R2}.json")))
+mutated_capture("executable operation", lambda c: (c / f"operations/{R1}.json").chmod(0o755))
+mutated_capture("world-writable operation", lambda c: (c / f"operations/{R1}.json").chmod(0o666))
+mutated_capture("group-writable operations dir", lambda c: (c / "operations").chmod(0o775))
+mutated_capture("alias hardlink to outside file", lambda c: (
+    (c / "capture.json").unlink(), os.link(paths["archive"], c / "capture.json")))
+
+real = fresh("root-symlink")
+write_capture(real / "capture")
+(real / "link").symlink_to(real / "capture")
+expect_fail("capture root symlink",
+            ["collect", "--request", request, "--capture", real / "link", "--out", work / "o1"],
+            work / "o1")
+(real / "parent-link").symlink_to(real)
+expect_fail("capture ancestor symlink",
+            ["collect", "--request", request, "--capture", real / "parent-link/capture",
+             "--out", work / "o2"], work / "o2")
+unsafe = fresh("writable-parent")
+write_capture(unsafe / "capture")
+unsafe.chmod(0o777)
+try:
+    expect_fail("writable capture parent",
+                ["collect", "--request", request, "--capture", unsafe / "capture",
+                 "--out", work / "o3"], work / "o3")
+finally:
+    unsafe.chmod(0o700)
+expect_fail("relative capture path",
+            ["collect", "--request", request, "--capture", "capture", "--out", work / "o4"])
+expect_fail("noncanonical capture path",
+            ["collect", "--request", request, "--capture", f"{capture}/../capture",
+             "--out", work / "o5"], work / "o5")
+ok("extras, links, FIFOs, special files, symlinked roots, and writable parents are rejected")
+
+# Total bound: files each within their own bound can still exceed 4 MiB together.
+over = fresh("total-bound") / "capture"
+write_capture(over)
+for operation_id, row in zip(OPERATION_IDS, READS):
+    target = over / f"operations/{operation_id}.json"
+    target.write_bytes(target.read_bytes() + b" " * (row["max_bytes"] - len(target.read_bytes())))
+manifest = over / "capture.json"
+manifest.write_bytes(manifest.read_bytes() + b" " * (900 * 1024))
+total = sum(p.stat().st_size for p in over.rglob("*") if p.is_file())
+assert total > C.TOTAL_CAPTURE_BYTES, total
+assert sum(row["max_bytes"] for row in READS) <= C.TOTAL_CAPTURE_BYTES
+err = expect_fail("capture over the 4 MiB total",
+                  ["collect", "--request", request, "--capture", over, "--out", work / "o6"],
+                  work / "o6")
+assert "byte bound" in err, err
+limits = C.capture_limits()
+assert limits.total_bytes == 4 * 1024 * 1024 and limits.entries <= 16
+ok("per-operation and 4 MiB total bounds are enforced")
+
+# --- request handling ---------------------------------------------------------
+
+bad_request = fresh("bad-request") / "request"
+shutil.copytree(request, bad_request)
+(bad_request / "request.json").write_bytes(b"{}\n")
+expect_fail("tampered request", ["collect", "--request", bad_request, "--capture", capture,
+                                 "--out", work / "o7"], work / "o7")
+expect_fail("tampered request plan", ["plan", "--request", bad_request])
+sums_request = fresh("sums-request") / "request"
+shutil.copytree(request, sums_request)
+(sums_request / "SHA256SUMS").write_text("0" * 64 + "  request.json\n")
+expect_fail("request checksum change", ["plan", "--request", sums_request])
+other_request = fresh("rebound-request") / "request"
+shutil.copytree(request, other_request)
+value = json.loads((other_request / "request.json").read_text())
+value["artifacts"]["deployment_kit"]["sha256"] = "7" * 64
+(other_request / "request.json").write_bytes(D.render_json(value))
+(other_request / "SHA256SUMS").write_text("".join(
+    f"{digest((other_request / p).read_bytes())}  {p}\n"
+    for p in ["STATUS.txt", "contracts/preflight-contract.json", "request.json", "status.json"]
+))
+expect_ok("plan", "--request", other_request)  # a different but valid request has its own hash
+expect_fail("capture bound to another request",
+            ["collect", "--request", other_request, "--capture", capture, "--out", work / "o8"],
+            work / "o8")
+ok("request must pass P.read_request and the capture must bind its SHA256SUMS hash")
+
+# --- overlap and publication --------------------------------------------------
+
+existing = work / "existing"
+existing.mkdir()
+expect_fail("existing output", ["collect", *args(), "--out", existing])
+expect_fail("output inside capture", ["collect", *args(), "--out", capture / "evidence"],
+            capture / "evidence")
+expect_fail("output inside request", ["collect", *args(), "--out", request / "evidence"],
+            request / "evidence")
+expect_fail("output equals capture", ["collect", *args(), "--out", capture])
+nest = fresh("nest")
+shutil.copytree(request, nest / "request")
+expect_fail("capture inside request",
+            ["collect", "--request", nest / "request", "--capture", nest / "request/capture",
+             "--out", work / "o9"], work / "o9")
+expect_fail("request equals capture",
+            ["collect", "--request", request, "--capture", request, "--out", work / "o10"],
+            work / "o10")
+unsafe_out = work / "unsafe-out"
+unsafe_out.mkdir()
+unsafe_out.chmod(0o777)
+try:
+    expect_fail("writable output parent",
+                ["collect", *args(), "--out", unsafe_out / "evidence"], unsafe_out / "evidence")
+finally:
+    unsafe_out.chmod(0o700)
+bind_parent = fresh("alias-parent")
+os.symlink(capture, bind_parent / "alias")
+expect_fail("output through a symlink into the capture",
+            ["collect", *args(), "--out", bind_parent / "alias/evidence"])
+assert not (capture / "evidence").exists()
+expect_fail("verify-evidence overlapping input",
+            ["verify-evidence", *args(), "--evidence", capture])
+expect_fail("verify-evidence given the request tree",
+            ["verify-evidence", *args(), "--evidence", request])
+code, out, err = invoke("collect", *args(), "--out", work / "never", "--live")
+assert code != 0 and not os.path.lexists(work / "never")
+code, out, err = invoke("collect", "--request", request, "--out", work / "never")
+assert code != 0
+ok("overlap, alias, existing, and writable-parent publication hazards fail closed")
+
+# --- TOCTOU: request or capture changes after the first read ------------------
+
+for label, target_name in (
+    ("operation", f"operations/{R1}.json"),
+    ("manifest", "capture.json"),
+):
+    racy = fresh("race") / "capture"
+    write_capture(racy)
+    original = C.read_capture
+    count = [0]
+
+    def mutate_after_first(*a, _target=racy / target_name, **kw):
+        result = original(*a, **kw)
+        count[0] += 1
+        if count[0] == 1:
+            _target.write_bytes(_target.read_bytes() + b" ")
+        return result
+
+    C.read_capture = mutate_after_first
+    try:
+        expect_fail(f"capture {label} changed after first read",
+                    ["collect", "--request", request, "--capture", racy, "--out", work / f"race-{label}"],
+                    work / f"race-{label}")
+    finally:
+        C.read_capture = original
+
+racy_request = fresh("race-request") / "request"
+shutil.copytree(request, racy_request)
+original_request_reader = C.read_request
+count = [0]
+
+
+def mutate_request(*a, **kw):
+    result = original_request_reader(*a, **kw)
+    count[0] += 1
+    if count[0] == 1:
+        with (racy_request / "STATUS.txt").open("ab") as stream:
+            stream.write(b"x")
+    return result
+
+
+C.read_request = mutate_request
+try:
+    expect_fail("request changed after first read",
+                ["collect", "--request", racy_request, "--capture", capture,
+                 "--out", work / "race-request"], work / "race-request")
+finally:
+    C.read_request = original_request_reader
+leftovers = [p.name for p in work.iterdir() if ".tmp-" in p.name]
+assert not leftovers, leftovers
+ok("request and capture are re-read inside verify_built and a changed byte aborts publication")
+
+# Stable inputs still publish after the same wrappers are removed.
+expect_ok("collect", *args(), "--out", work / "after-race")
+
+# --- runtime: no process spawn --------------------------------------------------
+
+
+def boom(*a, **kw):
+    raise AssertionError("process spawn attempted")
+
+
+saved = (os.system, os.fork, os.posix_spawn, os.execv, os.execvp)
+os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 5
+try:
+    expect_ok("plan", "--request", request)
+    expect_ok("verify-plan", "--request", request, "--plan", plan_file)
+    expect_ok("collect", *args(), "--out", work / "spawn-free")
+    expect_ok("verify-evidence", *args(), "--evidence", work / "spawn-free")
+finally:
+    os.system, os.fork, os.posix_spawn, os.execv, os.execvp = saved
+ok("collection and verification spawn no process")
+
+# --- contract tamper and version pins ---------------------------------------
+
+
+def clone_root(name):
+    target = fresh(name) / "root"
+    shutil.copytree(contracts_root, target)
+    return target
+
+
+root = clone_root("contract-hash")
+tampered = json.loads(capture_contract_bytes)
+tampered["components"]["preflight_contract"]["sha256"] = "0" * 64
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(D.render_json(tampered))
+expect_fail("capture contract pin changed", ["show"], root=root)
+root = clone_root("contract-claim")
+tampered = json.loads(capture_contract_bytes)
+tampered["evidence"]["live"] = True
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(D.render_json(tampered))
+expect_fail("capture contract live claim", ["plan", "--request", request], root=root)
+root = clone_root("contract-authority")
+tampered = json.loads(capture_contract_bytes)
+tampered["authority"]["hardware_read_authorized"] = True
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(D.render_json(tampered))
+expect_fail("capture contract authority claim", ["show"], root=root)
+root = clone_root("contract-version")
+tampered = json.loads(capture_contract_bytes)
+tampered["pinned_versions"]["preflight"] = "0.3.0"
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(D.render_json(tampered))
+expect_fail("capture contract version pin changed", ["show"], root=root)
+root = clone_root("contract-noncanonical")
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(json.dumps(capture_contract).encode())
+expect_fail("non-canonical capture contract", ["show"], root=root)
+root = clone_root("contract-missing")
+(root / C.CAPTURE_CONTRACT_PATH).unlink()
+expect_fail("missing capture contract", ["show"], root=root)
+root = clone_root("preflight-contract-changed")
+(root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes + b" ")
+expect_fail("preflight contract changed under the pin", ["show"], root=root)
+ok("capture contract tampering and a changed preflight contract fail closed")
+
+# Version pin: a preflight tool at another version is refused before any use.
+patched_tools = fresh("version-pin") / "tools"
+shutil.copytree(repo / "tools", patched_tools, ignore=shutil.ignore_patterns("__pycache__"))
+source = (patched_tools / "myron-preflight").read_text()
+assert 'VERSION = "0.2.0"' in source
+(patched_tools / "myron-preflight").write_text(source.replace('VERSION = "0.2.0"', 'VERSION = "0.2.1"', 1))
+saved_tool, saved_module = C.PREFLIGHT_TOOL, C._preflight
+C.PREFLIGHT_TOOL, C._preflight = patched_tools / "myron-preflight", None
+try:
+    code, out, err = invoke("show")
+    assert code != 0 and "unsupported verifier versions" in err, err
+finally:
+    C.PREFLIGHT_TOOL, C._preflight = saved_tool, saved_module
+ok("a preflight tool outside the pinned versions is refused")
+PY
+
+pass "myron collect fixture tests passed"

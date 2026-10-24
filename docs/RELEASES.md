@@ -134,6 +134,12 @@ and declares seven bounded/redacted read IDs. It executes none of them,
 collects no evidence, contacts no phone, preserves all blockers and sets every
 hardware-read/deployment authority flag false
 ([PREFLIGHT-GATE](myron/PREFLIGHT-GATE.md)).
+`tools/myron-collect` 0.1.0 (Phase 2.12) validates a bounded, pre-captured
+fixture tree against one preflight request and records five-file,
+artifact-structure-only evidence. It is fixture evidence only: not live
+evidence, not approval, no live transport, and it clears no blocker. All seven
+blockers stay missing and every authority flag stays false
+([CAPTURE-GATE](myron/CAPTURE-GATE.md)).
 
 ### 3.2 Keys to add later
 

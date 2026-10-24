@@ -75,7 +75,9 @@ collector. These are identifiers and field allowlists, not shell commands:
 Every operation says read-only, uses the future transport name
 `approved-read-only-recovery-session`, and stops on identity mismatch,
 two-source disagreement, a bound overrun, unstable reads, or any write attempt.
-No collector is implemented in 0.2.0.
+No live collector exists. Phase 2.12 adds an offline collector that only
+validates pre-captured fixtures against these IDs
+([CAPTURE-GATE.md](CAPTURE-GATE.md)); the preflight contract does not know it.
 
 R7 rejects every unlisted command-line or bootconfig key. Its command-line
 allowlist is limited to `androidboot.slot_suffix` (`_a` or `_b`),

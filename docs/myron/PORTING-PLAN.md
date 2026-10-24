@@ -170,6 +170,13 @@ execution and collected-evidence lists are empty and every authority flag is
 false. It contacts no phone and is not approval
 ([PREFLIGHT-GATE.md](PREFLIGHT-GATE.md)).
 
+Phase 2.12 (laptop-only, mechanism done): `device/myron/capture-contract.json`
+and `tools/myron-collect` 0.1.0 validate a bounded **pre-captured fixture**
+tree against one preflight request and record structure-only evidence. This is
+fixture evidence, not live evidence and not approval; it has no live transport,
+clears no blocker and sets no authority flag
+([CAPTURE-GATE.md](CAPTURE-GATE.md)).
+
 Phase 2.11 (laptop-only, mechanism done): kernel-contract and deployment tool
 0.4.0 add synthetic coverage for standard AArch64/GKI module layouts so real
 owner bytes are no longer guaranteed to fail on RELA, PREL32 exports,
@@ -312,7 +319,8 @@ Future build gates:
 
 ## Next implementation task
 
-Offline refusal tooling is now complete through the preflight request. Next,
+Offline refusal tooling is now complete through the preflight request, and the
+fixture collector (Phase 2.12) can check the shape of pre-captured evidence. Next,
 assemble a **real** kit and snapshot candidate from the owner-supplied qualified
 archive, runtime tree and symvers pair, then generate and independently review
 its preflight request SHA-256. That work stays offline. The following boundary

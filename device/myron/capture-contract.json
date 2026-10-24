@@ -1,0 +1,55 @@
+{
+  "authority": {
+    "atomic_snapshot_proof": false,
+    "atomicity_proven": false,
+    "bootable": false,
+    "deployment_authorized": false,
+    "flashable": false,
+    "hardware_qualified": false,
+    "hardware_read_authorized": false,
+    "image_ready": false,
+    "rollback_proven": false
+  },
+  "blockers": [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization"
+  ],
+  "capture": {
+    "extra_entries": "reject",
+    "kind": "myron-precaptured-fixture",
+    "operation_kind": "myron-precaptured-operation",
+    "total_max_bytes": 4194304,
+    "trusted_local_files_only": true
+  },
+  "capture_schema": "myron-capture-evidence-v1",
+  "components": {
+    "preflight_contract": {
+      "path": "device/myron/preflight-contract.json",
+      "sha256": "e84bdef703403b17ab6d4222fb66479a10b6464ff4978b6fce72076b54f761c5"
+    }
+  },
+  "evidence": {
+    "executes": false,
+    "human_approval_required": true,
+    "kind": "myron-capture-fixture-evidence",
+    "kit_snapshot_reverified": false,
+    "level": "artifact-structure-only",
+    "live": false,
+    "remote_commands": [],
+    "status": "fixture-evidence-recorded"
+  },
+  "format_version": "0.1.0",
+  "kind": "myron-capture-collector-contract",
+  "pinned_versions": {
+    "deployment": "0.4.0",
+    "preflight": "0.2.0",
+    "snapshot": "0.2.0"
+  },
+  "schema": 1,
+  "transport": "external-precaptured-fixture"
+}

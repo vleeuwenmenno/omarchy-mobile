@@ -1,0 +1,884 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Validate bounded pre-captured Myron fixtures against a preflight request.
+
+Offline and structural only: the one transport is a local, trusted,
+pre-captured fixture tree. Nothing here reads a phone or clears a blocker."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+if __name__ == "__main__":
+    _here = os.path.dirname(os.path.realpath(__file__))
+    sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _here]
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import re
+import stat
+
+sys.dont_write_bytecode = True
+
+VERSION = "0.1.0"
+REPO = Path(__file__).resolve().parent.parent
+PREFLIGHT_TOOL = REPO / "tools/myron-preflight"
+PINNED_VERSIONS = {"preflight": "0.2.0", "snapshot": "0.2.0", "deployment": "0.4.0"}
+CAPTURE_CONTRACT_PATH = "device/myron/capture-contract.json"
+PREFLIGHT_CONTRACT_PATH = "device/myron/preflight-contract.json"
+CONTRACT_KIND = "myron-capture-collector-contract"
+PLAN_KIND = "myron-capture-collection-plan"
+CAPTURE_KIND = "myron-precaptured-fixture"
+OPERATION_KIND = "myron-precaptured-operation"
+EVIDENCE_KIND = "myron-capture-fixture-evidence"
+TRANSPORT = "external-precaptured-fixture"
+EVIDENCE_LEVEL = "artifact-structure-only"
+EVIDENCE_STATUS = "fixture-evidence-recorded"
+TOTAL_CAPTURE_BYTES = 4 * 1024 * 1024
+MAX_FILE_BYTES = 1024 * 1024
+MAX_DEPTH = 8
+HEX256 = re.compile(r"[0-9a-f]{64}")
+PARTITION_NAME = re.compile(r"[a-z0-9_]{1,36}")
+MODULE_NAME = re.compile(r"[A-Za-z0-9_-]{1,56}")
+TAINT_FLAGS = re.compile(r"[A-Z]{0,8}")
+OS_VERSION = re.compile(r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}")
+KERNEL_RELEASE = re.compile(r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}[0-9A-Za-z._+-]{0,100}")
+IMAGE_NAME = re.compile(
+    r"(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?"
+)
+IDENTIFIER_PATTERNS = (
+    re.compile(r"(?i)(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}"),
+    re.compile(r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),
+    re.compile(r"[0-9]{14,}"),
+    re.compile(r"(?i)[0-9a-f]{24,}"),
+)
+COMPATIBLE = "qcom,canoe-mtp"
+FILESYSTEMS = ["ext4", "f2fs", "erofs", "btrfs", "xfs"]
+MOUNT_OPTIONS = [
+    "discard", "errors=remount-ro", "noatime", "nodev", "noexec", "nosuid", "relatime",
+    "ro", "rw",
+]
+STATUS_TEXT = (
+    "Omarchy Mobile Myron pre-captured fixture evidence (offline only)\n"
+    "\n"
+    "evidence_level: artifact-structure-only\n"
+    "live: false\n"
+    "executes: false\n"
+    "hardware_read_authorized: false\n"
+    "deployment_authorized: false\n"
+    "This artifact records that a pre-captured fixture tree matched the bounded\n"
+    "schemas of one preflight request. It is not live evidence, not approval, and\n"
+    "clears no blocker. Every blocker stays missing; a human decides what follows.\n"
+).encode("ascii")
+
+
+class CollectError(Exception):
+    """Capture input or evidence differs from the reviewed collector contract."""
+
+
+_preflight = None
+
+
+def preflight():
+    global _preflight
+    if _preflight is None:
+        try:
+            loader = importlib.machinery.SourceFileLoader("myron_preflight", str(PREFLIGHT_TOOL))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+        except (OSError, SyntaxError) as error:
+            raise CollectError(f"cannot load the preflight verifier: {error}") from error
+        found = {
+            "preflight": module.VERSION,
+            "snapshot": module.snapshot().VERSION,
+            "deployment": module.deploy().VERSION,
+        }
+        if found != PINNED_VERSIONS:
+            raise CollectError(f"unsupported verifier versions {found}; expected {PINNED_VERSIONS}")
+        _preflight = module
+    return _preflight
+
+
+def deploy():
+    return preflight().deploy()
+
+
+def kernel():
+    return deploy().kernel()
+
+
+def authority() -> dict:
+    return preflight().authority()
+
+
+def blocker_rows() -> list[dict]:
+    return [{"blocker": blocker, "state": "missing"} for blocker in deploy().BLOCKERS]
+
+
+def status_document() -> dict:
+    p = preflight()
+    return {
+        "artifact": EVIDENCE_KIND,
+        "blockers": list(deploy().BLOCKERS),
+        **p.authority(),
+    }
+
+
+def capture_limits():
+    return deploy().Limits(16, 2, MAX_FILE_BYTES, TOTAL_CAPTURE_BYTES)
+
+
+# --- contract -------------------------------------------------------------------
+
+
+def expected_capture_contract(preflight_contract_sha256: str) -> dict:
+    p = preflight()
+    return {
+        "schema": 1,
+        "kind": CONTRACT_KIND,
+        "format_version": VERSION,
+        "components": {
+            "preflight_contract": {
+                "path": PREFLIGHT_CONTRACT_PATH,
+                "sha256": preflight_contract_sha256,
+            }
+        },
+        "pinned_versions": dict(PINNED_VERSIONS),
+        "capture_schema": p.CAPTURE_SCHEMA,
+        "transport": TRANSPORT,
+        "capture": {
+            "kind": CAPTURE_KIND,
+            "operation_kind": OPERATION_KIND,
+            "total_max_bytes": TOTAL_CAPTURE_BYTES,
+            "extra_entries": "reject",
+            "trusted_local_files_only": True,
+        },
+        "evidence": {
+            "kind": EVIDENCE_KIND,
+            "level": EVIDENCE_LEVEL,
+            "status": EVIDENCE_STATUS,
+            "live": False,
+            "executes": False,
+            "kit_snapshot_reverified": False,
+            "remote_commands": [],
+            "human_approval_required": True,
+        },
+        "blockers": list(deploy().BLOCKERS),
+        "authority": p.authority(),
+    }
+
+
+def load_capture_contract(root: Path, preflight_contract_sha256: str) -> tuple[dict, bytes, str]:
+    d = deploy()
+    data = d.read_file(
+        f"{root}/{CAPTURE_CONTRACT_PATH}", "capture contract", d.MAX_SMALL_BYTES
+    )
+    value = d.strict_json(data, "capture contract")
+    expected = expected_capture_contract(preflight_contract_sha256)
+    if not kernel().strict_equal(value, expected):
+        raise CollectError("capture contract differs from its derived form")
+    if data != d.render_json(expected):
+        raise CollectError("capture contract is not canonical")
+    return value, data, d.sha256_bytes(data)
+
+
+class Environment:
+    def __init__(self, contracts, preflight_bytes, preflight_sha256, contract, contract_bytes, contract_sha256):
+        self.contracts = contracts
+        self.preflight_bytes = preflight_bytes
+        self.preflight_sha256 = preflight_sha256
+        self.contract = contract
+        self.contract_bytes = contract_bytes
+        self.contract_sha256 = contract_sha256
+
+
+def load_environment(root: Path) -> Environment:
+    p = preflight()
+    d = p.deploy()
+    s = p.snapshot()
+    contracts = d.load_contracts(root)
+    _, _, snapshot_sha256 = s.load_snapshot_contract(root, contracts)
+    _, preflight_bytes, preflight_sha256 = p.load_preflight_contract(
+        root, contracts, snapshot_sha256
+    )
+    contract, contract_bytes, contract_sha256 = load_capture_contract(root, preflight_sha256)
+    return Environment(
+        contracts, preflight_bytes, preflight_sha256, contract, contract_bytes, contract_sha256
+    )
+
+
+# --- strict value checks --------------------------------------------------------
+
+
+def need_dict(value, keys, label: str) -> dict:
+    if type(value) is not dict or set(value) != set(keys):
+        raise CollectError(f"{label} fields differ")
+    return value
+
+
+def need_int(value, label: str, low: int, high: int) -> int:
+    if type(value) is not int or not low <= value <= high:
+        raise CollectError(f"{label} is outside {low}..{high}")
+    return value
+
+
+def need_bool(value, label: str) -> bool:
+    if type(value) is not bool:
+        raise CollectError(f"{label} is not a boolean")
+    return value
+
+
+def need_enum(value, label: str, allowed) -> str:
+    if type(value) is not str or value not in allowed:
+        raise CollectError(f"{label} is not an allowed value")
+    return value
+
+
+def need_text(value, label: str, pattern) -> str:
+    if (
+        type(value) is not str
+        or not value.isascii()
+        or not value.isprintable()
+        or not pattern.fullmatch(value)
+    ):
+        raise CollectError(f"{label} does not match its pattern")
+    return value
+
+
+def need_hash(value, label: str) -> str:
+    return need_text(value, label, HEX256)
+
+
+def need_list(value, label: str, low: int, high: int) -> list:
+    if type(value) is not list or not low <= len(value) <= high:
+        raise CollectError(f"{label} must hold {low}..{high} entries")
+    return value
+
+
+def need_sorted_unique(names: list, label: str) -> None:
+    if names != sorted(set(names)):
+        raise CollectError(f"{label} is not unique and sorted")
+
+
+def reject_identifiers(value, label: str, depth: int = 0) -> None:
+    """Refuse identifier-shaped strings anywhere in a document, keys included."""
+    if depth > MAX_DEPTH:
+        raise CollectError(f"{label} nests too deeply")
+    forbidden = set(preflight().NEVER_EMITS)
+    if type(value) is dict:
+        for key, item in value.items():
+            reject_identifiers(key, label, depth + 1)
+            reject_identifiers(item, label, depth + 1)
+    elif type(value) is list:
+        for item in value:
+            reject_identifiers(item, label, depth + 1)
+    elif type(value) is str:
+        if HEX256.fullmatch(value):
+            return
+        if forbidden & set(re.split(r"[^a-z0-9]+", value.lower())):
+            raise CollectError(f"{label} names an excluded identifier or payload field")
+        if any(pattern.search(value) for pattern in IDENTIFIER_PATTERNS):
+            raise CollectError(f"{label} contains an identifier-shaped value")
+
+
+def field_key(emit: str) -> str:
+    return emit.replace("-", "_")
+
+
+# --- per-operation schemas ------------------------------------------------------
+
+
+def check_r1(data: dict) -> None:
+    need_enum(data["codename"], "R1 codename", ["myron"])
+    need_enum(data["soc"], "R1 soc", ["sm8850"])
+    need_enum(data["compatible_prefix"], "R1 compatible prefix", [COMPATIBLE])
+    slot = need_enum(data["current_slot"], "R1 current slot", ["a", "b"])
+    suffix = need_enum(data["slot_suffix"], "R1 slot suffix", ["_a", "_b"])
+    need_enum(
+        data["verified_boot_state"], "R1 verified boot state",
+        ["green", "yellow", "orange", "red"],
+    )
+    if need_bool(data["sources_agree"], "R1 sources agree") is not True:
+        raise CollectError("R1 sources disagree")
+    if suffix != "_" + slot:
+        raise CollectError("R1 slot and slot suffix disagree")
+
+
+def check_r2(data: dict) -> None:
+    rows = need_list(data["partitions"], "R2 partitions", 1, 128)
+    names = []
+    for row in rows:
+        need_dict(row, ["partition_name", "size_bytes", "bootable_flag", "slot_suffix"], "R2 partition")
+        name = need_text(row["partition_name"], "R2 partition name", PARTITION_NAME)
+        need_int(row["size_bytes"], "R2 size", 0, 2**50)
+        need_bool(row["bootable_flag"], "R2 bootable flag")
+        suffix = need_enum(row["slot_suffix"], "R2 slot suffix", ["", "_a", "_b"])
+        if suffix != (name[-2:] if name.endswith(("_a", "_b")) else ""):
+            raise CollectError("R2 slot suffix differs from the partition name")
+        names.append(name)
+    need_sorted_unique(names, "R2 partitions")
+    recovery = any(re.fullmatch(r"recovery(_a|_b)?", name) for name in names)
+    if need_bool(data["recovery_present"], "R2 recovery present") != recovery:
+        raise CollectError("R2 recovery flag differs from the inventory")
+
+
+def check_r3(data: dict) -> None:
+    rows = need_list(data["images"], "R3 images", 1, 12)
+    names = []
+    for row in rows:
+        need_dict(
+            row,
+            ["partition_name", "absent", "header_version", "page_size", "os_version",
+             "component_sizes", "component_offsets", "segment_count", "header_sha256"],
+            "R3 image",
+        )
+        names.append(need_text(row["partition_name"], "R3 partition name", IMAGE_NAME))
+        sizes = need_list(row["component_sizes"], "R3 component sizes", 0, 8)
+        offsets = need_list(row["component_offsets"], "R3 component offsets", 0, 8)
+        for item in sizes + offsets:
+            need_int(item, "R3 component value", 0, 2**32)
+        if need_bool(row["absent"], "R3 absent flag"):
+            if (
+                row["header_version"] is not None or row["page_size"] is not None
+                or row["os_version"] is not None or row["header_sha256"] is not None
+                or sizes or offsets or row["segment_count"] != 0
+                or type(row["segment_count"]) is not int
+            ):
+                raise CollectError("R3 absent image carries header fields")
+            continue
+        need_int(row["header_version"], "R3 header version", 0, 4)
+        need_enum_int(row["page_size"], "R3 page size", [2048, 4096, 8192, 16384])
+        need_text(row["os_version"], "R3 OS version", OS_VERSION)
+        need_hash(row["header_sha256"], "R3 header hash")
+        count = need_int(row["segment_count"], "R3 segment count", 1, 8)
+        if not len(sizes) == len(offsets) == count:
+            raise CollectError("R3 segment lists differ in length")
+    need_sorted_unique(names, "R3 images")
+
+
+def need_enum_int(value, label: str, allowed) -> int:
+    if type(value) is not int or value not in allowed:
+        raise CollectError(f"{label} is not an allowed value")
+    return value
+
+
+def check_r4(data: dict) -> None:
+    need_int(data["dtb_count"], "R4 DTB count", 0, 64)
+    board = data["selected_board_id"]
+    revision = data["selected_board_revision"]
+    if (board is None) != (revision is None):
+        raise CollectError("R4 board id and revision must both be set or both be null")
+    if board is not None:
+        need_int(board, "R4 board id", 0, 2**32 - 1)
+        need_int(revision, "R4 board revision", 0, 2**32 - 1)
+    need_int(data["dtbo_entry_count"], "R4 DTBO entry count", 0, 256)
+    need_enum(data["compatible_prefix"], "R4 compatible prefix", [COMPATIBLE])
+    need_enum(
+        data["selection_source"], "R4 selection source",
+        ["bootconfig", "device-tree", "dtbo-header"],
+    )
+
+
+def check_r5(data: dict) -> None:
+    names = need_list(data["module_names"], "R5 module names", 0, 1024)
+    index = need_list(data["load_order_index"], "R5 load order", len(names), len(names))
+    flags = need_list(data["taint_flags"], "R5 taint flags", len(names), len(names))
+    for name in names:
+        need_text(name, "R5 module name", MODULE_NAME)
+    for flag in flags:
+        need_text(flag, "R5 taint flag", TAINT_FLAGS)
+    if len(set(names)) != len(names):
+        raise CollectError("R5 module names repeat")
+    for position, value in enumerate(index):
+        if need_int(value, "R5 load index", 0, 1024) != position:
+            raise CollectError("R5 load order index is not sequential")
+    declared = [name.replace("-", "_") for name in deploy().REFERENCE_MODULE_ORDER]
+    seen = [name.replace("-", "_") for name in names]
+    matches = [name for name in seen if name in declared] == declared
+    if need_bool(data["order_matches_declared"], "R5 order flag") != matches:
+        raise CollectError("R5 order claim differs from the module list")
+
+
+def check_r6(data: dict) -> None:
+    need_text(data["root_source_gpt_name"], "R6 root name", PARTITION_NAME)
+    need_enum(data["filesystem_type"], "R6 filesystem", FILESYSTEMS)
+    options = need_list(data["mount_options"], "R6 mount options", 0, 16)
+    for option in options:
+        need_enum(option, "R6 mount option", MOUNT_OPTIONS)
+    need_sorted_unique(options, "R6 mount options")
+    need_enum_int(data["block_size"], "R6 block size", [1024, 2048, 4096, 8192, 16384, 65536])
+    total = need_int(data["rounded_total_bytes"], "R6 total", 1, 2**50)
+    free = need_int(data["rounded_free_bytes"], "R6 free", 0, 2**50)
+    mebibyte = 1024 * 1024
+    if total % mebibyte or free % mebibyte or free > total:
+        raise CollectError("R6 sizes are not rounded to 1 MiB or free exceeds total")
+
+
+def check_policy_entries(rows, label: str, policy: dict) -> dict:
+    allowed = {row["key"]: row for row in policy["entries"]}
+    rows = need_list(rows, label, 0, len(allowed))
+    keys, found = [], {}
+    for row in rows:
+        need_dict(row, ["key", "value"], f"{label} entry")
+        key = row["key"]
+        if type(key) is not str or key not in allowed:
+            raise CollectError(f"{label} has an unlisted key")
+        need_enum(row["value"], f"{label} value", allowed[key]["allowed_values"])
+        keys.append(key)
+        found[key] = row["value"]
+    need_sorted_unique(keys, label)
+    return found
+
+
+def check_r7(data: dict, spec: dict) -> dict:
+    need_text(data["kernel_release"], "R7 kernel release", KERNEL_RELEASE)
+    need_hash(data["notes_sha256"], "R7 notes hash")
+    policy = spec["field_policy"]
+    if policy["kernel_command_line"]["unknown_keys"] != "reject" or (
+        policy["bootconfig"]["unknown_keys"] != "reject"
+    ):
+        raise CollectError("R7 policy no longer rejects unknown keys")
+    cmdline = check_policy_entries(
+        data["allowlisted_cmdline"], "R7 command line", policy["kernel_command_line"]
+    )
+    bootconfig = check_policy_entries(
+        data["allowlisted_bootconfig_keys"], "R7 bootconfig", policy["bootconfig"]
+    )
+    return {"cmdline": cmdline, "bootconfig": bootconfig}
+
+
+OPERATION_CHECKS = {
+    "R1-identity-and-slot": check_r1,
+    "R2-gpt-and-recovery-inventory": check_r2,
+    "R3-boot-image-headers": check_r3,
+    "R4-dtb-dtbo-selection": check_r4,
+    "R5-module-load-order": check_r5,
+    "R6-storage-and-mount-model": check_r6,
+}
+R7_ID = "R7-kernel-identity-revalidation"
+CONTAINERS = {
+    "R2-gpt-and-recovery-inventory": (
+        "partitions", ["partition_name", "size_bytes", "bootable_flag", "slot_suffix"],
+    ),
+    "R3-boot-image-headers": (
+        "images",
+        ["partition_name", "absent", "header_version", "page_size", "os_version",
+         "component_sizes", "component_offsets", "segment_count", "header_sha256"],
+    ),
+}
+
+
+def operation_path(operation_id: str) -> str:
+    return f"operations/{operation_id}.json"
+
+
+def validate_operation(raw: bytes, spec: dict, request_sha256: str) -> tuple[dict, dict | None]:
+    d = deploy()
+    operation_id = spec["id"]
+    if len(raw) > spec["max_bytes"]:
+        raise CollectError(f"{operation_id} exceeds its {spec['max_bytes']}-byte bound")
+    document = d.strict_json(raw, operation_id)
+    if raw != d.render_json(document):
+        raise CollectError(f"{operation_id} is not canonical JSON")
+    reject_identifiers(document, operation_id)
+    need_dict(
+        document,
+        ["schema", "kind", "id", "request_sha256", "transport", "read_only", "bytes_read", "data"],
+        operation_id,
+    )
+    if type(document["schema"]) is not int or document["schema"] != 1:
+        raise CollectError(f"{operation_id} schema differs")
+    if document["kind"] != OPERATION_KIND or document["id"] != operation_id:
+        raise CollectError(f"{operation_id} identity differs")
+    if document["request_sha256"] != request_sha256:
+        raise CollectError(f"{operation_id} request binding differs")
+    if document["transport"] != TRANSPORT or document["read_only"] is not True:
+        raise CollectError(f"{operation_id} transport or read-only claim differs")
+    limit = spec["max_bytes"]
+    need_int(document["bytes_read"], f"{operation_id} bytes_read", 1, limit)
+    emitted = {field_key(emit) for emit in spec["emits"]}
+    container = CONTAINERS.get(operation_id)
+    keys = emitted
+    if container is not None:
+        rows_field, row_fields = container
+        if not set(row_fields) <= emitted:
+            raise CollectError(f"{operation_id} row fields are not emitted fields")
+        keys = (emitted - set(row_fields)) | {rows_field}
+    data = need_dict(document["data"], keys, f"{operation_id} data")
+    if operation_id == R7_ID:
+        return document, check_r7(data, spec)
+    check = OPERATION_CHECKS.get(operation_id)
+    if check is None:
+        raise CollectError(f"unknown operation {operation_id}")
+    check(data)
+    return document, None
+
+
+def cross_check(documents: dict, r7: dict) -> None:
+    r1 = documents["R1-identity-and-slot"]["data"]
+    r2 = {row["partition_name"] for row in documents["R2-gpt-and-recovery-inventory"]["data"]["partitions"]}
+    for image in documents["R3-boot-image-headers"]["data"]["images"]:
+        if (image["partition_name"] in r2) == image["absent"]:
+            raise CollectError("R3 presence differs from the R2 inventory")
+    if documents["R6-storage-and-mount-model"]["data"]["root_source_gpt_name"] not in r2:
+        raise CollectError("R6 root partition is not in the R2 inventory")
+    for source in (r7["cmdline"], r7["bootconfig"]):
+        if source.get("androidboot.slot_suffix", r1["slot_suffix"]) != r1["slot_suffix"]:
+            raise CollectError("R7 slot suffix disagrees with R1")
+        if source.get("androidboot.slot", r1["current_slot"]) != r1["current_slot"]:
+            raise CollectError("R7 slot disagrees with R1")
+    state = r7["bootconfig"].get("androidboot.verifiedbootstate", r1["verified_boot_state"])
+    if state != r1["verified_boot_state"]:
+        raise CollectError("R7 verified boot state disagrees with R1")
+
+
+# --- request and capture --------------------------------------------------------
+
+
+class Inputs:
+    def __init__(self, request, request_sha256, request_ids, capture):
+        self.request = request
+        self.request_sha256 = request_sha256
+        self.request_ids = request_ids
+        self.capture = capture
+
+
+class Capture:
+    def __init__(self, manifest, documents, sizes, capture_sha256, directory_ids):
+        self.manifest = manifest
+        self.documents = documents
+        self.sizes = sizes
+        self.capture_sha256 = capture_sha256
+        self.directory_ids = directory_ids
+
+
+def read_request(path: str, env: Environment):
+    p = preflight()
+    d = deploy()
+    document, ids, _identity = p.read_request(
+        path, env.contracts, env.preflight_bytes, env.preflight_sha256
+    )
+    spec = p.request_spec(env.preflight_bytes, document)
+    sums = next(data for name, kind, mode, data in spec if name == "SHA256SUMS")
+    return document, d.sha256_bytes(sums), ids
+
+
+def manifest_document(env: Environment, request_sha256: str, request: dict, files: dict) -> dict:
+    d = deploy()
+    return {
+        "schema": 1,
+        "kind": CAPTURE_KIND,
+        "format_version": VERSION,
+        "contract_sha256": env.contract_sha256,
+        "request_sha256": request_sha256,
+        "capture_schema": preflight().CAPTURE_SCHEMA,
+        "transport": TRANSPORT,
+        "live": False,
+        "operations": [
+            {
+                "id": row["id"],
+                "sha256": d.sha256_bytes(files[operation_path(row["id"])]),
+                "bytes": len(files[operation_path(row["id"])]),
+            }
+            for row in request["requested_reads"]
+        ],
+    }
+
+
+def read_capture(path: str, env: Environment, request: dict, request_sha256: str) -> Capture:
+    d = deploy()
+    descriptor, identity = d.open_trusted_artifact(path, "capture")
+    try:
+        tree = d.walk_tree(
+            descriptor, capture_limits(), allow_symlinks=False, keep_data=True,
+            trusted_ownership=True, label="capture",
+        )
+    finally:
+        os.close(descriptor)
+    reads = request["requested_reads"]
+    expected = {".": "dir", "operations": "dir", "capture.json": "file"}
+    expected.update({operation_path(row["id"]): "file" for row in reads})
+    actual = {entry.path: entry.kind for entry in tree.entries}
+    if actual != expected:
+        extra = sorted(set(actual) - set(expected))
+        missing = sorted(set(expected) - set(actual))
+        raise CollectError(f"capture tree differs (extra {extra}, missing {missing})")
+    for entry in tree.entries:
+        if entry.kind == "file" and entry.mode & 0o111:
+            raise CollectError(f"capture file is executable: {entry.path}")
+    if tree.file_bytes > TOTAL_CAPTURE_BYTES:
+        raise CollectError("capture exceeds the total byte bound")
+    manifest = d.strict_json(tree.data["capture.json"], "capture.json")
+    if tree.data["capture.json"] != d.render_json(manifest):
+        raise CollectError("capture.json is not canonical")
+    reject_identifiers(manifest, "capture.json")
+    expected_manifest = manifest_document(env, request_sha256, request, tree.data)
+    if not kernel().strict_equal(manifest, expected_manifest):
+        raise CollectError("capture.json differs from its operations or bindings")
+    documents, r7 = {}, None
+    for row in reads:
+        document, result = validate_operation(
+            tree.data[operation_path(row["id"])], row, request_sha256
+        )
+        documents[row["id"]] = document
+        if result is not None:
+            r7 = result
+    cross_check(documents, r7)
+    sums = "".join(
+        f"{entry.sha256}  {entry.path}\n" for entry in tree.entries if entry.kind == "file"
+    )
+    d.recheck_trusted_artifact(path, identity, "capture")
+    return Capture(
+        manifest, documents,
+        {row["id"]: len(tree.data[operation_path(row["id"])]) for row in reads},
+        d.sha256_bytes(sums.encode("ascii")), tree.directory_ids,
+    )
+
+
+def gather(args, env: Environment) -> Inputs:
+    d = deploy()
+    if d.paths_overlap(args.request, args.capture):
+        raise CollectError("capture and request paths overlap")
+    request, request_sha256, request_ids = read_request(args.request, env)
+    capture = read_capture(args.capture, env, request, request_sha256)
+    if request_ids & capture.directory_ids:
+        raise CollectError("capture aliases the request tree")
+    return Inputs(request, request_sha256, request_ids, capture)
+
+
+# --- documents ------------------------------------------------------------------
+
+
+def plan_document(env: Environment, request: dict, request_sha256: str) -> dict:
+    return {
+        "schema": 1,
+        "kind": PLAN_KIND,
+        "format_version": VERSION,
+        "contract_sha256": env.contract_sha256,
+        "request_sha256": request_sha256,
+        "transport": TRANSPORT,
+        "evidence_level": EVIDENCE_LEVEL,
+        "live": False,
+        "executes": False,
+        "remote_commands": [],
+        "capture_tree": {
+            "manifest": "capture.json",
+            "operations": [
+                {
+                    "id": row["id"],
+                    "path": operation_path(row["id"]),
+                    "max_bytes": row["max_bytes"],
+                    "fields": [field_key(emit) for emit in row["emits"]],
+                    "rows_field": CONTAINERS.get(row["id"], (None,))[0],
+                }
+                for row in request["requested_reads"]
+            ],
+            "total_max_bytes": TOTAL_CAPTURE_BYTES,
+            "extra_entries": "reject",
+        },
+        "evidence_files": [
+            "STATUS.txt", "SHA256SUMS", "contracts/capture-contract.json",
+            "evidence.json", "status.json",
+        ],
+        "human_approval_required": True,
+        "blockers": list(deploy().BLOCKERS),
+        "authority": authority(),
+    }
+
+
+def evidence_document(env: Environment, inputs: Inputs) -> dict:
+    reads = inputs.request["requested_reads"]
+    return {
+        "schema": 1,
+        "kind": EVIDENCE_KIND,
+        "format_version": VERSION,
+        "contract_sha256": env.contract_sha256,
+        "request_sha256": inputs.request_sha256,
+        "capture_sha256": inputs.capture.capture_sha256,
+        "transport": TRANSPORT,
+        "evidence_level": EVIDENCE_LEVEL,
+        "status": EVIDENCE_STATUS,
+        "live": False,
+        "executes": False,
+        "kit_snapshot_reverified": False,
+        "remote_commands": [],
+        "human_approval_required": True,
+        "operations": [
+            {
+                "id": row["id"],
+                "sha256": next(
+                    item["sha256"] for item in inputs.capture.manifest["operations"]
+                    if item["id"] == row["id"]
+                ),
+                "bytes": inputs.capture.sizes[row["id"]],
+                "bytes_read": inputs.capture.documents[row["id"]]["bytes_read"],
+                "max_bytes": row["max_bytes"],
+            }
+            for row in reads
+        ],
+        "blockers": blocker_rows(),
+        "authority": authority(),
+    }
+
+
+def evidence_spec(env: Environment, inputs: Inputs) -> list:
+    d = deploy()
+    files = {
+        "contracts/capture-contract.json": env.contract_bytes,
+        "evidence.json": d.render_json(evidence_document(env, inputs)),
+        "status.json": d.render_json(status_document()),
+        "STATUS.txt": STATUS_TEXT,
+    }
+    files["SHA256SUMS"] = "".join(
+        f"{d.sha256_bytes(files[path])}  {path}\n" for path in sorted(files)
+    ).encode("ascii")
+    spec = [("contracts", "dir", 0o755, None)]
+    spec += [(path, "file", 0o644, data) for path, data in files.items()]
+    spec.sort(key=lambda item: item[0].encode("utf-8"))
+    return spec
+
+
+def result_summary(status: str, inputs: Inputs, spec: list) -> dict:
+    d = deploy()
+    sums = next(data for path, kind, mode, data in spec if path == "SHA256SUMS")
+    return {
+        "status": status,
+        "evidence_level": EVIDENCE_LEVEL,
+        "evidence_sha256": d.sha256_bytes(sums),
+        "request_sha256": inputs.request_sha256,
+        "capture_sha256": inputs.capture.capture_sha256,
+        "operation_count": len(inputs.capture.documents),
+        "blocker_count": len(d.BLOCKERS),
+        "live": False,
+        "executes": False,
+        "kit_snapshot_reverified": False,
+        **authority(),
+    }
+
+
+# --- commands -------------------------------------------------------------------
+
+
+def command_plan(env: Environment, args) -> dict:
+    request, request_sha256, _ids = read_request(args.request, env)
+    return plan_document(env, request, request_sha256)
+
+
+def command_verify_plan(env: Environment, args) -> dict:
+    d = deploy()
+    request, request_sha256, _ids = read_request(args.request, env)
+    expected = plan_document(env, request, request_sha256)
+    raw = d.read_file(args.plan, "capture plan", d.MAX_SMALL_BYTES)
+    document = d.strict_json(raw, "capture plan")
+    if raw != d.render_json(document):
+        raise CollectError("capture plan is not canonical")
+    if not kernel().strict_equal(document, expected):
+        raise CollectError("capture plan differs from the request")
+    return {
+        "status": "verified",
+        "request_sha256": request_sha256,
+        "operation_count": len(expected["capture_tree"]["operations"]),
+        "live": False,
+        "executes": False,
+        **authority(),
+    }
+
+
+def command_collect(env: Environment, args) -> dict:
+    d = deploy()
+    inputs = gather(args, env)
+    spec = evidence_spec(env, inputs)
+    expected = d.spec_entries(spec)
+    protected = [args.request, args.capture]
+    protected_ids = frozenset(inputs.request_ids | inputs.capture.directory_ids)
+
+    def verify_built(temporary_path: str, descriptor: int) -> None:
+        again = gather(args, env)
+        if evidence_spec(env, again) != spec:
+            raise CollectError("request or capture changed during collection")
+        tree = d.walk_tree(
+            descriptor, d.STAGE_LIMITS, allow_symlinks=False, label="capture evidence"
+        )
+        d.diff_entries(tree.entries, expected, "capture evidence")
+
+    d.publish(args.out, protected, protected_ids, spec, verify_built)
+    return result_summary("collected", inputs, spec)
+
+
+def command_verify_evidence(env: Environment, args) -> dict:
+    d = deploy()
+    inputs = gather(args, env)
+    spec = evidence_spec(env, inputs)
+    if any(d.paths_overlap(args.evidence, path) for path in (args.request, args.capture)):
+        raise CollectError("evidence overlaps an input")
+    descriptor, identity = d.open_trusted_artifact(args.evidence, "capture evidence")
+    try:
+        tree = d.walk_tree(
+            descriptor, d.STAGE_LIMITS, allow_symlinks=False, keep_data=True,
+            trusted_ownership=True, label="capture evidence",
+        )
+    finally:
+        os.close(descriptor)
+    d.diff_entries(tree.entries, d.spec_entries(spec), "capture evidence")
+    if tree.directory_ids & (inputs.request_ids | inputs.capture.directory_ids):
+        raise CollectError("evidence aliases an input tree")
+    d.recheck_trusted_artifact(args.evidence, identity, "capture evidence")
+    return result_summary("verified", inputs, spec)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("show", help="print the offline capture contract")
+    plan = commands.add_parser("plan", help="print the value-free collection plan")
+    plan.add_argument("--request", required=True)
+    verify_plan = commands.add_parser("verify-plan", help="recompute a saved plan")
+    verify_plan.add_argument("--request", required=True)
+    verify_plan.add_argument("--plan", required=True)
+    collect = commands.add_parser("collect", help="validate a fixture and write evidence")
+    collect.add_argument("--request", required=True)
+    collect.add_argument("--capture", required=True)
+    collect.add_argument("--out", required=True)
+    verify = commands.add_parser("verify-evidence", help="recompute fixture evidence")
+    verify.add_argument("--request", required=True)
+    verify.add_argument("--capture", required=True)
+    verify.add_argument("--evidence", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        p = preflight()
+    except CollectError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    d = p.deploy()
+    s = p.snapshot()
+    root = contracts_root or REPO
+    try:
+        env = load_environment(root)
+        if args.command == "show":
+            result = env.contract
+        elif args.command == "plan":
+            result = command_plan(env, args)
+        elif args.command == "verify-plan":
+            result = command_verify_plan(env, args)
+        elif args.command == "collect":
+            result = command_collect(env, args)
+        else:
+            result = command_verify_evidence(env, args)
+    except (CollectError, p.PreflightError, s.SnapshotError, *d.handled_errors()) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
