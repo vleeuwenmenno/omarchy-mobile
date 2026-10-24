@@ -1,0 +1,566 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the activation-disabled Myron GPU session profile.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+
+bash -n install || fail "install parses"
+python3 -m py_compile bin/omamobile-myron-gpu-profile \
+  || fail "profile command parses"
+python3 -m json.tool reference.json >/dev/null || fail "reference parses"
+pass "metadata and scripts parse"
+
+bin/omamobile-myron-gpu-profile --reference reference.json show \
+  > "$tmp/reference.out" || fail "production reference validates"
+python3 - "$tmp/reference.out" <<'PY' || exit 1
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data["activation"] == {
+    "live_probe": "absent",
+    "mode": "disabled",
+    "session_opt_in": "manual-only",
+    "system_loader_registration": False,
+    "systemd_unit": None,
+}
+assert data["provenance"] == {
+    "device_qualification": "none",
+    "qualification": "offline-static-only",
+}
+assert data["forbidden_environment"] == ["AQ_BACKEND", "EGL_PLATFORM", "WAYLAND_DISPLAY"]
+PY
+pass "activation and qualification remain disabled"
+
+bin/omamobile-myron-gpu-profile --reference reference.json environment \
+  > "$tmp/environment.out" || fail "environment contract cannot be shown"
+python3 - "$tmp/environment.out" <<'PY' || exit 1
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data["activation"] == "not-applied"
+assert data["environment"] == {
+    "LD_LIBRARY_PATH": "/usr/lib/omamobile/myron-gpu",
+    "LIBGL_DRIVERS_PATH": "/usr/lib/omamobile/myron-gpu/dri",
+    "MESA_LOADER_DRIVER_OVERRIDE": "zink",
+    "VK_DRIVER_FILES": "/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json",
+}
+assert data["forbidden_environment"] == ["AQ_BACKEND", "EGL_PLATFORM", "WAYLAND_DISPLAY"]
+PY
+pass "environment is reported but not applied"
+
+grep -qx 'UnsetEnvironment=WAYLAND_DISPLAY AQ_BACKEND EGL_PLATFORM' \
+  session-drop-in.conf.disabled || fail "native-session variables are not removed"
+if grep -Eq '^(AQ_BACKEND|EGL_PLATFORM|WAYLAND_DISPLAY)=' profile.env; then
+  fail "profile forces a nested or Wayland EGL backend"
+fi
+if grep -Eq '^(provides|conflicts|replaces)=' PKGBUILD; then
+  fail "profile claims or replaces a system package"
+fi
+grep -Fq "'mesa-myron-zink-turnip=26.2.2'" PKGBUILD \
+  || fail "profile does not pin its Mesa contract"
+pass "package metadata cannot replace or globally select Mesa"
+
+./install "$tmp/root"
+printf '%s\n' \
+  usr/bin/omamobile-myron-gpu-profile \
+  usr/share/doc/omamobile-myron-gpu-profile/README.md \
+  usr/share/licenses/omamobile-myron-gpu-profile/LICENSE \
+  usr/share/omamobile/myron-gpu-profile/profile.env \
+  usr/share/omamobile/myron-gpu-profile/reference.json \
+  usr/share/omamobile/myron-gpu-profile/session-drop-in.conf.disabled \
+  usr/share/omamobile/myron-gpu-profile/version > "$tmp/expected-files"
+(cd "$tmp/root" && find . -type f -print | sed 's#^\./##' | sort) \
+  > "$tmp/actual-files"
+cmp -s "$tmp/expected-files" "$tmp/actual-files" \
+  || { diff -u "$tmp/expected-files" "$tmp/actual-files" >&2 || true; fail "package stages unexpected files"; }
+for forbidden in \
+  etc \
+  usr/lib/environment.d \
+  usr/lib/systemd \
+  usr/lib/udev \
+  usr/share/libalpm/hooks \
+  usr/share/vulkan; do
+  [[ ! -e $tmp/root/$forbidden ]] || fail "package stages activation path: /$forbidden"
+done
+pass "installed package contains only inert private data"
+
+python3 - "$tmp/root" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+root = Path(sys.argv[1])
+prefix = root / "usr/lib/omamobile/myron-gpu"
+(prefix / "dri").mkdir(parents=True)
+names = [
+    "dri/libdril_dri.so",
+    "libEGL.so.1.0.0",
+    "libGLESv2.so.2.0.0",
+    "libgallium-26.2.2.so",
+    "libgbm.so.1.0.0",
+    "libvulkan_freedreno.so",
+]
+header = bytearray(64)
+header[:6] = b"\x7fELF\x02\x01"
+header[18:20] = (183).to_bytes(2, "little")
+for name in names:
+    path = prefix / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(header + name.encode())
+(prefix / "freedreno-kgsl.json").write_text(json.dumps({
+    "ICD": {
+        "api_version": "1.4.354",
+        "library_arch": "64",
+        "library_path": "/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so",
+    },
+    "file_format_version": "1.0.1",
+}, indent=4, sort_keys=True) + "\n")
+links = {
+    "dri/zink_dri.so": "libdril_dri.so",
+    "libEGL.so": "libEGL.so.1",
+    "libEGL.so.1": "libEGL.so.1.0.0",
+    "libGLESv2.so": "libGLESv2.so.2",
+    "libGLESv2.so.2": "libGLESv2.so.2.0.0",
+    "libgbm.so": "libgbm.so.1",
+    "libgbm.so.1": "libgbm.so.1.0.0",
+}
+for name, target in links.items():
+    (prefix / name).symlink_to(target)
+regular = ["freedreno-kgsl.json", *names]
+(prefix / "SHA256SUMS").write_text("".join(
+    f"{hashlib.sha256((prefix / name).read_bytes()).hexdigest()}  {name}\n"
+    for name in regular
+))
+PY
+mkdir -p "$tmp/root/usr/share/omamobile/myron-gpu"
+if [[ -x ../mesa-myron-zink-turnip/omamobile-myron-gpu-verify ]]; then
+  cp ../mesa-myron-zink-turnip/reference.json \
+    "$tmp/root/usr/share/omamobile/myron-gpu/reference.json"
+else
+  python3 - "$tmp/root" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1])
+reference = root / "usr/share/omamobile/myron-gpu/reference.json"
+reference.write_text(json.dumps({
+    "activation": {"mode": "disabled", "system_loader_registration": False},
+    "build": {},
+    "package": {
+        "name": "mesa-myron-zink-turnip",
+        "prefix": "/usr/lib/omamobile/myron-gpu",
+        "version": "26.2.2",
+    },
+    "reference": {},
+    "schema": 1,
+    "source": {},
+}) + "\n")
+PY
+fi
+"$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static --root "$tmp/root" \
+  > "$tmp/verified.out" || fail "exact static profile was rejected"
+python3 - "$tmp/verified.out" <<'PY' || exit 1
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data == {
+    "activation": "disabled",
+    "environment_keys": [
+        "LD_LIBRARY_PATH", "LIBGL_DRIVERS_PATH",
+        "MESA_LOADER_DRIVER_OVERRIDE", "VK_DRIVER_FILES",
+    ],
+    "global_activators": 0,
+    "mesa_files": 7,
+    "status": "verified",
+}
+PY
+pass "static probe verifies exact payload without opening hardware"
+
+profile_env="$tmp/root/usr/share/omamobile/myron-gpu-profile/profile.env"
+cp "$profile_env" "$tmp/profile.env"
+printf 'changed\n' >> "$profile_env"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "changed profile asset was accepted"
+fi
+mv "$tmp/profile.env" "$profile_env"
+
+mkdir -p "$tmp/root/etc/environment.d"
+printf 'LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu\n' \
+  > "$tmp/root/etc/environment.d/myron-gpu.conf"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "global environment activation was accepted"
+fi
+rm "$tmp/root/etc/environment.d/myron-gpu.conf"
+
+mkdir -p "$tmp/root/etc/systemd/system.conf.d"
+printf '[Manager]\nDefaultEnvironment=LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu\n' \
+  > "$tmp/root/etc/systemd/system.conf.d/90-myron-gpu.conf"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "systemd manager environment activation was accepted"
+fi
+rm "$tmp/root/etc/systemd/system.conf.d/90-myron-gpu.conf"
+
+mkdir -p "$tmp/root/etc/systemd/system"
+printf '[Service]\nEnvironmentFile=/usr/share/omamobile/myron-gpu-profile/profile.env\n' \
+  > "$tmp/root/etc/systemd/system/myron-gpu.service"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "indirect profile.env activation was accepted"
+fi
+rm "$tmp/root/etc/systemd/system/myron-gpu.service"
+
+for activation_file in \
+  etc/vulkan/icd.d/myron.json \
+  etc/ld.so.preload \
+  etc/pacman.d/hooks/myron.hook \
+  etc/xdg/systemd/user/myron.service \
+  etc/systemd/system.control/myron.service \
+  etc/systemd/system-generators/myron-gpu \
+  run/systemd/generator.early/myron.service \
+  run/systemd/generator/myron.service \
+  run/systemd/generator.late/myron.service \
+  run/systemd/system.control/myron.service \
+  run/systemd/transient/myron.service \
+  usr/lib/systemd/system.conf \
+  usr/lib/systemd/user.conf \
+  usr/share/systemd/user/myron.service \
+  usr/local/lib/systemd/system.conf.d/myron-gpu.conf; do
+  mkdir -p "$tmp/root/$(dirname "$activation_file")"
+  printf '/usr/lib/omamobile/myron-gpu\n' > "$tmp/root/$activation_file"
+  if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+      --root "$tmp/root" >/dev/null 2>&1; then
+    fail "activation path was not scanned: /$activation_file"
+  fi
+  rm "$tmp/root/$activation_file"
+done
+
+printf 'VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json\n' \
+  > "$tmp/root/etc/hidden-gpu-activation"
+ln -s hidden-gpu-activation "$tmp/root/etc/environment"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "symlinked global activation was accepted"
+fi
+rm "$tmp/root/etc/environment"
+
+mkdir -p "$tmp/root/etc/systemd/system/multi-user.target.wants"
+ln -s /dev/null \
+  "$tmp/root/etc/systemd/system/multi-user.target.wants/masked.service"
+"$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static --root "$tmp/root" \
+  >/dev/null || fail "ordinary systemd mask was rejected"
+rm "$tmp/root/etc/systemd/system/multi-user.target.wants/masked.service"
+
+mkdir -p "$tmp/root/usr/lib/systemd/system"
+printf '[Service]\nType=oneshot\nExecStart=/usr/bin/true\n' \
+  > "$tmp/root/usr/lib/systemd/system/base.service"
+ln -s /usr/lib/systemd/system/base.service \
+  "$tmp/root/etc/systemd/system/second.service"
+ln -s second.service "$tmp/root/etc/systemd/system/first.service"
+"$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static --root "$tmp/root" \
+  >/dev/null || fail "safe absolute/chained unit symlinks were rejected"
+rm "$tmp/root/etc/systemd/system/first.service" \
+  "$tmp/root/etc/systemd/system/second.service" \
+  "$tmp/root/usr/lib/systemd/system/base.service"
+
+sentinel="$tmp/staged-verifier-ran"
+printf '#!/bin/sh\ntouch %s\n' "$sentinel" \
+  > "$tmp/root/usr/bin/omamobile-myron-gpu-verify"
+chmod +x "$tmp/root/usr/bin/omamobile-myron-gpu-verify"
+"$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static --root "$tmp/root" \
+  >/dev/null || fail "static verification failed with inert staged verifier"
+[[ ! -e $sentinel ]] || fail "static verification executed staged code"
+
+mkdir -p "$tmp/outside-etc/environment.d"
+printf 'VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json\n' \
+  > "$tmp/outside-etc/environment.d/myron-gpu.conf"
+mv "$tmp/root/etc" "$tmp/root/etc.real"
+ln -s "$tmp/outside-etc" "$tmp/root/etc"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "symlinked activation ancestor was accepted"
+fi
+rm "$tmp/root/etc"
+mv "$tmp/root/etc.real" "$tmp/root/etc"
+
+mesa="$tmp/root/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so"
+cp "$mesa" "$tmp/libvulkan_freedreno.so"
+printf 'changed\n' >> "$mesa"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "changed Mesa payload was accepted"
+fi
+mv "$tmp/libvulkan_freedreno.so" "$mesa"
+
+touch "$tmp/root/usr/lib/omamobile/myron-gpu/unexpected"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "unexpected Mesa payload path was accepted"
+fi
+rm "$tmp/root/usr/lib/omamobile/myron-gpu/unexpected"
+
+rm "$tmp/root/usr/lib/omamobile/myron-gpu/libEGL.so"
+ln -s libgbm.so.1 "$tmp/root/usr/lib/omamobile/myron-gpu/libEGL.so"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "changed Mesa symlink target was accepted"
+fi
+rm "$tmp/root/usr/lib/omamobile/myron-gpu/libEGL.so"
+ln -s libEGL.so.1 "$tmp/root/usr/lib/omamobile/myron-gpu/libEGL.so"
+
+prefix="$tmp/root/usr/lib/omamobile/myron-gpu"
+cp "$prefix/freedreno-kgsl.json" "$tmp/freedreno-kgsl.json"
+cp "$prefix/SHA256SUMS" "$tmp/SHA256SUMS"
+python3 - "$prefix" <<'PY'
+from pathlib import Path
+import hashlib, json, sys
+prefix = Path(sys.argv[1])
+path = prefix / "freedreno-kgsl.json"
+path.write_text(json.dumps({"ICD": []}) + "\n")
+lines = (prefix / "SHA256SUMS").read_text().splitlines()
+digest = hashlib.sha256(path.read_bytes()).hexdigest()
+(prefix / "SHA256SUMS").write_text("\n".join(
+    f"{digest}  freedreno-kgsl.json" if line.endswith("  freedreno-kgsl.json") else line
+    for line in lines
+) + "\n")
+PY
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "malformed Mesa ICD object was accepted"
+fi
+mv "$tmp/freedreno-kgsl.json" "$prefix/freedreno-kgsl.json"
+mv "$tmp/SHA256SUMS" "$prefix/SHA256SUMS"
+
+cp "$prefix/libEGL.so.1.0.0" "$tmp/libEGL.so.1.0.0"
+cp "$prefix/SHA256SUMS" "$tmp/SHA256SUMS"
+python3 - "$prefix" <<'PY'
+from pathlib import Path
+import hashlib, sys
+prefix = Path(sys.argv[1])
+path = prefix / "libEGL.so.1.0.0"
+data = bytearray(path.read_bytes())
+data[18:20] = (62).to_bytes(2, "little")
+path.write_bytes(data)
+lines = (prefix / "SHA256SUMS").read_text().splitlines()
+digest = hashlib.sha256(data).hexdigest()
+(prefix / "SHA256SUMS").write_text("\n".join(
+    f"{digest}  libEGL.so.1.0.0" if line.endswith("  libEGL.so.1.0.0") else line
+    for line in lines
+) + "\n")
+PY
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "wrong Mesa ELF architecture was accepted"
+fi
+mv "$tmp/libEGL.so.1.0.0" "$prefix/libEGL.so.1.0.0"
+mv "$tmp/SHA256SUMS" "$prefix/SHA256SUMS"
+
+mesa_reference="$tmp/root/usr/share/omamobile/myron-gpu/reference.json"
+cp "$mesa_reference" "$tmp/mesa-reference.json"
+python3 - "$mesa_reference" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+data["schema"] = True
+open(path, "w").write(json.dumps(data) + "\n")
+PY
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "boolean Mesa reference schema was accepted"
+fi
+mv "$tmp/mesa-reference.json" "$mesa_reference"
+
+mv "$profile_env" "$tmp/profile.env"
+ln -s "$tmp/profile.env" "$profile_env"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "symlinked profile asset was accepted"
+fi
+pass "static probe rejects activation, changed bytes, and symlinks"
+
+python3 - "$PWD/bin/omamobile-myron-gpu-profile" "$tmp" <<'PY' || exit 1
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+script = Path(sys.argv[1])
+work = Path(sys.argv[2])
+loader = importlib.machinery.SourceFileLoader("gpu_profile", str(script))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+calls = []
+real_open = module.os.open
+def tracked_open(path, flags, *args, **kwargs):
+    calls.append(flags)
+    return real_open(path, flags, *args, **kwargs)
+module.os.open = tracked_open
+try:
+    module.read_limited(Path("/dev/null"), "device fixture")
+except module.ProfileError:
+    pass
+else:
+    raise AssertionError("character device was accepted as a regular file")
+finally:
+    module.os.open = real_open
+assert len(calls) == 1 and calls[0] & os.O_PATH
+
+fifo = work / "reference.fifo"
+os.mkfifo(fifo)
+result = subprocess.run(
+    [sys.executable, str(script), "--reference", str(fifo), "show"],
+    capture_output=True,
+    text=True,
+    timeout=2,
+)
+assert result.returncode == 1 and "not a regular file" in result.stderr
+
+reference = json.loads((script.parent.parent / "reference.json").read_text())
+for number, change in enumerate((
+    {"schema": True},
+    {"activation": {**reference["activation"], "system_loader_registration": 0}},
+)):
+    changed = json.loads(json.dumps(reference))
+    changed.update(change)
+    path = work / f"bad-reference-{number}.json"
+    path.write_text(json.dumps(changed))
+    result = subprocess.run(
+        [sys.executable, str(script), "--reference", str(path), "show"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+
+scan_root = work / "scan-limit"
+(scan_root / "etc/profile.d").mkdir(parents=True)
+(scan_root / "etc/profile.d/a").write_text("safe\n")
+(scan_root / "etc/profile.d/b").write_text("safe\n")
+module.MAX_SCAN_FILES = 1
+root_descriptor = module.open_root(scan_root)
+try:
+    module.scan_global_activation(root_descriptor)
+except module.ProfileError as error:
+    assert "entry safety limit" in str(error)
+else:
+    raise AssertionError("activation scan entry limit was not enforced")
+finally:
+    os.close(root_descriptor)
+
+module.MAX_SCAN_FILES = 4096
+module.MAX_SCAN_BYTES = 1
+root_descriptor = module.open_root(scan_root)
+try:
+    module.scan_global_activation(root_descriptor)
+except module.ProfileError as error:
+    assert "byte safety limit" in str(error)
+else:
+    raise AssertionError("activation scan byte limit was not enforced")
+finally:
+    os.close(root_descriptor)
+
+growth_root = work / "scan-growth"
+(growth_root / "etc/profile.d").mkdir(parents=True)
+growth_file = growth_root / "etc/profile.d/growing"
+growth_file.write_bytes(b"")
+module.MAX_SCAN_FILES = 4096
+module.MAX_SCAN_BYTES = 1
+real_reopen = module.reopen_regular
+grown = False
+def growing_reopen(*args, **kwargs):
+    global grown
+    if not grown:
+        grown = True
+        growth_file.write_bytes(b"xx")
+    return real_reopen(*args, **kwargs)
+module.reopen_regular = growing_reopen
+root_descriptor = module.open_root(growth_root)
+try:
+    module.scan_global_activation(root_descriptor)
+except module.ProfileError as error:
+    assert "byte safety limit" in str(error)
+else:
+    raise AssertionError("concurrent file growth bypassed byte limit")
+finally:
+    os.close(root_descriptor)
+    module.reopen_regular = real_reopen
+
+deep_root = work / "scan-depth"
+(deep_root / "etc/profile.d/a/b").mkdir(parents=True)
+module.MAX_SCAN_BYTES = 32 * 1024 * 1024
+module.MAX_SCAN_DEPTH = 1
+root_descriptor = module.open_root(deep_root)
+try:
+    module.scan_global_activation(root_descriptor)
+except module.ProfileError as error:
+    assert "depth safety limit" in str(error)
+else:
+    raise AssertionError("activation scan depth limit was not enforced")
+finally:
+    os.close(root_descriptor)
+
+real_scandir = module.os.scandir
+def failed_scandir(*args, **kwargs):
+    raise PermissionError(13, "denied")
+module.os.scandir = failed_scandir
+module.MAX_SCAN_DEPTH = 64
+root_descriptor = module.open_root(scan_root)
+try:
+    module.scan_global_activation(root_descriptor)
+except module.ProfileError as error:
+    assert "directory scan failed" in str(error)
+else:
+    raise AssertionError("activation scan silently ignored a traversal error")
+finally:
+    os.close(root_descriptor)
+    module.os.scandir = real_scandir
+
+race_root = work / "ancestor-race"
+outside = work / "ancestor-outside"
+(race_root / "etc/profile.d").mkdir(parents=True)
+(outside / "profile.d").mkdir(parents=True)
+(race_root / "etc/profile.d/value").write_text("safe\n")
+(outside / "profile.d/value").write_text("/usr/lib/omamobile/myron-gpu\n")
+root_descriptor = module.open_root(race_root)
+real_open = module.os.open
+swapped = False
+def racing_open(path, flags, *args, **kwargs):
+    global swapped
+    descriptor = real_open(path, flags, *args, **kwargs)
+    if path == "etc" and not swapped:
+        swapped = True
+        (race_root / "etc").rename(race_root / "etc.pinned")
+        (race_root / "etc").symlink_to(outside)
+    return descriptor
+module.os.open = racing_open
+try:
+    data = module.read_beneath(
+        root_descriptor, Path("etc/profile.d/value"), "ancestor race fixture"
+    )
+    assert data == b"safe\n"
+finally:
+    module.os.open = real_open
+    os.close(root_descriptor)
+    (race_root / "etc").unlink()
+    (race_root / "etc.pinned").rename(race_root / "etc")
+PY
+pass "special files, schemas, bounds, and ancestor races fail closed"
+
+if bin/omamobile-myron-gpu-profile --reference reference.json verify-live \
+    >"$tmp/live.out" 2>"$tmp/live.err"; then
+  fail "live GPU probe was allowed"
+fi
+grep -Fq 'no qualified live reference; live GPU activation is blocked' \
+  "$tmp/live.err" || fail "live refusal does not explain the qualification gate"
+pass "live GPU probe remains blocked"

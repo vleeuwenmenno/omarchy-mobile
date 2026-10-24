@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Inert template. This file is outside every systemd unit search path.
+[Service]
+Environment="LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu"
+Environment="LIBGL_DRIVERS_PATH=/usr/lib/omamobile/myron-gpu/dri"
+Environment="MESA_LOADER_DRIVER_OVERRIDE=zink"
+Environment="VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json"
+UnsetEnvironment=WAYLAND_DISPLAY AQ_BACKEND EGL_PLATFORM

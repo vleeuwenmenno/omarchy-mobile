@@ -213,5 +213,7 @@ module boot order into an offline Arch staging design. Keep rootfs generation
 blocked until that design preserves the notes-keyed selector and private
 runtime-asset contract without importing
 Pixel `/usr/lib/modules` assumptions. The isolated glibc Mesa source package
-now builds offline. Next, add an activation-disabled GPU profile/probe contract
-around it; do not deploy it or import Attempt105's Alpine binaries.
+now builds offline, and its activation-disabled session profile can verify a
+staged root without opening GPU hardware. Next, stage both in an offline Myron
+rootfs and define the separately approved live equivalence runner; do not
+deploy them or import Attempt105's Alpine binaries.

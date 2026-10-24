@@ -85,8 +85,15 @@ system Mesa:
 1. `mesa-myron-zink-turnip`: Mesa libraries under
    `/usr/lib/omamobile/myron-gpu`, ICD and DRI paths included, no global loader
    configuration;
-2. `omamobile-myron-gpu-profile`: systemd environment/drop-ins and a probe
-   wrapper that opt the compositor/session into that exact prefix.
+2. `omamobile-myron-gpu-profile`: an activation-disabled environment contract,
+   inert session drop-in template, and static probe around that exact prefix.
+
+The profile package stores its environment and drop-in under its private
+`/usr/share/omamobile/myron-gpu-profile` directory, outside systemd,
+environment-generator, shell-profile, and Vulkan loader search paths. Its
+static probe verifies both packages and rejects literal private-stack markers
+in enumerated standard system activation locations. It does not claim coverage
+of arbitrary custom paths. The live probe remains absent and always refuses.
 
 The device package must not carry firmware or modules. A private provisioner
 places verified vendor assets under a separate versioned path and writes a
@@ -131,6 +138,24 @@ SHA-256 2d384eb7032d21aa0de347023c5407b8a056f8354fe82d84380e2c16fb45fbb7
 The artifact remains outside the signed repository under a disposable `/tmp`
 build directory. It has not been installed or run on the phone. This proves
 the glibc package builds; it does not qualify GPU hardware behavior.
+
+### Activation-disabled profile result (2026-10-24)
+
+`packages/omamobile-myron-gpu-profile` records the four proven environment
+variables without applying them. It explicitly forbids inherited
+`WAYLAND_DISPLAY`, `AQ_BACKEND`, and `EGL_PLATFORM` for a future native
+session. `verify-static` opens no device nodes: it verifies the isolated Mesa
+payload and searches enumerated standard activation paths for the private
+prefix and inert profile. Installing either package remains insufficient to
+select the stack; the scan does not claim coverage of arbitrary custom paths.
+
+The standalone package check and an extracted-root test with the Mesa artifact
+passed. Exact unsigned development artifact:
+
+```text
+omamobile-myron-gpu-profile-0.1.0-1-any.pkg.tar.zst
+SHA-256 2dd6c981013668bdbac65dcfa3ec4955ea9e0e3fd5d01421dff9ef45993814d7
+```
 
 ## Equivalence test ladder
 

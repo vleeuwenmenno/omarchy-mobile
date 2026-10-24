@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=omamobile-myron-gpu-profile
+pkgver=$(cat "${startdir:-.}/version")
+pkgrel=1
+pkgdesc="Activation-disabled session profile for the isolated Xiaomi myron GPU stack"
+arch=(any)
+url="https://github.com/derekross/omarchy-mobile"
+license=(MIT)
+depends=(python 'mesa-myron-zink-turnip=26.2.2')
+
+check() {
+  "$startdir/test/all"
+}
+
+package() {
+  "$startdir/install" "$pkgdir"
+}

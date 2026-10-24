@@ -1,0 +1,24 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stage an inert profile and read-only verifier. Nothing is installed under a
+# systemd, environment.d, Vulkan loader, shell-profile, hook, udev, or /etc path.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+destination=${1:?Usage: ./install DESTDIR}
+[[ $destination == /* && $destination != "/" ]] || {
+  echo "Use an absolute staging directory" >&2
+  exit 1
+}
+
+share="$destination/usr/share/omamobile/myron-gpu-profile"
+install -Dm755 bin/omamobile-myron-gpu-profile \
+  "$destination/usr/bin/omamobile-myron-gpu-profile"
+install -Dm644 reference.json "$share/reference.json"
+install -Dm644 profile.env "$share/profile.env"
+install -Dm644 session-drop-in.conf.disabled \
+  "$share/session-drop-in.conf.disabled"
+install -Dm644 version "$share/version"
+install -Dm644 README.md \
+  "$destination/usr/share/doc/omamobile-myron-gpu-profile/README.md"
+install -Dm644 LICENSE \
+  "$destination/usr/share/licenses/omamobile-myron-gpu-profile/LICENSE"

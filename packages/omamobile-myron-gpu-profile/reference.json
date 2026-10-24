@@ -1,0 +1,40 @@
+{
+  "activation": {
+    "live_probe": "absent",
+    "mode": "disabled",
+    "session_opt_in": "manual-only",
+    "system_loader_registration": false,
+    "systemd_unit": null
+  },
+  "assets": {
+    "/usr/share/omamobile/myron-gpu-profile/profile.env": "6aa51ea2131ac2a9d002d0e984adfa387bfd3dcb0645054ddb46890d4897a66d",
+    "/usr/share/omamobile/myron-gpu-profile/session-drop-in.conf.disabled": "ca9d49bedaceeb9f056b7132c5ca487b2ad939271a155d4a28581bae66232242"
+  },
+  "environment": {
+    "LD_LIBRARY_PATH": "/usr/lib/omamobile/myron-gpu",
+    "LIBGL_DRIVERS_PATH": "/usr/lib/omamobile/myron-gpu/dri",
+    "MESA_LOADER_DRIVER_OVERRIDE": "zink",
+    "VK_DRIVER_FILES": "/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json"
+  },
+  "forbidden_environment": [
+    "AQ_BACKEND",
+    "EGL_PLATFORM",
+    "WAYLAND_DISPLAY"
+  ],
+  "mesa": {
+    "name": "mesa-myron-zink-turnip",
+    "prefix": "/usr/lib/omamobile/myron-gpu",
+    "reference": "/usr/share/omamobile/myron-gpu/reference.json",
+    "verifier": "/usr/bin/omamobile-myron-gpu-verify",
+    "version": "26.2.2"
+  },
+  "package": {
+    "name": "omamobile-myron-gpu-profile",
+    "version": "0.1.0"
+  },
+  "provenance": {
+    "device_qualification": "none",
+    "qualification": "offline-static-only"
+  },
+  "schema": 1
+}

@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Verify and describe the inert Myron GPU session profile."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import sys
+
+
+DEFAULT_REFERENCE = Path("usr/share/omamobile/myron-gpu-profile/reference.json")
+MAX_FILE_BYTES = 1024 * 1024
+MAX_MESA_FILE_BYTES = 256 * 1024 * 1024
+MAX_SCAN_BYTES = 32 * 1024 * 1024
+MAX_SCAN_FILES = 4096
+MAX_SCAN_DEPTH = 64
+HEX256 = re.compile(r"[0-9a-f]{64}")
+MESA_PREFIX = Path("usr/lib/omamobile/myron-gpu")
+MESA_REGULAR_FILES = {
+    "dri/libdril_dri.so",
+    "freedreno-kgsl.json",
+    "libEGL.so.1.0.0",
+    "libGLESv2.so.2.0.0",
+    "libgallium-26.2.2.so",
+    "libgbm.so.1.0.0",
+    "libvulkan_freedreno.so",
+}
+MESA_SYMLINKS = {
+    "dri/zink_dri.so": "libdril_dri.so",
+    "libEGL.so": "libEGL.so.1",
+    "libEGL.so.1": "libEGL.so.1.0.0",
+    "libGLESv2.so": "libGLESv2.so.2",
+    "libGLESv2.so.2": "libGLESv2.so.2.0.0",
+    "libgbm.so": "libgbm.so.1",
+    "libgbm.so.1": "libgbm.so.1.0.0",
+}
+ENVIRONMENT = {
+    "LD_LIBRARY_PATH": "/usr/lib/omamobile/myron-gpu",
+    "LIBGL_DRIVERS_PATH": "/usr/lib/omamobile/myron-gpu/dri",
+    "MESA_LOADER_DRIVER_OVERRIDE": "zink",
+    "VK_DRIVER_FILES": "/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json",
+}
+GLOBAL_ACTIVATION_PATHS = (
+    "etc/environment",
+    "etc/environment.d",
+    "etc/ld.so.conf",
+    "etc/ld.so.conf.d",
+    "etc/ld.so.preload",
+    "etc/pacman.d/hooks",
+    "etc/profile",
+    "etc/profile.d",
+    "etc/security/pam_env.conf",
+    "etc/systemd/system.conf",
+    "etc/systemd/system.conf.d",
+    "etc/systemd/system.control",
+    "etc/systemd/system",
+    "etc/systemd/system.attached",
+    "etc/systemd/system-generators",
+    "etc/systemd/system-environment-generators",
+    "etc/systemd/user.conf",
+    "etc/systemd/user.conf.d",
+    "etc/systemd/user",
+    "etc/systemd/user-generators",
+    "etc/systemd/user-environment-generators",
+    "etc/udev/rules.d",
+    "etc/vulkan/explicit_layer.d",
+    "etc/vulkan/icd.d",
+    "etc/vulkan/implicit_layer.d",
+    "etc/xdg/systemd/user",
+    "run/environment.d",
+    "run/systemd/system.conf",
+    "run/systemd/system.conf.d",
+    "run/systemd/system.control",
+    "run/systemd/system",
+    "run/systemd/system.attached",
+    "run/systemd/transient",
+    "run/systemd/generator",
+    "run/systemd/generator.early",
+    "run/systemd/generator.late",
+    "run/systemd/system-generators",
+    "run/systemd/system-environment-generators",
+    "run/systemd/user.conf",
+    "run/systemd/user.conf.d",
+    "run/systemd/user",
+    "run/systemd/user-generators",
+    "run/systemd/user-environment-generators",
+    "run/udev/rules.d",
+    "usr/lib/environment.d",
+    "usr/lib/systemd/system.conf",
+    "usr/lib/systemd/system.conf.d",
+    "usr/lib/systemd/system",
+    "usr/lib/systemd/system-generators",
+    "usr/lib/systemd/system-environment-generators",
+    "usr/lib/systemd/user.conf.d",
+    "usr/lib/systemd/user.conf",
+    "usr/lib/systemd/user",
+    "usr/lib/systemd/user-generators",
+    "usr/lib/systemd/user-environment-generators",
+    "usr/lib/udev/rules.d",
+    "usr/local/lib/environment.d",
+    "usr/local/lib/systemd/system.conf",
+    "usr/local/lib/systemd/system.conf.d",
+    "usr/local/lib/systemd/system",
+    "usr/local/lib/systemd/system-generators",
+    "usr/local/lib/systemd/system-environment-generators",
+    "usr/local/lib/systemd/user",
+    "usr/local/lib/systemd/user.conf",
+    "usr/local/lib/systemd/user.conf.d",
+    "usr/local/lib/systemd/user-generators",
+    "usr/local/lib/systemd/user-environment-generators",
+    "usr/local/lib/udev/rules.d",
+    "usr/share/libalpm/hooks",
+    "usr/share/systemd/user",
+    "usr/share/vulkan/explicit_layer.d",
+    "usr/share/vulkan/icd.d",
+    "usr/share/vulkan/implicit_layer.d",
+    "usr/local/share/vulkan/explicit_layer.d",
+    "usr/local/share/vulkan/icd.d",
+    "usr/local/share/vulkan/implicit_layer.d",
+    "usr/local/share/systemd/user",
+)
+ACTIVATION_MARKERS = (
+    b"/usr/lib/omamobile/myron-gpu",
+    b"freedreno-kgsl.json",
+    b"/usr/share/omamobile/myron-gpu-profile/profile.env",
+)
+
+
+class ProfileError(Exception):
+    """The staged profile differs from the reviewed inert contract."""
+
+
+def strict_json(data: str | bytes, label: str) -> dict:
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ProfileError(f"{label} contains duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(data, object_pairs_hook=object_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProfileError(f"{label} is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise ProfileError(f"{label} must be a JSON object")
+    return value
+
+
+def reopen_regular(path_descriptor: int, label: str, display: str) -> int:
+    metadata = os.fstat(path_descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ProfileError(f"{label} is not a regular file: {display}")
+    try:
+        data_descriptor = os.open(
+            f"/proc/self/fd/{path_descriptor}",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK,
+        )
+        opened = os.fstat(data_descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            os.close(data_descriptor)
+            raise ProfileError(f"{label} changed while being opened: {display}")
+        return data_descriptor
+    except OSError as error:
+        raise ProfileError(f"{label} is unavailable: {display}: {error.strerror}") from error
+
+
+def open_regular(path: Path, label: str) -> int:
+    if not hasattr(os, "O_PATH") or not hasattr(os, "O_NOFOLLOW"):
+        raise ProfileError("safe regular-file inspection requires Linux O_PATH and O_NOFOLLOW")
+    path_descriptor = -1
+    try:
+        path_descriptor = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+        return reopen_regular(path_descriptor, label, str(path))
+    except OSError as error:
+        raise ProfileError(f"{label} is unavailable: {path}: {error.strerror}") from error
+    finally:
+        if path_descriptor >= 0:
+            os.close(path_descriptor)
+
+
+def safe_relative(relative: Path, label: str) -> tuple[str, ...]:
+    if relative.is_absolute() or not relative.parts or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ProfileError(f"{label} has an unsafe relative path: {relative}")
+    return relative.parts
+
+
+def open_root(root: Path) -> int:
+    if not hasattr(os, "O_PATH") or not hasattr(os, "O_NOFOLLOW"):
+        raise ProfileError("safe root inspection requires Linux O_PATH and O_NOFOLLOW")
+    try:
+        descriptor = os.open(
+            root, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError as error:
+        raise ProfileError(f"root is unavailable: {root}: {error.strerror}") from error
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ProfileError(f"root is not a real directory: {root}")
+    return descriptor
+
+
+def open_beneath(root_descriptor: int, relative: Path, label: str) -> int:
+    parts = safe_relative(relative, label)
+    current = os.dup(root_descriptor)
+    try:
+        for number, part in enumerate(parts):
+            next_descriptor = os.open(
+                part, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current
+            )
+            metadata = os.fstat(next_descriptor)
+            if number < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                os.close(next_descriptor)
+                raise ProfileError(f"{label} has a non-directory ancestor: {relative}")
+            os.close(current)
+            current = next_descriptor
+        return current
+    except OSError as error:
+        os.close(current)
+        raise ProfileError(f"{label} is unavailable: {relative}: {error.strerror}") from error
+    except ProfileError:
+        os.close(current)
+        raise
+
+
+def read_beneath(
+    root_descriptor: int, relative: Path, label: str, limit: int = MAX_FILE_BYTES
+) -> bytes:
+    path_descriptor = open_beneath(root_descriptor, relative, label)
+    try:
+        data_descriptor = reopen_regular(path_descriptor, label, str(relative))
+    finally:
+        os.close(path_descriptor)
+    with os.fdopen(data_descriptor, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > limit:
+            raise ProfileError(f"{label} exceeds the {limit}-byte safety limit")
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ProfileError(f"{label} exceeds the {limit}-byte safety limit")
+    return data
+
+
+def read_limited(path: Path, label: str, limit: int = MAX_FILE_BYTES) -> bytes:
+    descriptor = open_regular(path, label)
+    with os.fdopen(descriptor, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > limit:
+            raise ProfileError(f"{label} exceeds the {limit}-byte safety limit")
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ProfileError(f"{label} exceeds the {limit}-byte safety limit")
+    return data
+
+
+def load_reference(path: Path) -> dict:
+    return validate_reference(read_limited(path, "profile reference"))
+
+
+def validate_reference(data: bytes) -> dict:
+    reference = strict_json(data, "profile reference")
+    expected_top = {
+        "activation", "assets", "environment", "forbidden_environment",
+        "mesa", "package", "provenance", "schema",
+    }
+    if (
+        set(reference) != expected_top
+        or type(reference.get("schema")) is not int
+        or reference["schema"] != 1
+    ):
+        raise ProfileError("profile reference fields or schema differ")
+    if reference.get("package") != {
+        "name": "omamobile-myron-gpu-profile",
+        "version": "0.1.0",
+    }:
+        raise ProfileError("profile package identity differs")
+    if reference.get("mesa") != {
+        "name": "mesa-myron-zink-turnip",
+        "prefix": "/usr/lib/omamobile/myron-gpu",
+        "reference": "/usr/share/omamobile/myron-gpu/reference.json",
+        "verifier": "/usr/bin/omamobile-myron-gpu-verify",
+        "version": "26.2.2",
+    }:
+        raise ProfileError("Mesa package identity differs")
+    if reference.get("environment") != ENVIRONMENT:
+        raise ProfileError("profile environment differs")
+    if reference.get("forbidden_environment") != [
+        "AQ_BACKEND", "EGL_PLATFORM", "WAYLAND_DISPLAY"
+    ]:
+        raise ProfileError("native-session environment guard differs")
+    activation = reference.get("activation")
+    if (
+        not isinstance(activation, dict)
+        or type(activation.get("system_loader_registration")) is not bool
+        or activation != {
+        "live_probe": "absent",
+        "mode": "disabled",
+        "session_opt_in": "manual-only",
+        "system_loader_registration": False,
+        "systemd_unit": None,
+        }
+    ):
+        raise ProfileError("profile activation is not disabled")
+    if reference.get("provenance") != {
+        "device_qualification": "none",
+        "qualification": "offline-static-only",
+    }:
+        raise ProfileError("profile provenance overstates qualification")
+    assets = reference.get("assets")
+    expected_assets = {
+        "/usr/share/omamobile/myron-gpu-profile/profile.env",
+        "/usr/share/omamobile/myron-gpu-profile/session-drop-in.conf.disabled",
+    }
+    if (
+        not isinstance(assets, dict)
+        or set(assets) != expected_assets
+        or any(
+            type(value) is not str or not HEX256.fullmatch(value)
+            for value in assets.values()
+        )
+    ):
+        raise ProfileError("profile asset contract differs")
+    return reference
+
+
+def verify_assets(root_descriptor: int, reference: dict) -> None:
+    for name, expected in reference["assets"].items():
+        relative = Path(name).relative_to("/")
+        data = read_beneath(root_descriptor, relative, f"profile asset {name}")
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != expected:
+            raise ProfileError(f"profile asset SHA-256 differs: {name}")
+
+
+def verify_mesa_reference(root_descriptor: int, reference: dict) -> None:
+    relative = Path(reference["mesa"]["reference"]).relative_to("/")
+    mesa = strict_json(
+        read_beneath(root_descriptor, relative, "Mesa reference"), "Mesa reference"
+    )
+    if set(mesa) != {"activation", "build", "package", "reference", "schema", "source"}:
+        raise ProfileError("Mesa reference fields differ")
+    if type(mesa.get("schema")) is not int or mesa["schema"] != 1:
+        raise ProfileError("Mesa reference schema differs")
+    if mesa.get("package") != {
+        "name": "mesa-myron-zink-turnip",
+        "prefix": reference["mesa"]["prefix"],
+        "version": reference["mesa"]["version"],
+    }:
+        raise ProfileError("Mesa reference identity differs")
+    activation = mesa.get("activation")
+    if (
+        not isinstance(activation, dict)
+        or type(activation.get("system_loader_registration")) is not bool
+        or activation != {
+            "mode": "disabled",
+            "system_loader_registration": False,
+        }
+    ):
+        raise ProfileError("Mesa package activation is not disabled")
+
+
+def sha256_beneath(
+    root_descriptor: int, relative: Path, label: str, limit: int
+) -> str:
+    path_descriptor = open_beneath(root_descriptor, relative, label)
+    try:
+        descriptor = reopen_regular(path_descriptor, label, str(relative))
+    finally:
+        os.close(path_descriptor)
+    digest = hashlib.sha256()
+    with os.fdopen(descriptor, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > limit:
+            raise ProfileError(f"{label} exceeds the {limit}-byte safety limit")
+        remaining = size
+        while remaining:
+            block = stream.read(min(1024 * 1024, remaining))
+            if not block:
+                raise ProfileError(f"{label} changed size while being read")
+            digest.update(block)
+            remaining -= len(block)
+        if stream.read(1):
+            raise ProfileError(f"{label} changed size while being read")
+    return digest.hexdigest()
+
+
+def parse_mesa_manifest(data: bytes) -> dict[str, str]:
+    result = {}
+    for number, raw in enumerate(data.decode().splitlines(), 1):
+        parts = raw.split("  ", 1)
+        if len(parts) != 2 or not HEX256.fullmatch(parts[0]):
+            raise ProfileError(f"invalid Mesa manifest line {number}")
+        checksum, name = parts
+        candidate = PurePosixPath(name)
+        if candidate.is_absolute() or ".." in candidate.parts or str(candidate) != name:
+            raise ProfileError(f"unsafe Mesa manifest path on line {number}")
+        if name in result:
+            raise ProfileError(f"duplicate Mesa manifest path: {name}")
+        result[name] = checksum
+    if set(result) != MESA_REGULAR_FILES:
+        raise ProfileError("Mesa manifest file set differs from contract")
+    return result
+
+
+def verify_aarch64_elf(root_descriptor: int, relative: Path) -> None:
+    path_descriptor = open_beneath(root_descriptor, relative, "Mesa ELF")
+    try:
+        descriptor = reopen_regular(path_descriptor, "Mesa ELF", str(relative))
+    finally:
+        os.close(path_descriptor)
+    with os.fdopen(descriptor, "rb") as stream:
+        header = stream.read(20)
+    if len(header) != 20 or header[:4] != b"\x7fELF":
+        raise ProfileError(f"not ELF: {relative}")
+    if header[4] != 2 or header[5] != 1 or int.from_bytes(header[18:20], "little") != 183:
+        raise ProfileError(f"not little-endian AArch64 ELF64: {relative}")
+
+
+def reopen_directory(path_descriptor: int, label: str) -> int:
+    metadata = os.fstat(path_descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ProfileError(f"{label} is not a real directory")
+    try:
+        descriptor = os.open(
+            f"/proc/self/fd/{path_descriptor}",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        raise ProfileError(f"{label} cannot be scanned: {error.strerror}") from error
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        os.close(descriptor)
+        raise ProfileError(f"{label} changed while being opened")
+    return descriptor
+
+
+def open_entry(directory_descriptor: int, name: str, label: str) -> int:
+    try:
+        return os.open(
+            name,
+            os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        raise ProfileError(f"{label} changed during scan: {error.strerror}") from error
+
+
+def read_pinned_symlink(descriptor: int, label: str) -> str:
+    if not stat.S_ISLNK(os.fstat(descriptor).st_mode):
+        raise ProfileError(f"{label} is not a symlink")
+    try:
+        return os.readlink("", dir_fd=descriptor)
+    except OSError as error:
+        raise ProfileError(f"{label} cannot be read: {error.strerror}") from error
+
+
+def verify_mesa_tree(prefix_descriptor: int) -> None:
+    expected_files = MESA_REGULAR_FILES | set(MESA_SYMLINKS) | {"SHA256SUMS"}
+    expected_directories = {"dri"}
+    seen_files = set()
+    seen_directories = set()
+
+    def visit(directory_path_descriptor: int, relative: Path, depth: int) -> None:
+        if depth > 2:
+            raise ProfileError("Mesa payload exceeds expected directory depth")
+        directory_descriptor = reopen_directory(
+            directory_path_descriptor, f"Mesa directory {relative}"
+        )
+        try:
+            with os.scandir(directory_descriptor) as entries:
+                for entry in entries:
+                    child = relative / entry.name if relative.parts else Path(entry.name)
+                    child_name = child.as_posix()
+                    descriptor = open_entry(
+                        directory_descriptor, entry.name, f"Mesa path {child_name}"
+                    )
+                    try:
+                        mode = os.fstat(descriptor).st_mode
+                        if stat.S_ISDIR(mode):
+                            if child_name not in expected_directories:
+                                raise ProfileError(f"unexpected Mesa directory: {child_name}")
+                            seen_directories.add(child_name)
+                            visit(descriptor, child, depth + 1)
+                        elif stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                            if child_name not in expected_files:
+                                raise ProfileError(f"unexpected Mesa file: {child_name}")
+                            seen_files.add(child_name)
+                        else:
+                            raise ProfileError(f"unexpected Mesa path type: {child_name}")
+                    finally:
+                        os.close(descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+    visit(prefix_descriptor, Path(), 0)
+    if seen_directories != expected_directories or seen_files != expected_files:
+        raise ProfileError("Mesa payload contains unexpected or missing paths")
+
+
+def verify_mesa_layout(root_descriptor: int) -> dict:
+    prefix_descriptor = open_beneath(root_descriptor, MESA_PREFIX, "Mesa prefix")
+    try:
+        if not stat.S_ISDIR(os.fstat(prefix_descriptor).st_mode):
+            raise ProfileError("Mesa prefix is not a real directory")
+        verify_mesa_tree(prefix_descriptor)
+        manifest = parse_mesa_manifest(
+            read_beneath(prefix_descriptor, Path("SHA256SUMS"), "Mesa manifest")
+        )
+        for name, expected in manifest.items():
+            relative = Path(name)
+            if sha256_beneath(
+                prefix_descriptor, relative, f"Mesa payload {name}", MAX_MESA_FILE_BYTES
+            ) != expected:
+                raise ProfileError(f"Mesa payload SHA-256 differs: {name}")
+            if name != "freedreno-kgsl.json":
+                verify_aarch64_elf(prefix_descriptor, relative)
+        for name, target in MESA_SYMLINKS.items():
+            descriptor = open_beneath(prefix_descriptor, Path(name), "Mesa symlink")
+            try:
+                if read_pinned_symlink(descriptor, f"Mesa symlink {name}") != target:
+                    raise ProfileError(f"unexpected Mesa symlink: {name}")
+            finally:
+                os.close(descriptor)
+        icd = strict_json(
+            read_beneath(
+                prefix_descriptor, Path("freedreno-kgsl.json"), "Mesa ICD manifest"
+            ),
+            "Mesa ICD manifest",
+        )
+    finally:
+        os.close(prefix_descriptor)
+    expected_library = "/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so"
+    icd_entry = icd.get("ICD")
+    if not isinstance(icd_entry, dict) or icd_entry.get("library_path") != expected_library:
+        raise ProfileError("Mesa ICD does not point to isolated Turnip library")
+    return {
+        "activation": "disabled",
+        "files": len(MESA_REGULAR_FILES),
+        "prefix": "/usr/lib/omamobile/myron-gpu",
+        "status": "verified",
+    }
+
+
+def marker_in(data: bytes) -> bool:
+    return any(marker in data for marker in ACTIVATION_MARKERS)
+
+
+def normalize_symlink_target(link: Path, target_text: str) -> Path:
+    target = PurePosixPath(target_text)
+    parts = [] if target.is_absolute() else list(link.parent.parts)
+    for part in target.parts:
+        if part in {"", ".", "/"}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ProfileError(f"global activation symlink escapes root: {link}")
+            parts.pop()
+        else:
+            parts.append(part)
+    return Path(*parts)
+
+
+def in_activation_scope(relative: Path) -> bool:
+    return any(
+        relative == Path(scope) or Path(scope) in relative.parents
+        for scope in GLOBAL_ACTIVATION_PATHS
+    )
+
+
+def symlink_selects_private(
+    root_descriptor: int, link: Path, target_text: str
+) -> bool:
+    if marker_in(target_text.encode()):
+        return True
+    relative = normalize_symlink_target(link, target_text)
+    if relative == Path("dev/null"):
+        return False
+    if relative == link or not in_activation_scope(relative):
+        raise ProfileError(f"global activation symlink target is outside scan scope: {link}")
+    try:
+        descriptor = open_beneath(root_descriptor, relative, "global activation symlink")
+    except ProfileError as error:
+        raise ProfileError(f"global activation symlink is broken: {link}") from error
+    try:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ProfileError(f"global activation symlink selects a directory: {link}")
+    finally:
+        os.close(descriptor)
+    return False
+
+
+def open_optional_beneath(
+    root_descriptor: int, relative: Path, label: str
+) -> int | None:
+    parts = safe_relative(relative, label)
+    current = os.dup(root_descriptor)
+    try:
+        for number, part in enumerate(parts):
+            try:
+                next_descriptor = os.open(
+                    part, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current
+                )
+            except FileNotFoundError:
+                os.close(current)
+                return None
+            metadata = os.fstat(next_descriptor)
+            if number < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                os.close(next_descriptor)
+                raise ProfileError(f"{label} has a non-directory ancestor: {relative}")
+            os.close(current)
+            current = next_descriptor
+        return current
+    except OSError as error:
+        os.close(current)
+        raise ProfileError(f"{label} is unavailable: {relative}: {error.strerror}") from error
+    except ProfileError:
+        os.close(current)
+        raise
+
+
+def scan_global_activation(root_descriptor: int) -> list[str]:
+    hits = []
+    entries = 0
+    total = 0
+
+    def account_entry(size: int = 0) -> None:
+        nonlocal entries, total
+        entries += 1
+        total += size
+        if entries > MAX_SCAN_FILES:
+            raise ProfileError("global activation scan exceeds entry safety limit")
+        if total > MAX_SCAN_BYTES:
+            raise ProfileError("global activation scan exceeds byte safety limit")
+
+    def account_bytes(size: int) -> None:
+        nonlocal total
+        total += size
+        if total > MAX_SCAN_BYTES:
+            raise ProfileError("global activation scan exceeds byte safety limit")
+
+    def scan_candidate(descriptor: int, relative: Path) -> None:
+        metadata = os.fstat(descriptor)
+        if stat.S_ISLNK(metadata.st_mode):
+            target = read_pinned_symlink(
+                descriptor, f"global activation symlink /{relative}"
+            )
+            account_bytes(len(target.encode()))
+            if marker_in(target.encode()) or symlink_selects_private(
+                root_descriptor, relative, target
+            ):
+                hits.append("/" + str(relative))
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ProfileError(f"global activation candidate is not a file: /{relative}")
+        if metadata.st_size > MAX_FILE_BYTES:
+            raise ProfileError(f"global activation candidate is too large: /{relative}")
+        remaining = MAX_SCAN_BYTES - total
+        if metadata.st_size > remaining:
+            raise ProfileError("global activation scan exceeds byte safety limit")
+        data_descriptor = reopen_regular(
+            descriptor, "global activation candidate", "/" + str(relative)
+        )
+        with os.fdopen(data_descriptor, "rb") as stream:
+            data = stream.read(min(MAX_FILE_BYTES, remaining) + 1)
+        if len(data) > MAX_FILE_BYTES:
+            raise ProfileError(f"global activation candidate is too large: /{relative}")
+        if len(data) > remaining:
+            raise ProfileError("global activation scan exceeds byte safety limit")
+        account_bytes(len(data))
+        if marker_in(data):
+            hits.append("/" + str(relative))
+
+    def scan_directory(path_descriptor: int, relative: Path, depth: int) -> None:
+        if depth > MAX_SCAN_DEPTH:
+            raise ProfileError("global activation scan exceeds depth safety limit")
+        before = os.fstat(path_descriptor)
+        directory_descriptor = reopen_directory(
+            path_descriptor, f"global activation directory /{relative}"
+        )
+        try:
+            try:
+                with os.scandir(directory_descriptor) as directory_entries:
+                    for entry in directory_entries:
+                        child = relative / entry.name
+                        account_entry()
+                        descriptor = open_entry(
+                            directory_descriptor,
+                            entry.name,
+                            f"global activation path /{child}",
+                        )
+                        try:
+                            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                                scan_directory(descriptor, child, depth + 1)
+                            else:
+                                scan_candidate(descriptor, child)
+                        finally:
+                            os.close(descriptor)
+            except OSError as error:
+                raise ProfileError(
+                    f"global activation directory scan failed: /{relative}: {error.strerror}"
+                ) from error
+        finally:
+            os.close(directory_descriptor)
+        after = os.fstat(path_descriptor)
+        fingerprint = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_nlink,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if fingerprint(before) != fingerprint(after):
+            raise ProfileError(f"global activation directory changed during scan: /{relative}")
+
+    for relative_name in GLOBAL_ACTIVATION_PATHS:
+        relative = Path(relative_name)
+        descriptor = open_optional_beneath(
+            root_descriptor, relative, "global activation path"
+        )
+        if descriptor is None:
+            continue
+        try:
+            account_entry()
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                scan_directory(descriptor, relative, 0)
+            else:
+                scan_candidate(descriptor, relative)
+        finally:
+            os.close(descriptor)
+    return sorted(set(hits))
+
+
+def reference_path(arguments) -> Path:
+    if arguments.reference is not None:
+        return arguments.reference
+    return Path("/") / DEFAULT_REFERENCE
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reference", type=Path)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("show")
+    subparsers.add_parser("environment")
+    verify = subparsers.add_parser("verify-static")
+    verify.add_argument("--root", type=Path, required=True)
+    subparsers.add_parser("verify-live")
+    arguments = parser.parse_args()
+    root_descriptor = -1
+    try:
+        if arguments.command == "verify-live":
+            raise ProfileError("no qualified live reference; live GPU activation is blocked")
+        if arguments.command == "verify-static" and not arguments.root.is_absolute():
+            raise ProfileError("root must be absolute")
+        if arguments.command == "verify-static":
+            root_descriptor = open_root(arguments.root)
+            if arguments.reference is None:
+                reference = validate_reference(
+                    read_beneath(
+                        root_descriptor, DEFAULT_REFERENCE, "profile reference"
+                    )
+                )
+            else:
+                reference = load_reference(arguments.reference)
+        else:
+            reference = load_reference(reference_path(arguments))
+        if arguments.command == "show":
+            result = reference
+        elif arguments.command == "environment":
+            result = {
+                "activation": "not-applied",
+                "environment": reference["environment"],
+                "forbidden_environment": reference["forbidden_environment"],
+            }
+        else:
+            verify_assets(root_descriptor, reference)
+            verify_mesa_reference(root_descriptor, reference)
+            mesa = verify_mesa_layout(root_descriptor)
+            activators = scan_global_activation(root_descriptor)
+            if activators:
+                raise ProfileError(
+                    "private GPU stack is selected by global path: " + ", ".join(activators)
+                )
+            result = {
+                "activation": "disabled",
+                "environment_keys": sorted(reference["environment"]),
+                "global_activators": 0,
+                "mesa_files": mesa["files"],
+                "status": "verified",
+            }
+    except (OSError, ProfileError, ValueError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+    json.dump(result, sys.stdout, indent=2, sort_keys=True)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
