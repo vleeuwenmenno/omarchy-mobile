@@ -76,6 +76,11 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 T = importlib.util.module_from_spec(spec)
 loader.exec_module(T)
 K = T.kernel()
+_elf_loader = importlib.machinery.SourceFileLoader(
+    "synthetic_elf", str(repo / "packages/omamobile-myron-kernel-contract/test/synthetic_elf.py"))
+_elf_spec = importlib.util.spec_from_loader(_elf_loader.name, _elf_loader)
+ELF = importlib.util.module_from_spec(_elf_spec)
+_elf_loader.exec_module(ELF)
 
 counter = [0]
 
@@ -118,7 +123,29 @@ def standard_tsv():
     return (TSV_HEADER + "".join(rows)).encode()
 
 
-def make_fixture(variant=None, tsv=None):
+def symvers_row(crc, symbol, provider, kind="EXPORT_SYMBOL", namespace=""):
+    return f"0x{crc:08x}\t{symbol}\t{provider}\t{kind}\t{namespace}\n"
+
+
+ABI_VMLINUX = (
+    symvers_row(0xAAAA0001, "printk", "vmlinux")
+    + symvers_row(0xAAAA0002, "kernel_fn", "vmlinux", "EXPORT_SYMBOL_GPL")
+).encode()
+ABI_MODULE = (
+    symvers_row(0xAAAA0001, "printk", "vmlinux")
+    + symvers_row(0xAAAA0002, "kernel_fn", "vmlinux", "EXPORT_SYMBOL_GPL")
+    + symvers_row(0x11110001, "alpha_fn", "drivers/x/alpha")
+    + symvers_row(0x33330001, "other_sym", "drivers/o/other")
+).encode()
+ABI_MODULE_ELF = {
+    "alpha": dict(imports=[("printk", "global")], versions=[("printk", 0xAAAA0001)],
+                  exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001)]),
+    "beta": dict(imports=[("alpha_fn", "global"), ("kernel_fn", "weak")],
+                 versions=[("alpha_fn", 0x11110001), ("kernel_fn", 0xAAAA0002)]),
+}
+
+
+def make_fixture(variant=None, tsv=None, abi=False):
     base = fresh("fixture")
     notes = b"synthetic-notes\n"
     image, config = b"synthetic-image\n", b"synthetic-config\n"
@@ -129,8 +156,9 @@ def make_fixture(variant=None, tsv=None):
         "kernel-notes.bin": notes,
         **{
             f"modules/{name}.ko": (
-                f"module-{name}\0vermagic={'other' if variant == 'vermagic' else RELEASE} SMP\0"
-            ).encode()
+                ELF.build_elf(name, **ABI_MODULE_ELF[name]) if abi else
+                f"module-{name}\0vermagic={'other' if variant == 'vermagic' else RELEASE} SMP\0".encode()
+            )
             for name in MODULES
         },
     }
@@ -175,7 +203,8 @@ def make_fixture(variant=None, tsv=None):
             "release": RELEASE, "gki_source_revision": "0" * 40,
             "image_sha256": digest(image), "notes_sha256": digest(notes),
             "config_sha256": digest(config),
-            "vmlinux_symvers_sha256": "5" * 64, "module_symvers_sha256": "6" * 64,
+            "vmlinux_symvers_sha256": digest(ABI_VMLINUX) if abi else "5" * 64,
+            "module_symvers_sha256": digest(ABI_MODULE) if abi else "6" * 64,
         },
         "source": {"lock_sha256": "2" * 64, "manifest_sha256": "3" * 64, "patches": {"0001-test.patch": "4" * 64}},
         "module_assets": {
@@ -212,7 +241,13 @@ def make_fixture(variant=None, tsv=None):
     (root / T.DEPLOYMENT_CONTRACT_PATH).write_bytes(T.render_json(deployment))
     runtime_manifest = base / "runtime-manifest.tsv"
     runtime_manifest.write_bytes(tsv if tsv is not None else standard_tsv())
+    vmlinux_file = module_file = None
+    if abi:
+        vmlinux_file, module_file = base / "vmlinux.symvers", base / "Module.symvers"
+        vmlinux_file.write_bytes(ABI_VMLINUX)
+        module_file.write_bytes(ABI_MODULE)
     return {
+        "vmlinux_symvers": vmlinux_file, "module_symvers": module_file,
         "runtime_manifest": runtime_manifest,
         "base": base, "root": root, "archive": archive, "reference": reference,
         "reference_bytes": reference_bytes, "stage_bytes": stage_bytes, "gpu_bytes": gpu_bytes,
@@ -265,6 +300,8 @@ def run(root, *argv):
         arguments.extend(("--assets", archive))
     if arguments and arguments[0] in ("assemble", "verify", "gate") and "--runtime-assets" not in arguments:
         arguments.extend(("--runtime-assets", "none"))
+    if arguments and arguments[0] in ("assemble", "verify", "gate") and "--vmlinux-symvers" not in arguments:
+        arguments.extend(("--vmlinux-symvers", "none", "--module-symvers", "none"))
     return run_exact(root, *arguments)
 
 
@@ -1423,7 +1460,7 @@ _, bound_data = snapshot(bound_a)
 bound_document = json.loads(bound_data["kit.json"])
 assert bound_document["runtime_assets"] == expected_evidence(), bound_document["runtime_assets"]
 assert result["runtime_digest"] == expected_evidence()["digest"]
-assert bound_document["format_version"] == "0.2.0" == T.VERSION
+assert bound_document["format_version"] == "0.3.0" == T.VERSION
 assert bound_document["runtime_assets"]["bytes_copied_into_kit"] is False
 assert "runtime_assets" not in json.loads(bound_data["status.json"])
 assert "runtime_assets" not in bound_document["status"]
@@ -1970,6 +2007,211 @@ finally:
 assert snapshot(runtime_a) == runtime_before and RT_MANIFEST.read_bytes() == rt_manifest_before
 assert (rootfs_before, rootfs_data) == snapshot(rootfs)
 ok("runtime binding spawns no process and mutates no input")
+
+# ---- staged-set ABI evidence binding (0.3.0): synthetic ELF and symvers only -------
+abi_fx = make_fixture(abi=True)
+abi_root, abi_archive = abi_fx["root"], abi_fx["archive"]
+abi_rootfs, abi_manifest = make_rootfs(abi_fx)
+abi_stage_a, abi_stage_b = work / "abi-stage-a", work / "abi-stage-b"
+expect_ok(abi_root, "stage-modules", "--assets", abi_archive, "--out", abi_stage_a)
+expect_ok(abi_root, "stage-modules", "--assets", abi_archive, "--out", abi_stage_b)
+abi_vmlinux, abi_module = abi_fx["vmlinux_symvers"], abi_fx["module_symvers"]
+abi_inputs_before = {
+    "archive": abi_archive.read_bytes(),
+    "vmlinux": abi_vmlinux.read_bytes(),
+    "module": abi_module.read_bytes(),
+    "rootfs": snapshot(abi_rootfs),
+    "stage": snapshot(abi_stage_a),
+}
+
+
+def abi_assemble(out, stage=abi_stage_a, *, vmlinux=abi_vmlinux, module=abi_module):
+    return [
+        "assemble", "--rootfs-stage", abi_rootfs, "--rootfs-manifest", abi_manifest,
+        "--module-stage", stage, "--assets", abi_archive, "--runtime-assets", "none",
+        "--vmlinux-symvers", vmlinux, "--module-symvers", module, "--out", out,
+    ]
+
+
+def abi_check(command, kit, *, vmlinux=abi_vmlinux, module=abi_module):
+    return [
+        command, "--kit", kit, "--rootfs-stage", abi_rootfs,
+        "--rootfs-manifest", abi_manifest, "--assets", abi_archive,
+        "--runtime-assets", "none", "--vmlinux-symvers", vmlinux,
+        "--module-symvers", module,
+    ]
+
+
+abi_kit_a, abi_kit_b = work / "abi-kit-a", work / "abi-kit-b"
+abi_result = expect_ok(abi_root, *abi_assemble(abi_kit_a))
+expect_ok(abi_root, *abi_assemble(abi_kit_b, abi_stage_b))
+assert snapshot(abi_kit_a) == snapshot(abi_kit_b), "ABI-bound kits are not deterministic"
+_, abi_kit_data = snapshot(abi_kit_a)
+abi_document = json.loads(abi_kit_data["kit.json"])
+abi_evidence = abi_document["abi"]
+assert abi_result["abi_status"] == "staged-set-consistent"
+assert abi_evidence["status"] == "staged-set-consistent"
+assert abi_evidence["scope"] == "staged-set-only"
+assert abi_evidence["vendor_modules"] == "not-verified"
+assert abi_evidence["parser"] == "synthetic-offline-unqualified-on-real-modules"
+assert abi_evidence["activation"] == "disabled"
+assert abi_evidence["deployment_blocker"] == "unchanged"
+assert abi_evidence["blocker"] == "module-abi-import-and-load-order-not-verified"
+assert abi_evidence["symvers_bytes_copied_into_kit"] is False
+assert abi_evidence["module_count"] == len(MODULES) == len(abi_evidence["modules"])
+assert abi_evidence["declared_order"] == MODULES == abi_evidence["resolved_order"]
+assert abi_evidence["report_sha256"] and abi_evidence["digest"] == abi_result["abi_digest"]
+assert abi_document["overlay"]["module_order_status"] == "unverified"
+assert "module-abi-import-and-load-order-not-verified" in abi_document["status"]["blockers"]
+abi_blob = b"".join(abi_kit_data.values())
+assert ABI_VMLINUX not in abi_blob and ABI_MODULE not in abi_blob
+assert str(abi_vmlinux).encode() not in abi_blob and str(abi_module).encode() not in abi_blob
+assert abi_inputs_before["archive"] == abi_archive.read_bytes()
+assert abi_inputs_before["vmlinux"] == abi_vmlinux.read_bytes()
+assert abi_inputs_before["module"] == abi_module.read_bytes()
+assert abi_inputs_before["rootfs"] == snapshot(abi_rootfs)
+assert abi_inputs_before["stage"] == snapshot(abi_stage_a)
+ok("a deterministic ABI-bound kit records staged-set-only hash evidence and copies no symvers bytes")
+
+abi_verified = expect_ok(abi_root, *abi_check("verify", abi_kit_a))
+abi_gate = expect_ok(abi_root, *abi_check("gate", abi_kit_a))
+assert abi_verified["abi_status"] == "staged-set-consistent"
+assert abi_verified["abi_module_count"] == len(MODULES)
+assert abi_gate["abi_status"] == "staged-set-consistent"
+assert abi_gate["abi_scope"] == "staged-set-only"
+assert abi_gate["decision"] == "refused" and abi_gate["blockers"] == T.BLOCKERS
+assert abi_gate["deployment_authorized"] is False and abi_gate["bootable"] is False
+assert abi_gate["flashable"] is False and abi_gate["image_ready"] is False
+ok("verify and gate recompute ABI evidence while retaining every blocker and refusing deployment")
+
+none_abi = json.loads(snapshot(kit_a)[1]["kit.json"])["abi"]
+assert none_abi["status"] == "not-bound" and none_abi["module_count"] == 0
+assert none_abi["resolved_order"] is None and none_abi["modules"] == []
+assert none_abi["report_sha256"] is None and none_abi["digest"] is None
+assert none_abi["symvers_bytes_copied_into_kit"] is False
+assert expect_ok(root, "gate", "--kit", kit_a, "--rootfs-stage", rootfs)["abi_status"] == "not-bound"
+ok("an explicit none pair records strict not-bound ABI evidence")
+
+for name, argv, reason in (
+    ("a bound ABI kit verified with none",
+     ["verify", "--kit", abi_kit_a, "--rootfs-stage", abi_rootfs,
+      "--rootfs-manifest", abi_manifest, "--assets", abi_archive,
+      "--runtime-assets", "none", "--vmlinux-symvers", "none",
+      "--module-symvers", "none"], "binds ABI evidence"),
+    ("only one ABI file",
+     abi_assemble(work / "abi-one", vmlinux=abi_vmlinux, module="none"), "must both be 'none'"),
+    ("a relative ABI path",
+     abi_assemble(work / "abi-relative", vmlinux="vmlinux.symvers"), "absolute"),
+):
+    code, out, err = run_exact(abi_root, *[str(item) for item in argv])
+    assert code != 0 and reason in err and '"status": "assembled"' not in out, (name, err)
+    ok(f"{name} is rejected")
+
+missing_flags = [
+    "assemble", "--rootfs-stage", abi_rootfs, "--rootfs-manifest", abi_manifest,
+    "--module-stage", abi_stage_a, "--assets", abi_archive,
+    "--runtime-assets", "none", "--out", work / "abi-missing-flags",
+]
+code, out, err = run_exact(abi_root, *[str(item) for item in missing_flags])
+assert code != 0 and "--vmlinux-symvers" in err and "--module-symvers" in err
+assert '"status": "assembled"' not in out and not os.path.lexists(work / "abi-missing-flags")
+ok("ABI mode flags are mandatory and strictly paired")
+
+code, out, err = run_exact(
+    root, "verify", "--kit", kit_a, "--rootfs-stage", rootfs, "--assets", archive,
+    "--runtime-assets", "none", "--vmlinux-symvers", abi_vmlinux,
+    "--module-symvers", abi_module,
+)
+assert code != 0 and "not-bound: reassemble" in err and "artifact_verified" not in out
+ok("a not-bound ABI kit verified with symvers is rejected")
+
+wrong_symvers = fresh("wrong-symvers") / "vmlinux.symvers"
+wrong_symvers.write_bytes(ABI_VMLINUX + b"#changed\n")
+code, out, err = run_exact(abi_root, *[str(item) for item in abi_check(
+    "verify", abi_kit_a, vmlinux=wrong_symvers
+)])
+assert code != 0 and "SHA-256 differs" in err and "artifact_verified" not in out
+ok("changed ABI input bytes are rejected")
+
+symlink_symvers = fresh("abi-symlink") / "vmlinux.symvers"
+symlink_symvers.symlink_to(abi_vmlinux)
+code, _, err = run_exact(abi_root, *[str(item) for item in abi_assemble(
+    work / "abi-symlink-kit", vmlinux=symlink_symvers
+)])
+assert code != 0 and "not a regular file" in err
+
+writable_symvers = fresh("abi-writable") / "vmlinux.symvers"
+writable_symvers.write_bytes(ABI_VMLINUX)
+writable_symvers.chmod(0o664)
+code, _, err = run_exact(abi_root, *[str(item) for item in abi_assemble(
+    work / "abi-writable-kit", vmlinux=writable_symvers
+)])
+assert code != 0 and "writable or controlled" in err
+
+hardlink_dir = fresh("abi-hardlink")
+hardlink_symvers = hardlink_dir / "vmlinux.symvers"
+os.link(abi_vmlinux, hardlink_symvers)
+code, _, err = run_exact(abi_root, *[str(item) for item in abi_assemble(
+    work / "abi-hardlink-kit", vmlinux=hardlink_symvers
+)])
+assert code != 0 and "additional hard links" in err
+hardlink_symvers.unlink()
+ok("ABI files require canonical no-follow paths, trusted modes and single-link identity")
+
+real_verify_abi = K.verify_abi_bytes
+race_mtime = abi_vmlinux.stat().st_mtime_ns
+def race_verify_abi(*args, **kwargs):
+    report = real_verify_abi(*args, **kwargs)
+    os.utime(abi_vmlinux, ns=(race_mtime + 1, race_mtime + 1))
+    return report
+K.verify_abi_bytes = race_verify_abi
+try:
+    code, _, err = run_exact(abi_root, *[str(item) for item in abi_assemble(work / "abi-race-kit")])
+    assert code != 0 and "changed during verification" in err, (code, err)
+finally:
+    K.verify_abi_bytes = real_verify_abi
+    os.utime(abi_vmlinux, ns=(race_mtime, race_mtime))
+assert not os.path.lexists(work / "abi-race-kit")
+
+try:
+    T.check_abi_alias(frozenset({(1, 2)}), frozenset({(1, 2)}))
+except T.DeploymentError as error:
+    assert "aliases a directory" in str(error)
+else:
+    raise AssertionError("ABI parent alias accepted")
+ok("ABI capture detects path races and parent-directory aliases")
+
+abi_spawn_saved = (subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp)
+subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 6
+try:
+    abi_no_spawn = work / "abi-no-spawn"
+    expect_ok(abi_root, *abi_assemble(abi_no_spawn))
+    expect_ok(abi_root, *abi_check("gate", abi_no_spawn))
+finally:
+    subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp = abi_spawn_saved
+ok("ABI binding runs in-process and spawns no command")
+
+
+def abi_kit_case(name, mutate, reason):
+    clone = fresh("abi-kitcase") / "kit"
+    shutil.copytree(abi_kit_a, clone)
+    document_path = clone / "kit.json"
+    document = json.loads(document_path.read_text())
+    mutate(document["abi"])
+    document_path.write_bytes(T.render_json(document))
+    code, out, err = run_exact(abi_root, *[str(item) for item in abi_check("verify", clone)])
+    assert code != 0 and reason in err and "artifact_verified" not in out, (name, err)
+    ok(f"{name} is rejected by verify")
+
+
+abi_kit_case("a changed ABI digest", lambda d: d.update(digest="0" * 64), "digest differs")
+abi_kit_case("a changed ABI module hash", lambda d: d["modules"][0].update(sha256="0" * 64), "digest differs")
+abi_kit_case("a malformed ABI dependency", lambda d: d["modules"][1].update(depends_on=[1, "alpha"]), "dependencies differ")
+abi_kit_case("a changed ABI parser claim", lambda d: d.update(parser="qualified-real-modules"), "differs at parser")
+abi_kit_case("an ABI authorization claim", lambda d: d.update(deployment_authorized=True), "claims deployment_authorized")
+abi_kit_case("ABI evidence without its blocker", lambda d: d.update(blocker="cleared"), "differs at blocker")
+abi_kit_case("ABI evidence claiming vendor coverage", lambda d: d.update(vendor_modules="verified"), "differs at vendor_modules")
+ok("ABI evidence is strict, tamper-evident and cannot claim authority")
 
 # ---- no input mutated by any rejected run ------------------------------------------------
 assert (rootfs_before, rootfs_data) == snapshot(rootfs)

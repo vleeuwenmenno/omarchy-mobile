@@ -110,10 +110,9 @@ Implemented in the metadata-only contract package:
   qualified archive and both symvers files by SHA-256 before parsing, with
   `scope: staged-set-only`, `vendor_modules: not-verified` and
   `activation: disabled` in its JSON. Its ELF reader supports a synthetic
-  layout only and is unqualified on real modules; it is not yet wired into
-  `tools/myron-deployment`, whose gate still records order status unverified
-  and the same blocker. The blocker remains until the real qualified archive,
-  exact symvers and the full vendor module inventory are checked.
+  layout only and is unqualified on real modules. The blocker remains until
+  the real qualified archive, exact symvers and the full vendor module
+  inventory are checked.
 
 Phase 2.5 (laptop-only, done): `device/myron/deployment-contract.json` and
 `tools/myron-deployment` stage the module overlay writer-side and assemble a
@@ -133,6 +132,16 @@ qualification, copies no private bytes or manifest, and no real runtime tree has
 been bound. `private-runtime-asset-bytes-not-bound-to-kit` and the other six
 blockers are unchanged until a real, separately reviewed bound kit and contract
 revision ([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)).
+
+Phase 2.8 (laptop-only, mechanism done): `tools/myron-deployment` 0.3.0 binds
+the existing staged-set ABI verifier into `kit.json`, either explicitly
+`not-bound` or recomputed from the same exact archive bytes plus both exact
+symvers files. Only a fixed summary and report/evidence hashes enter the kit;
+symvers bytes and full symbol tables stay external. This does not qualify the
+synthetic-only parser, cover vendor modules, verify live load semantics or
+clear `module-abi-import-and-load-order-not-verified`. Activation, the
+unverified overlay order, all seven blockers and gate refusal remain unchanged
+([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)).
 
 Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
 host-key revalidation before another live read, and translation of the vendor

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Laptop-only, non-flashable Myron deployment-candidate kit (v0.2).
+"""Laptop-only, non-flashable Myron deployment-candidate kit (v0.3).
 
 Stages the exact qualified external module overlay and binds a rootfs stage,
 the kernel contract, the GPU profile and the private runtime-asset manifest
@@ -9,13 +9,19 @@ runtime_assets evidence: either "not-bound" (explicit --runtime-assets none) or
 a "verified" closure of the required stock-extracted runtime files, bound by
 hashes only from one pinned walk of a canonical runtime root. Binding is not
 provisioning, extraction, redistribution, ABI or hardware qualification, and
-it never clears a blocker. The tool never authorizes deployment: the gate
+it never clears a blocker. Since 0.3.0 a kit also records abi evidence: either
+"not-bound" (explicit --vmlinux-symvers none --module-symvers none) or the
+kernel verifier's staged-set-only ABI/import/load-order result over the exact
+archive bytes and two exact symvers files, kept as hashes and a fixed summary
+(the symvers files are never copied). It is not source reproduction, vendor
+module verification, a qualified parser or full ABI proof, and it never clears
+a blocker. The tool never authorizes deployment: the gate
 prints the permanent blockers and refuses. Nothing here is bootable, flashable,
 an image, an atomic-snapshot proof, or hardware-qualified.
 
 No external command is run and nothing outside the requested output is
-written. Inputs are only read; the rootfs stage and the runtime assets (and
-their manifest) are bound by hash, never copied.
+written. Inputs are only read; the rootfs stage, the runtime assets (and their
+manifest) and the symvers files are bound by hash, never copied.
 """
 
 from __future__ import annotations
@@ -43,7 +49,7 @@ from typing import NamedTuple
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO = Path(__file__).resolve().parent.parent
 KERNEL_VERIFIER = REPO / "packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify"
 GPU_VERIFIER = REPO / "packages/omamobile-myron-gpu-profile/bin/omamobile-myron-gpu-profile"
@@ -64,6 +70,11 @@ ROOTFS_DIGEST_ALGORITHM = "myron-rootfs-tree-v1-sha256"
 RUNTIME_DIGEST_ALGORITHM = "myron-runtime-assets-v1-sha256"
 RUNTIME_TARGET_PREFIX = "/usr/local/lib/myron-"
 RUNTIME_NONE = "none"
+ABI_NONE = "none"
+ABI_DIGEST_ALGORITHM = "myron-abi-evidence-v1-sha256"
+ABI_BLOCKER = "module-abi-import-and-load-order-not-verified"
+ABI_SCOPE = "staged-set-only"
+ABI_PARSER = "synthetic-offline-unqualified-on-real-modules"
 MODE_TEXT = re.compile(r"[0-7]{4}")
 KIT_KIND = "myron-deployment-candidate-kit"
 CONTRACT_KIND = "myron-deployment-candidate-contract"
@@ -139,6 +150,11 @@ RUNTIME_LIMITS = Limits(256, 12, 256 * 1024 * 1024, 1024 * 1024 * 1024)
 class RuntimeInput(NamedTuple):
     root: str | None  # None: explicit "none" (not bound)
     manifest: str | None
+
+
+class AbiInput(NamedTuple):
+    vmlinux: str | None  # None (with module None): explicit "none" (not bound)
+    module: str | None
 
 
 class ManifestHandle(NamedTuple):
@@ -764,8 +780,15 @@ def kernel_contracts(contracts: Contracts):
 
 def load_archive(contracts: Contracts, assets: str):
     """Return (stage plan, {destination: bytes}) for the qualified archive."""
+    return archive_contents(contracts, read_archive(assets))
+
+
+def read_archive(assets: str) -> bytes:
+    return read_file(assets, "module asset archive", kernel().MAX_ARCHIVE_BYTES)
+
+
+def archive_contents(contracts: Contracts, data: bytes):
     k = kernel()
-    data = read_file(assets, "module asset archive", k.MAX_ARCHIVE_BYTES)
     selector = contracts.stage["layout"]["selector"]
     plan = k.build_stage_plan_bytes(kernel_contracts(contracts), data)
     payload = k.read_module_payload_bytes(
@@ -1189,28 +1212,26 @@ def runtime_evidence_none(contracts: Contracts) -> dict:
     return {**runtime_identity(contracts), "status": "not-bound", "asset_count": 0, "files": [], "digest": None}
 
 
-def open_trusted_manifest(
-    path: str,
+def open_trusted_file(
+    path: str, label: str, short: str
 ) -> tuple[int, int, os.stat_result, tuple[int, int]]:
-    """Open a manifest through trusted no-follow ancestry and pin its inode."""
-    parts = split_canonical(path, "runtime manifest")
-    parent = open_trusted_output_parent(parts[:-1], "runtime manifest parent")
+    """Open a file through trusted no-follow ancestry and pin its inode."""
+    parts = split_canonical(path, short)
+    parent = open_trusted_output_parent(parts[:-1], f"{short} parent")
     pinned = descriptor = -1
     try:
-        pinned, descriptor, opened = open_pinned_regular_at(
-            parent, parts[-1], f"runtime asset manifest: {path}"
-        )
+        pinned, descriptor, opened = open_pinned_regular_at(parent, parts[-1], f"{label}: {path}")
         pinned_metadata = os.fstat(pinned)
         if identity_fields(pinned_metadata) != identity_fields(opened):
-            raise DeploymentError("runtime asset manifest changed while being opened")
-        trusted_parent_entry(parent, opened, "runtime asset manifest")
+            raise DeploymentError(f"{label} changed while being opened")
+        trusted_parent_entry(parent, opened, label)
         if untrusted_owner_or_mode(opened):
-            raise DeploymentError("runtime asset manifest is writable or controlled by another user")
+            raise DeploymentError(f"{label} is writable or controlled by another user")
         if opened.st_nlink != 1:
-            raise DeploymentError("runtime asset manifest has additional hard links")
-        parent_mount = kernel().mount_id_for_fd(parent, "runtime manifest parent")
-        if kernel().mount_id_for_fd(pinned, "runtime manifest") != parent_mount:
-            raise DeploymentError("runtime asset manifest crosses a file mount point")
+            raise DeploymentError(f"{label} has additional hard links")
+        parent_mount = kernel().mount_id_for_fd(parent, f"{short} parent")
+        if kernel().mount_id_for_fd(pinned, short) != parent_mount:
+            raise DeploymentError(f"{label} crosses a file mount point")
         parent_metadata = os.fstat(parent)
         return pinned, descriptor, opened, (parent_metadata.st_dev, parent_metadata.st_ino)
     except BaseException:
@@ -1221,6 +1242,47 @@ def open_trusted_manifest(
         raise
     finally:
         os.close(parent)
+
+
+def capture_trusted_file(path: str, label: str, short: str, limit: int) -> tuple[bytes, ManifestHandle]:
+    """One bounded, stable read of a trusted file; the pinned inode stays open."""
+    pinned, descriptor, before, parent_identity = open_trusted_file(path, label, short)
+    try:
+        if before.st_size > limit:
+            raise DeploymentError(f"{label} exceeds the {limit}-byte safety limit")
+        chunks, remaining = [], before.st_size
+        while remaining:
+            block = os.read(descriptor, min(1024 * 1024, remaining))
+            if not block:
+                raise DeploymentError(f"{label} changed size while being read")
+            chunks.append(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise DeploymentError(f"{label} changed size while being read")
+        after = os.fstat(descriptor)
+        if fingerprint(before) != fingerprint(after):
+            raise DeploymentError(f"{label} changed while being read")
+        return b"".join(chunks), ManifestHandle(pinned, fingerprint(before), parent_identity)
+    except BaseException:
+        os.close(pinned)
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def recheck_trusted_file(path: str, handle: ManifestHandle, label: str, short: str) -> None:
+    if fingerprint(os.fstat(handle.pinned)) != handle.identity:
+        raise DeploymentError(f"{label} changed during verification")
+    pinned = descriptor = -1
+    try:
+        pinned, descriptor, current, parent_identity = open_trusted_file(path, label, short)
+        if fingerprint(current) != handle.identity or parent_identity != handle.parent_identity:
+            raise DeploymentError(f"{label} changed during verification")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if pinned >= 0:
+            os.close(pinned)
 
 
 def parse_runtime_manifest_bytes(data: bytes, expected_hash: str) -> list[dict[str, str]]:
@@ -1266,46 +1328,18 @@ def parse_runtime_manifest_bytes(data: bytes, expected_hash: str) -> list[dict[s
 
 
 def capture_runtime_manifest(path: str, expected_hash: str) -> tuple[list[dict[str, str]], ManifestHandle]:
-    pinned, descriptor, before, parent_identity = open_trusted_manifest(path)
+    data, handle = capture_trusted_file(
+        path, "runtime asset manifest", "runtime manifest", MAX_MANIFEST_BYTES
+    )
     try:
-        if before.st_size > MAX_MANIFEST_BYTES:
-            raise DeploymentError(
-                f"runtime asset manifest exceeds the {MAX_MANIFEST_BYTES}-byte safety limit"
-            )
-        chunks, remaining = [], before.st_size
-        while remaining:
-            block = os.read(descriptor, min(1024 * 1024, remaining))
-            if not block:
-                raise DeploymentError("runtime asset manifest changed size while being read")
-            chunks.append(block)
-            remaining -= len(block)
-        if os.read(descriptor, 1):
-            raise DeploymentError("runtime asset manifest changed size while being read")
-        after = os.fstat(descriptor)
-        if fingerprint(before) != fingerprint(after):
-            raise DeploymentError("runtime asset manifest changed while being read")
-        rows = parse_runtime_manifest_bytes(b"".join(chunks), expected_hash)
-        return rows, ManifestHandle(pinned, fingerprint(before), parent_identity)
+        return parse_runtime_manifest_bytes(data, expected_hash), handle
     except BaseException:
-        os.close(pinned)
+        os.close(handle.pinned)
         raise
-    finally:
-        os.close(descriptor)
 
 
 def recheck_runtime_manifest(path: str, handle: ManifestHandle) -> None:
-    if fingerprint(os.fstat(handle.pinned)) != handle.identity:
-        raise DeploymentError("runtime asset manifest changed during verification")
-    pinned = descriptor = -1
-    try:
-        pinned, descriptor, current, parent_identity = open_trusted_manifest(path)
-        if fingerprint(current) != handle.identity or parent_identity != handle.parent_identity:
-            raise DeploymentError("runtime asset manifest changed during verification")
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if pinned >= 0:
-            os.close(pinned)
+    recheck_trusted_file(path, handle, "runtime asset manifest", "runtime manifest")
 
 
 def runtime_selection(
@@ -1463,6 +1497,223 @@ def runtime_report(evidence: dict) -> dict:
     }
 
 
+# --- staged-set ABI evidence (hashes and a report summary only) ------------------
+
+
+def abi_input(vmlinux: str, module: str) -> AbiInput:
+    if vmlinux == ABI_NONE and module == ABI_NONE:
+        return AbiInput(None, None)
+    if ABI_NONE in (vmlinux, module):
+        raise DeploymentError(
+            "--vmlinux-symvers and --module-symvers must both be 'none' or both be files"
+        )
+    split_canonical(vmlinux, "vmlinux.symvers")
+    split_canonical(module, "kernel_aarch64_Module.symvers")
+    if vmlinux == module:
+        raise DeploymentError("vmlinux.symvers and kernel_aarch64_Module.symvers are the same path")
+    return AbiInput(vmlinux, module)
+
+
+def check_abi_scope(abi: AbiInput, others: dict) -> None:
+    """Neither symvers file may equal or nest in any other path."""
+    if abi.vmlinux is None:
+        return
+    for label, path in others.items():
+        for name, own in (("vmlinux.symvers", abi.vmlinux), ("Module.symvers", abi.module)):
+            if paths_overlap(own, path):
+                raise DeploymentError(f"{name} input overlaps the {label}")
+
+
+def check_abi_alias(abi_parent_ids: frozenset, others: frozenset) -> None:
+    if abi_parent_ids & others:
+        raise DeploymentError("ABI symvers parent aliases a directory of another input or output tree")
+
+
+def abi_identity(contracts: Contracts) -> dict:
+    kernel_reference = contracts.reference["kernel"]
+    return {
+        "algorithm": ABI_DIGEST_ALGORITHM,
+        "scope": ABI_SCOPE,
+        "vendor_modules": "not-verified",
+        "parser": ABI_PARSER,
+        "activation": contracts.reference["activation"]["mode"],
+        "deployment_blocker": "unchanged",
+        "blocker": ABI_BLOCKER,
+        "symvers_bytes_copied_into_kit": False,
+        "kernel_release": kernel_reference["release"],
+        "reference_sha256": contracts.reference_sha256,
+        "stage_contract_sha256": contracts.stage_sha256,
+        "archive_sha256": contracts.reference["module_assets"]["archive_sha256"],
+        "vmlinux_symvers_sha256": kernel_reference["vmlinux_symvers_sha256"],
+        "module_symvers_sha256": kernel_reference["module_symvers_sha256"],
+    }
+
+
+def abi_evidence_none(contracts: Contracts) -> dict:
+    return {
+        **abi_identity(contracts), "status": "not-bound", "vermagic": None,
+        "declared_order": list(contracts.reference["module_assets"]["modules"]),
+        "resolved_order": None, "module_count": 0, "modules": [], "report_sha256": None,
+        "digest": None,
+    }
+
+
+def abi_digest(evidence: dict) -> str:
+    digest = hashlib.sha256(ABI_DIGEST_ALGORITHM.encode("ascii") + b"\n")
+    for key in (
+        "scope", "vendor_modules", "parser", "activation", "deployment_blocker", "blocker",
+        "kernel_release", "reference_sha256", "stage_contract_sha256", "archive_sha256",
+        "vmlinux_symvers_sha256", "module_symvers_sha256", "vermagic", "report_sha256",
+    ):
+        digest.update(f"{key}\t{json.dumps(evidence[key])}\n".encode("ascii"))
+    for key in ("declared_order", "resolved_order"):
+        digest.update(f"{key}\t{','.join(evidence[key])}\n".encode("ascii"))
+    for row in evidence["modules"]:
+        digest.update((
+            f"module\t{row['name']}\t{row['sha256']}\t{','.join(row['depends_on'])}"
+            f"\t{row['import_count']}\t{row['export_count']}\n"
+        ).encode("ascii"))
+    return digest.hexdigest()
+
+
+def abi_evidence_from_report(contracts: Contracts, report: dict) -> dict:
+    """Fixed summary of the kernel verifier's report; the whole report is hashed."""
+    identity = abi_identity(contracts)
+    k = kernel()
+    for key, expected in (
+        ("schema", 1), ("status", "staged-set-consistent"), ("scope", ABI_SCOPE),
+        ("vendor_modules", "not-verified"), ("activation", identity["activation"]),
+        ("parser", ABI_PARSER), ("deployment_blocker", "unchanged"),
+        ("kernel_release", identity["kernel_release"]),
+        ("reference_sha256", identity["reference_sha256"]),
+        ("stage_contract_sha256", identity["stage_contract_sha256"]),
+        ("archive_sha256", identity["archive_sha256"]),
+        ("vmlinux_symvers_sha256", identity["vmlinux_symvers_sha256"]),
+        ("module_symvers_sha256", identity["module_symvers_sha256"]),
+    ):
+        if key not in report or not k.strict_equal(report[key], expected):
+            raise DeploymentError(f"kernel ABI report differs at {key}")
+    rows = [
+        {
+            "name": module["name"], "sha256": module["sha256"],
+            "depends_on": list(module["depends_on"]),
+            "import_count": len(module["imports"]), "export_count": len(module["exports"]),
+        }
+        for module in report["modules"]
+    ]
+    canonical = json.dumps(report, sort_keys=True, separators=(",", ":")).encode("ascii")
+    evidence = {
+        **identity, "status": "staged-set-consistent", "vermagic": report["vermagic"],
+        "declared_order": list(report["declared_order"]),
+        "resolved_order": list(report["resolved_order"]), "module_count": len(rows),
+        "modules": rows, "report_sha256": sha256_bytes(canonical),
+    }
+    evidence["digest"] = abi_digest(evidence)
+    return evidence
+
+
+def bind_abi(contracts: Contracts, abi: AbiInput, archive_data: bytes) -> tuple[dict, frozenset]:
+    """Run the kernel verifier in process over the proven archive bytes and one
+    stable capture of each symvers file. No symvers byte is retained."""
+    if abi.vmlinux is None:
+        return abi_evidence_none(contracts), frozenset()
+    k = kernel()
+    vmlinux_label, module_label = "vmlinux.symvers", "kernel_aarch64_Module.symvers"
+    vmlinux_data, vmlinux_handle = capture_trusted_file(
+        abi.vmlinux, vmlinux_label, vmlinux_label, k.MAX_SYMVERS_BYTES
+    )
+    try:
+        module_data, module_handle = capture_trusted_file(
+            abi.module, module_label, module_label, k.MAX_SYMVERS_BYTES
+        )
+        try:
+            if vmlinux_handle.identity[:2] == module_handle.identity[:2]:
+                raise DeploymentError("vmlinux.symvers and Module.symvers are the same file")
+            report = k.verify_abi_bytes(
+                kernel_contracts(contracts), archive_data, vmlinux_data, module_data
+            )
+            evidence = abi_evidence_from_report(contracts, report)
+            recheck_trusted_file(abi.vmlinux, vmlinux_handle, vmlinux_label, vmlinux_label)
+            recheck_trusted_file(abi.module, module_handle, module_label, module_label)
+            parents = frozenset({vmlinux_handle.parent_identity, module_handle.parent_identity})
+        finally:
+            os.close(module_handle.pinned)
+    finally:
+        os.close(vmlinux_handle.pinned)
+    return evidence, parents
+
+
+def validate_abi_evidence(value, contracts: Contracts) -> dict:
+    """Strictly validate recorded abi evidence; return it unchanged."""
+    k = kernel()
+    identity = abi_identity(contracts)
+    keys = {
+        *identity, "status", "vermagic", "declared_order", "resolved_order", "module_count",
+        "modules", "report_sha256", "digest",
+    }
+    if type(value) is not dict:
+        raise DeploymentError("kit abi fields differ")
+    for flag in AUTHORITY_FLAGS:
+        if flag in value and value[flag] is not False:
+            raise DeploymentError(f"kit claims {flag}; deployment authorization is refused")
+    if set(value) != keys:
+        raise DeploymentError("kit abi fields differ")
+    if value["symvers_bytes_copied_into_kit"] is not False:
+        raise DeploymentError("kit abi symvers_bytes_copied_into_kit must be false")
+    for key, expected in identity.items():
+        if not k.strict_equal(value[key], expected):
+            raise DeploymentError(f"kit abi differs at {key}")
+    declared = list(contracts.reference["module_assets"]["modules"])
+    if not k.strict_equal(value["declared_order"], declared):
+        raise DeploymentError("kit abi differs at declared_order")
+    if value["status"] == "not-bound":
+        if not k.strict_equal(value, abi_evidence_none(contracts)):
+            raise DeploymentError("kit abi not-bound evidence must be empty")
+        return value
+    if value["status"] != "staged-set-consistent":
+        raise DeploymentError("kit abi status differs")
+    release = identity["kernel_release"]
+    vermagic, resolved, rows = value["vermagic"], value["resolved_order"], value["modules"]
+    if type(vermagic) is not str or vermagic.split(" ")[0] != release:
+        raise DeploymentError("kit abi vermagic differs")
+    if type(resolved) is not list or sorted(resolved, key=str) != sorted(declared):
+        raise DeploymentError("kit abi resolved_order differs")
+    if type(rows) is not list or type(value["module_count"]) is not int or value["module_count"] != len(rows):
+        raise DeploymentError("kit abi module count differs from its modules")
+    row_keys = {"name", "sha256", "depends_on", "import_count", "export_count"}
+    for name, row in zip(declared, rows):
+        if type(row) is not dict or set(row) != row_keys or row["name"] != name:
+            raise DeploymentError("kit abi module fields differ")
+        if type(row["sha256"]) is not str or not HEX256.fullmatch(row["sha256"]):
+            raise DeploymentError("kit abi module hash differs")
+        depends = row["depends_on"]
+        if type(depends) is not list or any(
+            type(item) is not str or item not in declared or item == name for item in depends
+        ):
+            raise DeploymentError("kit abi module dependencies differ")
+        if depends != sorted(depends):
+            raise DeploymentError("kit abi module dependencies are not sorted")
+        for count in ("import_count", "export_count"):
+            if type(row[count]) is not int or row[count] < 0:
+                raise DeploymentError("kit abi module counts differ")
+    if len(rows) != len(declared):
+        raise DeploymentError("kit abi module count differs from its modules")
+    if type(value["report_sha256"]) is not str or not HEX256.fullmatch(value["report_sha256"]):
+        raise DeploymentError("kit abi report hash differs")
+    if value["digest"] != abi_digest(value):
+        raise DeploymentError("kit abi digest differs from its fields")
+    return value
+
+
+def abi_report(evidence: dict) -> dict:
+    return {
+        "abi_status": evidence["status"],
+        "abi_scope": evidence["scope"],
+        "abi_module_count": evidence["module_count"],
+        "abi_digest": evidence["digest"],
+    }
+
+
 # --- kit layout -----------------------------------------------------------------
 
 
@@ -1481,12 +1732,14 @@ STATUS_TEXT = (
     "This kit is NOT bootable, NOT flashable, NOT image-ready, NOT an atomic\n"
     "snapshot proof, NOT hardware-qualified and NOT a deployment authorization.\n"
     "It binds identities; it activates nothing. Permanent blockers are listed in\n"
-    "status.json. Private runtime assets and the rootfs stay outside the kit.\n"
+    "status.json. Private runtime assets, symvers files and the rootfs stay\n"
+    "outside the kit.\n"
 ).encode("ascii")
 
 
 def kit_spec(
-    contracts: Contracts, module_files: list[dict], overlay: dict, binding: dict, runtime_assets: dict
+    contracts: Contracts, module_files: list[dict], overlay: dict, binding: dict, runtime_assets: dict,
+    abi: dict,
 ) -> list:
     """The exact kit as (path, kind, mode, bytes-or-None), parents first."""
     files = {
@@ -1518,6 +1771,7 @@ def kit_spec(
         "rootfs": binding,
         "runtime": contracts.deployment["runtime"],
         "runtime_assets": runtime_assets,
+        "abi": abi,
         "status": status_document(),
     }
     files["kit.json"] = render_json(document)
@@ -1910,29 +2164,37 @@ def command_stage_modules(contracts: Contracts, assets: str, out: str) -> dict:
     }
 
 
-def require_archive_plan(contracts: Contracts, assets: str, module_files: list[dict]) -> None:
-    plan, _ = load_archive(contracts, assets)
+def require_archive_plan(contracts: Contracts, assets: str, module_files: list[dict]) -> bytes:
+    """Prove the stage against the archive; return the exact archive bytes proven."""
+    data = read_archive(assets)
+    plan, _ = archive_contents(contracts, data)
     check_against_plan(module_files, plan)
+    return data
 
 
 def command_assemble(
     contracts: Contracts, rootfs: str, manifest: str, module_stage: str, out: str, assets: str,
-    runtime: RuntimeInput,
+    runtime: RuntimeInput, abi: AbiInput,
 ) -> dict:
-    check_runtime_scope(runtime, {
+    scope = {
         "rootfs stage": rootfs, "rootfs manifest": manifest, "module stage": module_stage,
         "module archive": assets, "output": out,
+    }
+    check_runtime_scope(runtime, scope)
+    check_abi_scope(abi, {
+        **scope, **({"runtime asset root": runtime.root, "runtime asset manifest": runtime.manifest}
+                    if runtime.root else {}),
     })
     binding, _, rootfs_directory_ids = check_rootfs(rootfs, manifest, contracts)
     tree, module_files = read_module_stage(contracts, module_stage, "module stage")
-    require_archive_plan(contracts, assets, module_files)
+    archive_data = require_archive_plan(contracts, assets, module_files)
     evidence, runtime_ids, manifest_parent_ids = bind_runtime(contracts, runtime)
-    check_runtime_alias(
-        runtime_ids, manifest_parent_ids,
-        frozenset(set(rootfs_directory_ids) | set(tree.directory_ids)),
-    )
+    input_ids = frozenset(set(rootfs_directory_ids) | set(tree.directory_ids))
+    check_runtime_alias(runtime_ids, manifest_parent_ids, input_ids)
+    abi_evidence, abi_parent_ids = bind_abi(contracts, abi, archive_data)
+    check_abi_alias(abi_parent_ids, frozenset(input_ids | runtime_ids))
     overlay = {"/" + path: data for path, data in tree.data.items()}
-    spec = kit_spec(contracts, module_files, overlay, binding, evidence)
+    spec = kit_spec(contracts, module_files, overlay, binding, evidence, abi_evidence)
     expected = spec_entries(spec)
 
     def verify_built(temporary_path: str, descriptor: int) -> None:
@@ -1954,11 +2216,12 @@ def command_assemble(
         "rootfs_digest": binding["digest"],
         "archive_proven": True,
         **runtime_report(evidence),
+        **abi_report(abi_evidence),
         "deployment_authorized": False,
     }
 
 
-def reject_authority_claims(tree: Tree, contracts: Contracts) -> dict:
+def reject_authority_claims(tree: Tree, contracts: Contracts) -> tuple[dict, dict]:
     for relative in ("status.json", "kit.json"):
         if relative not in tree.data:
             continue
@@ -1976,14 +2239,21 @@ def reject_authority_claims(tree: Tree, contracts: Contracts) -> dict:
     kit_document = strict_json(tree.data["kit.json"], "kit.json") if "kit.json" in tree.data else {}
     if "runtime_assets" not in kit_document:
         raise DeploymentError("kit.json has no runtime_assets section")
-    return validate_runtime_evidence(kit_document["runtime_assets"], contracts)
+    runtime = validate_runtime_evidence(kit_document["runtime_assets"], contracts)
+    if "abi" not in kit_document:
+        raise DeploymentError("kit.json has no abi section")
+    return runtime, validate_abi_evidence(kit_document["abi"], contracts)
 
 
 def command_verify(
-    contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str, runtime: RuntimeInput
+    contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str, runtime: RuntimeInput,
+    abi: AbiInput,
 ) -> dict:
-    check_runtime_scope(runtime, {
-        "rootfs stage": rootfs, "rootfs manifest": manifest, "module archive": assets, "kit": kit,
+    scope = {"rootfs stage": rootfs, "rootfs manifest": manifest, "module archive": assets, "kit": kit}
+    check_runtime_scope(runtime, scope)
+    check_abi_scope(abi, {
+        **scope, **({"runtime asset root": runtime.root, "runtime asset manifest": runtime.manifest}
+                    if runtime.root else {}),
     })
     binding, _, rootfs_directory_ids = check_rootfs(rootfs, manifest, contracts)
     descriptor, kit_identity = open_trusted_artifact(kit, "kit")
@@ -1998,7 +2268,14 @@ def command_verify(
         )
     finally:
         os.close(descriptor)
-    recorded = reject_authority_claims(tree, contracts)
+    recorded, abi_recorded = reject_authority_claims(tree, contracts)
+    abi_bound = abi_recorded["status"] == "staged-set-consistent"
+    if abi_bound and abi.vmlinux is None:
+        raise DeploymentError(
+            "kit binds ABI evidence: verify it with --vmlinux-symvers and --module-symvers files"
+        )
+    if not abi_bound and abi.vmlinux is not None:
+        raise DeploymentError("kit was assembled with ABI evidence not-bound: reassemble to bind it")
     kit_bound = recorded["status"] == "verified"
     if kit_bound and runtime.root is None:
         raise DeploymentError(
@@ -2019,16 +2296,18 @@ def command_verify(
     module_files = check_module_shape(
         Tree(overlay_entries, overlay_data, 0, frozenset()), contracts
     )
-    require_archive_plan(contracts, assets, module_files)
+    archive_data = require_archive_plan(contracts, assets, module_files)
     evidence, runtime_ids, manifest_parent_ids = bind_runtime(contracts, runtime)
-    check_runtime_alias(
-        runtime_ids, manifest_parent_ids,
-        frozenset(set(rootfs_directory_ids) | set(tree.directory_ids)),
-    )
+    input_ids = frozenset(set(rootfs_directory_ids) | set(tree.directory_ids))
+    check_runtime_alias(runtime_ids, manifest_parent_ids, input_ids)
     if evidence != recorded:
         raise DeploymentError("runtime asset evidence differs from the kit")
+    abi_evidence, abi_parent_ids = bind_abi(contracts, abi, archive_data)
+    check_abi_alias(abi_parent_ids, frozenset(input_ids | runtime_ids))
+    if abi_evidence != abi_recorded:
+        raise DeploymentError("ABI evidence differs from the kit")
     overlay = {"/" + path: data for path, data in overlay_data.items()}
-    spec = kit_spec(contracts, module_files, overlay, binding, evidence)
+    spec = kit_spec(contracts, module_files, overlay, binding, evidence, abi_evidence)
     diff_entries(tree.entries, spec_entries(spec), "kit")
     recheck_trusted_artifact(kit, kit_identity, "kit")
     return {
@@ -2038,14 +2317,16 @@ def command_verify(
         "rootfs_digest": binding["digest"],
         "archive_proven": True,
         **runtime_report(evidence),
+        **abi_report(abi_evidence),
         "deployment_authorized": False,
     }
 
 
 def command_gate(
-    contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str, runtime: RuntimeInput
+    contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str, runtime: RuntimeInput,
+    abi: AbiInput,
 ) -> dict:
-    verified = command_verify(contracts, kit, rootfs, manifest, assets, runtime)
+    verified = command_verify(contracts, kit, rootfs, manifest, assets, runtime, abi)
     return {
         "artifact_verified": True,
         "deployment_authorized": False,
@@ -2056,8 +2337,20 @@ def command_gate(
         "blockers": list(BLOCKERS),
         "kit_sha256": verified["kit_sha256"],
         "archive_proven": True,
-        **{key: verified[key] for key in ("runtime_status", "runtime_asset_count", "runtime_digest")},
+        **{
+            key: verified[key]
+            for key in (
+                "runtime_status", "runtime_asset_count", "runtime_digest",
+                "abi_status", "abi_scope", "abi_module_count", "abi_digest",
+            )
+        },
     }
+
+
+def add_abi_arguments(sub) -> None:
+    help_text = "literal 'none' (ABI not bound; give 'none' to both) or a canonical absolute file"
+    sub.add_argument("--vmlinux-symvers", required=True, help="vmlinux.symvers: " + help_text)
+    sub.add_argument("--module-symvers", required=True, help="kernel_aarch64_Module.symvers: " + help_text)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2076,6 +2369,7 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_help = "literal 'none' (not bound) or a canonical absolute runtime-asset root"
     assemble.add_argument("--runtime-assets", required=True, help=runtime_help)
     assemble.add_argument("--runtime-manifest", help="pinned runtime manifest TSV; required with a root DIR")
+    add_abi_arguments(assemble)
     for name, text in (("verify", "recompute every binding of a kit"), ("gate", "verify, then refuse deployment")):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--kit", required=True)
@@ -2084,6 +2378,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--assets", required=True, help="qualified module archive")
         sub.add_argument("--runtime-assets", required=True, help=runtime_help)
         sub.add_argument("--runtime-manifest", help="pinned runtime manifest TSV; required with a root DIR")
+        add_abi_arguments(sub)
     return parser
 
 
@@ -2099,6 +2394,7 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
             result = command_assemble(
                 contracts, args.rootfs_stage, args.rootfs_manifest, args.module_stage, args.out, args.assets,
                 runtime_input(args.runtime_assets, args.runtime_manifest),
+                abi_input(args.vmlinux_symvers, args.module_symvers),
             )
         else:
             manifest = args.rootfs_manifest or args.rootfs_stage + ".MANIFEST"
@@ -2106,6 +2402,7 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
             result = runner(
                 contracts, args.kit, args.rootfs_stage, manifest, args.assets,
                 runtime_input(args.runtime_assets, args.runtime_manifest),
+                abi_input(args.vmlinux_symvers, args.module_symvers),
             )
     except handled_errors() as error:
         print(f"ERROR: {error}", file=sys.stderr)

@@ -109,7 +109,12 @@ no private bytes or manifest, clears no blocker, and no real runtime tree has
 been bound.
 `omamobile-myron-kernel-contract` 0.3.0 adds `verify-abi`, an offline,
 staged-set-only module ABI/import/load-order check over a synthetic ELF layout;
-it is unqualified on real modules, not part of the gate, and clears no blocker.
+it is unqualified on real modules and clears no blocker. `myron-deployment`
+0.3.0 (Phase 2.8) can bind its fixed summary and report/evidence hashes from
+the exact archive and symvers pair into `kit.json`; it copies no symvers or full
+symbol table, leaves vendor modules and order unverified, preserves all seven
+blockers, and still always refuses deployment. No real archive/symvers set has
+been bound.
 
 ### 3.2 Keys to add later
 

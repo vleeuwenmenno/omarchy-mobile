@@ -27,10 +27,7 @@ read-only, pure-Python, staged-set-only check of module imports, exports, CRCs,
 providers and declared load order against the two exact symvers files. The
 parser handles a synthetic ELF layout only and is unqualified on real modules;
 vendor modules are `not-verified`, activation stays disabled and nothing is
-authorized. It is not integrated into `tools/myron-deployment`: the deployment
-gate still records order status unverified and keeps its blocker until the
-real qualified archive, exact symvers and full vendor module inventory are
-checked.
+authorized.
 
 Phase 2.5 adds `device/myron/deployment-contract.json` and the laptop-only
 `tools/myron-deployment` (`show`, `stage-modules`, `assemble`, `verify`,
@@ -50,6 +47,15 @@ redistribution, ABI or hardware qualification; no private bytes or manifest are
 copied, no real runtime tree has been bound, and
 `private-runtime-asset-bytes-not-bound-to-kit` stays until a real, separately
 reviewed bound kit and contract revision.
+
+Phase 2.8 (`tools/myron-deployment` 0.3.0) integrates that verifier as optional
+hash-only kit evidence. `assemble`, `verify` and `gate` require both
+`--vmlinux-symvers` and `--module-symvers`, each either `none` or an exact file.
+A bound kit records only a fixed staged-set summary plus report/evidence hashes;
+symvers bytes and symbol tables stay external. The parser and vendor inventory
+remain unverified, module order remains `unverified`, activation remains
+disabled, all seven blockers stay unchanged, and the gate still refuses. No
+real archive or symvers pair has been bound.
 
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not

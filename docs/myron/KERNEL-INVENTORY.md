@@ -178,6 +178,14 @@ binds the kernel contract; it is not a boot mechanism, not bootable, flashable
 or image-ready, and never authorizes deployment
 ([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)).
 
+Phase 2.8's `tools/myron-deployment` 0.3.0 can bind the staged-set ABI report
+from the same captured archive bytes and both exact symvers files into the kit
+as hashes and a fixed summary. It copies no symvers or symbol table, recomputes
+the evidence for verification and gating, and still labels the parser
+unqualified on real modules and vendor modules `not-verified`. The overlay
+order and deployment blocker remain unverified; no real archive/symvers set has
+been bound.
+
 The Phase 2 package follows that rule: it installs only a Python verifier,
 contract JSON, documentation, license, and version. It has no systemd unit,
 pacman hook, module payload, firmware, Image, DTB/DTBO, or partition writer.

@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: MIT -->
-# Myron deployment gate (Phase 2.5, runtime binding 2.7)
+# Myron deployment gate (Phase 2.5, runtime binding 2.7, ABI binding 2.8)
 
 Status (2026-10-24): laptop-only, offline, deterministic. `tools/myron-deployment`
 builds and verifies a **deployment-candidate kit** and then **always refuses to
@@ -9,7 +9,10 @@ authorization. No kit has been built from the real qualified archive: `out/repo`
 is empty and the archive and private runtime assets are external. As of
 `myron-deployment` 0.2.0 the tool can bind a runtime-asset closure by hashes
 only, but **no real runtime tree has been bound**; every real run so far, if any,
-would be `not-bound`.
+would be `not-bound`. Version 0.3.0 can also bind the existing staged-set ABI
+verifier report from the exact archive and two exact symvers files. No real
+archive or symvers pair has been bound, and the parser remains unqualified on
+real modules.
 
 ## What it binds
 
@@ -41,8 +44,8 @@ components or symlinks. No command runs an external program or `depmod`.
 | --- | --- |
 | `show` | print the validated contract |
 | `stage-modules --assets ARCHIVE --out DIR` | validate archive and contract with the kernel verifier, then write exactly the selector and seven modules (planned paths and modes) |
-| `assemble --rootfs-stage DIR --rootfs-manifest FILE --module-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] --out DIR` | validate both inputs against the archive, bind or explicitly not-bind runtime assets, reject collisions, write the kit |
-| `verify --kit DIR --rootfs-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] [--rootfs-manifest FILE]` | recompute every binding, content, mode and closure, including the runtime evidence |
+| `assemble --rootfs-stage DIR --rootfs-manifest FILE --module-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] --vmlinux-symvers none\|FILE --module-symvers none\|FILE --out DIR` | validate both inputs against the archive, bind or explicitly not-bind runtime and ABI evidence, reject collisions, write the kit |
+| `verify --kit DIR --rootfs-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] --vmlinux-symvers none\|FILE --module-symvers none\|FILE [--rootfs-manifest FILE]` | recompute every binding, content, mode and closure, including runtime and ABI evidence |
 | `gate` (same arguments) | `verify`, then print `artifact_verified: true`, `deployment_authorized: false` and the blockers |
 
 The manifest defaults to `<rootfs-stage>.MANIFEST`, the name
@@ -71,8 +74,9 @@ its target paths and modes), `kit.json`, `status.json`, `STATUS.txt` and
 (path, type, mode, size, content hash and symlink target of every entry; no
 owner, time or hardlink identity) and by the manifest hash. Runtime assets stay
 outside; the kit holds only the `runtime_assets` evidence described below, never
-a runtime byte or the manifest. There are no timestamps; two runs give identical
-bytes.
+a runtime byte or the manifest. Symvers files also stay outside; `kit.json`
+holds only the strict `abi` evidence described below. There are no timestamps;
+two runs give identical bytes.
 
 ## Runtime-asset binding (0.2.0)
 
@@ -116,6 +120,34 @@ not clear `private-runtime-asset-bytes-not-bound-to-kit` or reorder any blocker,
 and the gate still refuses. The gate reports `runtime_status`,
 `runtime_asset_count` and `runtime_digest`.
 
+## Staged-set ABI binding (0.3.0)
+
+`--vmlinux-symvers` and `--module-symvers` are required by `assemble`, `verify`
+and `gate`. They must both be the literal `none`, or both be canonical absolute
+regular files. `none` records strict `status: not-bound` evidence. With files,
+the tool opens each through trusted descriptor-relative no-follow ancestry,
+requires one link and safe ownership/mode, rejects file mount points and path
+or input-tree collisions, captures each file once with bounded stable reads,
+and rechecks both pinned inodes and canonical paths after verification.
+
+The existing kernel verifier runs in-process over those captured bytes and the
+same archive bytes already proven against the module stage. `kit.json` records
+only a fixed summary and hashes: `status: staged-set-consistent`,
+`scope: staged-set-only`,
+module hashes and dependency counts/order, a SHA-256 of the canonical full
+verifier report, and a separate evidence digest. Symvers bytes, symbol names,
+paths and full import/export tables are not copied into the kit. `verify` and
+`gate` must receive the same mode: a bound kit requires both files and
+recomputes equal evidence; a not-bound kit requires both literals `none`.
+
+This proves only consistency of the staged synthetic-parser module set.
+`vendor_modules` remains `not-verified`, the parser remains
+`synthetic-offline-unqualified-on-real-modules`, activation remains disabled,
+the overlay order remains `unverified`, and
+`module-abi-import-and-load-order-not-verified` remains in the unchanged
+seven-item blocker list. The gate reports `abi_status`, `abi_scope`,
+`abi_module_count` and `abi_digest` and still refuses.
+
 ## Rules enforced
 
 - **Rootfs**: equivalent to `tests/rootfs-stage` (required files, stage marker
@@ -139,7 +171,9 @@ and the gate still refuses. The gate reports `runtime_status`,
 - `--assets` is mandatory for assembly, verification, and gating. The archive
   stays external, but every accepted overlay must match its qualified plan.
 - The module order is the public Attempt79/VT staging order; load semantics
-  remain unverified. This is not full ABI, import, provider, or load-order proof.
+  remain unverified. Bound ABI evidence is staged-set-only, uses a parser not
+  qualified on real modules, and excludes the vendor module inventory. It is
+  not full ABI, provider, or load-order proof.
 - Runtime assets are bound only by hash evidence, and only when a root is
   supplied; no runtime or manifest byte is copied into the kit, and the kit is
   not proof that those files are the ones ever deployed. The blocker stays until
