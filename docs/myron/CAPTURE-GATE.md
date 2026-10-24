@@ -113,7 +113,9 @@ pin and the claims above:
 - `forbidden_operations` and `redaction` from the request;
 - `identity`: the device and kernel values the checks compare against;
 - `policy`: the typed registry;
-- `implementation`: the SHA-256 of the bytes of `tools/myron-collect`.
+- `implementation`: algorithm `sha256-of-captured-implementation-bytes`, path
+  `tools/lib/myron-collect-impl.py`, and the SHA-256 of the bytes the loader
+  captured and is executing.
 
 Nullable fields and branch rules are policy data, not code. A `nullable` or
 `null` type says where `null` is allowed; a `rows` spec may carry `variants`
@@ -132,14 +134,36 @@ contract that differs from it (`capture contract differs from its derived
 form`), so a policy change is always a reviewed contract change. The remaining
 rule logic is code (R1 slot, R2 suffix and recovery, R5 order and indexes, R6
 rounding, the R7 allowlist and the cross-checks), so the contract also pins the
-tool itself: `implementation.sha256` is recomputed from the tool file's bytes on
-every run (never stored in the tool), and any source edit, even a comment,
-fails every command until the contract is regenerated from the final source.
-The pin covers `tools/myron-collect` only; the preflight, snapshot and
+implementation too: `implementation.sha256` is the digest of the validator
+bytes that are running, and any edit to them, even a comment, fails every
+command until the contract is regenerated from the final source. The pin
+covers `tools/lib/myron-collect-impl.py` only; the preflight, snapshot and
 deployment tools it calls stay pinned by version.
 
 A capture that reports a stop condition (identity mismatch, source
 disagreement, `sources_agree: false`) is rejected, not recorded.
+
+### Trusted loader
+
+`tools/myron-collect` is a minimal loader (about 80 lines, no process or
+network facility) and the trust root of the collector. It opens
+`tools/lib/myron-collect-impl.py` once, component by component with no symlink
+following, requires a regular file owned by the caller and not group- or
+world-writable, reads at most 1 MiB, hashes those bytes, then compiles and
+executes **the same bytes** in its own module namespace. The digest it passes
+on (`CAPTURED_IMPLEMENTATION_SHA256`) is what the contract and the plan bind;
+the implementation path is never opened again. Restoring or replacing the file
+after the capture changes neither what runs nor what the pin says, so a
+modified validator cannot claim the original pin. The loader itself is reviewed
+in git and is not pinned by the contract. Tests import it with
+`SourceFileLoader`, as before.
+
+### Nesting
+
+Every operation document and `capture.json` is checked for JSON nesting
+(at most 8 levels; a saved plan, which embeds the policy, at most 32)
+iteratively and immediately after parsing, before the canonical-JSON renderer or
+any recursive check can expand it.
 
 ## Evidence artifact
 

@@ -69,9 +69,9 @@
     "kernel.release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
   },
   "implementation": {
-    "algorithm": "sha256-of-tool-file-bytes",
-    "path": "tools/myron-collect",
-    "sha256": "c2ec4a2079bd7794a5cf30827de8f35203c8cb422db99d78d4c73b448bb64cb1"
+    "algorithm": "sha256-of-captured-implementation-bytes",
+    "path": "tools/lib/myron-collect-impl.py",
+    "sha256": "1492cb030a7820a58e855488e158a3c53c12ea3b2c6501b0aa4030064c72d876"
   },
   "kind": "myron-capture-collector-contract",
   "pinned_versions": {

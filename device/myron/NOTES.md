@@ -85,7 +85,9 @@ separate read-only session, not permission for that session or for deployment.
 See [PREFLIGHT-GATE.md](../../docs/myron/PREFLIGHT-GATE.md).
 
 Phase 2.12 adds `device/myron/capture-contract.json` and `tools/myron-collect`
-0.1.0. The collector validates a local, trusted, **pre-captured fixture** tree
+0.1.0 (a minimal trusted loader for `tools/lib/myron-collect-impl.py`, whose
+captured bytes the contract pins). The collector validates a local, trusted,
+**pre-captured fixture** tree
 (`capture.json` plus `operations/R1`..`R7` JSON) against one preflight request
 and writes a five-file, structure-only evidence artifact. It is not live
 evidence, not approval, and clears no blocker; it has no live transport and

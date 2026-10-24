@@ -11,13 +11,17 @@ trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 export PYTHONPYCACHEPREFIX="$tmp/pycache"
 tmp=$(realpath "$tmp")
 
-python3 -m py_compile tools/myron-collect || fail "tool parses"
-grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http|ctypes|ssl|requests)|os\.(system|popen|exec|spawn|fork)|posix_spawn' tools/myron-collect \
-  && fail "tool references process, network, or broad-copy facilities"
-grep -Eqi '\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b' tools/myron-collect \
-  && fail "tool names a live transport command"
-grep -q 'external-precaptured-fixture' tools/myron-collect || fail "tool lacks the fixture transport"
-pass "tool parses and has no process, network, broad-copy, or live-transport facility"
+impl=tools/lib/myron-collect-impl.py
+python3 -m py_compile tools/myron-collect "$impl" || fail "tool parses"
+for f in tools/myron-collect "$impl"; do
+  grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http|ctypes|ssl|requests)|os\.(system|popen|exec|spawn|fork)|posix_spawn' "$f" \
+    && fail "$f references process, network, or broad-copy facilities"
+  grep -Eqi '\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b' "$f" \
+    && fail "$f names a live transport command"
+done
+grep -q 'external-precaptured-fixture' "$impl" || fail "tool lacks the fixture transport"
+[[ $(wc -l < tools/myron-collect) -le 90 ]] || fail "the trusted loader grew past 90 lines"
+pass "loader and implementation parse and have no process, network, broad-copy, or live-transport facility"
 
 tools/myron-collect show > "$tmp/show.json" || fail "repository capture contract failed"
 python3 - "$tmp/show.json" <<'PY' || exit 1
@@ -1397,24 +1401,28 @@ code, _out, _err = invoke("show")
 assert code == 0, _err
 ok("a registry that contradicts itself stops every command")
 
-# 4. The contract pins the collector's own source bytes.
-tool_bytes = (repo / "tools/myron-collect").read_bytes()
+# 4. The contract pins the bytes of the implementation that the loader captured.
+impl_path = repo / "tools/lib/myron-collect-impl.py"
+tool_bytes = impl_path.read_bytes()
 implementation = {
-    "algorithm": "sha256-of-tool-file-bytes", "path": "tools/myron-collect",
+    "algorithm": "sha256-of-captured-implementation-bytes",
+    "path": "tools/lib/myron-collect-impl.py",
     "sha256": digest(tool_bytes),
 }
 assert C.implementation_binding() == implementation
+assert C.CAPTURED_IMPLEMENTATION_SHA256 == implementation["sha256"]
 assert committed["implementation"] == implementation
 assert plan_a["implementation"] == implementation
 assert json.loads(capture_contract_bytes)["implementation"] == implementation
 shown, _ = expect_ok("show")
 assert shown["implementation"] == implementation
-assert implementation["sha256"].encode() not in tool_bytes, "tool must not hold its own pin"
-assert digest(capture_contract_bytes).encode() not in tool_bytes
-assert not any(value == implementation["sha256"] for value in vars(C).values())
-assert not any(
-    type(value) is str and C.HEX256.fullmatch(value) for value in vars(C).values()
-), "no stored digest in the tool"
+loader_bytes = (repo / "tools/myron-collect").read_bytes()
+for held in (tool_bytes, loader_bytes):
+    assert implementation["sha256"].encode() not in held, "no source file holds the pin"
+    assert digest(capture_contract_bytes).encode() not in held
+assert [name for name, value in vars(C).items()
+        if type(value) is str and C.HEX256.fullmatch(value)] == ["CAPTURED_IMPLEMENTATION_SHA256"], \
+    "the only digest in the namespace is the loader's capture"
 contract_tamper("contract implementation hash changed",
                 lambda v: v["implementation"].update(sha256="0" * 64))
 contract_tamper("contract implementation dropped", lambda v: v.pop("implementation"))
@@ -1422,7 +1430,7 @@ contract_tamper("contract implementation path changed",
                 lambda v: v["implementation"].update(path="tools/other"))
 contract_tamper("contract implementation algorithm changed",
                 lambda v: v["implementation"].update(algorithm="none"))
-ok("capture contract and plan bind the SHA-256 of the collector's file bytes, held nowhere in the tool")
+ok("capture contract and plan bind the SHA-256 of the captured implementation bytes, held in no source file")
 
 
 def tool_copy(name, edit=None):
@@ -1431,13 +1439,13 @@ def tool_copy(name, edit=None):
     (base / "packages").mkdir()
     for part in ["tools", *(f"packages/{p.name}" for p in (repo / "packages").glob("omamobile-myron-*"))]:
         shutil.copytree(repo / part, base / part, ignore=shutil.ignore_patterns("__pycache__"))
-    source = base / "tools/myron-collect"
+    source = base / "tools/lib/myron-collect-impl.py"
     if edit is not None:
         text = source.read_text()
         edited = edit(text)
         assert edited != text, f"{name}: edit changed nothing"
         source.write_text(edited)
-    return base, load(f"collect_copy_{counter[0]}", source)
+    return base, load(f"collect_copy_{counter[0]}", base / "tools/myron-collect")
 
 
 def refuses(module, label):
@@ -1480,6 +1488,192 @@ except Exception as error:
 else:
     raise AssertionError("a collector outside its pinned path produced a pin")
 ok("a collector that runs from another path cannot produce the pin")
+
+# 5. Phase 2.12 R3 review fixes: the hashed bytes are the executed bytes, and depth
+# is refused before anything renders.
+import subprocess
+
+R6_SPEC = READS[OPERATION_IDS.index(R6)]
+MIB = 1024 * 1024
+free_over_total = copy.deepcopy(DATA[R6])
+free_over_total.update(rounded_total_bytes=1 * MIB, rounded_free_bytes=2 * MIB)
+free_over_total_raw = D.render_json(operation_document(R6, data=free_over_total))
+try:
+    C.validate_operation(free_over_total_raw, R6_SPEC, request_sha256, envs.identity)
+except C.CollectError:
+    pass
+else:
+    raise AssertionError("the reviewed collector accepted free over total")
+r6_edit = lambda text: text.replace("or free > total:", ":", 1)
+
+# Reviewer exploit: load a modified validator, restore the original path, claim the old pin.
+base, modified = tool_copy("impl-restore", r6_edit)
+impl_copy = base / "tools/lib/myron-collect-impl.py"
+modified_sha = digest(impl_copy.read_bytes())
+assert modified_sha != implementation["sha256"]
+modified.validate_operation(free_over_total_raw, R6_SPEC, request_sha256, envs.identity)
+impl_copy.write_bytes(tool_bytes)
+assert digest(impl_copy.read_bytes()) == implementation["sha256"], "the path is restored"
+assert modified.validate_operation(  # the modified bytes are still the ones executing
+    free_over_total_raw, R6_SPEC, request_sha256, envs.identity)
+assert modified.implementation_binding()["sha256"] == modified_sha != implementation["sha256"]
+refuses(modified, "a modified validator with its path restored")
+restored = load("collect_restored", base / "tools/myron-collect")
+assert restored.implementation_binding() == implementation, "a fresh load of the restored bytes is the old pin"
+try:
+    restored.validate_operation(free_over_total_raw, R6_SPEC, request_sha256, envs.identity)
+except restored.CollectError:
+    pass
+else:
+    raise AssertionError("restored bytes still accept free over total")
+ok("a loaded modified validator with its path restored cannot claim the old pin")
+
+# The path is swapped to a different inode while the capture is reading.
+base, _ = tool_copy("impl-swap", r6_edit)
+impl_copy = base / "tools/lib/myron-collect-impl.py"
+modified_sha = digest(impl_copy.read_bytes())
+real_read, real_open, opened, swapped = os.read, os.open, [], []
+
+
+def swapping_read(descriptor, count):
+    if not swapped:
+        swapped.append(True)
+        replacement = impl_copy.with_name("swap.tmp")
+        replacement.write_bytes(tool_bytes)
+        replacement.chmod(0o644)
+        os.replace(replacement, impl_copy)
+    return real_read(descriptor, count)
+
+
+def counting_open(path, *a, **kw):
+    opened.append(os.fspath(path))
+    return real_open(path, *a, **kw)
+
+
+os.read, os.open = swapping_read, counting_open
+try:
+    swapped_module = load("collect_swapped", base / "tools/myron-collect")
+finally:
+    os.read, os.open = real_read, real_open
+assert swapped, "the swap fired"
+assert digest(impl_copy.read_bytes()) == implementation["sha256"]
+assert swapped_module.implementation_binding()["sha256"] == modified_sha
+swapped_module.validate_operation(free_over_total_raw, R6_SPEC, request_sha256, envs.identity)
+assert opened.count("myron-collect-impl.py") == 1, opened
+ok("path replacement during the capture changes neither the hashed nor the executed bytes")
+
+
+def reopen_refused(*a, **kw):
+    raise AssertionError("the implementation path was reopened after the capture")
+
+
+import builtins
+saved = builtins.open, os.open, Path.open, Path.read_bytes
+builtins.open = os.open = Path.open = Path.read_bytes = reopen_refused
+try:
+    assert swapped_module.implementation_binding()["sha256"] == modified_sha
+finally:
+    builtins.open, os.open, Path.open, Path.read_bytes = saved
+ok("the pin is answered from the captured bytes without opening any path")
+
+
+def loader_refuses(label, damage, match):
+    base, _ = tool_copy("impl-loader")
+    damage(base / "tools/lib/myron-collect-impl.py")
+    try:
+        load(f"collect_bad_{counter[0]}", base / "tools/myron-collect")
+    except ImportError as error:
+        assert match in str(error), (label, error)
+    else:
+        raise AssertionError(f"{label}: the loader accepted it")
+    result = subprocess.run([sys.executable, "-I", str(base / "tools/myron-collect"), "show"],
+                            capture_output=True, text=True)
+    assert result.returncode == 1 and result.stderr.startswith("ERROR: ") and not result.stdout, label
+    ok(f"the loader refuses {label}")
+
+
+def to_symlink(path):
+    target = path.with_name("target.py")
+    path.rename(target)
+    path.symlink_to(target)
+
+
+def to_fifo(path):
+    path.unlink()
+    os.mkfifo(path)
+
+
+loader_refuses("an implementation that is a symlink", to_symlink, "cannot read")
+loader_refuses("an implementation that is not a regular file", to_fifo, "not a regular file")
+loader_refuses("a group-writable implementation", lambda path: path.chmod(0o664), "writable by others")
+loader_refuses("an oversize implementation",
+               lambda path: path.write_bytes(b"#" * (1024 * 1024 + 1)), "byte bound")
+loader_refuses("a missing implementation", lambda path: path.unlink(), "cannot read")
+
+# Over-depth documents never reach the canonical renderer.
+renders = []
+real_render = D.render_json
+
+
+def counting_render(value):
+    if type(value) is dict and type(value.get("data")) is list:  # only the hostile document
+        renders.append(True)
+    return real_render(value)
+
+
+def deep(levels):
+    return b'{"data": ' + b"[" * levels + b"]" * levels + b"}"
+
+
+def refused_before_render(label, call, levels):
+    renders.clear()
+    try:
+        call()
+    except C.CollectError as error:
+        assert "nests too deeply" in str(error), (label, error)
+    else:
+        raise AssertionError(f"{label}: over-depth document accepted")
+    assert not renders, f"{label}: the renderer ran on a {levels}-deep document"
+
+
+big_spec = {**READS[0], "max_bytes": 1024 * 1024}
+for levels in (C.MAX_DEPTH + 1, C.PLAN_MAX_DEPTH + 1, 800):
+    raw = deep(levels)
+    assert len(raw) < 1024 * 1024
+    manifest_capture = fresh("deep-manifest") / "capture"
+    write_capture(manifest_capture)
+    (manifest_capture / "capture.json").write_bytes(raw)
+    plan_path = fresh("deep-plan") / "plan.json"
+    plan_path.write_bytes(raw)
+
+    def verify_plan():
+        code, _out, err = invoke("verify-plan", "--request", request, "--plan", plan_path)
+        assert code != 0, "plan: over-depth document accepted"
+        if "nests too deeply" not in err:
+            raise AssertionError(err)
+        raise C.CollectError("nests too deeply")
+
+    D.render_json = counting_render
+    try:
+        refused_before_render("operation", lambda: C.validate_operation(
+            raw, big_spec, request_sha256, envs.identity), levels)
+        refused_before_render("manifest", lambda: C.read_capture(
+            str(manifest_capture), envs, request_document, request_sha256), levels)
+        if levels > C.PLAN_MAX_DEPTH:
+            refused_before_render("plan", verify_plan, levels)
+    finally:
+        D.render_json = real_render
+    ok(f"a {levels}-deep operation and manifest (and plan, past its bound) are refused before the canonical renderer runs")
+
+edge = {"a": [[[[[[[{}]]]]]]]}  # depth 8: allowed
+C.check_json_depth(edge, "edge")
+try:
+    C.check_json_depth({"a": [[[[[[[[{}]]]]]]]]}, "edge")
+except C.CollectError:
+    pass
+else:
+    raise AssertionError("depth 9 accepted")
+ok("the depth check accepts depth 8 and refuses depth 9")
 
 PY
 
