@@ -40,6 +40,12 @@ Canonical reference metadata is
 105 pinned asset records: 98 stock-extracted inputs, six source-built outputs,
 and one repository-generated manifest.
 
+`tools/myron-deployment` 0.2.0 can bind the required `gpu`, `wifi` and `touch`
+stock-extracted rows of that manifest into kit evidence by hashes only. That is
+not provisioning, extraction, redistribution clearance, ABI or hardware
+qualification; no private bytes or manifest are copied, and no real runtime tree
+has been bound.
+
 ## GPU firmware observed live
 
 The following required names existed under `/usr/lib/firmware`:

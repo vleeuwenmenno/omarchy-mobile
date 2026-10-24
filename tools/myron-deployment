@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Laptop-only, non-flashable Myron deployment-candidate kit (v0.1).
+"""Laptop-only, non-flashable Myron deployment-candidate kit (v0.2).
 
 Stages the exact qualified external module overlay and binds a rootfs stage,
 the kernel contract, the GPU profile and the private runtime-asset manifest
-identity into one deterministic kit directory. It never authorizes deployment:
-the gate prints the permanent blockers and refuses. Nothing here is bootable,
-flashable, an image, an atomic-snapshot proof, or hardware-qualified.
+identity into one deterministic kit directory. Since 0.2.0 a kit also records
+runtime_assets evidence: either "not-bound" (explicit --runtime-assets none) or
+a "verified" closure of the required stock-extracted runtime files, bound by
+hashes only from one pinned walk of a canonical runtime root. Binding is not
+provisioning, extraction, redistribution, ABI or hardware qualification, and
+it never clears a blocker. The tool never authorizes deployment: the gate
+prints the permanent blockers and refuses. Nothing here is bootable, flashable,
+an image, an atomic-snapshot proof, or hardware-qualified.
 
 No external command is run and nothing outside the requested output is
-written. Inputs are only read; the rootfs stage is bound, never copied.
+written. Inputs are only read; the rootfs stage and the runtime assets (and
+their manifest) are bound by hash, never copied.
 """
 
 from __future__ import annotations
@@ -22,20 +28,22 @@ if __name__ == "__main__":  # never import a module planted beside the tool
     sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _here]
 
 import argparse
+import csv
 import ctypes
 import fnmatch
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 from typing import NamedTuple
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = Path(__file__).resolve().parent.parent
 KERNEL_VERIFIER = REPO / "packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify"
 GPU_VERIFIER = REPO / "packages/omamobile-myron-gpu-profile/bin/omamobile-myron-gpu-profile"
@@ -46,7 +54,17 @@ DEPLOYMENT_CONTRACT_PATH = "device/myron/deployment-contract.json"
 
 HEX256 = re.compile(r"[0-9a-f]{64}")
 MAX_SMALL_BYTES = 1024 * 1024
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024  # mirrors the kernel verifier
+MANIFEST_FIELDS = ["target", "sha256", "provenance", "redistribution", "feature"]
+MANIFEST_FEATURE = re.compile(r"[a-z0-9][a-z0-9-]*")
+MANIFEST_POLICY = {
+    "stock-extracted": "extract-only", "source-built": "build-output", "repo-generated": "source",
+}
 ROOTFS_DIGEST_ALGORITHM = "myron-rootfs-tree-v1-sha256"
+RUNTIME_DIGEST_ALGORITHM = "myron-runtime-assets-v1-sha256"
+RUNTIME_TARGET_PREFIX = "/usr/local/lib/myron-"
+RUNTIME_NONE = "none"
+MODE_TEXT = re.compile(r"[0-7]{4}")
 KIT_KIND = "myron-deployment-candidate-kit"
 CONTRACT_KIND = "myron-deployment-candidate-contract"
 
@@ -115,6 +133,18 @@ class Limits(NamedTuple):
 
 STAGE_LIMITS = Limits(64, 12, 256 * 1024 * 1024, 256 * 1024 * 1024)
 ROOTFS_LIMITS = Limits(2_000_000, 128, 8 * 1024**3, 64 * 1024**3)
+RUNTIME_LIMITS = Limits(256, 12, 256 * 1024 * 1024, 1024 * 1024 * 1024)
+
+
+class RuntimeInput(NamedTuple):
+    root: str | None  # None: explicit "none" (not bound)
+    manifest: str | None
+
+
+class ManifestHandle(NamedTuple):
+    pinned: int
+    identity: tuple
+    parent_identity: tuple[int, int]
 
 
 class Entry(NamedTuple):
@@ -404,7 +434,19 @@ def read_file(path: str, label: str, limit: int) -> bytes:
 
 
 def fingerprint(value) -> tuple:
-    return (value.st_dev, value.st_ino, value.st_nlink, value.st_mtime_ns, value.st_ctime_ns)
+    return (
+        value.st_dev, value.st_ino, value.st_nlink, value.st_mode, value.st_uid, value.st_gid,
+        value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+
+
+def untrusted_owner_or_mode(value) -> bool:
+    return value.st_uid not in {0, os.geteuid()} or bool(stat.S_IMODE(value.st_mode) & 0o022)
+
+
+def identity_fields(value) -> tuple:
+    """What a preliminary lstat and the opened descriptor must agree on."""
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid, value.st_nlink)
 
 
 def walk_tree(
@@ -422,10 +464,16 @@ def walk_tree(
     state = {"count": 0, "bytes": 0, "captured": 0}
     directory_ids = {(root_stat.st_dev, root_stat.st_ino)}
 
-    def visit(directory: int, prefix: str, depth: int) -> None:
+    def visit(directory: int, prefix: str, depth: int, opened_snapshot) -> None:
         if depth > limits.depth:
             raise DeploymentError(f"{label} exceeds the depth bound")
         before = os.fstat(directory)
+        if fingerprint(before) != fingerprint(opened_snapshot):
+            raise DeploymentError(f"{label} directory changed before traversal: /{prefix}")
+        if trusted_ownership and untrusted_owner_or_mode(before):
+            raise DeploymentError(
+                f"{label} entry is writable or controlled by another user: /{prefix}"
+            )
         try:
             names = []
             with os.scandir(directory) as children:
@@ -462,10 +510,7 @@ def walk_tree(
                     raise DeploymentError(f"{label} symlink /{relative} has a non-UTF-8 target") from error
                 entries.append(Entry(relative, "symlink", stat.S_IMODE(mode), 0, "", target))
             elif stat.S_ISDIR(mode):
-                if trusted_ownership and (
-                    metadata.st_uid not in {0, os.geteuid()}
-                    or stat.S_IMODE(metadata.st_mode) & 0o022
-                ):
+                if trusted_ownership and untrusted_owner_or_mode(metadata):
                     raise DeploymentError(
                         f"{label} entry is writable or controlled by another user: /{relative}"
                     )
@@ -475,20 +520,21 @@ def walk_tree(
                     raise DeploymentError(f"{label} directory /{relative} cannot be opened safely") from error
                 try:
                     opened = os.fstat(child)
-                    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    if identity_fields(opened) != identity_fields(metadata):
                         raise DeploymentError(f"{label} directory /{relative} changed while being opened")
+                    if trusted_ownership and untrusted_owner_or_mode(opened):
+                        raise DeploymentError(
+                            f"{label} entry is writable or controlled by another user: /{relative}"
+                        )
                     if k.mount_id_for_fd(child, f"{label} /{relative}") != root_mount:
                         raise DeploymentError(f"{label} crosses a mount point at /{relative}")
                     directory_ids.add((opened.st_dev, opened.st_ino))
                     entries.append(Entry(relative, "dir", stat.S_IMODE(opened.st_mode), 0, "", ""))
-                    visit(child, relative + "/", depth + 1)
+                    visit(child, relative + "/", depth + 1, opened)
                 finally:
                     os.close(child)
             elif stat.S_ISREG(mode):
-                if trusted_ownership and (
-                    metadata.st_uid not in {0, os.geteuid()}
-                    or stat.S_IMODE(metadata.st_mode) & 0o022
-                ):
+                if trusted_ownership and untrusted_owner_or_mode(metadata):
                     raise DeploymentError(
                         f"{label} entry is writable or controlled by another user: /{relative}"
                     )
@@ -505,10 +551,12 @@ def walk_tree(
             pinned, descriptor, opened = open_pinned_regular_at(
                 directory, name, f"{label} file /{relative}"
             )
-            if (opened.st_dev, opened.st_ino) != (
-                metadata.st_dev, metadata.st_ino
-            ):
+            if identity_fields(opened) != identity_fields(metadata):
                 raise DeploymentError(f"{label} file /{relative} changed while being opened")
+            if trusted_ownership and untrusted_owner_or_mode(opened):
+                raise DeploymentError(
+                    f"{label} entry is writable or controlled by another user: /{relative}"
+                )
             if opened.st_nlink != 1:
                 raise DeploymentError(f"{label} file /{relative} has additional hard links")
             if k.mount_id_for_fd(pinned, f"{label} /{relative}") != root_mount:
@@ -544,9 +592,7 @@ def walk_tree(
             if os.read(descriptor, 1):
                 raise DeploymentError(f"{label} file /{relative} grew while being read")
             closing = os.fstat(descriptor)
-            if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (
-                closing.st_size, closing.st_mtime_ns, closing.st_ctime_ns
-            ):
+            if fingerprint(opened) != fingerprint(closing):
                 raise DeploymentError(f"{label} file /{relative} changed while being read")
         finally:
             if descriptor >= 0:
@@ -560,7 +606,7 @@ def walk_tree(
             data[relative] = b"".join(chunks)
 
     try:
-        visit(root_fd, "", 0)
+        visit(root_fd, "", 0, root_stat)
     except OSError as error:
         raise DeploymentError(f"{label} scan failed: {error.strerror}") from error
     entries.sort(key=lambda entry: (entry.path != ".", entry.path.encode("utf-8")))
@@ -1076,6 +1122,347 @@ def check_collisions(index: dict, contracts: Contracts) -> None:
             raise DeploymentError(f"rootfs ancestor of the module overlay is not a real directory: {ancestor}")
 
 
+# --- private runtime-asset binding (hashes only) -----------------------------------
+
+
+def runtime_input(assets: str, manifest: str | None) -> RuntimeInput:
+    if assets == RUNTIME_NONE:
+        if manifest is not None:
+            raise DeploymentError("--runtime-manifest is only valid with a --runtime-assets directory")
+        return RuntimeInput(None, None)
+    split_canonical(assets, "runtime assets root")
+    if manifest is None:
+        raise DeploymentError("--runtime-assets DIR requires --runtime-manifest")
+    split_canonical(manifest, "runtime manifest")
+    return RuntimeInput(assets, manifest)
+
+
+def paths_overlap(first: str, second: str) -> bool:
+    return first == second or first.startswith(second + "/") or second.startswith(first + "/")
+
+
+def check_runtime_scope(runtime: RuntimeInput, others: dict) -> None:
+    """The runtime root and manifest must not nest in or equal any other path."""
+    if runtime.root is None:
+        return
+    if paths_overlap(runtime.root, runtime.manifest):
+        raise DeploymentError("runtime asset manifest overlaps the runtime asset root")
+    for label, path in others.items():
+        for name, own in (("root", runtime.root), ("manifest", runtime.manifest)):
+            if own is not None and paths_overlap(own, path):
+                raise DeploymentError(f"runtime asset {name} overlaps the {label}")
+
+
+def check_runtime_alias(
+    runtime_ids: frozenset, manifest_parent_ids: frozenset, others: frozenset
+) -> None:
+    if runtime_ids & others:
+        raise DeploymentError("runtime asset root aliases a directory of another input or output tree")
+    if manifest_parent_ids & (runtime_ids | others):
+        raise DeploymentError("runtime asset manifest parent aliases a directory of another input tree")
+
+
+def runtime_digest(manifest_sha256: str, features: list, files: list) -> str:
+    digest = hashlib.sha256(RUNTIME_DIGEST_ALGORITHM.encode("ascii") + b"\n")
+    digest.update(f"manifest\t{manifest_sha256}\n".encode("ascii"))
+    digest.update(f"features\t{','.join(features)}\n".encode("ascii"))
+    for row in files:
+        line = (
+            f"file\t{row['mode']}\t{row['size']}\t{row['sha256']}\t{row['feature']}"
+            f"\t{row['provenance']}\t{json.dumps(row['target'])}\n"
+        )
+        digest.update(line.encode("ascii"))
+    return digest.hexdigest()
+
+
+def runtime_identity(contracts: Contracts) -> dict:
+    runtime = contracts.deployment["runtime"]
+    return {
+        "algorithm": RUNTIME_DIGEST_ALGORITHM,
+        "manifest_sha256": runtime["manifest_sha256"],
+        "required_features": list(runtime["required_features"]),
+        "bytes_copied_into_kit": False,
+    }
+
+
+def runtime_evidence_none(contracts: Contracts) -> dict:
+    return {**runtime_identity(contracts), "status": "not-bound", "asset_count": 0, "files": [], "digest": None}
+
+
+def open_trusted_manifest(
+    path: str,
+) -> tuple[int, int, os.stat_result, tuple[int, int]]:
+    """Open a manifest through trusted no-follow ancestry and pin its inode."""
+    parts = split_canonical(path, "runtime manifest")
+    parent = open_trusted_output_parent(parts[:-1], "runtime manifest parent")
+    pinned = descriptor = -1
+    try:
+        pinned, descriptor, opened = open_pinned_regular_at(
+            parent, parts[-1], f"runtime asset manifest: {path}"
+        )
+        pinned_metadata = os.fstat(pinned)
+        if identity_fields(pinned_metadata) != identity_fields(opened):
+            raise DeploymentError("runtime asset manifest changed while being opened")
+        trusted_parent_entry(parent, opened, "runtime asset manifest")
+        if untrusted_owner_or_mode(opened):
+            raise DeploymentError("runtime asset manifest is writable or controlled by another user")
+        if opened.st_nlink != 1:
+            raise DeploymentError("runtime asset manifest has additional hard links")
+        parent_mount = kernel().mount_id_for_fd(parent, "runtime manifest parent")
+        if kernel().mount_id_for_fd(pinned, "runtime manifest") != parent_mount:
+            raise DeploymentError("runtime asset manifest crosses a file mount point")
+        parent_metadata = os.fstat(parent)
+        return pinned, descriptor, opened, (parent_metadata.st_dev, parent_metadata.st_ino)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if pinned >= 0:
+            os.close(pinned)
+        raise
+    finally:
+        os.close(parent)
+
+
+def parse_runtime_manifest_bytes(data: bytes, expected_hash: str) -> list[dict[str, str]]:
+    """Parse the kernel contract's TSV schema from one captured byte string."""
+    actual_hash = sha256_bytes(data)
+    if actual_hash != expected_hash:
+        raise DeploymentError(
+            f"runtime asset manifest SHA-256 differs: expected {expected_hash}, got {actual_hash}"
+        )
+    try:
+        stream = io.StringIO(data.decode("utf-8"), newline="")
+        reader = csv.DictReader(stream, delimiter="\t")
+        if reader.fieldnames != MANIFEST_FIELDS:
+            raise DeploymentError("runtime asset manifest header differs")
+        rows = list(reader)
+    except (UnicodeDecodeError, csv.Error) as error:
+        raise DeploymentError(f"cannot read runtime asset manifest: {error}") from error
+    if not rows:
+        raise DeploymentError("runtime asset manifest is empty")
+    seen: set[str] = set()
+    for number, row in enumerate(rows, 2):
+        if set(row) != set(MANIFEST_FIELDS) or any(value is None for value in row.values()):
+            raise DeploymentError(f"runtime asset column count differs on line {number}")
+        target = row["target"]
+        target_path = PurePosixPath(target)
+        if (
+            not target_path.is_absolute()
+            or ".." in target_path.parts
+            or target in seen
+            or not target.startswith(("/usr/lib/", "/usr/local/", "/usr/sbin/"))
+        ):
+            raise DeploymentError(f"unsafe or duplicate runtime target on line {number}")
+        if not HEX256.fullmatch(row["sha256"]):
+            raise DeploymentError(f"invalid runtime hash on line {number}")
+        if not MANIFEST_FEATURE.fullmatch(row["feature"]):
+            raise DeploymentError(f"invalid runtime feature on line {number}")
+        if row["provenance"] not in MANIFEST_POLICY:
+            raise DeploymentError(f"invalid runtime provenance on line {number}")
+        if row["redistribution"] != MANIFEST_POLICY[row["provenance"]]:
+            raise DeploymentError(f"invalid redistribution policy on line {number}")
+        seen.add(target)
+    return rows
+
+
+def capture_runtime_manifest(path: str, expected_hash: str) -> tuple[list[dict[str, str]], ManifestHandle]:
+    pinned, descriptor, before, parent_identity = open_trusted_manifest(path)
+    try:
+        if before.st_size > MAX_MANIFEST_BYTES:
+            raise DeploymentError(
+                f"runtime asset manifest exceeds the {MAX_MANIFEST_BYTES}-byte safety limit"
+            )
+        chunks, remaining = [], before.st_size
+        while remaining:
+            block = os.read(descriptor, min(1024 * 1024, remaining))
+            if not block:
+                raise DeploymentError("runtime asset manifest changed size while being read")
+            chunks.append(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise DeploymentError("runtime asset manifest changed size while being read")
+        after = os.fstat(descriptor)
+        if fingerprint(before) != fingerprint(after):
+            raise DeploymentError("runtime asset manifest changed while being read")
+        rows = parse_runtime_manifest_bytes(b"".join(chunks), expected_hash)
+        return rows, ManifestHandle(pinned, fingerprint(before), parent_identity)
+    except BaseException:
+        os.close(pinned)
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def recheck_runtime_manifest(path: str, handle: ManifestHandle) -> None:
+    if fingerprint(os.fstat(handle.pinned)) != handle.identity:
+        raise DeploymentError("runtime asset manifest changed during verification")
+    pinned = descriptor = -1
+    try:
+        pinned, descriptor, current, parent_identity = open_trusted_manifest(path)
+        if fingerprint(current) != handle.identity or parent_identity != handle.parent_identity:
+            raise DeploymentError("runtime asset manifest changed during verification")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if pinned >= 0:
+            os.close(pinned)
+
+
+def runtime_selection(
+    contracts: Contracts, manifest_path: str
+) -> tuple[list[dict], ManifestHandle]:
+    """The pinned manifest's rows of every required feature, fail closed."""
+    runtime = contracts.deployment["runtime"]
+    rows, handle = capture_runtime_manifest(manifest_path, runtime["manifest_sha256"])
+    features = runtime["required_features"]
+    try:
+        for feature in features:
+            if not any(row["feature"] == feature for row in rows):
+                raise DeploymentError(f"runtime manifest has no row for required feature: {feature}")
+        selected = [row for row in rows if row["feature"] in features]
+        for row in selected:
+            split_canonical(row["target"], "runtime target")
+            if not row["target"].startswith(RUNTIME_TARGET_PREFIX):
+                raise DeploymentError(
+                    f"required runtime target is outside {RUNTIME_TARGET_PREFIX}*: {row['target']}"
+                )
+            if row["provenance"] != "stock-extracted" or row["redistribution"] != "extract-only":
+                raise DeploymentError(
+                    f"required runtime row is not stock-extracted and extract-only: {row['target']}"
+                )
+        targets = sorted(row["target"] for row in selected)
+        for target in targets:
+            if any(other.startswith(target + "/") for other in targets):
+                raise DeploymentError(f"required runtime target is an ancestor of another: {target}")
+        return selected, handle
+    except BaseException:
+        os.close(handle.pinned)
+        raise
+
+
+def inspect_runtime(
+    contracts: Contracts, runtime: RuntimeInput
+) -> tuple[dict, frozenset, frozenset]:
+    """Evidence for the required closure, derived from one captured walk.
+
+    Hashes and sizes come only from the walk of the pinned root; nothing is
+    reopened per file and no byte is retained."""
+    selected, manifest_handle = runtime_selection(contracts, runtime.manifest)
+    try:
+        wanted = {row["target"].lstrip("/"): row for row in selected}
+        ancestors = {"."}
+        for path in wanted:
+            parts = path.split("/")
+            ancestors.update("/".join(parts[:number]) for number in range(1, len(parts)))
+        descriptor, identity = open_trusted_artifact(runtime.root, "runtime assets root")
+        try:
+            tree = walk_tree(
+                descriptor, RUNTIME_LIMITS, allow_symlinks=False, trusted_ownership=True,
+                label="runtime assets",
+            )
+        finally:
+            os.close(descriptor)
+        files = {entry.path: entry for entry in tree.entries if entry.kind == "file"}
+        dirs = {entry.path for entry in tree.entries if entry.kind == "dir"}
+        extra = sorted(set(files) - set(wanted))
+        if extra:
+            raise DeploymentError(f"runtime assets contain unlisted or optional files: {extra}")
+        missing = sorted(set(wanted) - set(files))
+        if missing:
+            raise DeploymentError(f"runtime assets are missing required files: {missing}")
+        if dirs != ancestors:
+            raise DeploymentError("runtime assets directory set differs from the required closure")
+        rows = []
+        for path in sorted(wanted, key=lambda item: item.encode("utf-8")):
+            entry, row = files[path], wanted[path]
+            if entry.sha256 != row["sha256"]:
+                raise DeploymentError(f"runtime asset SHA-256 differs: {row['target']}")
+            rows.append({
+                "target": row["target"], "sha256": entry.sha256, "size": entry.size,
+                "mode": f"{entry.mode:04o}", "feature": row["feature"],
+                "provenance": row["provenance"],
+            })
+        recheck_trusted_artifact(runtime.root, identity, "runtime assets root")
+        recheck_runtime_manifest(runtime.manifest, manifest_handle)
+    finally:
+        os.close(manifest_handle.pinned)
+    features = list(contracts.deployment["runtime"]["required_features"])
+    manifest_sha256 = contracts.deployment["runtime"]["manifest_sha256"]
+    evidence = {
+        **runtime_identity(contracts), "status": "verified", "asset_count": len(rows), "files": rows,
+        "digest": runtime_digest(manifest_sha256, features, rows),
+    }
+    return evidence, tree.directory_ids, frozenset({manifest_handle.parent_identity})
+
+
+def bind_runtime(
+    contracts: Contracts, runtime: RuntimeInput
+) -> tuple[dict, frozenset, frozenset]:
+    if runtime.root is None:
+        return runtime_evidence_none(contracts), frozenset(), frozenset()
+    return inspect_runtime(contracts, runtime)
+
+
+def validate_runtime_evidence(value, contracts: Contracts) -> dict:
+    """Strictly validate recorded runtime_assets evidence; return it unchanged."""
+    k = kernel()
+    identity = runtime_identity(contracts)
+    keys = {*identity, "status", "asset_count", "files", "digest"}
+    if type(value) is not dict:
+        raise DeploymentError("kit runtime_assets fields differ")
+    for flag in AUTHORITY_FLAGS:
+        if flag in value and value[flag] is not False:
+            raise DeploymentError(f"kit claims {flag}; deployment authorization is refused")
+    if set(value) != keys:
+        raise DeploymentError("kit runtime_assets fields differ")
+    if value["bytes_copied_into_kit"] is not False:
+        raise DeploymentError("kit runtime_assets bytes_copied_into_kit must be false")
+    for key, expected in identity.items():
+        if not k.strict_equal(value[key], expected):
+            raise DeploymentError(f"kit runtime_assets differs at {key}")
+    count, files = value["asset_count"], value["files"]
+    if type(count) is not int or type(files) is not list or count != len(files):
+        raise DeploymentError("kit runtime_assets count differs from its files")
+    if value["status"] == "not-bound":
+        if count != 0 or value["digest"] is not None:
+            raise DeploymentError("kit runtime_assets not-bound evidence must be empty")
+        return value
+    if value["status"] != "verified" or count < 1:
+        raise DeploymentError("kit runtime_assets status differs")
+    features = identity["required_features"]
+    row_keys = {"target", "sha256", "size", "mode", "feature", "provenance"}
+    previous = None
+    for row in files:
+        if type(row) is not dict or set(row) != row_keys:
+            raise DeploymentError("kit runtime_assets file fields differ")
+        target = row["target"]
+        if type(target) is not str or not target.startswith(RUNTIME_TARGET_PREFIX):
+            raise DeploymentError("kit runtime_assets file target differs")
+        split_canonical(target, "recorded runtime target")
+        if previous is not None and target.encode("utf-8") <= previous:
+            raise DeploymentError("kit runtime_assets files are not sorted and unique")
+        previous = target.encode("utf-8")
+        if type(row["sha256"]) is not str or not HEX256.fullmatch(row["sha256"]):
+            raise DeploymentError("kit runtime_assets file hash differs")
+        if type(row["size"]) is not int or row["size"] < 0:
+            raise DeploymentError("kit runtime_assets file size differs")
+        if type(row["mode"]) is not str or not MODE_TEXT.fullmatch(row["mode"]):
+            raise DeploymentError("kit runtime_assets file mode differs")
+        if row["feature"] not in features or row["provenance"] != "stock-extracted":
+            raise DeploymentError("kit runtime_assets file feature or provenance differs")
+    if value["digest"] != runtime_digest(identity["manifest_sha256"], features, files):
+        raise DeploymentError("kit runtime_assets digest differs from its files")
+    return value
+
+
+def runtime_report(evidence: dict) -> dict:
+    return {
+        "runtime_status": evidence["status"],
+        "runtime_asset_count": evidence["asset_count"],
+        "runtime_digest": evidence["digest"],
+    }
+
+
 # --- kit layout -----------------------------------------------------------------
 
 
@@ -1098,7 +1485,9 @@ STATUS_TEXT = (
 ).encode("ascii")
 
 
-def kit_spec(contracts: Contracts, module_files: list[dict], overlay: dict, binding: dict) -> list:
+def kit_spec(
+    contracts: Contracts, module_files: list[dict], overlay: dict, binding: dict, runtime_assets: dict
+) -> list:
     """The exact kit as (path, kind, mode, bytes-or-None), parents first."""
     files = {
         "contracts/deployment-contract.json": contracts.deployment_bytes,
@@ -1128,6 +1517,7 @@ def kit_spec(contracts: Contracts, module_files: list[dict], overlay: dict, bind
         },
         "rootfs": binding,
         "runtime": contracts.deployment["runtime"],
+        "runtime_assets": runtime_assets,
         "status": status_document(),
     }
     files["kit.json"] = render_json(document)
@@ -1526,13 +1916,23 @@ def require_archive_plan(contracts: Contracts, assets: str, module_files: list[d
 
 
 def command_assemble(
-    contracts: Contracts, rootfs: str, manifest: str, module_stage: str, out: str, assets: str
+    contracts: Contracts, rootfs: str, manifest: str, module_stage: str, out: str, assets: str,
+    runtime: RuntimeInput,
 ) -> dict:
+    check_runtime_scope(runtime, {
+        "rootfs stage": rootfs, "rootfs manifest": manifest, "module stage": module_stage,
+        "module archive": assets, "output": out,
+    })
     binding, _, rootfs_directory_ids = check_rootfs(rootfs, manifest, contracts)
     tree, module_files = read_module_stage(contracts, module_stage, "module stage")
     require_archive_plan(contracts, assets, module_files)
+    evidence, runtime_ids, manifest_parent_ids = bind_runtime(contracts, runtime)
+    check_runtime_alias(
+        runtime_ids, manifest_parent_ids,
+        frozenset(set(rootfs_directory_ids) | set(tree.directory_ids)),
+    )
     overlay = {"/" + path: data for path, data in tree.data.items()}
-    spec = kit_spec(contracts, module_files, overlay, binding)
+    spec = kit_spec(contracts, module_files, overlay, binding, evidence)
     expected = spec_entries(spec)
 
     def verify_built(temporary_path: str, descriptor: int) -> None:
@@ -1541,8 +1941,8 @@ def command_assemble(
 
     publish(
         out,
-        [rootfs, module_stage],
-        frozenset(set(rootfs_directory_ids) | set(tree.directory_ids)),
+        [rootfs, module_stage, *([runtime.root] if runtime.root else [])],
+        frozenset(set(rootfs_directory_ids) | set(tree.directory_ids) | set(runtime_ids)),
         spec,
         verify_built,
     )
@@ -1553,11 +1953,12 @@ def command_assemble(
         "module_files": len(module_files),
         "rootfs_digest": binding["digest"],
         "archive_proven": True,
+        **runtime_report(evidence),
         "deployment_authorized": False,
     }
 
 
-def reject_authority_claims(tree: Tree) -> None:
+def reject_authority_claims(tree: Tree, contracts: Contracts) -> dict:
     for relative in ("status.json", "kit.json"):
         if relative not in tree.data:
             continue
@@ -1572,10 +1973,19 @@ def reject_authority_claims(tree: Tree) -> None:
             raise DeploymentError(f"{relative} blocker list differs from the permanent blockers")
         if set(status) != {"artifact", "blockers", *AUTHORITY_FLAGS}:
             raise DeploymentError(f"{relative} status fields differ")
+    kit_document = strict_json(tree.data["kit.json"], "kit.json") if "kit.json" in tree.data else {}
+    if "runtime_assets" not in kit_document:
+        raise DeploymentError("kit.json has no runtime_assets section")
+    return validate_runtime_evidence(kit_document["runtime_assets"], contracts)
 
 
-def command_verify(contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str) -> dict:
-    binding, _, _ = check_rootfs(rootfs, manifest, contracts)
+def command_verify(
+    contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str, runtime: RuntimeInput
+) -> dict:
+    check_runtime_scope(runtime, {
+        "rootfs stage": rootfs, "rootfs manifest": manifest, "module archive": assets, "kit": kit,
+    })
+    binding, _, rootfs_directory_ids = check_rootfs(rootfs, manifest, contracts)
     descriptor, kit_identity = open_trusted_artifact(kit, "kit")
     try:
         tree = walk_tree(
@@ -1588,7 +1998,14 @@ def command_verify(contracts: Contracts, kit: str, rootfs: str, manifest: str, a
         )
     finally:
         os.close(descriptor)
-    reject_authority_claims(tree)
+    recorded = reject_authority_claims(tree, contracts)
+    kit_bound = recorded["status"] == "verified"
+    if kit_bound and runtime.root is None:
+        raise DeploymentError(
+            "kit binds runtime assets: verify it with --runtime-assets DIR and --runtime-manifest"
+        )
+    if not kit_bound and runtime.root is not None:
+        raise DeploymentError("kit was assembled with runtime assets not-bound: reassemble to bind them")
     overlay_entries = []
     for entry in tree.entries:
         if entry.path == "overlay":
@@ -1603,8 +2020,15 @@ def command_verify(contracts: Contracts, kit: str, rootfs: str, manifest: str, a
         Tree(overlay_entries, overlay_data, 0, frozenset()), contracts
     )
     require_archive_plan(contracts, assets, module_files)
+    evidence, runtime_ids, manifest_parent_ids = bind_runtime(contracts, runtime)
+    check_runtime_alias(
+        runtime_ids, manifest_parent_ids,
+        frozenset(set(rootfs_directory_ids) | set(tree.directory_ids)),
+    )
+    if evidence != recorded:
+        raise DeploymentError("runtime asset evidence differs from the kit")
     overlay = {"/" + path: data for path, data in overlay_data.items()}
-    spec = kit_spec(contracts, module_files, overlay, binding)
+    spec = kit_spec(contracts, module_files, overlay, binding, evidence)
     diff_entries(tree.entries, spec_entries(spec), "kit")
     recheck_trusted_artifact(kit, kit_identity, "kit")
     return {
@@ -1613,12 +2037,15 @@ def command_verify(contracts: Contracts, kit: str, rootfs: str, manifest: str, a
         "module_files": len(module_files),
         "rootfs_digest": binding["digest"],
         "archive_proven": True,
+        **runtime_report(evidence),
         "deployment_authorized": False,
     }
 
 
-def command_gate(contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str) -> dict:
-    verified = command_verify(contracts, kit, rootfs, manifest, assets)
+def command_gate(
+    contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str, runtime: RuntimeInput
+) -> dict:
+    verified = command_verify(contracts, kit, rootfs, manifest, assets, runtime)
     return {
         "artifact_verified": True,
         "deployment_authorized": False,
@@ -1629,6 +2056,7 @@ def command_gate(contracts: Contracts, kit: str, rootfs: str, manifest: str, ass
         "blockers": list(BLOCKERS),
         "kit_sha256": verified["kit_sha256"],
         "archive_proven": True,
+        **{key: verified[key] for key in ("runtime_status", "runtime_asset_count", "runtime_digest")},
     }
 
 
@@ -1645,12 +2073,17 @@ def build_parser() -> argparse.ArgumentParser:
     assemble.add_argument("--module-stage", required=True)
     assemble.add_argument("--assets", required=True, help="qualified module archive")
     assemble.add_argument("--out", required=True)
+    runtime_help = "literal 'none' (not bound) or a canonical absolute runtime-asset root"
+    assemble.add_argument("--runtime-assets", required=True, help=runtime_help)
+    assemble.add_argument("--runtime-manifest", help="pinned runtime manifest TSV; required with a root DIR")
     for name, text in (("verify", "recompute every binding of a kit"), ("gate", "verify, then refuse deployment")):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--kit", required=True)
         sub.add_argument("--rootfs-stage", required=True)
         sub.add_argument("--rootfs-manifest", help="default: <rootfs-stage>.MANIFEST")
         sub.add_argument("--assets", required=True, help="qualified module archive")
+        sub.add_argument("--runtime-assets", required=True, help=runtime_help)
+        sub.add_argument("--runtime-manifest", help="pinned runtime manifest TSV; required with a root DIR")
     return parser
 
 
@@ -1664,12 +2097,16 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
             result = command_stage_modules(contracts, args.assets, args.out)
         elif args.command == "assemble":
             result = command_assemble(
-                contracts, args.rootfs_stage, args.rootfs_manifest, args.module_stage, args.out, args.assets
+                contracts, args.rootfs_stage, args.rootfs_manifest, args.module_stage, args.out, args.assets,
+                runtime_input(args.runtime_assets, args.runtime_manifest),
             )
         else:
             manifest = args.rootfs_manifest or args.rootfs_stage + ".MANIFEST"
             runner = command_verify if args.command == "verify" else command_gate
-            result = runner(contracts, args.kit, args.rootfs_stage, manifest, args.assets)
+            result = runner(
+                contracts, args.kit, args.rootfs_stage, manifest, args.assets,
+                runtime_input(args.runtime_assets, args.runtime_manifest),
+            )
     except handled_errors() as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

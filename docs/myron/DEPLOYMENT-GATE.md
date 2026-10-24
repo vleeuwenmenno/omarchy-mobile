@@ -1,12 +1,15 @@
 <!-- SPDX-License-Identifier: MIT -->
-# Myron deployment gate (Phase 2.5)
+# Myron deployment gate (Phase 2.5, runtime binding 2.7)
 
 Status (2026-10-24): laptop-only, offline, deterministic. `tools/myron-deployment`
 builds and verifies a **deployment-candidate kit** and then **always refuses to
 authorize deployment**. The kit is not bootable, not flashable, not image-ready,
 not an atomic-snapshot proof, not hardware-qualified, and not a deployment
 authorization. No kit has been built from the real qualified archive: `out/repo`
-is empty and the archive and private runtime assets are external.
+is empty and the archive and private runtime assets are external. As of
+`myron-deployment` 0.2.0 the tool can bind a runtime-asset closure by hashes
+only, but **no real runtime tree has been bound**; every real run so far, if any,
+would be `not-bound`.
 
 ## What it binds
 
@@ -38,8 +41,8 @@ components or symlinks. No command runs an external program or `depmod`.
 | --- | --- |
 | `show` | print the validated contract |
 | `stage-modules --assets ARCHIVE --out DIR` | validate archive and contract with the kernel verifier, then write exactly the selector and seven modules (planned paths and modes) |
-| `assemble --rootfs-stage DIR --rootfs-manifest FILE --module-stage DIR --assets ARCHIVE --out DIR` | validate both inputs against the archive, reject collisions, write the kit |
-| `verify --kit DIR --rootfs-stage DIR --assets ARCHIVE [--rootfs-manifest FILE]` | recompute every binding, content, mode and closure |
+| `assemble --rootfs-stage DIR --rootfs-manifest FILE --module-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] --out DIR` | validate both inputs against the archive, bind or explicitly not-bind runtime assets, reject collisions, write the kit |
+| `verify --kit DIR --rootfs-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] [--rootfs-manifest FILE]` | recompute every binding, content, mode and closure, including the runtime evidence |
 | `gate` (same arguments) | `verify`, then print `artifact_verified: true`, `deployment_authorized: false` and the blockers |
 
 The manifest defaults to `<rootfs-stage>.MANIFEST`, the name
@@ -67,8 +70,51 @@ its target paths and modes), `kit.json`, `status.json`, `STATUS.txt` and
 `SHA256SUMS`. The rootfs stays outside: it is bound by a deterministic digest
 (path, type, mode, size, content hash and symlink target of every entry; no
 owner, time or hardlink identity) and by the manifest hash. Runtime assets stay
-outside and are identified by the contract's manifest hash only; no private byte
-is copied. There are no timestamps; two runs give identical bytes.
+outside; the kit holds only the `runtime_assets` evidence described below, never
+a runtime byte or the manifest. There are no timestamps; two runs give identical
+bytes.
+
+## Runtime-asset binding (0.2.0)
+
+`--runtime-assets` is required by `assemble`, `verify` and `gate`: the literal
+`none`, or a canonical absolute runtime root. `--runtime-manifest` (the pinned
+private TSV, canonical absolute path) is required with a root and rejected with
+`none`. `kit.json` (never `status.json`) gets a strict `runtime_assets` object:
+
+- `none` records `status: not-bound`, `asset_count: 0`, `files: []`,
+  `digest: null`, plus the algorithm `myron-runtime-assets-v1-sha256`, the
+  contract's manifest hash and required features, and
+  `bytes_copied_into_kit: false`.
+- A root records `status: verified`, the sorted rows (`target`, `sha256`, `size`,
+  `mode`, `feature`, `provenance`) and a digest over the algorithm, the pinned
+  manifest hash, the required feature order and those rows.
+
+The manifest is opened through trusted, descriptor-relative no-follow ancestry,
+must be singly linked and not group/world-writable, and is parsed from one
+bounded, stable byte capture against the contract's pinned hash using the kernel
+verifier's TSV schema. Its pinned inode and canonical path are rechecked after
+the runtime walk. Its parent-directory identity may not alias the runtime root,
+rootfs, module stage or kit through another path or bind mount. Rows of the
+required features `gpu`, `wifi`, `touch` must each be `stock-extracted` and
+`extract-only` with a target below
+`/usr/local/lib/myron-`; anything else fails closed. Optional rows are ignored
+and must not exist in the tree. The root is read by the existing
+descriptor-confined walk (trusted ancestry and ownership, no symlinks, hardlinks,
+special files, mount or device crossing, no unstable reads; bounds 256 entries,
+depth 12, 256 MiB per file, 1 GiB total). It must contain exactly the selected
+targets and their parent directories. All asset hashes and the digest come from
+that single walk; no asset file is reopened and no byte is retained in the kit.
+
+A kit assembled `verified` is verified or gated only with its root and manifest
+and the evidence must recompute equal; a kit assembled `not-bound` is verified or
+gated only with `none` (a root is rejected: reassemble). The output may not lie
+in, contain or alias the runtime root, its manifest or any other input.
+
+This is hash binding of a tree. It is not provisioning, extraction,
+redistribution clearance, ABI compatibility or hardware qualification. It does
+not clear `private-runtime-asset-bytes-not-bound-to-kit` or reorder any blocker,
+and the gate still refuses. The gate reports `runtime_status`,
+`runtime_asset_count` and `runtime_digest`.
 
 ## Rules enforced
 
@@ -94,7 +140,10 @@ is copied. There are no timestamps; two runs give identical bytes.
   stays external, but every accepted overlay must match its qualified plan.
 - The module order is the public Attempt79/VT staging order; load semantics
   remain unverified. This is not full ABI, import, provider, or load-order proof.
-- The tool reads no runtime asset bytes; they are not bound to the kit.
+- Runtime assets are bound only by hash evidence, and only when a root is
+  supplied; no runtime or manifest byte is copied into the kit, and the kit is
+  not proof that those files are the ones ever deployed. The blocker stays until
+  a real, separately reviewed bound kit and a contract revision say otherwise.
 - The rootfs directory and manifest are ordinary external paths, not an atomic
   filesystem snapshot. They must be quiescent while a command runs. This is why
   `atomic-snapshot-and-rollback-not-proven` remains a permanent blocker.

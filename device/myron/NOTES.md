@@ -42,6 +42,15 @@ bootable, flashable or image-ready, is no atomic-snapshot proof, is not
 hardware-qualified, and is no authorization; no kit has been built from the real
 archive. See [DEPLOYMENT-GATE.md](../../docs/myron/DEPLOYMENT-GATE.md).
 
+Phase 2.7 (`tools/myron-deployment` 0.2.0) adds `--runtime-assets none|DIR`: the
+kit records `runtime_assets` evidence, either `not-bound` or a hash-only
+`verified` closure of the required stock-extracted `gpu`/`wifi`/`touch` files
+(contract and blockers unchanged). Binding is not provisioning, extraction,
+redistribution, ABI or hardware qualification; no private bytes or manifest are
+copied, no real runtime tree has been bound, and
+`private-runtime-asset-bytes-not-bound-to-kit` stays until a real, separately
+reviewed bound kit and contract revision.
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,

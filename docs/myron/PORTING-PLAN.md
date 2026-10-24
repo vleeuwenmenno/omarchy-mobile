@@ -124,6 +124,16 @@ image-ready, an atomic-snapshot proof, hardware-qualified or an authorization
 ([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)). It runs no `depmod` and no external
 command, and nothing has been built from the real archive.
 
+Phase 2.7 (laptop-only, mechanism done): `tools/myron-deployment` 0.2.0 records
+`runtime_assets` evidence in the kit, either explicitly `not-bound` or a
+hash-only `verified` closure of the required stock-extracted `gpu`, `wifi` and
+`touch` files, derived from one hardened tree walk against the pinned manifest.
+It is not provisioning, extraction, redistribution, ABI or hardware
+qualification, copies no private bytes or manifest, and no real runtime tree has
+been bound. `private-runtime-asset-bytes-not-bound-to-kit` and the other six
+blockers are unchanged until a real, separately reviewed bound kit and contract
+revision ([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)).
+
 Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
 host-key revalidation before another live read, and translation of the vendor
 module boot order. The generic rootfs builder remains blocked because its

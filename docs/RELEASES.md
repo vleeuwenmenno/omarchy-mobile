@@ -102,7 +102,11 @@ laptop-only deployment-candidate kit binding the stage, module overlay, kernel
 contract, GPU profile and runtime-manifest identity; its gate always refuses.
 The kit is not bootable, flashable, image-ready, an atomic-snapshot proof,
 hardware-qualified or a deployment authorization, and no release ships it
-([DEPLOYMENT-GATE](myron/DEPLOYMENT-GATE.md)).
+([DEPLOYMENT-GATE](myron/DEPLOYMENT-GATE.md)). Version 0.2.0 (Phase 2.7) can
+record hash-only runtime-asset evidence (`--runtime-assets none|DIR`); that is
+not provisioning, extraction, redistribution or hardware qualification, copies
+no private bytes or manifest, clears no blocker, and no real runtime tree has
+been bound.
 `omamobile-myron-kernel-contract` 0.3.0 adds `verify-abi`, an offline,
 staged-set-only module ABI/import/load-order check over a synthetic ELF layout;
 it is unqualified on real modules, not part of the gate, and clears no blocker.

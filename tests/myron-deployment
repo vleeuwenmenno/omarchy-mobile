@@ -100,9 +100,25 @@ def fresh(label):
 RELEASE = "test-release"
 MODULES = ["alpha", "beta"]
 RUNTIME_MARKER = b"SECRET-RUNTIME-ASSET-BYTES"
+RUNTIME_FILES = {
+    "/usr/local/lib/myron-gpu/libgpu.so": ("gpu", RUNTIME_MARKER + b"-gpu"),
+    "/usr/local/lib/myron-wifi/fw/wifi.bin": ("wifi", RUNTIME_MARKER + b"-wifi"),
+    "/usr/local/lib/myron-touch/touch.fw": ("touch", RUNTIME_MARKER + b"-touch"),
+}
+RUNTIME_OPTIONAL = {"/usr/local/lib/myron-extra/optional.bin": ("camera", RUNTIME_MARKER + b"-optional")}
+TSV_HEADER = "target\tsha256\tprovenance\tredistribution\tfeature\n"
 
 
-def make_fixture(variant=None):
+def tsv_row(target, data, feature, provenance="stock-extracted", policy="extract-only"):
+    return f"{target}\t{digest(data)}\t{provenance}\t{policy}\t{feature}\n"
+
+
+def standard_tsv():
+    rows = [tsv_row(t, d, f) for t, (f, d) in {**RUNTIME_FILES, **RUNTIME_OPTIONAL}.items()]
+    return (TSV_HEADER + "".join(rows)).encode()
+
+
+def make_fixture(variant=None, tsv=None):
     base = fresh("fixture")
     notes = b"synthetic-notes\n"
     image, config = b"synthetic-image\n", b"synthetic-config\n"
@@ -169,7 +185,7 @@ def make_fixture(variant=None):
             "previous_selector_sha256": digest(payload["previous-module-dir.sh"]),
             "forbidden_modules": ["rmnet_core"], "modules": MODULES,
         },
-        "runtime_assets": {"manifest_sha256": digest(RUNTIME_MARKER)},
+        "runtime_assets": {"manifest_sha256": digest(tsv if tsv is not None else standard_tsv())},
         "activation": {
             "mode": "disabled", "source_lock_reproduction": "not_verified",
             "device_qualification": "reference_evidence_only",
@@ -194,7 +210,10 @@ def make_fixture(variant=None):
         (root / relative).write_bytes(data)
     deployment = T.expected_deployment_contract(reference, digest(reference_bytes), digest(stage_bytes), digest(gpu_bytes))
     (root / T.DEPLOYMENT_CONTRACT_PATH).write_bytes(T.render_json(deployment))
+    runtime_manifest = base / "runtime-manifest.tsv"
+    runtime_manifest.write_bytes(tsv if tsv is not None else standard_tsv())
     return {
+        "runtime_manifest": runtime_manifest,
         "base": base, "root": root, "archive": archive, "reference": reference,
         "reference_bytes": reference_bytes, "stage_bytes": stage_bytes, "gpu_bytes": gpu_bytes,
     }
@@ -244,6 +263,8 @@ def run(root, *argv):
     arguments = list(argv)
     if arguments and arguments[0] in ("assemble", "verify", "gate") and "--assets" not in arguments:
         arguments.extend(("--assets", archive))
+    if arguments and arguments[0] in ("assemble", "verify", "gate") and "--runtime-assets" not in arguments:
+        arguments.extend(("--runtime-assets", "none"))
     return run_exact(root, *arguments)
 
 
@@ -1327,6 +1348,628 @@ assert code != 0
 code, _, err = run(root, "verify", "--kit", "relative", "--rootfs-stage", rootfs)
 assert code != 0 and "absolute" in err
 ok("verify and gate recompute everything")
+
+# ---- runtime-asset binding (0.2.0): synthetic bytes, hashes only ---------------------
+RT_MANIFEST = fx["runtime_manifest"]
+
+
+def make_runtime(files=None, base=None):
+    tree = (base or fresh("runtime")) / "assets"
+    for target, (feature, data) in (files or RUNTIME_FILES).items():
+        path = tree / target.lstrip("/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(0o640)
+    return tree
+
+
+def rt_asm(out, runtime_root, runtime_manifest=RT_MANIFEST, *, tree=None, mani=None, stage=stage_a, extra=()):
+    argv = ["assemble", "--rootfs-stage", tree or rootfs, "--rootfs-manifest", mani or manifest,
+            "--module-stage", stage, "--out", out, "--runtime-assets", runtime_root]
+    if runtime_manifest is not None:
+        argv += ["--runtime-manifest", runtime_manifest]
+    return argv + list(extra)
+
+
+def rt_check(command, kit, runtime_root, runtime_manifest=RT_MANIFEST):
+    argv = [command, "--kit", kit, "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+            "--runtime-assets", runtime_root]
+    if runtime_manifest is not None:
+        argv += ["--runtime-manifest", runtime_manifest]
+    return argv
+
+
+def rt_fail(name, argv, contains, *outputs, contracts=None):
+    code, out, err = run(contracts or root, *argv)
+    assert code != 0, f"{name}: accepted"
+    assert contains in err, f"{name}: wrong reason: {err.strip()}"
+    assert "artifact_verified" not in out and '"status": "assembled"' not in out, name
+    for path in outputs:
+        assert not os.path.lexists(path), f"{name}: left output {path}"
+    if outputs:
+        assert not any(".tmp-" in p.name for p in Path(outputs[0]).parent.iterdir()), f"{name}: left temp"
+    ok(f"{name} is rejected")
+
+
+def expected_evidence():
+    rows = []
+    for target in sorted(RUNTIME_FILES):
+        feature, data = RUNTIME_FILES[target]
+        rows.append({"target": target, "sha256": digest(data), "size": len(data), "mode": "0640",
+                     "feature": feature, "provenance": "stock-extracted"})
+    h = hashlib.sha256(b"myron-runtime-assets-v1-sha256\n")
+    h.update(f"manifest\t{digest(RT_MANIFEST.read_bytes())}\n".encode())
+    h.update(b"features\tgpu,wifi,touch\n")
+    for r in rows:
+        h.update((f"file\t{r['mode']}\t{r['size']}\t{r['sha256']}\t{r['feature']}\t{r['provenance']}"
+                  f"\t{json.dumps(r['target'])}\n").encode())
+    return {
+        "algorithm": "myron-runtime-assets-v1-sha256", "manifest_sha256": digest(RT_MANIFEST.read_bytes()),
+        "required_features": ["gpu", "wifi", "touch"], "status": "verified", "asset_count": 3,
+        "files": rows, "digest": h.hexdigest(), "bytes_copied_into_kit": False,
+    }
+
+
+runtime_a = make_runtime({**RUNTIME_FILES})
+runtime_before = snapshot(runtime_a)
+rt_manifest_before = RT_MANIFEST.read_bytes()
+bound_a, bound_b = work / "bound-a", work / "bound-b"
+result = expect_ok(root, *rt_asm(bound_a, runtime_a))
+assert result["runtime_status"] == "verified" and result["runtime_asset_count"] == 3
+assert result["deployment_authorized"] is False
+expect_ok(root, *rt_asm(bound_b, make_runtime()))
+assert snapshot(bound_a) == snapshot(bound_b), "bound kits are not deterministic"
+_, bound_data = snapshot(bound_a)
+bound_document = json.loads(bound_data["kit.json"])
+assert bound_document["runtime_assets"] == expected_evidence(), bound_document["runtime_assets"]
+assert result["runtime_digest"] == expected_evidence()["digest"]
+assert bound_document["format_version"] == "0.2.0" == T.VERSION
+assert bound_document["runtime_assets"]["bytes_copied_into_kit"] is False
+assert "runtime_assets" not in json.loads(bound_data["status.json"])
+assert "runtime_assets" not in bound_document["status"]
+joined = b"".join(bound_data.values())
+assert RUNTIME_MARKER not in joined and RT_MANIFEST.read_bytes() not in joined
+assert b"optional.bin" not in joined and digest(RUNTIME_OPTIONAL["/usr/local/lib/myron-extra/optional.bin"][1]).encode() not in joined
+assert snapshot(runtime_a) == runtime_before and RT_MANIFEST.read_bytes() == rt_manifest_before
+assert snapshot(bound_a)[0] != snapshot(kit_a)[0]
+ok("a bound kit has exact, deterministic runtime evidence and copies no runtime or manifest bytes")
+
+none_document = json.loads(snapshot(kit_a)[1]["kit.json"])
+assert none_document["runtime_assets"] == {
+    "algorithm": "myron-runtime-assets-v1-sha256", "manifest_sha256": digest(RT_MANIFEST.read_bytes()),
+    "required_features": ["gpu", "wifi", "touch"], "status": "not-bound", "asset_count": 0,
+    "files": [], "digest": None, "bytes_copied_into_kit": False,
+}
+ok("an explicit none kit records strict not-bound evidence")
+
+verified = expect_ok(root, *rt_check("verify", bound_a, runtime_a))
+assert verified["runtime_status"] == "verified" and verified["runtime_asset_count"] == 3
+assert verified["runtime_digest"] == expected_evidence()["digest"]
+gate = expect_ok(root, *rt_check("gate", bound_a, runtime_a))
+assert gate["decision"] == "refused" and gate["blockers"] == T.BLOCKERS
+assert gate["deployment_authorized"] is False and gate["bootable"] is False
+assert gate["runtime_status"] == "verified" and gate["runtime_asset_count"] == 3
+assert gate["runtime_digest"] == expected_evidence()["digest"]
+assert "private-runtime-asset-bytes-not-bound-to-kit" in gate["blockers"]
+gate_none = expect_ok(root, "gate", "--kit", kit_a, "--rootfs-stage", rootfs)
+assert gate_none["runtime_status"] == "not-bound" and gate_none["runtime_asset_count"] == 0
+assert gate_none["runtime_digest"] is None and gate_none["blockers"] == T.BLOCKERS
+ok("verify and gate recompute bound and none evidence; the decision stays refused with every blocker")
+
+# mode mismatches
+for command in ("verify", "gate"):
+    rt_fail(f"{command} of a bound kit with none", [command, "--kit", bound_a, "--rootfs-stage", rootfs,
+            "--rootfs-manifest", manifest], "binds runtime assets")
+    rt_fail(f"{command} of a none kit with a runtime directory", rt_check(command, kit_a, runtime_a),
+            "not-bound: reassemble")
+for name, argv, reason in (
+    ("none with a runtime manifest", rt_asm(work / "n1", "none"), "only valid with"),
+    ("a runtime directory without a manifest", rt_asm(work / "n2", runtime_a, None), "requires --runtime-manifest"),
+    ("a relative runtime directory", rt_asm(work / "n3", "runtime", RT_MANIFEST), "absolute"),
+    ("a noncanonical runtime directory", rt_asm(work / "n4", f"{runtime_a}/", RT_MANIFEST), "canonical"),
+    ("a relative runtime manifest", rt_asm(work / "n5", runtime_a, "m.tsv"), "absolute"),
+    ("a root runtime directory", rt_asm(work / "n6", "/", RT_MANIFEST), "must not be /"),
+):
+    rt_fail(name, argv, reason, argv[argv.index("--out") + 1])
+argv = rt_asm(work / "n7", runtime_a)
+argv = [a for a in argv if a not in ("--runtime-assets", str(runtime_a))]
+code, _, err = run_exact(root, *argv, "--assets", archive)
+assert code != 0 and "--runtime-assets" in err
+code, _, err = run_exact(root, "verify", "--kit", bound_a, "--rootfs-stage", rootfs, "--assets", archive)
+assert code != 0 and "--runtime-assets" in err
+ok("runtime mode flags are required and strictly paired")
+
+# tampered kit evidence
+def rt_kit_case(name, reason, mutate, source=bound_a, runtime_root=runtime_a, rootfs_runtime=True):
+    kit = fresh("rtkit") / "kit"
+    shutil.copytree(source, kit, symlinks=True)
+    mutate(kit)
+    for command in ("verify", "gate"):
+        argv = rt_check(command, kit, runtime_root) if runtime_root else \
+            [command, "--kit", kit, "--rootfs-stage", rootfs, "--rootfs-manifest", manifest]
+        code, out, err = run(root, *argv)
+        assert code != 0, f"{name}: {command} accepted"
+        assert reason in err, f"{name}: {command} wrong reason: {err.strip()}"
+        assert "artifact_verified" not in out, name
+    ok(f"{name} is rejected by verify and gate")
+
+
+def edit_evidence(function):
+    return edit_json("kit.json", lambda d: function(d["runtime_assets"]))
+
+
+rt_kit_case("a changed runtime digest", "digest differs", edit_evidence(lambda r: r.update(digest="0" * 64)))
+rt_kit_case("a null runtime digest on a bound kit", "digest differs", edit_evidence(lambda r: r.update(digest=None)))
+rt_kit_case("a changed runtime count", "count differs", edit_evidence(lambda r: r.update(asset_count=2)))
+rt_kit_case("a changed runtime status", "status differs", edit_evidence(lambda r: r.update(status="bound")))
+rt_kit_case("a bound kit relabelled not-bound", "not-bound evidence must be empty", edit_evidence(lambda r: r.update(status="not-bound")))
+rt_kit_case("a removed runtime file row", "count differs", edit_evidence(lambda r: r["files"].pop()))
+rt_kit_case("a changed runtime row hash", "digest differs", edit_evidence(lambda r: r["files"][0].update(sha256="1" * 64)))
+rt_kit_case("a changed runtime row size", "digest differs", edit_evidence(lambda r: r["files"][0].update(size=1)))
+rt_kit_case("a changed runtime row mode", "file mode differs", edit_evidence(lambda r: r["files"][0].update(mode="640")))
+rt_kit_case("a changed runtime row provenance", "feature or provenance", edit_evidence(lambda r: r["files"][0].update(provenance="source-built")))
+rt_kit_case("a changed runtime row feature", "feature or provenance", edit_evidence(lambda r: r["files"][0].update(feature="camera")))
+rt_kit_case("a changed runtime row target", "target differs", edit_evidence(lambda r: r["files"][0].update(target="/usr/lib/x")))
+rt_kit_case("an unknown runtime row field", "file fields differ", edit_evidence(lambda r: r["files"][0].update(extra=1)))
+rt_kit_case("reordered runtime rows", "not sorted", edit_evidence(lambda r: r["files"].reverse()))
+rt_kit_case("a boolean standing for the runtime count", "count differs", edit_evidence(lambda r: r.update(asset_count=True)))
+rt_kit_case("a runtime bytes-copied claim", "bytes_copied_into_kit must be false", edit_evidence(lambda r: r.update(bytes_copied_into_kit=True)))
+rt_kit_case("an integer standing for the bytes-copied flag", "bytes_copied_into_kit must be false", edit_evidence(lambda r: r.update(bytes_copied_into_kit=0)))
+rt_kit_case("an authorization claim inside runtime_assets", "claims deployment_authorized", edit_evidence(lambda r: r.update(deployment_authorized=True)))
+rt_kit_case("an unknown runtime_assets field", "runtime_assets fields differ", edit_evidence(lambda r: r.update(extra=1)))
+rt_kit_case("a changed runtime algorithm", "differs at algorithm", edit_evidence(lambda r: r.update(algorithm="other")))
+rt_kit_case("a changed runtime manifest identity", "differs at manifest_sha256", edit_evidence(lambda r: r.update(manifest_sha256="0" * 64)))
+rt_kit_case("reordered runtime features in evidence", "differs at required_features", edit_evidence(lambda r: r.update(required_features=["wifi", "gpu", "touch"])))
+rt_kit_case("a removed runtime_assets section", "no runtime_assets section", edit_json("kit.json", lambda d: d.pop("runtime_assets")))
+rt_kit_case("runtime_assets copied into status.json", "status fields differ", edit_json("status.json", lambda d: d.update(runtime_assets={})))
+rt_kit_case("a none kit given verified evidence", "kit differs at", edit_json("kit.json", lambda d: d.update(runtime_assets=bound_document["runtime_assets"])), source=kit_a)
+rt_kit_case("a none kit with a file row", "count differs", edit_json("kit.json", lambda d: d["runtime_assets"].update(files=[{}])), source=kit_a, runtime_root=None)
+rt_kit_case("a none kit with a digest", "not-bound evidence must be empty", edit_json("kit.json", lambda d: d["runtime_assets"].update(digest="0" * 64)), source=kit_a, runtime_root=None)
+rt_kit_case("a none kit claiming a count", "count differs", edit_json("kit.json", lambda d: d["runtime_assets"].update(asset_count=1)), source=kit_a, runtime_root=None)
+rt_kit_case("a copied runtime file in the kit", "differs from the stage contract", lambda k: write(k / "overlay/usr/local/lib/myron-gpu/libgpu.so", RUNTIME_MARKER))
+rt_kit_case("a runtime file beside the kit", "unexpected paths", lambda k: write(k / "runtime-assets/libgpu.so", RUNTIME_MARKER))
+
+# the runtime tree changing after assembly
+def mutate_runtime(name, reason, mutate):
+    tree = make_runtime()
+    mutate(tree)
+    for command in ("verify", "gate"):
+        rt_fail(f"{command} after {name}", rt_check(command, bound_a, tree), reason)
+
+
+mutate_runtime("a changed runtime file", "SHA-256 differs", lambda t: (t / "usr/local/lib/myron-gpu/libgpu.so").write_bytes(b"x"))
+mutate_runtime("a removed runtime file", "missing required files", lambda t: (t / "usr/local/lib/myron-touch/touch.fw").unlink())
+mutate_runtime("an added runtime file", "unlisted or optional", lambda t: write(t / "usr/local/lib/myron-gpu/new", b"x"))
+other_manifest = work / "other-manifest.tsv"
+other_manifest.write_bytes(standard_tsv() + b"\n")
+rt_fail(
+    "verify with a different manifest file",
+    rt_check("verify", bound_a, runtime_a, other_manifest),
+    "SHA-256 differs",
+)
+
+# runtime tree rejections at assembly
+def rt_case(name, reason, mutate, files=None):
+    tree = make_runtime(files)
+    mutate(tree)
+    out = tree.parent / "kit"
+    rt_fail(name, rt_asm(out, tree), reason, out)
+
+
+gpu_path = "usr/local/lib/myron-gpu/libgpu.so"
+rt_case("a missing runtime file", "missing required files", lambda t: (t / gpu_path).unlink())
+rt_case("a wrong runtime file", "SHA-256 differs", lambda t: (t / gpu_path).write_bytes(b"wrong"))
+rt_case("an extra runtime file", "unlisted or optional", lambda t: write(t / "usr/local/lib/myron-gpu/extra", b"x"))
+rt_case("an optional runtime file", "unlisted or optional",
+        lambda t: write(t / "usr/local/lib/myron-extra/optional.bin", RUNTIME_OPTIONAL["/usr/local/lib/myron-extra/optional.bin"][1]))
+rt_case("an extra empty runtime directory", "directory set differs", lambda t: (t / "usr/local/lib/myron-empty").mkdir())
+rt_case("a runtime file replaced by a directory", "missing required files", lambda t: ((t / gpu_path).unlink(), (t / gpu_path).mkdir()))
+rt_case("a symlinked runtime file", "symlink", lambda t: ((t / gpu_path).unlink(), (t / gpu_path).symlink_to("../myron-wifi/fw/wifi.bin")))
+rt_case("a symlinked runtime directory", "symlink", lambda t: (shutil.rmtree(t / "usr/local/lib/myron-touch"), (t / "usr/local/lib/myron-touch").symlink_to("myron-gpu")))
+rt_case("a hardlinked runtime file", "hard links", lambda t: os.link(t / gpu_path, t / "usr/local/lib/myron-gpu/again"))
+rt_case("a runtime FIFO", "special file", lambda t: os.mkfifo(t / "usr/local/lib/myron-gpu/fifo"))
+rt_case("a group-writable runtime file", "writable or controlled", lambda t: os.chmod(t / gpu_path, 0o664))
+rt_case("a world-writable runtime directory", "writable or controlled", lambda t: os.chmod(t / "usr/local/lib/myron-gpu", 0o777))
+rt_case("a group-writable runtime root", "writable or controlled", lambda t: os.chmod(t, 0o775))
+rt_case("a runtime root with a non-closure directory", "directory set differs", lambda t: (t / "etc").mkdir())
+dirty_parent = fresh("runtime-link")
+(dirty_parent / "real").mkdir()
+(dirty_parent / "link").symlink_to(dirty_parent / "real")
+rt_fail("a symlinked runtime root", rt_asm(work / "n-link", dirty_parent / "link"), "unavailable", work / "n-link")
+rt_fail("a missing runtime root", rt_asm(work / "n-miss", work / "no-such-root"), "unavailable", work / "n-miss")
+(work / "not-a-dir-file").write_bytes(b"x")
+rt_fail("a file as the runtime root", rt_asm(work / "n-file", work / "not-a-dir-file"), "unavailable", work / "n-file")
+unsafe_runtime = fresh("runtime-unsafe-ancestry")
+tree = make_runtime(base=unsafe_runtime)
+unsafe_runtime.chmod(0o777)
+try:
+    rt_fail("a runtime root below writable ancestry", rt_asm(work / "n-anc", tree), "writable or controlled", work / "n-anc")
+finally:
+    unsafe_runtime.chmod(0o700)
+
+# limits
+real_limits = T.RUNTIME_LIMITS
+for name, limits, reason in (
+    ("a runtime tree beyond the entry bound", T.Limits(5, 12, 1 << 20, 1 << 20), "entry bound"),
+    ("a runtime tree beyond the depth bound", T.Limits(256, 3, 1 << 20, 1 << 20), "depth bound"),
+    ("a runtime file beyond the size bound", T.Limits(256, 12, 8, 1 << 20), "size bound"),
+    ("a runtime tree beyond the byte bound", T.Limits(256, 12, 1 << 20, 40), "byte bound"),
+):
+    T.RUNTIME_LIMITS = limits
+    try:
+        tree = make_runtime()
+        rt_fail(name, rt_asm(tree.parent / "kit", tree), reason, tree.parent / "kit")
+    finally:
+        T.RUNTIME_LIMITS = real_limits
+assert T.RUNTIME_LIMITS.entries <= 1024 and T.RUNTIME_LIMITS.total_bytes <= 4 << 30
+ok("runtime limits are conservative")
+
+# mount change, growth, same-pass snapshot
+real_mount_id = K.mount_id_for_fd
+def runtime_mount(descriptor, label):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    return 424242 if target.endswith("/myron-wifi") else real_mount_id(descriptor, label)
+K.mount_id_for_fd = runtime_mount
+try:
+    tree = make_runtime()
+    rt_fail("a runtime tree crossing a same-device mount", rt_asm(tree.parent / "kit", tree), "mount point", tree.parent / "kit")
+finally:
+    K.mount_id_for_fd = real_mount_id
+
+real_read = os.read
+grown = [False]
+def growing_runtime_read(descriptor, count):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    if target.endswith("/wifi.bin") and not grown[0]:
+        grown[0] = True
+        with open(target, "ab") as stream:
+            stream.write(b"more")
+    return real_read(descriptor, count)
+os.read = growing_runtime_read
+try:
+    tree = make_runtime()
+    rt_fail("a runtime file that grows while being read", rt_asm(tree.parent / "kit", tree), "while being read", tree.parent / "kit")
+finally:
+    os.read = real_read
+
+opened_files = []
+real_pinned = T.open_pinned_regular_at
+def counting_pinned(directory_fd, name, label):
+    if "runtime assets" in label:
+        opened_files.append(name)
+    return real_pinned(directory_fd, name, label)
+T.open_pinned_regular_at = counting_pinned
+try:
+    tree = make_runtime()
+    expect_ok(root, *rt_asm(tree.parent / "kit", tree))
+finally:
+    T.open_pinned_regular_at = real_pinned
+assert sorted(opened_files) == ["libgpu.so", "touch.fw", "wifi.bin"], opened_files
+ok("runtime evidence derives from one walk that opens each required file once")
+
+# manifest / selection rejections, with fixtures that pin their own manifest
+def manifest_case(name, reason, rows=None, text=None, header=TSV_HEADER):
+    if text is None:
+        body = rows if rows is not None else [tsv_row(t, d, f) for t, (f, d) in RUNTIME_FILES.items()]
+        text = header + "".join(body)
+    other = make_fixture(tsv=text.encode())
+    tree_r, mani_r = make_rootfs(other)
+    runtime_tree = make_runtime()
+    out = tree_r.parent / "kit"
+    rt_fail(name, rt_asm(out, runtime_tree, other["runtime_manifest"], tree=tree_r, mani=mani_r), reason, out, contracts=other["root"])
+
+
+gpu_t = "/usr/local/lib/myron-gpu/libgpu.so"
+row = lambda t, f, **kw: tsv_row(t, RUNTIME_FILES[gpu_t][1], f, **kw)
+base_rows = [tsv_row(t, d, f) for t, (f, d) in RUNTIME_FILES.items()]
+manifest_case("a manifest with a changed header", "header differs", header="target\tsha256\tprovenance\tfeature\tredistribution\n")
+manifest_case("a manifest with a duplicate target", "unsafe or duplicate", rows=base_rows + [base_rows[0]])
+manifest_case("a manifest with a dot-dot target", "unsafe or duplicate", rows=base_rows + [row("/usr/local/lib/myron-gpu/../x", "gpu")])
+manifest_case("a manifest with a relative target", "unsafe or duplicate", rows=base_rows + [row("usr/local/lib/myron-x", "gpu")])
+manifest_case("a manifest with an empty component", "must be a canonical absolute path", rows=base_rows + [row("/usr/local/lib/myron-gpu//x", "gpu")])
+manifest_case("a manifest with a dot component", "must not contain . or ..", rows=base_rows + [row("/usr/local/lib/myron-gpu/./x", "gpu")])
+manifest_case("a required target outside the myron prefix", "outside /usr/local/lib/myron-", rows=base_rows + [row("/usr/lib/other.so", "gpu")])
+manifest_case("a required target under a lookalike prefix", "outside /usr/local/lib/myron-", rows=base_rows + [row("/usr/local/lib/myrons/x", "wifi")])
+manifest_case("a bad provenance", "invalid runtime provenance", rows=base_rows + [row("/usr/local/lib/myron-gpu/x", "gpu", provenance="unknown")])
+manifest_case("a bad redistribution policy", "invalid redistribution policy", rows=base_rows + [row("/usr/local/lib/myron-gpu/x", "gpu", policy="build-output")])
+manifest_case("a required source-built row", "not stock-extracted", rows=base_rows + [row("/usr/local/lib/myron-gpu/x", "gpu", provenance="source-built", policy="build-output")])
+manifest_case("a required repo-generated row", "not stock-extracted", rows=base_rows + [row("/usr/local/lib/myron-wifi/x", "wifi", provenance="repo-generated", policy="source")])
+manifest_case("a manifest lacking a required feature", "no row for required feature: touch", rows=base_rows[:2])
+manifest_case("a bad hash", "invalid runtime hash", rows=base_rows + [f"/usr/local/lib/myron-gpu/x\tzz\tstock-extracted\textract-only\tgpu\n"])
+manifest_case("an empty manifest", "empty", rows=[])
+manifest_case("nested required targets", "ancestor of another", rows=base_rows + [row("/usr/local/lib/myron-gpu/libgpu.so/child", "gpu")])
+manifest_case("a short row", "column count differs", rows=base_rows + ["/usr/local/lib/myron-gpu/x\n"])
+wrong_hash_manifest = work / "wrong-hash.tsv"
+wrong_hash_manifest.write_bytes(standard_tsv() + b"\n")
+rt_fail("a manifest whose hash is not pinned", rt_asm(work / "n-hash", runtime_a, wrong_hash_manifest), "SHA-256 differs", work / "n-hash")
+fifo_manifest = work / "manifest.fifo"
+os.mkfifo(fifo_manifest)
+rt_fail("a FIFO manifest", rt_asm(work / "n-fifo", runtime_a, fifo_manifest), "not a regular file", work / "n-fifo")
+link_manifest = work / "manifest-link.tsv"
+link_manifest.symlink_to(RT_MANIFEST)
+rt_fail("a symlinked manifest", rt_asm(work / "n-ml", runtime_a, link_manifest), "not a regular file", work / "n-ml")
+
+assert T.parse_runtime_manifest_bytes(
+    RT_MANIFEST.read_bytes(), digest(RT_MANIFEST.read_bytes())
+) == K.parse_runtime_manifest(RT_MANIFEST, digest(RT_MANIFEST.read_bytes()))
+ok("the captured-byte manifest parser matches the kernel schema on the canonical fixture")
+
+manifest_ancestor = fresh("manifest-symlink-ancestor")
+(manifest_ancestor / "real").mkdir()
+(manifest_ancestor / "real/runtime.tsv").write_bytes(RT_MANIFEST.read_bytes())
+(manifest_ancestor / "link").symlink_to(manifest_ancestor / "real")
+rt_fail(
+    "a manifest below a symlinked ancestor",
+    rt_asm(work / "n-ma", runtime_a, manifest_ancestor / "link/runtime.tsv"),
+    "unavailable", work / "n-ma",
+)
+
+unsafe_manifest_parent = fresh("manifest-unsafe-ancestor")
+(unsafe_manifest_parent / "runtime.tsv").write_bytes(RT_MANIFEST.read_bytes())
+unsafe_manifest_parent.chmod(0o777)
+try:
+    rt_fail(
+        "a manifest below writable ancestry",
+        rt_asm(work / "n-mwa", runtime_a, unsafe_manifest_parent / "runtime.tsv"),
+        "writable or controlled", work / "n-mwa",
+    )
+finally:
+    unsafe_manifest_parent.chmod(0o700)
+
+writable_manifest = work / "manifest-writable.tsv"
+writable_manifest.write_bytes(RT_MANIFEST.read_bytes())
+writable_manifest.chmod(0o666)
+try:
+    rt_fail(
+        "a writable manifest", rt_asm(work / "n-mw", runtime_a, writable_manifest),
+        "writable or controlled", work / "n-mw",
+    )
+finally:
+    writable_manifest.chmod(0o600)
+
+hardlink_manifest = work / "manifest-hardlink.tsv"
+os.link(RT_MANIFEST, hardlink_manifest)
+try:
+    rt_fail(
+        "a hardlinked manifest", rt_asm(work / "n-mh", runtime_a, hardlink_manifest),
+        "additional hard links", work / "n-mh",
+    )
+finally:
+    hardlink_manifest.unlink()
+
+real_manifest_mount = K.mount_id_for_fd
+def changed_manifest_mount(descriptor, label):
+    return 424242 if label == "runtime manifest" else real_manifest_mount(descriptor, label)
+K.mount_id_for_fd = changed_manifest_mount
+try:
+    rt_fail(
+        "a manifest crossing a file mount", rt_asm(work / "n-mm", runtime_a, RT_MANIFEST),
+        "mount point", work / "n-mm",
+    )
+finally:
+    K.mount_id_for_fd = real_manifest_mount
+
+mutating_manifest = work / "manifest-mutating.tsv"
+mutating_manifest.write_bytes(RT_MANIFEST.read_bytes())
+real_read = os.read
+manifest_mutated = [False]
+def mutating_manifest_read(descriptor, count):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    if target.endswith("/manifest-mutating.tsv") and not manifest_mutated[0]:
+        manifest_mutated[0] = True
+        with open(target, "ab") as stream:
+            stream.write(b"changed")
+    return real_read(descriptor, count)
+os.read = mutating_manifest_read
+try:
+    rt_fail(
+        "a manifest changed while being read",
+        rt_asm(work / "n-mutate", runtime_a, mutating_manifest),
+        "changed", work / "n-mutate",
+    )
+finally:
+    os.read = real_read
+
+replaced_manifest = work / "manifest-replaced.tsv"
+replaced_manifest.write_bytes(RT_MANIFEST.read_bytes())
+replacement_backup = work / "manifest-replaced.old"
+real_walk = T.walk_tree
+manifest_replaced = [False]
+def replacing_manifest_walk(descriptor, limits, **kwargs):
+    tree = real_walk(descriptor, limits, **kwargs)
+    if kwargs.get("label") == "runtime assets" and not manifest_replaced[0]:
+        manifest_replaced[0] = True
+        replaced_manifest.rename(replacement_backup)
+        replaced_manifest.write_bytes(RT_MANIFEST.read_bytes())
+    return tree
+T.walk_tree = replacing_manifest_walk
+try:
+    rt_fail(
+        "a manifest path replaced after capture",
+        rt_asm(work / "n-mreplace", runtime_a, replaced_manifest),
+        "changed during verification", work / "n-mreplace",
+    )
+finally:
+    T.walk_tree = real_walk
+ok("runtime manifests use trusted ancestry, stable captured bytes and path revalidation")
+
+# Ownership and mode are rechecked after opening each runtime entry.
+race_tree = make_runtime()
+race_out = race_tree.parent / "kit"
+real_pinned = T.open_pinned_regular_at
+file_raced = [False]
+def racing_runtime_file(directory_fd, name, label):
+    if label.endswith("runtime assets file /usr/local/lib/myron-gpu/libgpu.so") and not file_raced[0]:
+        file_raced[0] = True
+        os.chmod(f"/proc/self/fd/{directory_fd}/{name}", 0o666)
+    return real_pinned(directory_fd, name, label)
+T.open_pinned_regular_at = racing_runtime_file
+try:
+    rt_fail(
+        "a runtime file mode changed between lstat and open",
+        rt_asm(race_out, race_tree), "changed while being opened", race_out,
+    )
+finally:
+    T.open_pinned_regular_at = real_pinned
+
+race_tree = make_runtime()
+race_out = race_tree.parent / "kit"
+real_open = os.open
+directory_raced = [False]
+def racing_runtime_directory(path, flags, *args, **kwargs):
+    directory_fd = kwargs.get("dir_fd")
+    parent = os.readlink(f"/proc/self/fd/{directory_fd}") if directory_fd is not None else ""
+    if (
+        path == "myron-gpu" and parent.startswith(str(race_tree) + "/")
+        and not directory_raced[0]
+    ):
+        directory_raced[0] = True
+        os.chmod(f"/proc/self/fd/{directory_fd}/{path}", 0o777)
+    return real_open(path, flags, *args, **kwargs)
+os.open = racing_runtime_directory
+try:
+    rt_fail(
+        "a runtime directory mode changed between lstat and open",
+        rt_asm(race_out, race_tree), "changed while being opened", race_out,
+    )
+finally:
+    os.open = real_open
+ok("runtime entry permission races are rejected after descriptor open")
+
+race_tree = make_runtime()
+race_out = race_tree.parent / "kit"
+real_mount = K.mount_id_for_fd
+directory_raced = [False]
+def racing_directory_mount(descriptor, label):
+    if label.endswith("runtime assets /usr/local/lib/myron-gpu") and not directory_raced[0]:
+        directory_raced[0] = True
+        os.fchmod(descriptor, 0o777)
+    return real_mount(descriptor, label)
+K.mount_id_for_fd = racing_directory_mount
+try:
+    rt_fail(
+        "a runtime directory mode changed after descriptor open",
+        rt_asm(race_out, race_tree), "changed before traversal", race_out,
+    )
+finally:
+    K.mount_id_for_fd = real_mount
+
+race_tree = make_runtime()
+race_out = race_tree.parent / "kit"
+real_walk = T.walk_tree
+root_raced = [False]
+def racing_runtime_root(descriptor, limits, **kwargs):
+    if kwargs.get("label") == "runtime assets" and not root_raced[0]:
+        root_raced[0] = True
+        os.fchmod(descriptor, 0o777)
+    return real_walk(descriptor, limits, **kwargs)
+T.walk_tree = racing_runtime_root
+try:
+    rt_fail(
+        "a runtime root mode changed after descriptor open",
+        rt_asm(race_out, race_tree), "writable or controlled", race_out,
+    )
+finally:
+    T.walk_tree = real_walk
+ok("runtime directories retain their trusted opened metadata through traversal")
+
+# A descriptor alias stands in for a bind-mounted manifest parent inside rootfs.
+alias_fx = make_fixture()
+alias_rootfs, alias_rootfs_manifest = make_rootfs(alias_fx)
+alias_manifest = alias_rootfs / "usr/share" / alias_fx["runtime_manifest"].name
+alias_manifest.write_bytes(alias_fx["runtime_manifest"].read_bytes())
+alias_runtime = make_runtime()
+alias_out = work / "manifest-parent-alias-kit"
+real_trusted_parent = T.open_trusted_output_parent
+def alias_manifest_parent(parts, label):
+    if label == "runtime manifest parent":
+        return os.open(alias_manifest.parent, os.O_RDONLY | os.O_DIRECTORY)
+    return real_trusted_parent(parts, label)
+T.open_trusted_output_parent = alias_manifest_parent
+try:
+    rt_fail(
+        "a manifest parent aliased inside rootfs",
+        rt_asm(
+            alias_out, alias_runtime, alias_fx["runtime_manifest"],
+            tree=alias_rootfs, mani=alias_rootfs_manifest,
+        ),
+        "manifest parent aliases", alias_out, contracts=alias_fx["root"],
+    )
+finally:
+    T.open_trusted_output_parent = real_trusted_parent
+ok("manifest parent identity cannot alias another input tree")
+
+# optional non-stock rows are not part of the required closure
+mixed = make_fixture(tsv=(TSV_HEADER + "".join(base_rows) + tsv_row(
+    "/usr/local/lib/myron-extra/built.so", b"b", "camera", provenance="source-built", policy="build-output")).encode())
+mixed_rootfs, mixed_manifest = make_rootfs(mixed)
+mixed_runtime = make_runtime()
+mixed_out = work / "mixed-kit"
+code, _, err = run(mixed["root"], *rt_asm(mixed_out, mixed_runtime, mixed["runtime_manifest"], tree=mixed_rootfs, mani=mixed_manifest))
+assert code == 0, err
+assert json.loads(snapshot(mixed_out)[1]["kit.json"])["runtime_assets"]["asset_count"] == 3
+ok("optional rows outside the required features stay out of the closure")
+
+# collisions and scope
+runtime_c = make_runtime()
+rt_fail("an output inside the runtime root", rt_asm(runtime_c / "kit", runtime_c), "overlaps the output")
+rt_fail("a runtime root inside the output path", rt_asm(runtime_c.parent, runtime_c), "overlaps the output")
+rt_fail("a runtime root equal to the output", rt_asm(runtime_c, runtime_c), "overlaps the output")
+rt_fail("a runtime root inside the rootfs", rt_asm(work / "n-in", rootfs / "usr/share"), "overlaps the rootfs stage", work / "n-in")
+rt_fail("a runtime root containing the rootfs", rt_asm(work / "n-con", rootfs.parent), "overlaps the rootfs stage", work / "n-con")
+rt_fail("a runtime root containing the module stage", rt_asm(work / "n-ms", stage_a), "overlaps the module stage", work / "n-ms")
+inner_manifest = runtime_c / "manifest.tsv"
+rt_fail("a manifest inside the runtime root", rt_asm(work / "n-mi", runtime_c, inner_manifest), "overlaps the runtime asset root", work / "n-mi")
+rt_fail("a runtime root containing the kit", rt_check("verify", runtime_c / "kit", runtime_c), "overlaps the kit")
+rt_fail("a runtime root equal to the kit", rt_check("gate", bound_a, bound_a), "overlaps the kit")
+
+alias_runtime = make_runtime()
+alias_fd = os.open(alias_runtime / "usr/local", os.O_RDONLY | os.O_DIRECTORY)
+alias_parent = fresh("runtime-alias")
+alias_out = alias_parent / "kit-alias"
+real_open_components = T.open_trusted_output_parent
+def alias_open(parts, label):
+    return os.dup(alias_fd) if label == "output parent" else real_open_components(parts, label)
+T.open_trusted_output_parent = alias_open
+try:
+    rt_fail("an output parent aliased inside the runtime root", rt_asm(alias_out, alias_runtime),
+            "aliases a directory inside an input tree", alias_out)
+finally:
+    T.open_trusted_output_parent = real_open_components
+    os.close(alias_fd)
+
+# runtime root aliasing another input is rejected by directory identity
+real_walk = T.walk_tree
+def aliasing_walk(fd, limits, **kwargs):
+    tree = real_walk(fd, limits, **kwargs)
+    if kwargs.get("label") == "runtime assets":
+        rootfs_fd = T.open_canonical_dir(str(rootfs), "rootfs")
+        try:
+            meta = os.fstat(rootfs_fd)
+        finally:
+            os.close(rootfs_fd)
+        tree = tree._replace(directory_ids=frozenset(set(tree.directory_ids) | {(meta.st_dev, meta.st_ino)}))
+    return tree
+T.walk_tree = aliasing_walk
+try:
+    tree = make_runtime()
+    rt_fail("a runtime root aliasing the rootfs directory identity", rt_asm(tree.parent / "kit", tree), "aliases a directory", tree.parent / "kit")
+finally:
+    T.walk_tree = real_walk
+ok("runtime scope, collision and alias rules hold")
+
+# no process, no mutation, cleanup
+boom_saved = (subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp)
+subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 6
+try:
+    probe = work / "probe-bound"
+    expect_ok(root, *rt_asm(probe, runtime_a))
+    expect_ok(root, *rt_check("gate", probe, runtime_a))
+finally:
+    subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp = boom_saved
+assert snapshot(runtime_a) == runtime_before and RT_MANIFEST.read_bytes() == rt_manifest_before
+assert (rootfs_before, rootfs_data) == snapshot(rootfs)
+ok("runtime binding spawns no process and mutates no input")
 
 # ---- no input mutated by any rejected run ------------------------------------------------
 assert (rootfs_before, rootfs_data) == snapshot(rootfs)
