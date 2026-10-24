@@ -18,7 +18,8 @@ inputs. All seven blockers stay `missing` and every authority flag stays
 
 | Command | Effect |
 | --- | --- |
-| `show` | Print the canonical session contract. |
+| `show` | Verify the committed session contract against its derived form and print it. |
+| `derive-contract` | Print the canonical contract derived from the pinned upstream contracts and the loaded implementation bytes. Stdout only: it needs no committed session contract, writes nothing and authorizes nothing. |
 | `plan --request R` | Print the deterministic, value-free plan: input closure, bounds, parser per operation, output closure, accounting rule, coverage classes and limitations. No commands, no device paths. |
 | `verify-plan --request R --plan P` | Recompute the plan; `P` must match byte for byte. |
 | `rehearse --request R --reads D --out O` | Adapt the synthetic reads in `D` and publish a new rehearsal artifact. |
@@ -29,7 +30,8 @@ inputs. All seven blockers stay `missing` and every authority flag stays
 
 ## Synthetic reads (the input)
 
-One flat directory with exactly these twelve files and nothing else:
+One flat directory with exactly 11 payload files plus `reads.json`, 12 files in all, and
+nothing else:
 
 ```text
 reads.json
@@ -50,10 +52,29 @@ session contract and one request. The registry in the contract, not the input,
 chooses each file's parser, path and byte bound; a manifest cannot name a
 parser or add a path.
 
-Rules, all enforced before a payload byte is ingested where they can be:
+Admission happens in a fixed order, and no payload byte is read until every step
+before the read has passed:
 
-- the directory listing is checked against the exact closure first (at most 13
-  entries, so an overbound tree stops at the listing); only then are files read;
+1. the directory is opened through the trusted-artifact ancestry checks and its
+   listing must equal the exact closure (at most 13 entries, so an overbound
+   tree stops at the listing);
+2. every one of the 12 files is pinned by a descriptor-relative, no-follow open and
+   judged on its metadata alone: regular file, one link, caller or root owner,
+   not group- or world-writable, not executable, same device and mount as the
+   directory, and its stat size inside its own bound and inside the 4 MiB total;
+3. the listing, the directory's identity and every pinned descriptor are
+   re-checked against their names, so a file deleted, added, renamed, replaced or
+   chmod-ed since the listing refuses here;
+4. only then are the pinned descriptors read, each for exactly its stat size, with
+   an end-of-file probe and an unchanged-metadata check per file;
+5. the listing, the directory and every name are checked once more.
+
+A missing, extra or metadata-unsafe file therefore stops the read at zero payload
+bytes. A file that changes while it is read fails as unstable (grew, shrank,
+changed, was replaced), not later as a manifest mismatch.
+
+Other rules:
+
 - flat only: no nested directory, symlink, hard link, FIFO or special file,
   executable file, mount crossing, writable ancestry, or alias of the request
   or output;
@@ -64,7 +85,16 @@ Rules, all enforced before a payload byte is ingested where they can be:
 - the files and the tree must not change while they are read.
 
 Diagnostics never echo an input value: they name a file, field or rule, so an
-identifier planted in an input cannot leak through an error.
+identifier planted in an input cannot leak through an error. The same holds for
+names. An unknown entry in the reads is reported by count (`2 extra, 1 missing`),
+never by name. A rehearsal tree under `verify-rehearsal` (and the tree built
+inside `rehearse`) is untrusted too: the shared tree reader's, the entry
+comparison's and the collector's capture-read errors are replaced at the session
+boundary by fixed text such as `rehearsal tree failed safe inspection (code
+symlink)`, `rehearsal has 2 unexpected paths (names withheld)` or `rehearsed
+capture was refused by the collector's read (code capture-rejected)`. Only
+names the contract itself fixes (the closure, the expected output paths) can
+appear.
 
 ## Transformations
 
@@ -151,10 +181,32 @@ contract pins. Changing any session constant, schema or registry row, or the
 implementation bytes, changes the derived contract and every command refuses
 the committed one until it is regenerated from the final source.
 
+### Regenerating and comparing (fish)
+
+`derive-contract` prints the contract the current source and pinned upstream
+contracts derive. It does not read, write or replace anything. After any edit to
+`tools/lib/myron-session-impl.py` (or an upstream contract it pins):
+
+```fish
+set derived (mktemp)
+tools/myron-session derive-contract > $derived
+cmp $derived device/myron/session-contract.json        # silent: nothing to do
+cp $derived device/myron/session-contract.json          # differs: take the derived bytes
+tools/myron-session show > /dev/null                   # verifies the committed bytes
+rm $derived
+```
+
+Review the diff of `device/myron/session-contract.json` like any other change:
+the derived bytes are the only accepted ones, so a contract edited by hand is
+refused. `tests/myron-session` fails if the committed file is not byte for byte
+the output of `derive-contract`. The command authorizes nothing: it only shows
+what `show` will accept.
+
 ## Safety and publication
 
 The tool starts no process and has no network, archive, decompression or
-broad-copy facility. It reuses the deployment tool's trusted tree reader and
+broad-copy facility. The reads tree has its own flat reader (see Synthetic reads); the rehearsal
+trees use the deployment tool's trusted tree reader, and publication uses its
 `publish` (private same-parent temp directory, `renameat2(RENAME_NOREPLACE)`).
 The request and reads are protected inputs: an output inside, equal to or
 aliasing either is refused, and both are re-read and the rehearsal recomputed

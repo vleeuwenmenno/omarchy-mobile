@@ -51,6 +51,11 @@ assert impl["path"] == "tools/lib/myron-session-impl.py"
 assert impl["sha256"] == hashlib.sha256(open(impl["path"], "rb").read()).hexdigest()
 PY
 pass "repository contract is canonical, one-way pinned, synthetic, and authorizes nothing"
+tools/myron-session derive-contract > "$tmp/derived.json" || fail "derive-contract failed"
+cmp -s "$tmp/derived.json" device/myron/session-contract.json \
+  || fail "committed session contract differs from derive-contract (regenerate it, see docs/myron/SESSION-GATE.md)"
+tools/myron-session show | cmp -s - "$tmp/derived.json" || fail "show differs from derive-contract"
+pass "derive-contract output equals the committed session contract byte for byte"
 
 mkdir "$tmp/fixture"
 MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
@@ -147,9 +152,40 @@ def expect_ok(*arguments, **kwargs):
     return json.loads(out), out
 
 
-def expect_fail(name, arguments, *outputs, match=None, absent=(), **kwargs):
-    code, out, err = invoke(*arguments, **kwargs)
+@contextlib.contextmanager
+def payload_counter(directory):
+    """Count the bytes os.read returns from any file under DIRECTORY (None: count nothing)."""
+    counted = [0]
+    if directory is None:
+        yield counted
+        return
+    prefix = str(directory) + "/"
+    original = os.read
+
+    def counting(descriptor, count):
+        block = original(descriptor, count)
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            target = ""
+        if target.startswith(prefix):
+            counted[0] += len(block)
+        return block
+
+    os.read = counting
+    try:
+        yield counted
+    finally:
+        os.read = original
+
+
+def expect_fail(name, arguments, *outputs, match=None, absent=(), untouched=None, **kwargs):
+    """UNTOUCHED names a reads directory from which not one payload byte may have been read."""
+    with payload_counter(untouched) as counted:
+        code, out, err = invoke(*arguments, **kwargs)
     assert code != 0, f"{name}: accepted\n{out}"
+    if untouched is not None:
+        assert counted[0] == 0, f"{name}: {counted[0]} payload bytes were read before the refusal"
     if match is not None:
         assert match in err, f"{name}: expected {match!r}, got {err!r}"
     for text in absent:
@@ -463,6 +499,47 @@ root = clone_root("preflight-contract-changed")
 expect_fail("preflight contract changed under the pin", ["show"], root=root)
 ok("contract tampering and changed pinned contracts fail closed")
 
+# derive-contract: stdout only, no committed session contract needed, nothing written or authorized.
+derived, derived_text = expect_ok("derive-contract")
+assert derived_text.encode() == session_contract_bytes and derived == contract
+assert derived_text.encode() == D.render_json(S.expected_session_contract(collector_env))
+
+
+def tree_state(root):
+    return sorted((str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns)
+                  for p in root.rglob("*"))
+
+
+root = clone_root("derive-without-contract")
+(root / S.SESSION_CONTRACT_PATH).unlink()
+before = tree_state(root)
+_, text = expect_ok("derive-contract", root=root)
+assert text.encode() == session_contract_bytes
+assert tree_state(root) == before and not (root / S.SESSION_CONTRACT_PATH).exists()
+expect_fail("show without its committed contract", ["show"], root=root)
+root = clone_root("derive-over-tampered-contract")
+bad = json.loads(session_contract_bytes)
+bad["authority"]["bootable"] = True
+(root / S.SESSION_CONTRACT_PATH).write_bytes(D.render_json(bad))
+_, text = expect_ok("derive-contract", root=root)
+assert text.encode() == session_contract_bytes and "bootable\": true" not in text
+expect_fail("show still verifies the committed contract", ["show"], root=root,
+            match="differs from its derived form")
+root = clone_root("derive-changed-pin")
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes + b" ")
+expect_fail("derive-contract refuses a changed pinned upstream contract", ["derive-contract"], root=root)
+expect_fail("derive-contract takes no output argument", ["derive-contract", "--out", work / "derive-out"],
+            work / "derive-out")
+assert all(v is False for v in derived["authority"].values()) and derived["synthetic"] is True
+# the committed contract is exactly what the shipped command derives
+committed = subprocess.run([str(repo / "tools/myron-session"), "derive-contract"], check=True,
+                           capture_output=True, cwd=repo)
+assert committed.stdout == (repo / "device/myron/session-contract.json").read_bytes(), (
+    "regenerate: tools/myron-session derive-contract > device/myron/session-contract.json")
+assert committed.stderr == b""
+ok("derive-contract prints the canonical derived contract to stdout, needs no committed contract, "
+   "writes and authorizes nothing, and equals the committed contract")
+
 # --- plan ---------------------------------------------------------------------
 
 plan_a, plan_text = expect_ok("plan", "--request", request)
@@ -702,21 +779,23 @@ ok("R7 projections are sorted, narrow and accept empty files as empty lists")
 # --- exact input closure and tree hazards ----------------------------------------
 
 
-def bad_reads(name, edits=None, *, match=None, absent=(), **kwargs):
+def bad_reads(name, edits=None, *, match=None, absent=(), zero=False, **kwargs):
     base = fresh("reads-bad") / "reads"
     write_reads(base, edits, **kwargs)
     out = work / f"bad-out-{counter[0]}"
     expect_fail(name, ["rehearse", "--request", request, "--reads", base, "--out", out], out,
-                match=match, absent=absent)
+                match=match, absent=absent, untouched=base if zero else None)
     return base
 
 
-def mutated_reads(name, mutate, match=None):
+def mutated_reads(name, mutate, match=None, absent=()):
+    """Closure and metadata hazards: refused with zero payload bytes read."""
     base = fresh("reads-shape") / "reads"
     write_reads(base)
     mutate(base)
     out = work / f"shape-out-{counter[0]}"
-    expect_fail(name, ["rehearse", "--request", request, "--reads", base, "--out", out], out, match=match)
+    expect_fail(name, ["rehearse", "--request", request, "--reads", base, "--out", out], out,
+                match=match, absent=absent, untouched=base)
 
 
 mutated_reads("extra file", lambda c: (c / "notes.txt").write_text("x"), match="exact closure")
@@ -794,10 +873,10 @@ for name, size in (("r1-source-a.json", 16 * 1024 + 1), ("r2-partitions.json", 6
                    ("r5-modules.tsv", 32 * 1024 + 1), ("r7-notes.bin", 512 * 1024 + 1),
                    ("r7-release.txt", 257), ("r7-cmdline.txt", 4097), ("r7-bootconfig.txt", 4097),
                    ("r4-selection.json", 16 * 1024 + 1), ("r6-filesystem.json", 16 * 1024 + 1)):
-    bad_reads(f"{name} over its bound", {name: b" " * size}, match="bound")
-bad_reads("empty required file", {"r5-modules.tsv": b""}, match="bound")
-bad_reads("empty R1 record", {"r1-source-a.json": b""}, match="bound")
-bad_reads("manifest over 64 KiB", manifest_raw=b" " * (64 * 1024 + 1), match="bound")
+    bad_reads(f"{name} over its bound", {name: b" " * size}, match="bound", zero=True)
+bad_reads("empty required file", {"r5-modules.tsv": b""}, match="bound", zero=True)
+bad_reads("empty R1 record", {"r1-source-a.json": b""}, match="bound", zero=True)
+bad_reads("manifest over 64 KiB", manifest_raw=b" " * (64 * 1024 + 1), match="bound", zero=True)
 over = fresh("entries") / "reads"
 write_reads(over)
 for number in range(2):
@@ -807,23 +886,216 @@ expect_fail("more entries than the bound", ["rehearse", "--request", request, "-
 big = fresh("closure-first") / "reads"
 write_reads(big)
 (big / "z-extra.bin").write_bytes(b"x" * (3 * MIB))
-real_read = os.read
-read_sizes = []
-
-
-def counting_read(descriptor, count):
-    read_sizes.append(count)
-    return real_read(descriptor, count)
-
-
-os.read = counting_read
-try:
-    expect_fail("oversized extra file", ["rehearse", "--request", request, "--reads", big,
-                                         "--out", work / "o9"], work / "o9", match="exact closure")
-finally:
-    os.read = real_read
-assert max(read_sizes or [0]) < MIB, "no payload was ingested before the closure was rejected"
+expect_fail("oversized extra file", ["rehearse", "--request", request, "--reads", big,
+                                     "--out", work / "o9"], work / "o9", match="exact closure", untouched=big)
 ok("exact closure, links, special files, writable ancestry, mount crossing and bounds fail closed")
+
+# The closure is 11 payload files plus reads.json: 12 files in all, and one more entry is overbound.
+assert len(S.INPUT_FILES) == 11 and len(S.CLOSURE) == 12 and S.READS_ENTRIES == 13
+assert sorted(row["path"] for row in S.INPUT_FILES) == sorted(set(S.CLOSURE) - {"reads.json"})
+assert len(json.loads((reads / "reads.json").read_text())["files"]) == 11
+assert len(list(reads.iterdir())) == 12
+ok("the exact closure is 11 payload files plus reads.json, 12 files in all")
+
+# Unknown names never reach a diagnostic, at the top level or nested, whatever their kind.
+NAME_CANARY = "canary" + "q7k2"
+for label, plant in (
+    ("canary file", lambda c: (c / f"{NAME_CANARY}.json").write_text("x")),
+    ("canary directory", lambda c: (c / NAME_CANARY).mkdir()),
+    ("canary nested file", lambda c: ((c / NAME_CANARY).mkdir(), (c / NAME_CANARY / f"{NAME_CANARY}.txt").write_text("x"))),
+    ("canary symlink", lambda c: (c / NAME_CANARY).symlink_to("r1-source-a.json")),
+    ("canary fifo", lambda c: os.mkfifo(c / NAME_CANARY)),
+    ("canary replacing a payload name", lambda c: (c / "r5-modules.tsv").rename(c / NAME_CANARY)),
+    ("canary with a control character", lambda c: (c / f"bad\x01{NAME_CANARY}").write_text("x")),
+):
+    mutated_reads(f"unknown name: {label}", plant, match="exact closure", absent=(NAME_CANARY,))
+canary_reads = fresh("canary-verify-reads") / "reads"
+write_reads(canary_reads)
+(canary_reads / NAME_CANARY).mkdir()
+expect_fail("verify-rehearsal with an unknown name in the reads", [
+    "verify-rehearsal", "--request", request, "--reads", canary_reads, "--rehearsal", work / "no-rehearsal"],
+    match="exact closure", absent=(NAME_CANARY,), untouched=canary_reads)
+ok("input-side closure errors count names and never echo an unknown one")
+
+# Admission races: the tree changes after the listing, while the descriptors are being pinned.
+# Every case must refuse before ONE payload byte is read, and the injection must really fire.
+def admission_race(label, hooks, match):
+    base = fresh("admission") / "reads"
+    write_reads(base)
+    out = work / f"admission-out-{counter[0]}"
+    fired = []
+    real_open = D.open_pinned_regular_at
+
+    def factory(original):
+        def patched(directory_fd, name, description):
+            hook = hooks.get((name, "before")) if name in S.CLOSURE else None
+            if hook:
+                fired.append((name, "before"))
+                hook(base)
+            result = original(directory_fd, name, description)
+            hook = hooks.get((name, "after")) if name in S.CLOSURE else None
+            if hook:
+                fired.append((name, "after"))
+                hook(base)
+            return result
+        return patched
+
+    with_patch(D, "open_pinned_regular_at", factory, lambda: expect_fail(
+        label, ["rehearse", "--request", request, "--reads", base, "--out", out], out,
+        match=match, untouched=base))
+    assert fired, f"{label}: the injection never ran"
+    assert D.open_pinned_regular_at is real_open
+    return base
+
+
+def unlink(name):
+    return lambda base: (base / name).unlink()
+
+
+def add_file(base):
+    (base / "late-extra.bin").write_bytes(b"x" * 6949)
+
+
+def rename_away(name):
+    return lambda base: (base / name).rename(base / (name + ".moved"))
+
+
+def make_executable(name):
+    return lambda base: (base / name).chmod(0o755)
+
+
+def replace_with_copy(name):
+    def apply(base):
+        (base / "swap.tmp").write_bytes((base / name).read_bytes())
+        (base / "swap.tmp").chmod(0o644)
+        os.replace(base / "swap.tmp", base / name)
+    return apply
+
+
+def grow(name):
+    def apply(base):
+        with (base / name).open("ab") as stream:
+            stream.write(b" ")
+    return apply
+
+
+FIRST, LAST = S.CLOSURE[0], S.CLOSURE[-1]
+admission_race("payload deleted before its pin", {(FIRST, "before"): unlink("r7-release.txt")},
+               "cannot be opened safely")
+admission_race("payload deleted after its own pin", {("r7-release.txt", "after"): unlink("r7-release.txt")},
+               "changed during admission and differ from the exact closure (0 extra, 1 missing)")
+admission_race("pinned payload deleted after a later pin", {("r2-partitions.json", "after"): unlink(FIRST)},
+               "changed during admission and differ from the exact closure")
+admission_race("manifest deleted after the last pin", {(LAST, "after"): unlink("reads.json")},
+               "changed during admission and differ from the exact closure")
+admission_race("file added before the first pin", {(FIRST, "before"): add_file},
+               "changed during admission and differ from the exact closure (1 extra, 0 missing)")
+admission_race("file added after the last pin", {(LAST, "after"): add_file},
+               "changed during admission and differ from the exact closure (1 extra, 0 missing)")
+admission_race("pinned payload renamed away", {("r5-modules.tsv", "after"): rename_away("r5-modules.tsv")},
+               "changed during admission and differ from the exact closure (1 extra, 1 missing)")
+admission_race("payload renamed away before its pin", {(FIRST, "before"): rename_away("r6-filesystem.json")},
+               "cannot be opened safely")
+admission_race("pinned payload replaced by a same-bytes file", {("r4-selection.json", "after"): replace_with_copy("r4-selection.json")},
+               "changed during admission")
+admission_race("payload swapped for a symlink before its pin", {("r4-selection.json", "before"): lambda b: (
+    (b / "r4-selection.json").unlink(), (b / "r4-selection.json").symlink_to("r3-header-summaries.json"))},
+               "not a regular file")
+admission_race("payload swapped for a fifo before its pin", {("r4-selection.json", "before"): lambda b: (
+    (b / "r4-selection.json").unlink(), os.mkfifo(b / "r4-selection.json"))}, "not a regular file")
+admission_race("payload swapped for a hardlink before its pin", {("r4-selection.json", "before"): lambda b: (
+    (b / "r4-selection.json").unlink(), os.link(b / "r3-header-summaries.json", b / "r4-selection.json"))},
+               "additional hard links")
+admission_race("payload made executable before its pin", {("r6-filesystem.json", "before"): make_executable("r6-filesystem.json")},
+               "executable")
+admission_race("pinned payload made executable after its pin", {("r1-source-a.json", "after"): make_executable("r1-source-a.json")},
+               "changed during admission")
+admission_race("manifest made executable before its pin", {("reads.json", "before"): make_executable("reads.json")},
+               "executable")
+admission_race("payload made group-writable before its pin", {("r3-header-summaries.json", "before"):
+               lambda b: (b / "r3-header-summaries.json").chmod(0o664)}, "writable")
+admission_race("payload grown past its bound before its pin", {("r7-release.txt", "before"):
+               lambda b: (b / "r7-release.txt").write_bytes(b"x" * 300)}, "byte bounds")
+admission_race("pinned payload grown after its pin", {("r5-modules.tsv", "after"): grow("r5-modules.tsv")},
+               "changed during admission")
+admission_race("reads directory made group-writable after the pins", {(LAST, "after"):
+               lambda b: b.chmod(0o775)}, "changed during admission")
+no_leftovers("admission races")
+ok("closure, metadata and identity changes during admission refuse with zero payload bytes read")
+
+
+# Changes during the captured-descriptor reads fail for instability, never for a later manifest mismatch.
+def during_read(label, victim_name, mutate, match, nth=1):
+    base = fresh("during-read") / "reads"
+    write_reads(base)
+    victim = str(base / victim_name)
+    seen, fired = [0], []
+    original = os.read
+
+    def patched(descriptor, count):
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            target = ""
+        if target == victim:
+            seen[0] += 1
+            if seen[0] == nth:
+                fired.append(True)
+                mutate(base)
+        return original(descriptor, count)
+
+    out = work / f"during-read-out-{counter[0]}"
+    os.read = patched
+    try:
+        err = expect_fail(label, ["rehearse", "--request", request, "--reads", base, "--out", out], out,
+                          match=match)
+    finally:
+        os.read = original
+    assert fired, f"{label}: the injection never ran"
+    assert "differs from the file" not in err, f"{label}: failed on a manifest mismatch, not instability"
+
+
+def append_bytes(name, extra=b"extra\t\n"):
+    def apply(base):
+        with (base / name).open("ab") as stream:
+            stream.write(extra)
+    return apply
+
+
+def overwrite_same_size(name):
+    def apply(base):
+        data = (base / name).read_bytes()
+        with (base / name).open("r+b") as stream:
+            stream.write(bytes([data[0] ^ 1]) + data[1:])
+    return apply
+
+
+def truncate(name, cut=3):
+    return lambda base: (base / name).write_bytes((base / name).read_bytes()[:-cut])
+
+
+during_read("file grows during its own read", "r5-modules.tsv", append_bytes("r5-modules.tsv"),
+            "grew while being read")
+during_read("manifest grows during its own read", "reads.json", append_bytes("reads.json", b" "),
+            "grew while being read")
+during_read("file shrinks during its own read", "r5-modules.tsv", truncate("r5-modules.tsv"),
+            "changed size while being read")
+during_read("file rewritten in place during its own read", "r6-filesystem.json",
+            overwrite_same_size("r6-filesystem.json"), "changed while being read")
+during_read("file made executable during its own read", "r4-selection.json",
+            make_executable("r4-selection.json"), "changed while being read")
+during_read("file grows after its bytes were read", "r5-modules.tsv", append_bytes("r5-modules.tsv"),
+            "grew while being read", nth=2)
+during_read("another file grows while a later one is read", "r7-notes.bin", append_bytes("r1-source-a.json", b" "),
+            "changed while being read")
+during_read("an earlier file is deleted while a later one is read", "r7-notes.bin", unlink("r2-partitions.json"),
+            "changed while being read")
+during_read("an extra file appears while the last file is read", "reads.json", add_file,
+            "changed while being read and differ from the exact closure", nth=2)
+during_read("an earlier file is replaced while the last file is read", "reads.json",
+            replace_with_copy("r1-source-a.json"), "changed while being read", nth=2)
+no_leftovers("reads read races")
+ok("grow, shrink, rewrite, delete, add and replace during the captured-descriptor reads fail for instability")
 
 # Reads bound to another request or contract, and manifest rows.
 bad_reads("manifest wrong request", req_sha="1" * 64, match="request binding")
@@ -1169,14 +1441,14 @@ def reseal(clone):
         f"{digest((clone / name).read_bytes())}  {name}\n" for name in SUM_FILES(clone)))
 
 
-def tampered(name, mutate_files=None, *, resum=True, match=None):
+def tampered(name, mutate_files=None, *, resum=True, match=None, absent=()):
     clone = fresh("rehearsal-tamper") / "rehearsal"
     shutil.copytree(rehearsal_a, clone)
     if mutate_files:
         mutate_files(clone)
     if resum:
         reseal(clone)
-    expect_fail(name, ["verify-rehearsal", *args(), "--rehearsal", clone], match=match)
+    return expect_fail(name, ["verify-rehearsal", *args(), "--rehearsal", clone], match=match, absent=absent)
 
 
 def edit_document(relative, mutate):
@@ -1285,6 +1557,79 @@ expect_fail("verify given the request tree", ["verify-rehearsal", *args(), "--re
 expect_fail("verify with the capture only", ["verify-rehearsal", *args(), "--rehearsal", rehearsal_a / "capture"])
 ok("verify-rehearsal recomputes from request and reads: every binding, document, claim and checksum matters")
 
+# An untrusted rehearsal tree never reaches a diagnostic by name: root and nested names, links,
+# special files, and the collector's own capture-tree errors become fixed codes.
+CN = NAME_CANARY
+plants = (
+    ("outer file", lambda c: (c / f"{CN}.txt").write_text("x"), "unexpected paths"),
+    ("outer directory", lambda c: (c / CN).mkdir(), "unexpected paths"),
+    ("outer directory with a file", lambda c: ((c / CN).mkdir(), (c / CN / CN).write_text("x")), "unexpected paths"),
+    ("capture file", lambda c: (c / f"capture/{CN}.json").write_text("x"), "unexpected paths"),
+    ("operations file", lambda c: (c / f"capture/operations/{CN}.json").write_text("x"), "unexpected paths"),
+    ("deep directory", lambda c: ((c / f"capture/operations/{CN}").mkdir(),
+                                  (c / f"capture/operations/{CN}/{CN}").write_text("x")), "unexpected paths"),
+    ("outer symlink", lambda c: (c / CN).symlink_to("rehearsal.json"), "code symlink"),
+    ("nested symlink", lambda c: (c / f"capture/{CN}").symlink_to("../rehearsal.json"), "code symlink"),
+    ("replacing a file by a symlink", lambda c: ((c / "manifest.json").unlink(),
+                                                 (c / "manifest.json").symlink_to(CN)), "code symlink"),
+    ("outer fifo", lambda c: os.mkfifo(c / CN), "code special-file"),
+    ("nested fifo", lambda c: os.mkfifo(c / f"capture/operations/{CN}"), "code special-file"),
+    ("outer hardlink", lambda c: os.link(c / "rehearsal.json", c / CN), "code hardlink"),
+    ("nested hardlink", lambda c: os.link(c / "rehearsal.json", c / f"capture/{CN}"), "code hardlink"),
+    ("control character name", lambda c: (c / f"bad\x01{CN}").write_text("x"), "code unsafe-name"),
+    ("canary replacing a real file", lambda c: (c / "manifest.json").rename(c / f"{CN}.json"), "unexpected paths"),
+    ("executable canary", lambda c: ((c / f"{CN}.sh").write_text("x"), (c / f"{CN}.sh").chmod(0o755)), "unexpected paths"),
+)
+for label, plant, code in plants:
+    err = tampered(f"rehearsal tree with a {label}", plant, resum=False, match=code, absent=(CN,))
+    assert "ERROR: rehearsal" in err, (label, err)
+
+with_patch(C, "read_capture", lambda original: lambda *a, **kw: (_ for _ in ()).throw(
+    C.CollectError(f"capture tree differs (extra ['{CN}'], missing [])")),
+    lambda: expect_fail("collector capture-tree error in verify-rehearsal", [
+        "verify-rehearsal", *args(), "--rehearsal", rehearsal_a], match="code capture-rejected", absent=(CN,)))
+with_patch(C, "read_capture", lambda original: lambda *a, **kw: (_ for _ in ()).throw(
+    D.DeploymentError(f"capture contains a symlink: /{CN}")),
+    lambda: expect_fail("collector tree-reader error in verify-rehearsal", [
+        "verify-rehearsal", *args(), "--rehearsal", rehearsal_a], match="code capture-rejected", absent=(CN,)))
+
+real_walk = D.walk_tree
+
+
+def planting_walker(original):
+    def patched(descriptor, limits, **kw):
+        tree = original(descriptor, limits, **kw)
+        if kw.get("label") == "rehearsal":
+            tree.entries.append(D.Entry(CN, "file", 0o644, 1, "0" * 64, ""))
+        return tree
+    return patched
+
+
+def failing_walker(original):
+    def patched(descriptor, limits, **kw):
+        if kw.get("label") == "rehearsal":
+            raise D.DeploymentError(f"rehearsal contains a symlink: /{CN}")
+        return original(descriptor, limits, **kw)
+    return patched
+
+
+out = work / "canary-built-extra"
+with_patch(D, "walk_tree", planting_walker, lambda: expect_fail(
+    "unexpected name in the built tree", ["rehearse", *args(), "--out", out], out,
+    match="unexpected paths", absent=(CN,)))
+out = work / "canary-built-symlink"
+with_patch(D, "walk_tree", failing_walker, lambda: expect_fail(
+    "tree-reader error in the built tree", ["rehearse", *args(), "--out", out], out,
+    match="code symlink", absent=(CN,)))
+out = work / "canary-built-collector"
+with_patch(C, "read_capture", lambda original: lambda *a, **kw: (_ for _ in ()).throw(
+    C.CollectError(f"capture tree differs (extra ['{CN}'], missing [])")),
+    lambda: expect_fail("collector capture-tree error in the built tree", ["rehearse", *args(), "--out", out],
+                        out, match="code capture-rejected", absent=(CN,)))
+assert D.walk_tree is real_walk
+no_leftovers("rehearsal tree sanitization")
+ok("untrusted rehearsal-tree failures name no input: fixed codes at the session boundary")
+
 # --- publication hazards --------------------------------------------------------
 
 existing = work / "existing"
@@ -1367,48 +1712,7 @@ for at in (1, 2):
                                    ["rehearse", "--request", clone, "--reads", reads, "--out", out], out))
 no_leftovers("request races")
 
-# unstable reads: a file that grows while it is read, and one whose size changes between stat and read
-growing = fresh("growing") / "reads"
-write_reads(growing)
-victim = growing / "r5-modules.tsv"
-real_os_read = os.read
-state = {"done": False}
-
-
-def growing_read(descriptor, count):
-    if not state["done"]:
-        state["done"] = True
-        with victim.open("ab") as stream:
-            stream.write(b"extra\t\n")
-    return real_os_read(descriptor, count)
-
-
-os.read = growing_read
-try:
-    expect_fail("file grows while it is read", ["rehearse", "--request", request, "--reads", growing,
-                                                "--out", work / "grow-out"], work / "grow-out")
-finally:
-    os.read = real_os_read
-shrinking = fresh("shrinking") / "reads"
-write_reads(shrinking)
-victim = shrinking / "r5-modules.tsv"
-state = {"done": False}
-
-
-def shrinking_read(descriptor, count):
-    if not state["done"]:
-        state["done"] = True
-        victim.write_bytes(victim.read_bytes()[:-3])
-    return real_os_read(descriptor, count)
-
-
-os.read = shrinking_read
-try:
-    expect_fail("file shrinks while it is read", ["rehearse", "--request", request, "--reads", shrinking,
-                                                  "--out", work / "shrink-out"], work / "shrink-out")
-finally:
-    os.read = real_os_read
-no_leftovers("unstable reads")
+# unstable reads during the captured-descriptor read are covered above, with precise injection
 
 # collector rejection after the build leaves no output at any stage
 calls = {"count": 0}
@@ -1440,7 +1744,8 @@ for stage in (1, 2):
 
     with_patch(C, "read_capture", late_reject,
                lambda: expect_fail(f"collector capture read rejection at stage {stage}",
-                                   ["rehearse", *args(), "--out", out], out, match="injected capture rejection"))
+                                   ["rehearse", *args(), "--out", out], out, match="code capture-rejected",
+                                   absent=("injected capture rejection",)))
 no_leftovers("collector rejection")
 # the published-path verification removes a published output when it fails
 real_publish = D.publish

@@ -232,7 +232,8 @@ NON_GOALS = [
 SAFETY = [
     "flat-tree-only", "exact-closure-before-payload-read", "no-symlinks", "no-hardlinks",
     "no-executable-files", "no-special-files", "no-mount-crossing", "no-writable-ancestry",
-    "no-aliases-of-inputs", "stable-while-read",
+    "no-aliases-of-inputs", "stable-while-read", "metadata-admitted-before-payload-read",
+    "names-revalidated-after-read",
 ]
 
 
@@ -962,10 +963,14 @@ class Reads:
         self.sha256 = sha256_hex(manifest_bytes)
 
 
-def reads_limits():
-    return deploy().Limits(
-        READS_ENTRIES, 0, max(row["max_bytes"] for row in INPUT_FILES), TOTAL_READS_BYTES
-    )
+class Held:
+    """One closure file pinned by descriptor: its name is a closure constant, never input."""
+
+    def __init__(self, name, pinned, descriptor, opened):
+        self.name = name
+        self.pinned = pinned
+        self.descriptor = descriptor
+        self.opened = opened
 
 
 def list_names(descriptor: int) -> list[str]:
@@ -978,27 +983,100 @@ def list_names(descriptor: int) -> list[str]:
     return names
 
 
-def check_closure(names: list[str]) -> None:
+def check_closure(names: list[str], when: str = "") -> None:
+    """Diagnostics carry counts only: an unexpected name is never echoed."""
     if sorted(names) != CLOSURE:
         extra = len(set(names) - set(CLOSURE))
         missing = len(set(CLOSURE) - set(names))
         raise SessionError(
-            f"synthetic reads differ from the exact closure ({extra} extra, {missing} missing)"
+            f"synthetic reads {when}differ from the exact closure ({extra} extra, {missing} missing)"
         )
 
 
-def admit(relative: str, size: int):
-    """Called by the tree reader before it reads a file's payload."""
-    if relative == MANIFEST_PATH:
-        low, high = 1, MANIFEST_MAX_BYTES
-    else:
-        row = INPUT_ROWS.get(relative)
-        if row is None:
-            raise SessionError("synthetic reads hold a path outside the closure")
-        low, high = row["min_bytes"], row["max_bytes"]
-    if not low <= size <= high:
-        raise SessionError(f"synthetic reads file {relative} is outside its {low}..{high} byte bounds")
-    return size
+def reads_bounds(name: str) -> tuple[int, int]:
+    if name == MANIFEST_PATH:
+        return 1, MANIFEST_MAX_BYTES
+    row = INPUT_ROWS[name]
+    return row["min_bytes"], row["max_bytes"]
+
+
+def release(held: list) -> None:
+    for item in held:
+        for descriptor in (item.descriptor, item.pinned):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def pin_reads(directory: int, root, root_mount: int) -> list:
+    """Pin every closure file and judge all of its metadata; no payload byte is read here."""
+    d = deploy()
+    held, total = [], 0
+    try:
+        for name in CLOSURE:
+            pinned, descriptor, opened = d.open_pinned_regular_at(
+                directory, name, f"synthetic reads file {name}"
+            )
+            held.append(Held(name, pinned, descriptor, opened))
+            if opened.st_nlink != 1:
+                raise SessionError(f"synthetic reads file {name} has additional hard links")
+            if d.untrusted_owner_or_mode(opened):
+                raise SessionError(f"synthetic reads file {name} is writable or controlled by another user")
+            if opened.st_mode & 0o111:
+                raise SessionError(f"synthetic reads file is executable: {name}")
+            if opened.st_dev != root.st_dev:
+                raise SessionError(f"synthetic reads file {name} crosses a device boundary")
+            if d.kernel().mount_id_for_fd(pinned, f"synthetic reads file {name}") != root_mount:
+                raise SessionError(f"synthetic reads file {name} crosses a mount point")
+            low, high = reads_bounds(name)
+            if not low <= opened.st_size <= high:
+                raise SessionError(f"synthetic reads file {name} is outside its {low}..{high} byte bounds")
+            total += opened.st_size
+            if total > TOTAL_READS_BYTES:
+                raise SessionError("synthetic reads exceed the total byte bound")
+    except BaseException:
+        release(held)
+        raise
+    return held
+
+
+def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> None:
+    """The listing, the directory and every name still match the pinned descriptors."""
+    d = deploy()
+    check_closure(list_names(directory), f"changed {when} and ")
+    if d.fingerprint(os.fstat(directory)) != root_before:
+        raise SessionError(f"synthetic reads directory changed {when}")
+    for item in held:
+        pinned = d.fingerprint(item.opened)
+        if d.fingerprint(os.fstat(item.descriptor)) != pinned:
+            raise SessionError(f"synthetic reads file {item.name} changed {when}")
+        try:
+            current = os.stat(item.name, dir_fd=directory, follow_symlinks=False)
+        except OSError as error:
+            raise SessionError(f"synthetic reads file {item.name} was removed {when}") from error
+        if d.fingerprint(current) != pinned:
+            raise SessionError(f"synthetic reads file {item.name} was replaced {when}")
+
+
+def read_pinned(item: Held) -> bytes:
+    """Exactly the stat size from the captured descriptor, then a stability check."""
+    d = deploy()
+    pinned = d.fingerprint(item.opened)
+    if d.fingerprint(os.fstat(item.descriptor)) != pinned:
+        raise SessionError(f"synthetic reads file {item.name} changed before being read")
+    chunks, remaining = [], item.opened.st_size
+    while remaining:
+        block = os.read(item.descriptor, min(MIB, remaining))
+        if not block:
+            raise SessionError(f"synthetic reads file {item.name} changed size while being read")
+        chunks.append(block)
+        remaining -= len(block)
+    if os.read(item.descriptor, 1):
+        raise SessionError(f"synthetic reads file {item.name} grew while being read")
+    if d.fingerprint(os.fstat(item.descriptor)) != pinned:
+        raise SessionError(f"synthetic reads file {item.name} changed while being read")
+    return b"".join(chunks)
 
 
 def check_manifest(raw: bytes, files: dict, env: Environment, request_sha256: str) -> None:
@@ -1020,29 +1098,31 @@ def check_manifest(raw: bytes, files: dict, env: Environment, request_sha256: st
 
 
 def read_reads(path: str, env: Environment, request_sha256: str) -> Reads:
+    """Admit the flat tree in order: exact closure, then every descriptor's metadata, then a
+    re-listing, and only then the payload bytes, from the pinned descriptors, with the names
+    revalidated afterwards. A missing, extra or unsafe file stops the read at zero payload bytes."""
     d = deploy()
     descriptor, identity = d.open_trusted_artifact(path, "synthetic reads")
+    held = []
     try:
+        root = os.fstat(descriptor)
+        if d.untrusted_owner_or_mode(root):
+            raise SessionError("synthetic reads directory is writable or controlled by another user")
+        root_mount = d.kernel().mount_id_for_fd(descriptor, "synthetic reads root")
+        root_before = d.fingerprint(root)
         check_closure(list_names(descriptor))
-        tree = d.walk_tree(
-            descriptor, reads_limits(), allow_symlinks=False, capture=admit,
-            trusted_ownership=True, label="synthetic reads",
-        )
+        held = pin_reads(descriptor, root, root_mount)
+        settle_reads(descriptor, held, root_before, "during admission")
+        data = {item.name: read_pinned(item) for item in held}
+        settle_reads(descriptor, held, root_before, "while being read")
     finally:
+        release(held)
         os.close(descriptor)
-    kinds = {entry.path: entry.kind for entry in tree.entries}
-    if kinds != {".": "dir", **{name: "file" for name in CLOSURE}}:
-        raise SessionError("synthetic reads differ from the exact closure")
-    for entry in tree.entries:
-        if entry.kind == "file" and entry.mode & 0o111:
-            raise SessionError(f"synthetic reads file is executable: {entry.path}")
-    if tree.file_bytes > TOTAL_READS_BYTES:
-        raise SessionError("synthetic reads exceed the total byte bound")
-    manifest_bytes = tree.data[MANIFEST_PATH]
-    files = {name: tree.data[name] for name in CLOSURE if name != MANIFEST_PATH}
+    manifest_bytes = data[MANIFEST_PATH]
+    files = {name: data[name] for name in CLOSURE if name != MANIFEST_PATH}
     check_manifest(manifest_bytes, files, env, request_sha256)
     d.recheck_trusted_artifact(path, identity, "synthetic reads")
-    return Reads(manifest_bytes, files, tree.directory_ids)
+    return Reads(manifest_bytes, files, frozenset({(root.st_dev, root.st_ino)}))
 
 
 # --- adaptation -----------------------------------------------------------------
@@ -1334,6 +1414,61 @@ def plan_document(env: Environment, request: dict, request_sha256: str) -> dict:
     }
 
 
+# --- untrusted rehearsal trees --------------------------------------------------
+# A rehearsal tree under verification is untrusted: its names, links and special
+# files must never reach a diagnostic. Every failure from the shared tree reader,
+# the entry comparison and the collector's capture read becomes a fixed code here.
+
+TREE_FAILURE_CODES = (
+    ("symlink", "symlink"), ("special file", "special-file"), ("hard link", "hardlink"),
+    ("writable or controlled", "ownership-or-mode"), ("mount", "mount-crossing"),
+    ("device boundary", "mount-crossing"), ("name", "unsafe-name"), ("exceeds", "bound"),
+    ("changed", "unstable"),
+)
+
+
+def tree_failure_code(message: str) -> str:
+    """A fixed code chosen from the reader's wording; the wording itself is never passed on."""
+    for fragment, code in TREE_FAILURE_CODES:
+        if fragment in message:
+            return code
+    return "unsafe"
+
+
+def walk_rehearsal(descriptor: int, label: str, **options):
+    d = deploy()
+    try:
+        return d.walk_tree(descriptor, d.STAGE_LIMITS, allow_symlinks=False, label=label, **options)
+    except (d.DeploymentError, OSError) as error:
+        raise SessionError(
+            f"{label} tree failed safe inspection (code {tree_failure_code(str(error))})"
+        ) from None
+
+
+def diff_rehearsal(actual: list, expected: list, label: str) -> None:
+    """Compare entries; only the expected side's own paths may be named."""
+    have = {entry.path: entry for entry in actual}
+    want = {entry.path: entry for entry in expected}
+    extra = len(set(have) - set(want))
+    if extra:
+        raise SessionError(f"{label} has {extra} unexpected paths (names withheld)")
+    missing = sorted(set(want) - set(have))
+    if missing:
+        raise SessionError(f"{label} is missing paths: {missing}")
+    for path in sorted(want):
+        if have[path] != want[path]:
+            raise SessionError(f"{label} differs at {path}")
+
+
+def reread_capture(path: str, env: Environment, request: dict, request_sha256: str, label: str):
+    """The collector's own capture read, with its diagnostics replaced by one fixed code."""
+    c, d = collect(), deploy()
+    try:
+        return c.read_capture(path, env.collector, request, request_sha256)
+    except (c.CollectError, d.DeploymentError, OSError, ValueError):
+        raise SessionError(f"{label} capture was refused by the collector's read (code capture-rejected)") from None
+
+
 # --- commands -------------------------------------------------------------------
 
 
@@ -1365,7 +1500,7 @@ def command_verify_plan(env: Environment, args) -> dict:
 
 
 def command_rehearse(env: Environment, args) -> dict:
-    c, d = collect(), deploy()
+    d = deploy()
     for path in (args.request, args.reads):
         if d.paths_overlap(args.out, path):
             raise SessionError("output path overlaps an input")
@@ -1379,10 +1514,10 @@ def command_rehearse(env: Environment, args) -> dict:
         again = gather(args, env)
         if rehearsal_spec(env, again) != spec:
             raise SessionError("request or reads changed during the rehearsal")
-        tree = d.walk_tree(descriptor, d.STAGE_LIMITS, allow_symlinks=False, label="rehearsal")
-        d.diff_entries(tree.entries, expected, "rehearsal")
-        built = c.read_capture(
-            f"{temporary_path}/capture", env.collector, again.request, again.request_sha256
+        tree = walk_rehearsal(descriptor, "rehearsal")
+        diff_rehearsal(tree.entries, expected, "rehearsal")
+        built = reread_capture(
+            f"{temporary_path}/capture", env, again.request, again.request_sha256, "built"
         )
         if built.capture_sha256 != capture_digest(spec):
             raise SessionError("built capture differs from the rehearsed capture")
@@ -1392,24 +1527,21 @@ def command_rehearse(env: Environment, args) -> dict:
 
 
 def command_verify_rehearsal(env: Environment, args) -> dict:
-    c, d = collect(), deploy()
+    d = deploy()
     inputs = gather(args, env)
     spec = rehearsal_spec(env, inputs)
     if any(d.paths_overlap(args.rehearsal, path) for path in (args.request, args.reads)):
         raise SessionError("rehearsal overlaps an input")
     descriptor, identity = d.open_trusted_artifact(args.rehearsal, "rehearsal")
     try:
-        tree = d.walk_tree(
-            descriptor, d.STAGE_LIMITS, allow_symlinks=False, keep_data=True,
-            trusted_ownership=True, label="rehearsal",
-        )
+        tree = walk_rehearsal(descriptor, "rehearsal", keep_data=True, trusted_ownership=True)
     finally:
         os.close(descriptor)
-    d.diff_entries(tree.entries, d.spec_entries(spec), "rehearsal")
+    diff_rehearsal(tree.entries, d.spec_entries(spec), "rehearsal")
     if tree.directory_ids & (inputs.request_ids | inputs.reads.directory_ids):
         raise SessionError("rehearsal aliases an input tree")
-    built = c.read_capture(
-        f"{args.rehearsal}/capture", env.collector, inputs.request, inputs.request_sha256
+    built = reread_capture(
+        f"{args.rehearsal}/capture", env, inputs.request, inputs.request_sha256, "rehearsed"
     )
     if built.capture_sha256 != capture_digest(spec):
         raise SessionError("rehearsed capture differs from the recomputed capture")
@@ -1423,7 +1555,11 @@ def command_verify_rehearsal(env: Environment, args) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("show", help="print the offline session contract")
+    commands.add_parser("show", help="verify and print the committed session contract")
+    commands.add_parser(
+        "derive-contract",
+        help="print the contract derived from the pinned upstream contracts; writes nothing",
+    )
     plan = commands.add_parser("plan", help="print the value-free rehearsal plan")
     plan.add_argument("--request", required=True)
     verify_plan = commands.add_parser("verify-plan", help="recompute a saved plan")
@@ -1452,17 +1588,22 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
     s = p.snapshot()
     root = contracts_root or REPO
     try:
-        env = load_environment(root)
-        if args.command == "show":
-            result = env.contract
-        elif args.command == "plan":
-            result = command_plan(env, args)
-        elif args.command == "verify-plan":
-            result = command_verify_plan(env, args)
-        elif args.command == "rehearse":
-            result = command_rehearse(env, args)
+        if args.command == "derive-contract":
+            # No committed session contract is read: the pinned upstream contracts and this
+            # source alone derive the bytes that `show` verifies. Nothing is written or authorized.
+            result = expected_session_contract(c.load_environment(root))
         else:
-            result = command_verify_rehearsal(env, args)
+            env = load_environment(root)
+            if args.command == "show":
+                result = env.contract
+            elif args.command == "plan":
+                result = command_plan(env, args)
+            elif args.command == "verify-plan":
+                result = command_verify_plan(env, args)
+            elif args.command == "rehearse":
+                result = command_rehearse(env, args)
+            else:
+                result = command_verify_rehearsal(env, args)
     except (SessionError, c.CollectError, p.PreflightError, s.SnapshotError, *d.handled_errors()) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

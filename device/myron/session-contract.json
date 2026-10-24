@@ -356,7 +356,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-session-impl.py",
-    "sha256": "027db95c7177bf7f9d20a931422cbc8b9d5f9d52316fbf85c86e5f1ea73e0591"
+    "sha256": "9caf0e6a62f017d6896b4e382c8da6f560547589379b16745cc9fa4727ad9bd1"
   },
   "input": {
     "closure": [
@@ -491,7 +491,9 @@
       "no-mount-crossing",
       "no-writable-ancestry",
       "no-aliases-of-inputs",
-      "stable-while-read"
+      "stable-while-read",
+      "metadata-admitted-before-payload-read",
+      "names-revalidated-after-read"
     ],
     "schemas": {
       "r1-source-a.json": {
