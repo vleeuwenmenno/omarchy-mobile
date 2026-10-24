@@ -1,0 +1,101 @@
+{
+  "blockers": [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization"
+  ],
+  "bootable": false,
+  "components": {
+    "gpu_profile_reference": {
+      "path": "packages/omamobile-myron-gpu-profile/reference.json",
+      "sha256": "b9039c75d535411e60ff65d4295b5fbf00fa8e3dd42f0a996245ed867ce1be7b"
+    },
+    "kernel_reference": {
+      "path": "device/myron/kernel-contract.json",
+      "sha256": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193"
+    },
+    "stage_contract": {
+      "path": "device/myron/stage-contract.json",
+      "sha256": "2baee9e393ffac17da7b21f61dacbc153dfb0e29d7dc5df46671f5f473f9826e"
+    }
+  },
+  "deployment_authorized": false,
+  "device": {
+    "boot_method": "external-android",
+    "codename": "myron",
+    "compatible": "qcom,canoe-mtp",
+    "model_contains": "Myron",
+    "soc": "sm8850"
+  },
+  "flashable": false,
+  "image_ready": false,
+  "kind": "myron-deployment-candidate-contract",
+  "modules": {
+    "archive_sha256": "342139d347edcb1a0bcb37498eead80657b307709920666fc7fae40e0dcd3496",
+    "file_count": 8,
+    "module_count": 7,
+    "module_directory": "/usr/local/lib/myron-gki-module-sets/8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
+    "order": {
+      "modules": [
+        "pwrseq-core",
+        "bluetooth",
+        "btbcm",
+        "btqca",
+        "hci_uart",
+        "rfkill",
+        "rmnet"
+      ],
+      "source": "public myron-postmarketOS Attempt79/VT staging order; load semantics unverified",
+      "status": "unverified"
+    },
+    "selector_destination": "/usr/local/sbin/myron-attempt79-module-dir"
+  },
+  "rootfs": {
+    "bound_files": {
+      "usr/share/omamobile/myron-gpu-profile/reference.json": "b9039c75d535411e60ff65d4295b5fbf00fa8e3dd42f0a996245ed867ce1be7b",
+      "usr/share/omamobile/myron-kernel-contract/reference.json": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193",
+      "usr/share/omamobile/myron-kernel-contract/stage-contract.json": "2baee9e393ffac17da7b21f61dacbc153dfb0e29d7dc5df46671f5f473f9826e"
+    },
+    "copied_into_kit": false,
+    "device_lines": [
+      "BOOT_METHOD=external-android",
+      "ROOTFS_INTEGRATION=external-contract"
+    ],
+    "digest_algorithm": "myron-rootfs-tree-v1-sha256",
+    "digest_scope": "path, type, mode, size, content sha256 and symlink target of every entry, sorted by path; no owner, time or hardlink identity",
+    "external": true,
+    "hardlinks": "rejected",
+    "manifest_lines": [
+      "rootfs integration: external-contract",
+      "rootfs package profile: myron",
+      "package closure: required present; forbidden absent",
+      "kernel modules: none (external contract, no module payload)"
+    ],
+    "required_files": [
+      "usr/share/omamobile/device.conf",
+      "usr/share/omamobile/device-myron/version",
+      "usr/share/omamobile/myron-kernel-contract/reference.json",
+      "usr/bin/omamobile-myron-kernel-verify",
+      "usr/share/omamobile/myron-gpu/reference.json",
+      "usr/share/omamobile/myron-gpu-profile/reference.json",
+      "usr/lib/omamobile/myron-gpu/SHA256SUMS"
+    ],
+    "stage_marker": "# Omarchy Mobile root STAGE (not bootable",
+    "symlinks": "recorded in the digest and never followed"
+  },
+  "runtime": {
+    "bytes": "external-private",
+    "copied_into_kit": false,
+    "manifest_sha256": "6e4cd92a61b246c52255ccdbea8cc6280d6ceecdae12d083417f220fe6b90fbc",
+    "required_features": [
+      "gpu",
+      "wifi",
+      "touch"
+    ]
+  },
+  "schema": 1
+}

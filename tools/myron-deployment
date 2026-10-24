@@ -1,0 +1,1683 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Laptop-only, non-flashable Myron deployment-candidate kit (v0.1).
+
+Stages the exact qualified external module overlay and binds a rootfs stage,
+the kernel contract, the GPU profile and the private runtime-asset manifest
+identity into one deterministic kit directory. It never authorizes deployment:
+the gate prints the permanent blockers and refuses. Nothing here is bootable,
+flashable, an image, an atomic-snapshot proof, or hardware-qualified.
+
+No external command is run and nothing outside the requested output is
+written. Inputs are only read; the rootfs stage is bound, never copied.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+if __name__ == "__main__":  # never import a module planted beside the tool
+    _here = os.path.dirname(os.path.realpath(__file__))
+    sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _here]
+
+import argparse
+import ctypes
+import fnmatch
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import re
+import stat
+from typing import NamedTuple
+
+sys.dont_write_bytecode = True
+
+VERSION = "0.1.0"
+REPO = Path(__file__).resolve().parent.parent
+KERNEL_VERIFIER = REPO / "packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify"
+GPU_VERIFIER = REPO / "packages/omamobile-myron-gpu-profile/bin/omamobile-myron-gpu-profile"
+KERNEL_REFERENCE_PATH = "device/myron/kernel-contract.json"
+STAGE_CONTRACT_PATH = "device/myron/stage-contract.json"
+GPU_REFERENCE_PATH = "packages/omamobile-myron-gpu-profile/reference.json"
+DEPLOYMENT_CONTRACT_PATH = "device/myron/deployment-contract.json"
+
+HEX256 = re.compile(r"[0-9a-f]{64}")
+MAX_SMALL_BYTES = 1024 * 1024
+ROOTFS_DIGEST_ALGORITHM = "myron-rootfs-tree-v1-sha256"
+KIT_KIND = "myron-deployment-candidate-kit"
+CONTRACT_KIND = "myron-deployment-candidate-contract"
+
+ROOTFS_REQUIRED_FILES = [
+    "usr/share/omamobile/device.conf",
+    "usr/share/omamobile/device-myron/version",
+    "usr/share/omamobile/myron-kernel-contract/reference.json",
+    "usr/bin/omamobile-myron-kernel-verify",
+    "usr/share/omamobile/myron-gpu/reference.json",
+    "usr/share/omamobile/myron-gpu-profile/reference.json",
+    "usr/lib/omamobile/myron-gpu/SHA256SUMS",
+]
+ROOTFS_KERNEL_REFERENCE = "usr/share/omamobile/myron-kernel-contract/reference.json"
+ROOTFS_STAGE_CONTRACT = "usr/share/omamobile/myron-kernel-contract/stage-contract.json"
+ROOTFS_GPU_REFERENCE = "usr/share/omamobile/myron-gpu-profile/reference.json"
+ROOTFS_DEVICE_LINES = ["BOOT_METHOD=external-android", "ROOTFS_INTEGRATION=external-contract"]
+ROOTFS_MARKER = "# Omarchy Mobile root STAGE (not bootable"
+ROOTFS_MANIFEST_LINES = [
+    "rootfs integration: external-contract",
+    "rootfs package profile: myron",
+    "package closure: required present; forbidden absent",
+    "kernel modules: none (external contract, no module payload)",
+]
+ROOTFS_ABSENT = [
+    "vendor", "odm", "system_ext",
+    "usr/share/omamobile/myron-runtime-assets", "var/lib/omamobile/myron-assets",
+    "etc/systemd/system/omamobile-myron-gpu.service",
+    "etc/systemd/system/omamobile-myron-session.service",
+    "etc/profile.d/omamobile-myron-gpu.sh",
+    "etc/vulkan/icd.d/myron-kgsl.json",
+]
+ROOTFS_PAYLOAD_NAMES = [
+    ".omamobile-tarball", "modules.dep*", "*.ko", "*.ko.*", "vmlinu[xz]*", "Image",
+    "Image.*", "*.dtb", "*.dtbo", "boot.img", "init_boot.img", "vendor_boot.img",
+    "initramfs*", "*.img", "*.img.zst",
+]
+RUNTIME_FEATURES = ["gpu", "wifi", "touch"]
+REFERENCE_MODULE_ORDER = [
+    "pwrseq-core", "bluetooth", "btbcm", "btqca", "hci_uart", "rfkill", "rmnet",
+]
+BLOCKERS = [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization",
+]
+AUTHORITY_FLAGS = (
+    "deployment_authorized", "bootable", "flashable", "image_ready",
+    "hardware_qualified", "atomic_snapshot_proof",
+)
+
+
+class DeploymentError(Exception):
+    """An input or artifact differs from the reviewed deployment contract."""
+
+
+class Limits(NamedTuple):
+    entries: int
+    depth: int
+    file_bytes: int
+    total_bytes: int
+
+
+STAGE_LIMITS = Limits(64, 12, 256 * 1024 * 1024, 256 * 1024 * 1024)
+ROOTFS_LIMITS = Limits(2_000_000, 128, 8 * 1024**3, 64 * 1024**3)
+
+
+class Entry(NamedTuple):
+    path: str
+    kind: str  # dir, file, symlink
+    mode: int
+    size: int
+    sha256: str
+    target: str
+
+
+class Tree(NamedTuple):
+    entries: list
+    data: dict
+    file_bytes: int
+    directory_ids: frozenset[tuple[int, int]]
+
+
+class CreatedEntry(NamedTuple):
+    path: str
+    kind: str
+    device: int
+    inode: int
+
+
+# --- loading the reviewed verifiers (source import; nothing is executed) -------
+
+_modules: dict = {}
+
+
+def _load(name: str, path: Path):
+    if name not in _modules:
+        try:
+            loader = importlib.machinery.SourceFileLoader(f"myron_{name}", str(path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+        except (OSError, SyntaxError) as error:
+            raise DeploymentError(f"cannot load the {name} verifier: {error}") from error
+        _modules[name] = module
+    return _modules[name]
+
+
+def kernel():
+    return _load("kernel", KERNEL_VERIFIER)
+
+
+def gpu():
+    return _load("gpu", GPU_VERIFIER)
+
+
+def handled_errors() -> tuple:
+    try:
+        return (DeploymentError, kernel().ContractError, gpu().ProfileError, OSError, ValueError)
+    except DeploymentError:
+        return (DeploymentError, OSError, ValueError)
+
+
+# --- strict JSON and canonical rendering ---------------------------------------
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def strict_json(data: bytes, label: str) -> dict:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise DeploymentError(f"{label} contains duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def constant(name):
+        raise DeploymentError(f"{label} contains non-finite number {name}")
+
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise DeploymentError(f"{label} is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise DeploymentError(f"{label} must be a JSON object")
+    return value
+
+
+def render_json(value) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("ascii")
+
+
+# --- canonical paths and descriptor-relative I/O --------------------------------
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def check_name(name: str, where: str) -> None:
+    try:
+        raw = name.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise DeploymentError(f"non-UTF-8 name under {where}") from error
+    if not raw or len(raw) > 255 or any(byte < 0x20 or byte == 0x7F for byte in raw):
+        raise DeploymentError(f"unsafe name under {where}")
+
+
+def split_canonical(path: str, label: str) -> list[str]:
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise DeploymentError(f"{label} is not a valid path")
+    if not path.startswith("/"):
+        raise DeploymentError(f"{label} must be an absolute path")
+    if path == "/":
+        raise DeploymentError(f"{label} must not be /")
+    parts = path.split("/")[1:]
+    if any(part == "" for part in parts):
+        raise DeploymentError(f"{label} must be a canonical absolute path (no empty components)")
+    if any(part in (".", "..") for part in parts):
+        raise DeploymentError(f"{label} must not contain . or .. components")
+    for part in parts:
+        check_name(part, label)
+    return parts
+
+
+def open_dir_components(parts: list[str], label: str) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise DeploymentError("safe inspection needs O_NOFOLLOW")
+    try:
+        current = os.open("/", DIR_FLAGS)
+    except OSError as error:
+        raise DeploymentError(f"cannot open /: {error.strerror}") from error
+    try:
+        for part in parts:
+            following = os.open(part, DIR_FLAGS, dir_fd=current)
+            os.close(current)
+            current = following
+        return current
+    except OSError as error:
+        os.close(current)
+        raise DeploymentError(
+            f"{label} is unavailable, a symlink, or crosses a non-directory: {error.strerror}"
+        ) from error
+
+
+def open_canonical_dir(path: str, label: str) -> int:
+    return open_dir_components(split_canonical(path, label), label)
+
+
+def open_pinned_regular_at(directory_fd: int, name: str, label: str) -> tuple[int, int, os.stat_result]:
+    """Validate through O_PATH before any data-open, then reopen that inode."""
+    if not hasattr(os, "O_PATH") or not hasattr(os, "O_NOFOLLOW"):
+        raise DeploymentError("safe regular-file inspection needs O_PATH and O_NOFOLLOW")
+    pinned = descriptor = -1
+    try:
+        pinned = os.open(
+            name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd
+        )
+        metadata = os.fstat(pinned)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise DeploymentError(f"{label} is not a regular file")
+        descriptor = os.open(
+            f"/proc/self/fd/{pinned}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise DeploymentError(f"{label} changed while being opened")
+        return pinned, descriptor, opened
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if pinned >= 0:
+            os.close(pinned)
+        raise DeploymentError(f"{label} cannot be opened safely: {error.strerror}") from error
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if pinned >= 0:
+            os.close(pinned)
+        raise
+
+
+def open_trusted_output_parent(parts: list[str], label: str) -> int:
+    """Open an output parent whose ancestry cannot be renamed by other users."""
+    current = os.open("/", DIR_FLAGS)
+    try:
+        for component in parts:
+            following = -1
+            try:
+                following = os.open(component, DIR_FLAGS, dir_fd=current)
+                parent = os.fstat(current)
+                child = os.fstat(following)
+                trusted_owner = parent.st_uid in {0, os.geteuid()}
+                writable_by_others = bool(stat.S_IMODE(parent.st_mode) & 0o022)
+                sticky_protection = bool(parent.st_mode & stat.S_ISVTX) and child.st_uid == os.geteuid()
+                if not trusted_owner or (writable_by_others and not sticky_protection):
+                    raise DeploymentError(
+                        f"{label} ancestry is writable or controlled by another user"
+                    )
+            except BaseException:
+                if following >= 0:
+                    os.close(following)
+                raise
+            os.close(current)
+            current = following
+        return current
+    except OSError as error:
+        os.close(current)
+        raise DeploymentError(f"{label} is unavailable: {error.strerror}") from error
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def trusted_parent_entry(parent_fd: int, child_metadata, label: str) -> None:
+    parent = os.fstat(parent_fd)
+    trusted_owner = parent.st_uid in {0, os.geteuid()}
+    writable_by_others = bool(stat.S_IMODE(parent.st_mode) & 0o022)
+    sticky_protection = bool(parent.st_mode & stat.S_ISVTX) and child_metadata.st_uid == os.geteuid()
+    if not trusted_owner or (writable_by_others and not sticky_protection):
+        raise DeploymentError(f"{label} parent is writable or controlled by another user")
+
+
+def open_trusted_artifact(path: str, label: str) -> tuple[int, tuple[int, int]]:
+    parts = split_canonical(path, label)
+    parent_fd = open_trusted_output_parent(parts[:-1], f"{label} parent")
+    descriptor = -1
+    try:
+        descriptor = os.open(parts[-1], DIR_FLAGS, dir_fd=parent_fd)
+        metadata = os.fstat(descriptor)
+        trusted_parent_entry(parent_fd, metadata, label)
+        if metadata.st_uid not in {0, os.geteuid()} or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise DeploymentError(f"{label} is writable or controlled by another user")
+        return descriptor, (metadata.st_dev, metadata.st_ino)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise DeploymentError(f"{label} is unavailable: {error.strerror}") from error
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def recheck_trusted_artifact(path: str, identity: tuple[int, int], label: str) -> None:
+    descriptor, current = open_trusted_artifact(path, label)
+    os.close(descriptor)
+    if current != identity:
+        raise DeploymentError(f"{label} changed during verification")
+
+
+def read_file(path: str, label: str, limit: int) -> bytes:
+    parts = split_canonical(path, label)
+    parent = open_dir_components(parts[:-1], label)
+    pinned = descriptor = -1
+    try:
+        pinned, descriptor, before = open_pinned_regular_at(
+            parent, parts[-1], f"{label}: {path}"
+        )
+        parent_mount = kernel().mount_id_for_fd(parent, f"{label} parent")
+        if kernel().mount_id_for_fd(pinned, label) != parent_mount:
+            raise DeploymentError(f"{label} crosses a file mount point: {path}")
+        if before.st_size > limit:
+            raise DeploymentError(f"{label} exceeds the {limit}-byte safety limit")
+        chunks, remaining = [], before.st_size
+        while remaining:
+            block = os.read(descriptor, min(1024 * 1024, remaining))
+            if not block:
+                raise DeploymentError(f"{label} changed size while being read")
+            chunks.append(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise DeploymentError(f"{label} changed size while being read")
+        after = os.fstat(descriptor)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise DeploymentError(f"{label} changed while being read")
+        return b"".join(chunks)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if pinned >= 0:
+            os.close(pinned)
+        os.close(parent)
+
+
+def fingerprint(value) -> tuple:
+    return (value.st_dev, value.st_ino, value.st_nlink, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def walk_tree(
+    root_fd: int, limits: Limits, *, allow_symlinks: bool, keep_data: bool = False,
+    capture=None, capture_total_bytes: int = 0, trusted_ownership: bool = False,
+    label: str = "tree",
+) -> Tree:
+    """Read a tree exactly: no symlink follow, no hardlinks, no special files,
+    no mount or device crossing, bounded, and stable while it is read."""
+    k = kernel()
+    root_stat = os.fstat(root_fd)
+    root_mount = k.mount_id_for_fd(root_fd, f"{label} root")
+    entries = [Entry(".", "dir", stat.S_IMODE(root_stat.st_mode), 0, "", "")]
+    data: dict = {}
+    state = {"count": 0, "bytes": 0, "captured": 0}
+    directory_ids = {(root_stat.st_dev, root_stat.st_ino)}
+
+    def visit(directory: int, prefix: str, depth: int) -> None:
+        if depth > limits.depth:
+            raise DeploymentError(f"{label} exceeds the depth bound")
+        before = os.fstat(directory)
+        try:
+            names = []
+            with os.scandir(directory) as children:
+                for child in children:
+                    state["count"] += 1
+                    if state["count"] > limits.entries:
+                        raise DeploymentError(f"{label} exceeds the entry bound")
+                    names.append(child.name)
+            names.sort()
+        except OSError as error:
+            raise DeploymentError(f"{label} cannot be listed at /{prefix}: {error.strerror}") from error
+        for name in names:
+            check_name(name, f"{label} /{prefix}")
+            relative = prefix + name
+            try:
+                metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except OSError as error:
+                raise DeploymentError(f"{label} entry /{relative} is unavailable: {error.strerror}") from error
+            if metadata.st_dev != root_stat.st_dev:
+                raise DeploymentError(f"{label} crosses a device boundary at /{relative}")
+            mode = metadata.st_mode
+            if stat.S_ISLNK(mode):
+                if not allow_symlinks:
+                    raise DeploymentError(f"{label} contains a symlink: /{relative}")
+                try:
+                    target = os.readlink(name, dir_fd=directory)
+                except OSError as error:
+                    raise DeploymentError(f"{label} symlink /{relative} is unreadable") from error
+                if "\0" in target or len(target) > 4096:
+                    raise DeploymentError(f"{label} symlink /{relative} has an unsafe target")
+                try:
+                    target.encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise DeploymentError(f"{label} symlink /{relative} has a non-UTF-8 target") from error
+                entries.append(Entry(relative, "symlink", stat.S_IMODE(mode), 0, "", target))
+            elif stat.S_ISDIR(mode):
+                if trusted_ownership and (
+                    metadata.st_uid not in {0, os.geteuid()}
+                    or stat.S_IMODE(metadata.st_mode) & 0o022
+                ):
+                    raise DeploymentError(
+                        f"{label} entry is writable or controlled by another user: /{relative}"
+                    )
+                try:
+                    child = os.open(name, DIR_FLAGS, dir_fd=directory)
+                except OSError as error:
+                    raise DeploymentError(f"{label} directory /{relative} cannot be opened safely") from error
+                try:
+                    opened = os.fstat(child)
+                    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        raise DeploymentError(f"{label} directory /{relative} changed while being opened")
+                    if k.mount_id_for_fd(child, f"{label} /{relative}") != root_mount:
+                        raise DeploymentError(f"{label} crosses a mount point at /{relative}")
+                    directory_ids.add((opened.st_dev, opened.st_ino))
+                    entries.append(Entry(relative, "dir", stat.S_IMODE(opened.st_mode), 0, "", ""))
+                    visit(child, relative + "/", depth + 1)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(mode):
+                if trusted_ownership and (
+                    metadata.st_uid not in {0, os.geteuid()}
+                    or stat.S_IMODE(metadata.st_mode) & 0o022
+                ):
+                    raise DeploymentError(
+                        f"{label} entry is writable or controlled by another user: /{relative}"
+                    )
+                read_member(directory, name, relative, metadata)
+            else:
+                raise DeploymentError(f"{label} contains a special file: /{relative}")
+        after = os.fstat(directory)
+        if fingerprint(before) != fingerprint(after):
+            raise DeploymentError(f"{label} directory changed while being read: /{prefix}")
+
+    def read_member(directory: int, name: str, relative: str, metadata) -> None:
+        pinned = descriptor = -1
+        try:
+            pinned, descriptor, opened = open_pinned_regular_at(
+                directory, name, f"{label} file /{relative}"
+            )
+            if (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev, metadata.st_ino
+            ):
+                raise DeploymentError(f"{label} file /{relative} changed while being opened")
+            if opened.st_nlink != 1:
+                raise DeploymentError(f"{label} file /{relative} has additional hard links")
+            if k.mount_id_for_fd(pinned, f"{label} /{relative}") != root_mount:
+                raise DeploymentError(f"{label} crosses a mount point at /{relative}")
+            if opened.st_size > limits.file_bytes:
+                raise DeploymentError(f"{label} file /{relative} exceeds the size bound")
+            state["bytes"] += opened.st_size
+            if state["bytes"] > limits.total_bytes:
+                raise DeploymentError(f"{label} exceeds the byte bound")
+            capture_selected = keep_data
+            capture_bytes = opened.st_size if keep_data else 0
+            if capture is not None and not keep_data:
+                requested = capture(relative, opened.st_size)
+                if requested is not None:
+                    if type(requested) is not int or not 0 <= requested <= opened.st_size:
+                        raise DeploymentError(f"{label} capture policy is invalid for /{relative}")
+                    capture_selected = True
+                    capture_bytes = requested
+            state["captured"] += capture_bytes
+            if capture_total_bytes and state["captured"] > capture_total_bytes:
+                raise DeploymentError(f"{label} exceeds the captured-byte bound")
+            digest, remaining, chunks, captured = hashlib.sha256(), opened.st_size, [], 0
+            while remaining:
+                block = os.read(descriptor, min(1024 * 1024, remaining))
+                if not block:
+                    raise DeploymentError(f"{label} file /{relative} changed size while being read")
+                digest.update(block)
+                if captured < capture_bytes:
+                    piece = block[: capture_bytes - captured]
+                    chunks.append(piece)
+                    captured += len(piece)
+                remaining -= len(block)
+            if os.read(descriptor, 1):
+                raise DeploymentError(f"{label} file /{relative} grew while being read")
+            closing = os.fstat(descriptor)
+            if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (
+                closing.st_size, closing.st_mtime_ns, closing.st_ctime_ns
+            ):
+                raise DeploymentError(f"{label} file /{relative} changed while being read")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if pinned >= 0:
+                os.close(pinned)
+        entries.append(Entry(
+            relative, "file", stat.S_IMODE(opened.st_mode), opened.st_size, digest.hexdigest(), ""
+        ))
+        if capture_selected:
+            data[relative] = b"".join(chunks)
+
+    try:
+        visit(root_fd, "", 0)
+    except OSError as error:
+        raise DeploymentError(f"{label} scan failed: {error.strerror}") from error
+    entries.sort(key=lambda entry: (entry.path != ".", entry.path.encode("utf-8")))
+    return Tree(entries, data, state["bytes"], frozenset(directory_ids))
+
+
+def diff_entries(actual: list, expected: list, label: str) -> None:
+    have = {entry.path: entry for entry in actual}
+    want = {entry.path: entry for entry in expected}
+    extra = sorted(set(have) - set(want))
+    if extra:
+        raise DeploymentError(f"{label} has unexpected paths: {extra}")
+    missing = sorted(set(want) - set(have))
+    if missing:
+        raise DeploymentError(f"{label} is missing paths: {missing}")
+    for path in sorted(want):
+        if have[path] != want[path]:
+            raise DeploymentError(f"{label} differs at {path}")
+
+
+def tree_digest(entries: list) -> str:
+    digest = hashlib.sha256(ROOTFS_DIGEST_ALGORITHM.encode("ascii") + b"\n")
+    for entry in entries:
+        if entry.kind == "file":
+            detail = entry.sha256
+        elif entry.kind == "symlink":
+            detail = json.dumps(entry.target)
+        else:
+            detail = "-"
+        line = f"{entry.kind}\t{entry.mode:04o}\t{entry.size}\t{detail}\t{json.dumps(entry.path)}\n"
+        digest.update(line.encode("ascii"))
+    return digest.hexdigest()
+
+
+# --- contracts ------------------------------------------------------------------
+
+
+class Contracts(NamedTuple):
+    reference: dict
+    reference_bytes: bytes
+    reference_sha256: str
+    stage: dict
+    stage_bytes: bytes
+    stage_sha256: str
+    gpu: dict
+    gpu_bytes: bytes
+    gpu_sha256: str
+    deployment: dict
+    deployment_bytes: bytes
+    deployment_sha256: str
+
+
+def expected_deployment_contract(reference: dict, reference_sha256: str, stage_sha256: str, gpu_sha256: str) -> dict:
+    assets = reference["module_assets"]
+    stage_destination = "/usr/local/sbin/myron-attempt79-module-dir"
+    reference_order = (
+        list(REFERENCE_MODULE_ORDER)
+        if set(assets["modules"]) == set(REFERENCE_MODULE_ORDER)
+        else list(assets["modules"])
+    )
+    return {
+        "schema": 1,
+        "kind": CONTRACT_KIND,
+        "components": {
+            "kernel_reference": {"path": KERNEL_REFERENCE_PATH, "sha256": reference_sha256},
+            "stage_contract": {"path": STAGE_CONTRACT_PATH, "sha256": stage_sha256},
+            "gpu_profile_reference": {"path": GPU_REFERENCE_PATH, "sha256": gpu_sha256},
+        },
+        "device": dict(reference["device"]),
+        "rootfs": {
+            "external": True,
+            "copied_into_kit": False,
+            "digest_algorithm": ROOTFS_DIGEST_ALGORITHM,
+            "digest_scope": "path, type, mode, size, content sha256 and symlink target of every entry, sorted by path; no owner, time or hardlink identity",
+            "symlinks": "recorded in the digest and never followed",
+            "hardlinks": "rejected",
+            "stage_marker": ROOTFS_MARKER,
+            "device_lines": list(ROOTFS_DEVICE_LINES),
+            "manifest_lines": list(ROOTFS_MANIFEST_LINES),
+            "required_files": list(ROOTFS_REQUIRED_FILES),
+            "bound_files": {
+                ROOTFS_KERNEL_REFERENCE: reference_sha256,
+                ROOTFS_STAGE_CONTRACT: stage_sha256,
+                ROOTFS_GPU_REFERENCE: gpu_sha256,
+            },
+        },
+        "modules": {
+            "archive_sha256": assets["archive_sha256"],
+            "module_directory": assets["module_directory"],
+            "selector_destination": stage_destination,
+            "file_count": 1 + len(assets["modules"]),
+            "module_count": len(assets["modules"]),
+            "order": {
+                "source": "public myron-postmarketOS Attempt79/VT staging order; load semantics unverified",
+                "status": "unverified",
+                "modules": reference_order,
+            },
+        },
+        "runtime": {
+            "manifest_sha256": reference["runtime_assets"]["manifest_sha256"],
+            "required_features": list(RUNTIME_FEATURES),
+            "bytes": "external-private",
+            "copied_into_kit": False,
+        },
+        "blockers": list(BLOCKERS),
+        "deployment_authorized": False,
+        "bootable": False,
+        "flashable": False,
+        "image_ready": False,
+    }
+
+
+def load_contracts(root: Path) -> Contracts:
+    k, g = kernel(), gpu()
+    base = str(root)
+
+    def read(relative: str, label: str) -> bytes:
+        return read_file(f"{base}/{relative}", label, MAX_SMALL_BYTES)
+
+    reference_bytes = read(KERNEL_REFERENCE_PATH, "kernel contract reference")
+    reference = strict_json(reference_bytes, "kernel contract reference")
+    k.validate_reference(reference)
+    reference_sha256 = sha256_bytes(reference_bytes)
+    stage_bytes = read(STAGE_CONTRACT_PATH, "stage contract")
+    stage = strict_json(stage_bytes, "stage contract")
+    k.validate_stage_contract(stage, reference, reference_sha256)
+    stage_sha256 = sha256_bytes(stage_bytes)
+    gpu_bytes = read(GPU_REFERENCE_PATH, "GPU profile reference")
+    gpu_reference = g.validate_reference(gpu_bytes)
+    gpu_sha256 = sha256_bytes(gpu_bytes)
+    deployment_bytes = read(DEPLOYMENT_CONTRACT_PATH, "deployment contract")
+    deployment = strict_json(deployment_bytes, "deployment contract")
+    expected = expected_deployment_contract(reference, reference_sha256, stage_sha256, gpu_sha256)
+    if set(deployment) != set(expected):
+        raise DeploymentError("deployment contract top-level fields differ")
+    for key, value in expected.items():
+        if not k.strict_equal(deployment[key], value):
+            raise DeploymentError(f"deployment contract differs at {key}")
+    if deployment_bytes != render_json(expected):
+        raise DeploymentError("deployment contract is not in canonical form")
+    return Contracts(
+        reference, reference_bytes, reference_sha256, stage, stage_bytes, stage_sha256,
+        gpu_reference, gpu_bytes, gpu_sha256, deployment, deployment_bytes, sha256_bytes(deployment_bytes),
+    )
+
+
+def kernel_contracts(contracts: Contracts):
+    return kernel().Contracts(
+        contracts.reference, contracts.reference_sha256, contracts.stage, contracts.stage_sha256
+    )
+
+
+# --- module archive and stage plan ----------------------------------------------
+
+
+def load_archive(contracts: Contracts, assets: str):
+    """Return (stage plan, {destination: bytes}) for the qualified archive."""
+    k = kernel()
+    data = read_file(assets, "module asset archive", k.MAX_ARCHIVE_BYTES)
+    selector = contracts.stage["layout"]["selector"]
+    plan = k.build_stage_plan_bytes(kernel_contracts(contracts), data)
+    payload = k.read_module_payload_bytes(
+        contracts.reference, data, selector["destination"]
+    )
+    template = contracts.stage["layout"]["module_file"]
+    members = {selector["destination"]: selector["archive_member"]}
+    for name in contracts.reference["module_assets"]["modules"]:
+        members[template["destination"].format(name=name)] = template["archive_member"].format(name=name)
+    contents = {destination: payload[member] for destination, member in members.items()}
+    if sorted(contents) != [entry["destination"] for entry in plan["files"]]:
+        raise DeploymentError("stage plan and archive members differ")
+    return plan, contents
+
+
+def module_layout(contracts: Contracts) -> tuple[dict, dict]:
+    layout = contracts.stage["layout"]
+    mode = int(layout["directory_mode"], 8)
+    directories = {
+        path.lstrip("/"): mode
+        for path in (*layout["ancestor_directories"], *layout["owned_directories"])
+    }
+    selector = layout["selector"]
+    template = layout["module_file"]
+    files = {selector["destination"].lstrip("/"): int(selector["mode"], 8)}
+    for name in contracts.reference["module_assets"]["modules"]:
+        files[template["destination"].format(name=name).lstrip("/")] = int(template["mode"], 8)
+    return directories, files
+
+
+def check_module_shape(tree: Tree, contracts: Contracts) -> list[dict]:
+    """The module stage is exactly the contract's directories, selector and modules."""
+    directories, files = module_layout(contracts)
+    mode = int(contracts.stage["layout"]["directory_mode"], 8)
+    actual_dirs = {e.path: e for e in tree.entries if e.kind == "dir"}
+    actual_files = {e.path: e for e in tree.entries if e.kind == "file"}
+    if set(actual_dirs) != {".", *directories}:
+        raise DeploymentError("module stage directory set differs from the stage contract")
+    if set(actual_files) != set(files):
+        raise DeploymentError("module stage file set differs from the stage contract")
+    if any(entry.mode != mode for entry in actual_dirs.values()):
+        raise DeploymentError("module stage directory mode differs from the stage contract")
+    for path, expected_mode in files.items():
+        if actual_files[path].mode != expected_mode:
+            raise DeploymentError(f"module stage file mode differs: /{path}")
+    selector = contracts.stage["layout"]["selector"]["destination"].lstrip("/")
+    if actual_files[selector].sha256 != contracts.reference["module_assets"]["candidate_selector_sha256"]:
+        raise DeploymentError("module stage selector is not the qualified candidate selector")
+    marker = b"vermagic=" + contracts.reference["kernel"]["release"].encode("ascii")
+    template = contracts.stage["layout"]["module_file"]
+    for name in contracts.reference["module_assets"]["modules"]:
+        path = template["destination"].format(name=name).lstrip("/")
+        body = tree.data[path]
+        if marker + b" " not in body and marker + b"\0" not in body:
+            raise DeploymentError(f"module does not carry the exact kernel release: {name}")
+    return [
+        {"destination": "/" + path, "mode": f"{actual_files[path].mode:04o}",
+         "size": actual_files[path].size, "sha256": actual_files[path].sha256}
+        for path in sorted(files)
+    ]
+
+
+def check_against_plan(module_files: list[dict], plan: dict) -> None:
+    if module_files != plan["files"]:
+        raise DeploymentError("module stage differs from the qualified archive plan")
+
+
+def read_module_stage(contracts: Contracts, path: str, label: str) -> tuple[Tree, list[dict]]:
+    descriptor = open_canonical_dir(path, label)
+    try:
+        tree = walk_tree(descriptor, STAGE_LIMITS, allow_symlinks=False, keep_data=True, label=label)
+    finally:
+        os.close(descriptor)
+    return tree, check_module_shape(tree, contracts)
+
+
+# --- rootfs stage -------------------------------------------------------------
+
+
+def rootfs_absent(index: dict, relative: str) -> None:
+    parts = relative.split("/")
+    for number in range(len(parts)):
+        entry = index.get("/".join(parts[: number + 1]))
+        if entry is None:
+            return
+        if number == len(parts) - 1:
+            raise DeploymentError(f"proprietary, vendor or activation path present: {relative}")
+        if entry.kind != "dir":
+            raise DeploymentError(f"unsafe ancestor for {relative}")
+
+
+def full_snapshot_file(tree: Tree, index: dict, path: str, limit: int, label: str) -> bytes:
+    entry = index.get(path)
+    data = tree.data.get(path)
+    if entry is None or entry.kind != "file" or entry.size > limit or data is None or len(data) != entry.size:
+        raise DeploymentError(f"{label} is missing, unsafe, or exceeds its snapshot bound")
+    return data
+
+
+def validate_gpu_snapshot(tree: Tree, index: dict, contracts: Contracts) -> None:
+    """Validate GPU/profile bytes captured by the same pass that made the digest."""
+    g = gpu()
+    reference_data = full_snapshot_file(
+        tree, index, ROOTFS_GPU_REFERENCE, MAX_SMALL_BYTES, "GPU profile reference"
+    )
+    reference = g.validate_reference(reference_data)
+    if sha256_bytes(reference_data) != contracts.gpu_sha256:
+        raise DeploymentError("rootfs GPU profile reference differs from the contract")
+
+    for absolute, expected in reference["assets"].items():
+        relative = absolute.lstrip("/")
+        entry = index.get(relative)
+        if entry is None or entry.kind != "file" or entry.sha256 != expected:
+            raise DeploymentError(f"GPU profile asset differs from its snapshot contract: {absolute}")
+
+    mesa_reference_path = reference["mesa"]["reference"].lstrip("/")
+    g.validate_mesa_reference(
+        full_snapshot_file(tree, index, mesa_reference_path, MAX_SMALL_BYTES, "Mesa reference"),
+        reference,
+    )
+
+    prefix = g.MESA_PREFIX.as_posix()
+    expected = {"dri": "dir", "SHA256SUMS": "file"}
+    expected.update({name: "file" for name in g.MESA_REGULAR_FILES})
+    expected.update({name: "symlink" for name in g.MESA_SYMLINKS})
+    actual = {}
+    for entry in tree.entries:
+        if entry.path.startswith(prefix + "/"):
+            actual[entry.path[len(prefix) + 1:]] = entry.kind
+    if actual != expected:
+        raise DeploymentError("Mesa snapshot layout differs from the isolated GPU contract")
+
+    manifest_path = prefix + "/SHA256SUMS"
+    manifest = g.parse_mesa_manifest(
+        full_snapshot_file(tree, index, manifest_path, MAX_SMALL_BYTES, "Mesa manifest")
+    )
+    for name, expected_hash in manifest.items():
+        path = prefix + "/" + name
+        entry = index.get(path)
+        if (
+            entry is None
+            or entry.kind != "file"
+            or entry.size > g.MAX_MESA_FILE_BYTES
+            or entry.sha256 != expected_hash
+        ):
+            raise DeploymentError(f"Mesa snapshot payload SHA-256 differs: {name}")
+        if name != "freedreno-kgsl.json":
+            header = tree.data.get(path, b"")
+            if (
+                len(header) != 20
+                or header[:4] != b"\x7fELF"
+                or header[4] != 2
+                or header[5] != 1
+                or int.from_bytes(header[18:20], "little") != 183
+            ):
+                raise DeploymentError(f"Mesa snapshot payload is not little-endian AArch64 ELF64: {name}")
+    for name, target in g.MESA_SYMLINKS.items():
+        entry = index.get(prefix + "/" + name)
+        if entry is None or entry.kind != "symlink" or entry.target != target:
+            raise DeploymentError(f"Mesa snapshot symlink differs: {name}")
+
+    icd_path = prefix + "/freedreno-kgsl.json"
+    icd = g.strict_json(
+        full_snapshot_file(tree, index, icd_path, MAX_SMALL_BYTES, "Mesa ICD manifest"),
+        "Mesa ICD manifest",
+    )
+    if not isinstance(icd.get("ICD"), dict) or icd["ICD"].get("library_path") != (
+        "/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so"
+    ):
+        raise DeploymentError("Mesa snapshot ICD does not point to isolated Turnip")
+
+    for scope_name in g.GLOBAL_ACTIVATION_PATHS:
+        parts = Path(scope_name).parts
+        for number in range(1, len(parts)):
+            ancestor = "/".join(parts[:number])
+            entry = index.get(ancestor)
+            if entry is None:
+                break
+            if entry.kind != "dir":
+                raise DeploymentError(
+                    f"global activation path has a non-directory ancestor: {scope_name}"
+                )
+
+    activation_entries = [
+        entry for entry in tree.entries
+        if entry.path != "." and g.in_activation_scope(Path(entry.path))
+    ]
+    if len(activation_entries) > g.MAX_SCAN_FILES:
+        raise DeploymentError("global activation snapshot exceeds entry safety limit")
+    total = 0
+    hits = []
+    for entry in activation_entries:
+        if entry.kind == "dir":
+            path = Path(entry.path)
+            depths = [
+                len(path.parts) - len(Path(scope).parts)
+                for scope in g.GLOBAL_ACTIVATION_PATHS
+                if path == Path(scope) or Path(scope) in path.parents
+            ]
+            if depths and max(depths) > g.MAX_SCAN_DEPTH:
+                raise DeploymentError("global activation snapshot exceeds depth safety limit")
+            continue
+        if entry.kind == "file":
+            if entry.size > g.MAX_FILE_BYTES:
+                raise DeploymentError(f"global activation candidate is too large: /{entry.path}")
+            body = tree.data.get(entry.path)
+            if body is None or len(body) != entry.size:
+                raise DeploymentError(f"global activation candidate lacks snapshot bytes: /{entry.path}")
+            total += len(body)
+            if g.marker_in(body):
+                hits.append("/" + entry.path)
+        else:
+            encoded = entry.target.encode()
+            total += len(encoded)
+            link = Path(entry.path)
+            if g.marker_in(encoded):
+                hits.append("/" + entry.path)
+                continue
+            target = g.normalize_symlink_target(link, entry.target)
+            if target != Path("dev/null"):
+                target_name = target.as_posix()
+                if target == link or not g.in_activation_scope(target) or target_name not in index:
+                    raise DeploymentError(f"unsafe global activation symlink: /{entry.path}")
+        if total > g.MAX_SCAN_BYTES:
+            raise DeploymentError("global activation snapshot exceeds byte safety limit")
+    if hits:
+        raise DeploymentError("private GPU stack is selected by global path: " + ", ".join(hits))
+
+
+def check_rootfs(root: str, manifest_path: str, contracts: Contracts) -> tuple[dict, dict, frozenset]:
+    """Fail-closed equivalent of tests/rootfs-stage; return binding, index, directory IDs."""
+    g = gpu()
+    gpu_full_paths = {
+        ROOTFS_REQUIRED_FILES[0],
+        ROOTFS_GPU_REFERENCE,
+        *(path.lstrip("/") for path in contracts.gpu["assets"]),
+        contracts.gpu["mesa"]["reference"].lstrip("/"),
+        g.MESA_PREFIX.as_posix() + "/SHA256SUMS",
+        g.MESA_PREFIX.as_posix() + "/freedreno-kgsl.json",
+    }
+
+    def capture(path: str, size: int) -> int | None:
+        if path in gpu_full_paths or g.in_activation_scope(Path(path)):
+            return size
+        if path.startswith(g.MESA_PREFIX.as_posix() + "/"):
+            return min(size, 20)
+        return None
+
+    descriptor = open_canonical_dir(root, "rootfs stage")
+    try:
+        tree = walk_tree(
+            descriptor,
+            ROOTFS_LIMITS,
+            allow_symlinks=True,
+            capture=capture,
+            capture_total_bytes=g.MAX_SCAN_BYTES + 8 * MAX_SMALL_BYTES,
+            label="rootfs stage",
+        )
+    finally:
+        os.close(descriptor)
+    index = {entry.path: entry for entry in tree.entries}
+
+    for relative in ROOTFS_REQUIRED_FILES:
+        entry = index.get(relative)
+        if entry is None or entry.kind != "file":
+            raise DeploymentError(f"missing or unsafe Myron metadata/contract: {relative}")
+        if entry.size > MAX_SMALL_BYTES:
+            raise DeploymentError(f"Myron metadata/contract is too large: {relative}")
+    for relative, expected in contracts.deployment["rootfs"]["bound_files"].items():
+        entry = index.get(relative)
+        if entry is None or entry.kind != "file":
+            raise DeploymentError(f"missing or unsafe bound contract: {relative}")
+        if entry.sha256 != expected:
+            raise DeploymentError(f"rootfs contract differs from the deployment contract: {relative}")
+
+    device_path = ROOTFS_REQUIRED_FILES[0]
+    device_bytes = full_snapshot_file(
+        tree, index, device_path, MAX_SMALL_BYTES, "device contract"
+    )
+    try:
+        device_lines = set(device_bytes.decode("utf-8").splitlines())
+    except UnicodeDecodeError as error:
+        raise DeploymentError("device contract is not UTF-8") from error
+    for expected in ROOTFS_DEVICE_LINES:
+        if expected not in device_lines:
+            raise DeploymentError(f"device.conf lacks {expected}")
+
+    manifest_bytes = read_file(manifest_path, "rootfs MANIFEST", MAX_SMALL_BYTES)
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise DeploymentError("rootfs MANIFEST is not UTF-8") from error
+    if not manifest_text.startswith(ROOTFS_MARKER):
+        raise DeploymentError("MANIFEST lacks the non-bootable stage marker")
+    manifest_lines = set(manifest_text.splitlines())
+    for expected in ROOTFS_MANIFEST_LINES:
+        if expected not in manifest_lines:
+            raise DeploymentError(f"MANIFEST lacks {expected}")
+
+    firmware = index.get("usr/lib/firmware")
+    if firmware is None or firmware.kind != "dir":
+        raise DeploymentError("firmware directory is not a real directory")
+    names = set()
+    for entry in tree.entries:
+        if entry.path.startswith("usr/lib/firmware/"):
+            rest = entry.path[len("usr/lib/firmware/"):]
+            if "/" in rest or entry.kind != "file":
+                raise DeploymentError(f"firmware entry is not a regular file: {rest}")
+            names.add(rest)
+    if names != {"regulatory.db", "regulatory.db.p7s"}:
+        raise DeploymentError("firmware directory differs from regulatory database allowlist")
+
+    alias = index.get("lib")
+    if alias is not None and (alias.kind != "symlink" or alias.target != "usr/lib"):
+        raise DeploymentError("system library alias differs from the usr-merged symlink: lib")
+    modules = index.get("usr/lib/modules")
+    if modules is not None:
+        if modules.kind != "dir":
+            raise DeploymentError("kernel modules path is not a real directory: usr/lib/modules")
+        if any(entry.path.startswith("usr/lib/modules/") for entry in tree.entries):
+            raise DeploymentError("kernel modules in the stage")
+    for relative in ROOTFS_ABSENT:
+        rootfs_absent(index, relative)
+    for entry in tree.entries:
+        name = entry.path.rsplit("/", 1)[-1]
+        if entry.path != "." and any(fnmatch.fnmatchcase(name, pattern) for pattern in ROOTFS_PAYLOAD_NAMES):
+            raise DeploymentError(f"kernel, module, or boot payload: {entry.path}")
+
+    check_collisions(index, contracts)
+
+    validate_gpu_snapshot(tree, index, contracts)
+
+    binding = {
+        "digest_algorithm": ROOTFS_DIGEST_ALGORITHM,
+        "digest": tree_digest(tree.entries),
+        "entry_count": len(tree.entries),
+        "file_bytes": tree.file_bytes,
+        "manifest_sha256": sha256_bytes(manifest_bytes),
+        "manifest_size": len(manifest_bytes),
+        "copied_into_kit": False,
+    }
+    return binding, index, tree.directory_ids
+
+
+def check_collisions(index: dict, contracts: Contracts) -> None:
+    layout = contracts.stage["layout"]
+    owned = [layout["selector"]["destination"], *layout["owned_directories"]]
+    for destination in owned:
+        if destination.lstrip("/") in index:
+            raise DeploymentError(f"module overlay destination collides with the rootfs: {destination}")
+    for ancestor in layout["ancestor_directories"]:
+        entry = index.get(ancestor.lstrip("/"))
+        if entry is not None and entry.kind != "dir":
+            raise DeploymentError(f"rootfs ancestor of the module overlay is not a real directory: {ancestor}")
+
+
+# --- kit layout -----------------------------------------------------------------
+
+
+def status_document() -> dict:
+    return {
+        "artifact": KIT_KIND,
+        "blockers": list(BLOCKERS),
+        **{flag: False for flag in AUTHORITY_FLAGS},
+    }
+
+
+STATUS_TEXT = (
+    "Omarchy Mobile Myron deployment-candidate kit (laptop-only)\n"
+    "\n"
+    "deployment_authorized: false\n"
+    "This kit is NOT bootable, NOT flashable, NOT image-ready, NOT an atomic\n"
+    "snapshot proof, NOT hardware-qualified and NOT a deployment authorization.\n"
+    "It binds identities; it activates nothing. Permanent blockers are listed in\n"
+    "status.json. Private runtime assets and the rootfs stay outside the kit.\n"
+).encode("ascii")
+
+
+def kit_spec(contracts: Contracts, module_files: list[dict], overlay: dict, binding: dict) -> list:
+    """The exact kit as (path, kind, mode, bytes-or-None), parents first."""
+    files = {
+        "contracts/deployment-contract.json": contracts.deployment_bytes,
+        "contracts/gpu-profile-reference.json": contracts.gpu_bytes,
+        "contracts/kernel-contract.json": contracts.reference_bytes,
+        "contracts/stage-contract.json": contracts.stage_bytes,
+        "STATUS.txt": STATUS_TEXT,
+        "status.json": render_json(status_document()),
+    }
+    directories, _ = module_layout(contracts)
+    document = {
+        "schema": 1,
+        "kind": KIT_KIND,
+        "format_version": VERSION,
+        "contracts": {
+            "deployment": {"path": "contracts/deployment-contract.json", "sha256": contracts.deployment_sha256},
+            "gpu_profile_reference": {"path": "contracts/gpu-profile-reference.json", "sha256": contracts.gpu_sha256},
+            "kernel_reference": {"path": "contracts/kernel-contract.json", "sha256": contracts.reference_sha256},
+            "stage_contract": {"path": "contracts/stage-contract.json", "sha256": contracts.stage_sha256},
+        },
+        "overlay": {
+            "root": "overlay",
+            "archive_sha256": contracts.reference["module_assets"]["archive_sha256"],
+            "module_directory": contracts.reference["module_assets"]["module_directory"],
+            "module_order_status": "unverified",
+            "files": module_files,
+        },
+        "rootfs": binding,
+        "runtime": contracts.deployment["runtime"],
+        "status": status_document(),
+    }
+    files["kit.json"] = render_json(document)
+    modes = {path: 0o644 for path in files}
+    for entry in module_files:
+        relative = "overlay" + entry["destination"]
+        files[relative] = overlay[entry["destination"]]
+        modes[relative] = int(entry["mode"], 8)
+    sums = "".join(f"{sha256_bytes(files[path])}  {path}\n" for path in sorted(files)).encode("ascii")
+    files["SHA256SUMS"] = sums
+    modes["SHA256SUMS"] = 0o644
+    dirs = {"contracts", "overlay", *("overlay/" + path for path in directories)}
+    spec = [(path, "dir", int(contracts.stage["layout"]["directory_mode"], 8), None) for path in dirs]
+    spec += [(path, "file", modes[path], files[path]) for path in files]
+    spec.sort(key=lambda item: item[0].encode("utf-8"))
+    return spec
+
+
+def spec_entries(spec: list, root_mode: int = 0o755) -> list[Entry]:
+    entries = [Entry(".", "dir", root_mode, 0, "", "")]
+    for path, kind, mode, data in spec:
+        if kind == "dir":
+            entries.append(Entry(path, "dir", mode, 0, "", ""))
+        else:
+            entries.append(Entry(path, "file", mode, len(data), sha256_bytes(data), ""))
+    entries.sort(key=lambda entry: (entry.path != ".", entry.path.encode("utf-8")))
+    return entries
+
+
+def open_created_parent(root_fd: int, path: str) -> tuple[int, str]:
+    parent, _, name = path.rpartition("/")
+    descriptor = os.dup(root_fd)
+    try:
+        for component in parent.split("/") if parent else ():
+            following = os.open(component, DIR_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = following
+        return descriptor, name
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def cleanup_created(root_fd: int, created: list[CreatedEntry]) -> None:
+    """Remove only inodes atomically recorded as created by this run."""
+    for entry in reversed(created):
+        parent_fd = -1
+        try:
+            parent_fd, name = open_created_parent(root_fd, entry.path)
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (metadata.st_dev, metadata.st_ino) != (entry.device, entry.inode):
+                continue
+            if entry.kind == "dir":
+                os.rmdir(name, dir_fd=parent_fd)
+            else:
+                os.unlink(name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+
+
+def write_spec(root_fd: int, spec: list, created: list[CreatedEntry] | None = None) -> None:
+    if created is None:
+        created = []
+    directories = {".": root_fd}
+    try:
+        for path, kind, mode, data in spec:
+            parent, _, name = path.rpartition("/")
+            parent_fd = directories[parent or "."]
+            if kind == "dir":
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+                try:
+                    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    try:
+                        os.rmdir(name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                    raise
+                if not stat.S_ISDIR(named.st_mode):
+                    raise DeploymentError(f"output directory is not a directory: {path}")
+                created.append(CreatedEntry(path, "dir", named.st_dev, named.st_ino))
+                os.chmod(name, 0o700, dir_fd=parent_fd, follow_symlinks=False)
+                normalized = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (normalized.st_dev, normalized.st_ino) != (named.st_dev, named.st_ino):
+                    raise DeploymentError(f"output directory changed while setting mode: {path}")
+                descriptor = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+                directories[path] = descriptor
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino):
+                    raise DeploymentError(f"output directory changed while being opened: {path}")
+                os.fchmod(descriptor, mode)
+                continue
+            descriptor = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600, dir_fd=parent_fd,
+            )
+            try:
+                try:
+                    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError:
+                    try:
+                        os.unlink(name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                    raise
+                if not stat.S_ISREG(named.st_mode):
+                    raise DeploymentError(f"output file is not regular: {path}")
+                created.append(CreatedEntry(path, "file", named.st_dev, named.st_ino))
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino):
+                    raise DeploymentError(f"output file changed while being opened: {path}")
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(descriptor, view):]
+                os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        for path, descriptor in directories.items():
+            if path != ".":
+                os.fsync(descriptor)
+    except OSError as error:
+        cleanup_created(root_fd, created)
+        created.clear()
+        raise DeploymentError(f"cannot write the output tree: {error.strerror}") from error
+    finally:
+        for path, descriptor in directories.items():
+            if path != ".":
+                os.close(descriptor)
+
+
+# --- publication ----------------------------------------------------------------
+
+
+def rename_noreplace(parent_fd: int, old: str, new: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "renameat2", None)
+    if function is None:
+        raise DeploymentError("atomic no-replace publication (renameat2) is unavailable")
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(parent_fd, os.fsencode(old), parent_fd, os.fsencode(new), 1) != 0:
+        raise DeploymentError(f"cannot publish the output atomically: {os.strerror(ctypes.get_errno())}")
+
+
+def remove_owned(
+    parent_fd: int,
+    name: str,
+    owned: tuple,
+    descriptor: int,
+    created: list[CreatedEntry],
+) -> None:
+    """Remove only recorded output inodes, never unrelated directory contents."""
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != owned[:2]:
+            return
+        if kernel().mount_id_for_fd(descriptor, "cleanup root") == owned[2]:
+            cleanup_created(descriptor, created)
+    except Exception:
+        # Cleanup must never mask the original failure.
+        pass
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if not stat.S_ISDIR(named.st_mode) or (named.st_dev, named.st_ino) != owned[:2]:
+        return
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
+def reject_protected_directory_alias(
+    output_parent_fd: int, protected_directory_ids: frozenset[tuple[int, int]]
+) -> None:
+    """Reject output parents inside any protected tree, including bind aliases."""
+    if not protected_directory_ids:
+        return
+    current = os.dup(output_parent_fd)
+    seen: set[tuple[int, int]] = set()
+    try:
+        for _ in range(4096):
+            metadata = os.fstat(current)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if identity in protected_directory_ids:
+                raise DeploymentError("output parent aliases a directory inside an input tree")
+            if identity in seen:
+                raise DeploymentError("output parent ancestry contains a directory loop")
+            seen.add(identity)
+            following = -1
+            try:
+                following = os.open("..", DIR_FLAGS, dir_fd=current)
+                parent = os.fstat(following)
+                parent_identity = (parent.st_dev, parent.st_ino)
+            except BaseException:
+                if following >= 0:
+                    os.close(following)
+                raise
+            os.close(current)
+            current = following
+            if parent_identity == identity:
+                return
+        raise DeploymentError("output parent ancestry exceeds the safety bound")
+    finally:
+        os.close(current)
+
+
+def publish(
+    out: str,
+    protected: list[str],
+    protected_directory_ids: frozenset[tuple[int, int]],
+    spec: list,
+    verify_built,
+) -> None:
+    """Write SPEC under a private same-parent temp directory, verify it, and
+    atomically publish it to the nonexistent canonical absolute OUT."""
+    parts = split_canonical(out, "output path")
+    for path in protected:
+        if out == path or out.startswith(path + "/"):
+            raise DeploymentError("output path lies inside an input tree")
+    name = parts[-1]
+    if len(name.encode("utf-8")) > 200:
+        raise DeploymentError("output name is too long")
+    parent_fd = open_trusted_output_parent(parts[:-1], "output parent")
+    try:
+        parent_metadata = os.fstat(parent_fd)
+        if parent_metadata.st_uid != os.geteuid() or stat.S_IMODE(parent_metadata.st_mode) & 0o022:
+            raise DeploymentError(
+                "output parent must be owned by the invoking user and not group/world-writable"
+            )
+        reject_protected_directory_alias(parent_fd, protected_directory_ids)
+        parent_mount_id = kernel().mount_id_for_fd(parent_fd, "output parent")
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise DeploymentError(f"output path is unavailable: {error.strerror}") from error
+        else:
+            raise DeploymentError(f"output path already exists: {out}")
+        temporary = None
+        for _ in range(8):
+            candidate = f".{name}.tmp-{os.urandom(6).hex()}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise DeploymentError(f"cannot create a private temp directory: {error.strerror}") from error
+            temporary = candidate
+            break
+        if temporary is None:
+            raise DeploymentError("cannot create a unique private temp directory")
+        created = None
+        try:
+            os.chmod(temporary, 0o700, dir_fd=parent_fd, follow_symlinks=False)
+            created = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            try:
+                os.rmdir(temporary, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise DeploymentError(f"cannot inspect the private temp directory: {error.strerror}") from error
+        if (
+            not stat.S_ISDIR(created.st_mode)
+            or created.st_uid != os.geteuid()
+            or stat.S_IMODE(created.st_mode) != 0o700
+        ):
+            raise DeploymentError("private temp directory identity is unsafe")
+        owned = (created.st_dev, created.st_ino, parent_mount_id)
+        published = False
+        renamed = False
+        descriptor = -1
+        created_entries: list[CreatedEntry] = []
+        try:
+            descriptor = os.open(temporary, DIR_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != owned[:2]:
+                raise DeploymentError("temp directory changed while being opened")
+            if kernel().mount_id_for_fd(descriptor, "temp directory") != owned[2]:
+                raise DeploymentError("temp directory crossed a mount point")
+            if os.listdir(descriptor):
+                raise DeploymentError("private temp directory was not empty")
+            write_spec(descriptor, spec, created_entries)
+            os.fchmod(descriptor, 0o755)
+            os.fsync(descriptor)
+            temporary_path = "/" + "/".join([*parts[:-1], temporary])
+            verify_built(temporary_path, descriptor)
+            named = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(named.st_mode) or (named.st_dev, named.st_ino) != owned[:2]:
+                raise DeploymentError("temp directory changed before publication")
+            rename_noreplace(parent_fd, temporary, name)
+            renamed = True
+            published_descriptor = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+            try:
+                opened = os.fstat(published_descriptor)
+                if (opened.st_dev, opened.st_ino) != owned[:2]:
+                    raise DeploymentError("published output identity differs from verified temp")
+                if kernel().mount_id_for_fd(published_descriptor, "published output") != owned[2]:
+                    raise DeploymentError("published output crossed a mount point")
+                published_path = "/" + "/".join(parts)
+                verify_built(published_path, published_descriptor)
+            finally:
+                os.close(published_descriptor)
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(named.st_mode) or (named.st_dev, named.st_ino) != owned[:2]:
+                raise DeploymentError("published output changed after verification")
+            canonical_parent = open_trusted_output_parent(parts[:-1], "published output parent")
+            try:
+                canonical_metadata = os.fstat(canonical_parent)
+                if (canonical_metadata.st_dev, canonical_metadata.st_ino) != (
+                    parent_metadata.st_dev,
+                    parent_metadata.st_ino,
+                ):
+                    raise DeploymentError("published output ancestry changed during publication")
+                canonical_named = os.stat(name, dir_fd=canonical_parent, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(canonical_named.st_mode)
+                    or (canonical_named.st_dev, canonical_named.st_ino) != owned[:2]
+                ):
+                    raise DeploymentError("canonical published output differs from verified output")
+            finally:
+                os.close(canonical_parent)
+            published = True
+        except BaseException:
+            if not published:
+                if descriptor >= 0:
+                    remove_owned(
+                        parent_fd,
+                        name if renamed else temporary,
+                        owned,
+                        descriptor,
+                        created_entries,
+                    )
+                else:
+                    # No pinned inode exists. Remove only an empty name whose
+                    # identity still matches the directory created above.
+                    try:
+                        named = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+                        if stat.S_ISDIR(named.st_mode) and (named.st_dev, named.st_ino) == owned[:2]:
+                            os.rmdir(temporary, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
+    finally:
+        os.close(parent_fd)
+
+
+# --- commands -------------------------------------------------------------------
+
+
+def command_show(contracts: Contracts) -> dict:
+    return contracts.deployment
+
+
+def command_stage_modules(contracts: Contracts, assets: str, out: str) -> dict:
+    plan, contents = load_archive(contracts, assets)
+    directories, files = module_layout(contracts)
+    mode = int(contracts.stage["layout"]["directory_mode"], 8)
+    spec = [(path, "dir", mode, None) for path in directories]
+    spec += [(path, "file", files[path], contents["/" + path]) for path in files]
+    spec.sort(key=lambda item: item[0].encode("utf-8"))
+    expected = spec_entries(spec)
+
+    def verify_built(temporary_path: str, descriptor: int) -> None:
+        tree = walk_tree(descriptor, STAGE_LIMITS, allow_symlinks=False, keep_data=True, label="module stage")
+        diff_entries(tree.entries, expected, "module stage")
+        check_against_plan(check_module_shape(tree, contracts), plan)
+        kernel().verify_stage_tree(plan, temporary_path)
+
+    publish(out, [], frozenset(), spec, verify_built)
+    return {
+        "status": "staged",
+        "file_count": len(plan["files"]),
+        "module_count": len(contracts.reference["module_assets"]["modules"]),
+        "archive_sha256": plan["archive_sha256"],
+        "deployment_authorized": False,
+    }
+
+
+def require_archive_plan(contracts: Contracts, assets: str, module_files: list[dict]) -> None:
+    plan, _ = load_archive(contracts, assets)
+    check_against_plan(module_files, plan)
+
+
+def command_assemble(
+    contracts: Contracts, rootfs: str, manifest: str, module_stage: str, out: str, assets: str
+) -> dict:
+    binding, _, rootfs_directory_ids = check_rootfs(rootfs, manifest, contracts)
+    tree, module_files = read_module_stage(contracts, module_stage, "module stage")
+    require_archive_plan(contracts, assets, module_files)
+    overlay = {"/" + path: data for path, data in tree.data.items()}
+    spec = kit_spec(contracts, module_files, overlay, binding)
+    expected = spec_entries(spec)
+
+    def verify_built(temporary_path: str, descriptor: int) -> None:
+        built = walk_tree(descriptor, STAGE_LIMITS, allow_symlinks=False, label="kit")
+        diff_entries(built.entries, expected, "kit")
+
+    publish(
+        out,
+        [rootfs, module_stage],
+        frozenset(set(rootfs_directory_ids) | set(tree.directory_ids)),
+        spec,
+        verify_built,
+    )
+    sums = [data for path, kind, mode, data in spec if path == "SHA256SUMS"][0]
+    return {
+        "status": "assembled",
+        "kit_sha256": sha256_bytes(sums),
+        "module_files": len(module_files),
+        "rootfs_digest": binding["digest"],
+        "archive_proven": True,
+        "deployment_authorized": False,
+    }
+
+
+def reject_authority_claims(tree: Tree) -> None:
+    for relative in ("status.json", "kit.json"):
+        if relative not in tree.data:
+            continue
+        document = strict_json(tree.data[relative], relative)
+        status = document.get("status") if relative == "kit.json" else document
+        if not isinstance(status, dict):
+            raise DeploymentError(f"{relative} has no status section")
+        for flag in AUTHORITY_FLAGS:
+            if flag in status and status[flag] is not False:
+                raise DeploymentError(f"kit claims {flag}; deployment authorization is refused")
+        if status.get("blockers") != BLOCKERS:
+            raise DeploymentError(f"{relative} blocker list differs from the permanent blockers")
+        if set(status) != {"artifact", "blockers", *AUTHORITY_FLAGS}:
+            raise DeploymentError(f"{relative} status fields differ")
+
+
+def command_verify(contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str) -> dict:
+    binding, _, _ = check_rootfs(rootfs, manifest, contracts)
+    descriptor, kit_identity = open_trusted_artifact(kit, "kit")
+    try:
+        tree = walk_tree(
+            descriptor,
+            STAGE_LIMITS,
+            allow_symlinks=False,
+            keep_data=True,
+            trusted_ownership=True,
+            label="kit",
+        )
+    finally:
+        os.close(descriptor)
+    reject_authority_claims(tree)
+    overlay_entries = []
+    for entry in tree.entries:
+        if entry.path == "overlay":
+            overlay_entries.append(entry._replace(path="."))
+        elif entry.path.startswith("overlay/"):
+            overlay_entries.append(entry._replace(path=entry.path[len("overlay/"):]))
+    overlay_data = {
+        path[len("overlay/"):]: data for path, data in tree.data.items() if path.startswith("overlay/")
+    }
+    overlay_entries.sort(key=lambda entry: (entry.path != ".", entry.path.encode("utf-8")))
+    module_files = check_module_shape(
+        Tree(overlay_entries, overlay_data, 0, frozenset()), contracts
+    )
+    require_archive_plan(contracts, assets, module_files)
+    overlay = {"/" + path: data for path, data in overlay_data.items()}
+    spec = kit_spec(contracts, module_files, overlay, binding)
+    diff_entries(tree.entries, spec_entries(spec), "kit")
+    recheck_trusted_artifact(kit, kit_identity, "kit")
+    return {
+        "status": "verified",
+        "kit_sha256": sha256_bytes(tree.data["SHA256SUMS"]),
+        "module_files": len(module_files),
+        "rootfs_digest": binding["digest"],
+        "archive_proven": True,
+        "deployment_authorized": False,
+    }
+
+
+def command_gate(contracts: Contracts, kit: str, rootfs: str, manifest: str, assets: str) -> dict:
+    verified = command_verify(contracts, kit, rootfs, manifest, assets)
+    return {
+        "artifact_verified": True,
+        "deployment_authorized": False,
+        "bootable": False,
+        "flashable": False,
+        "image_ready": False,
+        "decision": "refused",
+        "blockers": list(BLOCKERS),
+        "kit_sha256": verified["kit_sha256"],
+        "archive_proven": True,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("show", help="print the deployment contract; changes nothing")
+    stage = commands.add_parser("stage-modules", help="stage the qualified module overlay into a new directory")
+    stage.add_argument("--assets", required=True)
+    stage.add_argument("--out", required=True)
+    assemble = commands.add_parser("assemble", help="bind rootfs, overlay and contracts into a new kit")
+    assemble.add_argument("--rootfs-stage", required=True)
+    assemble.add_argument("--rootfs-manifest", required=True)
+    assemble.add_argument("--module-stage", required=True)
+    assemble.add_argument("--assets", required=True, help="qualified module archive")
+    assemble.add_argument("--out", required=True)
+    for name, text in (("verify", "recompute every binding of a kit"), ("gate", "verify, then refuse deployment")):
+        sub = commands.add_parser(name, help=text)
+        sub.add_argument("--kit", required=True)
+        sub.add_argument("--rootfs-stage", required=True)
+        sub.add_argument("--rootfs-manifest", help="default: <rootfs-stage>.MANIFEST")
+        sub.add_argument("--assets", required=True, help="qualified module archive")
+    return parser
+
+
+def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        contracts = load_contracts(contracts_root or REPO)
+        if args.command == "show":
+            result = command_show(contracts)
+        elif args.command == "stage-modules":
+            result = command_stage_modules(contracts, args.assets, args.out)
+        elif args.command == "assemble":
+            result = command_assemble(
+                contracts, args.rootfs_stage, args.rootfs_manifest, args.module_stage, args.out, args.assets
+            )
+        else:
+            manifest = args.rootfs_manifest or args.rootfs_stage + ".MANIFEST"
+            runner = command_verify if args.command == "verify" else command_gate
+            result = runner(contracts, args.kit, args.rootfs_stage, manifest, args.assets)
+    except handled_errors() as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if args.command == "gate":
+        print("deployment refused: the kit is verified but not authorized", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

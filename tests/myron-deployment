@@ -1,0 +1,1337 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for tools/myron-deployment, the laptop-only, non-flashable
+# Myron deployment-candidate kit. Synthetic bytes only: nothing here is a
+# kernel, module, firmware, boot image, or private runtime asset. No root,
+# device, Docker, or network access.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+python3 -m py_compile tools/myron-deployment || fail "tool parses"
+grep -Eq '^(import|from) (subprocess|shutil)|os\.(system|popen|exec|spawn|fork)|posix_spawn' tools/myron-deployment \
+  && fail "tool references process-spawning or broad-copy facilities"
+pass "tool parses and spawns nothing"
+
+# Repository contract: strictly derived and bound; the real show works.
+mkdir -p "$tmp/fakes"
+: > "$tmp/calls"
+for command in ssh scp adb fastboot docker mount tar pacman depmod modprobe systemctl cp; do
+  printf '#!/bin/sh\nprintf "%%s\\n" "%s $*" >> "$CALLS"\nexit 97\n' "$command" > "$tmp/fakes/$command"
+  chmod +x "$tmp/fakes/$command"
+done
+CALLS="$tmp/calls" PATH="$tmp/fakes:$PATH" tools/myron-deployment show > "$tmp/show.json" \
+  || fail "show of the repository deployment contract failed"
+python3 - "$tmp/show.json" <<'PY' || exit 1
+import json, sys
+c = json.load(open(sys.argv[1]))
+assert c["deployment_authorized"] is False and c["bootable"] is False
+assert c["flashable"] is False and c["image_ready"] is False
+assert c["runtime"]["required_features"] == ["gpu", "wifi", "touch"]
+assert c["runtime"]["bytes"] == "external-private"
+assert c["modules"]["order"]["status"] == "unverified"
+assert c["modules"]["order"]["modules"] == [
+    "pwrseq-core", "bluetooth", "btbcm", "btqca", "hci_uart", "rfkill", "rmnet",
+]
+assert c["modules"]["file_count"] == 8 and len(c["blockers"]) == 7
+PY
+: > "$tmp/not-the-archive"
+if CALLS="$tmp/calls" PATH="$tmp/fakes:$PATH" \
+    tools/myron-deployment stage-modules --assets "$tmp/not-the-archive" --out "$tmp/never" >/dev/null 2>&1; then
+  fail "stage-modules accepted an archive that is not the qualified one"
+fi
+[[ ! -e $tmp/never ]] || fail "refused stage-modules left output"
+[[ ! -s $tmp/calls ]] || fail "tool invoked an external system tool"
+pass "repository contract is canonical, show is read-only, a wrong archive writes nothing"
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import errno
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+from types import SimpleNamespace
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader("deploy_tool", str(repo / "tools/myron-deployment"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+T = importlib.util.module_from_spec(spec)
+loader.exec_module(T)
+K = T.kernel()
+
+counter = [0]
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def fresh(label):
+    counter[0] += 1
+    path = work / f"{label}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+# ---- synthetic qualified inputs ------------------------------------------------
+
+RELEASE = "test-release"
+MODULES = ["alpha", "beta"]
+RUNTIME_MARKER = b"SECRET-RUNTIME-ASSET-BYTES"
+
+
+def make_fixture(variant=None):
+    base = fresh("fixture")
+    notes = b"synthetic-notes\n"
+    image, config = b"synthetic-image\n", b"synthetic-config\n"
+    directory = f"/usr/local/lib/myron-gki-module-sets/{digest(notes)}"
+    payload = {
+        "candidate-module-dir.sh": b"#!/bin/sh\nexit 0\n",
+        "previous-module-dir.sh": b"#!/bin/sh\nexit 1\n",
+        "kernel-notes.bin": notes,
+        **{
+            f"modules/{name}.ko": (
+                f"module-{name}\0vermagic={'other' if variant == 'vermagic' else RELEASE} SMP\0"
+            ).encode()
+            for name in MODULES
+        },
+    }
+    manifest = {
+        "phase": "inactive-staging-payload-only",
+        "candidate_image_sha256": digest(image),
+        "candidate_config_sha256": digest(config),
+        "candidate_notes_sha256": digest(notes),
+        "module_directory": directory,
+        "selector_destination": "/usr/local/sbin/myron-attempt79-module-dir",
+        "files": {name: digest(data) for name, data in sorted(payload.items())},
+    }
+    payload["manifest.json"] = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    payload["SHA256SUMS"] = "".join(
+        f"{digest(data)}  {name}\n" for name, data in sorted(payload.items())
+    ).encode()
+    archive = base / "assets.tar.gz"
+    with archive.open("wb") as output:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as zipped:
+            with tarfile.open(fileobj=zipped, mode="w") as tar:
+                for name, data in sorted(payload.items()):
+                    info = tarfile.TarInfo("fixture/" + name)
+                    info.size = len(data)
+                    info.mode = 0o644
+                    tar.addfile(info, io.BytesIO(data))
+                if variant == "extra-member":
+                    info = tarfile.TarInfo("fixture/extra.txt")
+                    info.size = 1
+                    tar.addfile(info, io.BytesIO(b"x"))
+                if variant == "link-member":
+                    info = tarfile.TarInfo("fixture/modules/alpha.ko")
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = "/etc/passwd"
+                    tar.addfile(info)
+    reference = {
+        "schema": 1,
+        "device": {
+            "codename": "myron", "compatible": "qcom,canoe-mtp", "soc": "sm8850",
+            "model_contains": "Myron", "boot_method": "external-android",
+        },
+        "kernel": {
+            "release": RELEASE, "gki_source_revision": "0" * 40,
+            "image_sha256": digest(image), "notes_sha256": digest(notes),
+            "config_sha256": digest(config),
+            "vmlinux_symvers_sha256": "5" * 64, "module_symvers_sha256": "6" * 64,
+        },
+        "source": {"lock_sha256": "2" * 64, "manifest_sha256": "3" * 64, "patches": {"0001-test.patch": "4" * 64}},
+        "module_assets": {
+            "archive_sha256": digest(archive.read_bytes()), "root": "fixture",
+            "module_directory": directory,
+            "candidate_selector_sha256": digest(payload["candidate-module-dir.sh"]),
+            "previous_selector_sha256": digest(payload["previous-module-dir.sh"]),
+            "forbidden_modules": ["rmnet_core"], "modules": MODULES,
+        },
+        "runtime_assets": {"manifest_sha256": digest(RUNTIME_MARKER)},
+        "activation": {
+            "mode": "disabled", "source_lock_reproduction": "not_verified",
+            "device_qualification": "reference_evidence_only",
+        },
+        "payload": {"kind": "metadata-only"},
+        "provenance": {
+            "reference_repository_base_commit": "1" * 40, "reference_worktree_state": "synthetic",
+            "qualification": "test", "status": "metadata-only",
+        },
+    }
+    reference_bytes = (json.dumps(reference, indent=2, sort_keys=True) + "\n").encode()
+    stage = K.expected_stage_contract(reference, digest(reference_bytes))
+    stage_bytes = (json.dumps(stage, indent=2, sort_keys=True) + "\n").encode()
+    gpu_bytes = (repo / T.GPU_REFERENCE_PATH).read_bytes()
+    root = base / "contracts-root"
+    for relative, data in (
+        (T.KERNEL_REFERENCE_PATH, reference_bytes),
+        (T.STAGE_CONTRACT_PATH, stage_bytes),
+        (T.GPU_REFERENCE_PATH, gpu_bytes),
+    ):
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_bytes(data)
+    deployment = T.expected_deployment_contract(reference, digest(reference_bytes), digest(stage_bytes), digest(gpu_bytes))
+    (root / T.DEPLOYMENT_CONTRACT_PATH).write_bytes(T.render_json(deployment))
+    return {
+        "base": base, "root": root, "archive": archive, "reference": reference,
+        "reference_bytes": reference_bytes, "stage_bytes": stage_bytes, "gpu_bytes": gpu_bytes,
+    }
+
+
+def make_rootfs(fx):
+    base = fresh("rootfs")
+    tree = base / "omamobile-rootfs-stage-synthetic-aarch64"
+    (tree / "etc/systemd/system").mkdir(parents=True)
+    for script in (
+        "packages/omamobile-device-myron/install",
+        "packages/omamobile-myron-kernel-contract/install",
+        "packages/omamobile-myron-gpu-profile/install",
+        "packages/omamobile-myron-gpu-profile/test/stage-mesa-fixture",
+    ):
+        subprocess.run([str(repo / script), str(tree)], check=True, stdout=subprocess.DEVNULL)
+    share = tree / "usr/share/omamobile/myron-kernel-contract"
+    (share / "reference.json").write_bytes(fx["reference_bytes"])
+    (share / "stage-contract.json").write_bytes(fx["stage_bytes"])
+    (tree / "usr/lib/firmware").mkdir(parents=True)
+    (tree / "usr/lib/firmware/regulatory.db").write_bytes(b"")
+    (tree / "usr/lib/firmware/regulatory.db.p7s").write_bytes(b"")
+    manifest = Path(str(tree) + ".MANIFEST")
+    manifest.write_text(
+        "# Omarchy Mobile root STAGE (not bootable, not an image)\n"
+        "version: synthetic\n"
+        "rootfs integration: external-contract\n"
+        "rootfs package profile: myron\n"
+        "package closure: required present; forbidden absent\n"
+        "kernel modules: none (external contract, no module payload)\n"
+        "boot payload: none; proprietary payload: none\n"
+    )
+    return tree, manifest
+
+
+def run_exact(root, *argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = T.main([str(item) for item in argv], contracts_root=root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def run(root, *argv):
+    arguments = list(argv)
+    if arguments and arguments[0] in ("assemble", "verify", "gate") and "--assets" not in arguments:
+        arguments.extend(("--assets", archive))
+    return run_exact(root, *arguments)
+
+
+def expect_ok(root, *argv):
+    code, out, err = run(root, *argv)
+    assert code == 0, f"{argv[0]} failed: {err}"
+    return json.loads(out)
+
+
+def expect_fail(name, root, argv, contains, *outputs):
+    code, out, err = run(root, *argv)
+    assert code != 0, f"{name}: accepted"
+    assert contains in err, f"{name}: wrong reason: {err.strip()}"
+    for path in outputs:
+        assert not os.path.lexists(path), f"{name}: left output {path}"
+    siblings = [p.name for p in Path(outputs[0]).parent.iterdir()] if outputs else []
+    assert not any(".tmp-" in s and "someoneelse" not in s for s in siblings), f"{name}: left temp {siblings}"
+    ok(f"{name} is rejected")
+
+
+def snapshot(path):
+    fd = T.open_canonical_dir(str(path), "snapshot")
+    try:
+        tree = T.walk_tree(fd, T.ROOTFS_LIMITS, allow_symlinks=True, keep_data=True)
+    finally:
+        os.close(fd)
+    return tree.entries, tree.data
+
+
+fx = make_fixture()
+root, archive = fx["root"], fx["archive"]
+rootfs, manifest = make_rootfs(fx)
+archive_before = digest(archive.read_bytes())
+
+# ---- happy path, determinism, no input mutation --------------------------------
+stage_a, stage_b = work / "stage-a", work / "stage-b"
+result = expect_ok(root, "stage-modules", "--assets", archive, "--out", stage_a)
+assert result["status"] == "staged" and result["file_count"] == 3 and result["deployment_authorized"] is False
+expect_ok(root, "stage-modules", "--assets", archive, "--out", stage_b)
+assert snapshot(stage_a) == snapshot(stage_b)
+entries, _ = snapshot(stage_a)
+files = sorted(e.path for e in entries if e.kind == "file")
+assert files == sorted([
+    f"usr/local/lib/myron-gki-module-sets/{fx['reference']['kernel']['notes_sha256']}/{name}.ko"
+    for name in MODULES
+] + ["usr/local/sbin/myron-attempt79-module-dir"]), files
+modes = {e.path: e.mode for e in entries}
+assert modes["usr/local/sbin/myron-attempt79-module-dir"] == 0o755
+assert all(e.mode == 0o755 for e in entries if e.kind == "dir")
+assert all(e.mode == 0o644 for e in entries if e.kind == "file" and e.path.endswith(".ko"))
+assert not any("notes" in e.path.rsplit("/", 1)[-1] or "previous" in e.path or e.path.endswith(".json") for e in entries if e.kind == "file")
+ok("stage-modules writes exactly the selector and the modules, deterministically")
+
+rootfs_before, rootfs_data = snapshot(rootfs)
+stage_before = snapshot(stage_a)
+manifest_before = manifest.read_bytes()
+kit_a, kit_b = work / "kit-a", work / "kit-b"
+result = expect_ok(root, "assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+                   "--module-stage", stage_a, "--out", kit_a)
+assert result["status"] == "assembled" and result["deployment_authorized"] is False and result["archive_proven"] is True
+expect_ok(root, "assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+          "--module-stage", stage_b, "--assets", archive, "--out", kit_b)
+assert snapshot(kit_a) == snapshot(kit_b), "kits are not deterministic"
+assert (rootfs_before, rootfs_data) == snapshot(rootfs), "assemble mutated the rootfs"
+assert stage_before == snapshot(stage_a) and manifest.read_bytes() == manifest_before
+assert digest(archive.read_bytes()) == archive_before
+ok("assemble is deterministic and leaves every input untouched")
+
+verified = expect_ok(root, "verify", "--kit", kit_a, "--rootfs-stage", rootfs)
+assert verified["status"] == "verified" and verified["deployment_authorized"] is False
+expect_ok(root, "verify", "--kit", kit_a, "--rootfs-stage", rootfs, "--assets", archive)
+gate = expect_ok(root, "gate", "--kit", kit_a, "--rootfs-stage", rootfs)
+assert gate["artifact_verified"] is True and gate["deployment_authorized"] is False
+assert gate["bootable"] is False and gate["flashable"] is False and gate["image_ready"] is False
+assert gate["blockers"] == T.BLOCKERS and gate["decision"] == "refused"
+code, _, err = run(root, "gate", "--kit", kit_a, "--rootfs-stage", rootfs)
+assert "refused" in err
+ok("verify recomputes every binding; gate verifies but always refuses authorization")
+
+# ---- kit holds public contracts and overlay only ---------------------------------
+kit_entries, kit_data = snapshot(kit_a)
+top = {e.path for e in kit_entries if "/" not in e.path and e.path != "."}
+assert top == {"contracts", "overlay", "kit.json", "status.json", "STATUS.txt", "SHA256SUMS"}, top
+ko = [e.path for e in kit_entries if e.path.endswith(".ko")]
+assert len(ko) == len(MODULES) and all(p.startswith("overlay/usr/local/lib/myron-gki-module-sets/") for p in ko)
+for forbidden in ("boot", "etc", "vendor", "systemd", "firmware", "modprobe.d", "vulkan", "libalpm"):
+    assert not any(forbidden in e.path.split("/") for e in kit_entries), forbidden
+blob = b"".join(kit_data.values())
+assert RUNTIME_MARKER not in blob and b"ExecStart" not in blob and b"vmlinuz" not in blob
+assert b"/usr/share/omamobile/myron-gpu/reference.json" not in b"".join(
+    d for p, d in kit_data.items() if p.startswith("overlay/")
+)
+assert not any(p.startswith("overlay/usr/share") or p.startswith("overlay/usr/lib") for p in kit_data)
+status = json.loads(kit_data["status.json"])
+assert status["deployment_authorized"] is False and status["blockers"] == T.BLOCKERS
+kit_document = json.loads(kit_data["kit.json"])
+assert kit_document["rootfs"]["copied_into_kit"] is False
+assert kit_document["runtime"]["bytes"] == "external-private"
+assert b"NOT bootable" in kit_data["STATUS.txt"]
+sums = kit_data["SHA256SUMS"].decode().splitlines()
+assert len(sums) == len([e for e in kit_entries if e.kind == "file"]) - 1
+ok("kit carries only public contracts, the module overlay and status files; no rootfs, runtime bytes or activation")
+
+# ---- no external commands, in-process too -----------------------------------------
+def boom(*args, **kwargs):
+    raise AssertionError("external command attempted")
+
+
+saved = (subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp)
+subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 6
+try:
+    probe = work / "probe-kit"
+    expect_ok(root, "assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+              "--module-stage", stage_a, "--out", probe)
+    expect_ok(root, "gate", "--kit", probe, "--rootfs-stage", rootfs)
+finally:
+    subprocess.Popen, os.system, os.fork, os.posix_spawn, os.execv, os.execvp = saved
+ok("no process is spawned by any command")
+
+# ---- wrong component hashes, strict contract ---------------------------------------
+def contract_variant(mutate):
+    clone = fresh("variant")
+    shutil.copytree(root, clone / "root")
+    mutate(clone / "root")
+    return clone / "root"
+
+
+def edit_deployment(function):
+    def mutate(path):
+        target = path / T.DEPLOYMENT_CONTRACT_PATH
+        document = json.loads(target.read_text())
+        function(document)
+        target.write_bytes(T.render_json(document))
+    return mutate
+
+
+def deploy_text(function):
+    def mutate(path):
+        target = path / T.DEPLOYMENT_CONTRACT_PATH
+        target.write_text(function(target.read_text()))
+    return mutate
+
+
+for name, mutate, reason in (
+    ("a wrong kernel-reference hash", edit_deployment(lambda d: d["components"]["kernel_reference"].update(sha256="0" * 64)), "differs at components"),
+    ("a wrong stage-contract hash", edit_deployment(lambda d: d["components"]["stage_contract"].update(sha256="0" * 64)), "differs at components"),
+    ("a wrong GPU-profile hash", edit_deployment(lambda d: d["components"]["gpu_profile_reference"].update(sha256="0" * 64)), "differs at components"),
+    ("a changed GPU reference", lambda p: (p / T.GPU_REFERENCE_PATH).write_bytes(b'{"schema": 1}\n'), "profile reference"),
+    ("a changed stage contract", lambda p: (p / T.STAGE_CONTRACT_PATH).write_bytes(fx["stage_bytes"].replace(b"0755", b"0777", 1)), "stage contract"),
+    ("a wrong runtime manifest hash", edit_deployment(lambda d: d["runtime"].update(manifest_sha256="0" * 64)), "differs at runtime"),
+    ("missing runtime features", edit_deployment(lambda d: d["runtime"].update(required_features=["gpu", "wifi"])), "differs at runtime"),
+    ("reordered runtime features", edit_deployment(lambda d: d["runtime"].update(required_features=["wifi", "gpu", "touch"])), "differs at runtime"),
+    ("a runtime bytes claim of public", edit_deployment(lambda d: d["runtime"].update(bytes="public")), "differs at runtime"),
+    ("an authorization claim", edit_deployment(lambda d: d.update(deployment_authorized=True)), "differs at deployment_authorized"),
+    ("a bootable claim", edit_deployment(lambda d: d.update(bootable=True)), "differs at bootable"),
+    ("an omitted blocker", edit_deployment(lambda d: d["blockers"].pop()), "differs at blockers"),
+    ("a reordered blocker list", edit_deployment(lambda d: d["blockers"].reverse()), "differs at blockers"),
+    ("an unknown field", edit_deployment(lambda d: d.update(extra=1)), "top-level fields differ"),
+    ("a verified module order", edit_deployment(lambda d: d["modules"]["order"].update(status="verified")), "differs at modules"),
+    ("a boolean standing for an integer", deploy_text(lambda t: t.replace('"schema": 1', '"schema": true', 1)), "differs at schema"),
+    ("a float standing for an integer", deploy_text(lambda t: t.replace('"file_count": 3', '"file_count": 3.0')), "differs at modules"),
+    ("a duplicate key", deploy_text(lambda t: t.replace('"bootable": false,', '"bootable": false, "bootable": false,', 1)), "duplicate JSON key"),
+    ("a non-finite number", deploy_text(lambda t: t.replace('"file_count": 3', '"file_count": NaN')), "non-finite"),
+    ("a non-canonical rendering", deploy_text(lambda t: t.replace("\n", "\n ", 1)), "canonical form"),
+):
+    root_variant = contract_variant(mutate)
+    code, out, err = run(root_variant, "show")
+    assert code != 0 and not out, f"{name}: accepted"
+    assert reason in err, f"{name}: wrong reason: {err.strip()}"
+    ok(f"{name} is rejected by the deployment contract")
+
+# ---- archive deviations come from the kernel verifier ------------------------------
+for variant, reason in (("extra-member", "member set differs"), ("link-member", "member set differs"), ("vermagic", "exact kernel release")):
+    other = make_fixture(variant)
+    out = work / f"never-{variant}"
+    expect_fail(f"an archive with {variant}", other["root"],
+                ["stage-modules", "--assets", other["archive"], "--out", out], "", out)
+tampered = work / "tampered.tar.gz"
+tampered.write_bytes(archive.read_bytes() + b"x")
+expect_fail("an archive with a wrong hash", root, ["stage-modules", "--assets", tampered, "--out", work / "never-t"], "SHA-256 differs", work / "never-t")
+fifo = work / "assets.fifo"
+os.mkfifo(fifo)
+expect_fail("a FIFO archive", root, ["stage-modules", "--assets", fifo, "--out", work / "never-f"], "not a regular file", work / "never-f")
+link = work / "assets-link.tar.gz"
+link.symlink_to(archive)
+expect_fail("a symlinked archive", root, ["stage-modules", "--assets", link, "--out", work / "never-l"], "not a regular file", work / "never-l")
+
+# A special inode is rejected from O_PATH metadata before any data-open.
+probe = fresh("special-open")
+(probe / "entry").write_bytes(b"regular fixture")
+probe_fd = os.open(probe, os.O_RDONLY | os.O_DIRECTORY)
+real_open, real_fstat = T.os.open, T.os.fstat
+pinned_fd, data_opened = [-1], [False]
+def guarded_open(path, flags, *args, **kwargs):
+    if isinstance(path, str) and path == "entry" and flags & os.O_PATH:
+        descriptor = real_open(path, flags, *args, **kwargs)
+        pinned_fd[0] = descriptor
+        return descriptor
+    if isinstance(path, str) and path == f"/proc/self/fd/{pinned_fd[0]}":
+        data_opened[0] = True
+    return real_open(path, flags, *args, **kwargs)
+def special_fstat(descriptor):
+    if descriptor == pinned_fd[0]:
+        return SimpleNamespace(st_mode=stat.S_IFCHR | 0o600)
+    return real_fstat(descriptor)
+T.os.open, T.os.fstat = guarded_open, special_fstat
+try:
+    try:
+        T.open_pinned_regular_at(probe_fd, "entry", "special probe")
+    except T.DeploymentError as error:
+        assert "not a regular file" in str(error)
+    else:
+        raise AssertionError("special inode accepted")
+finally:
+    T.os.open, T.os.fstat = real_open, real_fstat
+    os.close(probe_fd)
+assert not data_opened[0], "special inode received a data-open"
+assert K.read_limited_regular is T.kernel().read_limited_regular
+ok("special inputs are type-checked before data-open; archive verification has no shared override")
+
+# Entry bounds stop enumeration before the full directory is accumulated.
+bounded = fresh("bounded-enumeration")
+bounded_fd = os.open(bounded, os.O_RDONLY | os.O_DIRECTORY)
+real_scandir = T.os.scandir
+produced = [0]
+class ManyEntries:
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def __iter__(self): return self
+    def __next__(self):
+        if produced[0] >= 10_000:
+            raise StopIteration
+        produced[0] += 1
+        return SimpleNamespace(name=f"entry-{produced[0]:05d}")
+def many_scandir(descriptor):
+    return ManyEntries() if descriptor == bounded_fd else real_scandir(descriptor)
+T.os.scandir = many_scandir
+try:
+    try:
+        T.walk_tree(bounded_fd, T.Limits(2, 2, 1024, 1024), allow_symlinks=False)
+    except T.DeploymentError as error:
+        assert "entry bound" in str(error)
+    else:
+        raise AssertionError("unbounded directory enumeration accepted")
+finally:
+    T.os.scandir = real_scandir
+    os.close(bounded_fd)
+assert produced[0] == 3, produced[0]
+ok("entry bound stops directory enumeration before sorting")
+
+# ---- output and input path rules ----------------------------------------------------
+parent = fresh("paths")
+(parent / "dir").mkdir()
+(parent / "file").write_text("x")
+(parent / "dangling").symlink_to(parent / "nowhere")
+(parent / "realdir").mkdir()
+(parent / "viadir").symlink_to(parent / "realdir")
+for name, out, reason in (
+    ("an existing directory output", parent / "dir", "already exists"),
+    ("an existing file output", parent / "file", "already exists"),
+    ("a dangling symlink output", parent / "dangling", "already exists"),
+    ("an output through a symlinked parent", parent / "viadir/out", "unavailable"),
+    ("a relative output", "relative-out", "absolute"),
+    ("a root output", "/", "must not be /"),
+    ("an output with a dot component", f"{parent}/./x", ". or .."),
+    ("an output with a dot-dot component", f"{parent}/dir/../x", ". or .."),
+    ("an output with an empty component", f"{parent}//x", "canonical"),
+    ("an output with a trailing slash", f"{parent}/x/", "canonical"),
+    ("an output below a missing parent", parent / "missing/x", "unavailable"),
+):
+    expect_fail(name, root, ["stage-modules", "--assets", archive, "--out", out], reason)
+assert sorted(p.name for p in parent.iterdir()) == ["dangling", "dir", "file", "realdir", "viadir"]
+unsafe_parent = fresh("unsafe-output-parent")
+unsafe_parent.chmod(0o777)
+try:
+    expect_fail(
+        "a group/world-writable output parent",
+        root,
+        ["stage-modules", "--assets", archive, "--out", unsafe_parent / "out"],
+        "not group/world-writable",
+        unsafe_parent / "out",
+    )
+finally:
+    unsafe_parent.chmod(0o700)
+unsafe_kit_base = fresh("unsafe-kit-ancestry")
+unsafe_kit_branch = unsafe_kit_base / "branch"
+unsafe_kit_branch.mkdir()
+unsafe_kit = unsafe_kit_branch / "kit"
+shutil.copytree(kit_a, unsafe_kit)
+unsafe_kit_base.chmod(0o777)
+try:
+    for command in ("verify", "gate"):
+        code, _, err = run(
+            root, command, "--kit", unsafe_kit,
+            "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+        )
+        assert code != 0 and "ancestry is writable" in err
+finally:
+    unsafe_kit_base.chmod(0o700)
+ok("verify and gate reject kits below other-user-writable ancestry")
+
+unsafe_kit_root = fresh("unsafe-kit-root") / "kit"
+shutil.copytree(kit_a, unsafe_kit_root)
+unsafe_kit_root.chmod(0o777)
+code, _, err = run(
+    root, "verify", "--kit", unsafe_kit_root,
+    "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+)
+assert code != 0 and "writable or controlled" in err and "Bad file descriptor" not in err
+unsafe_kit_root.chmod(0o755)
+ok("unsafe kit-root rejection preserves the intended error")
+
+foreign_kit = fresh("foreign-kit-entry") / "kit"
+shutil.copytree(kit_a, foreign_kit)
+real_stat = os.stat
+
+
+def foreign_status_stat(path, *args, **kwargs):
+    value = real_stat(path, *args, **kwargs)
+    if path == "status.json" and kwargs.get("dir_fd") is not None:
+        return SimpleNamespace(
+            st_dev=value.st_dev, st_ino=value.st_ino, st_nlink=value.st_nlink,
+            st_mtime_ns=value.st_mtime_ns, st_ctime_ns=value.st_ctime_ns,
+            st_mode=value.st_mode, st_size=value.st_size, st_uid=os.geteuid() + 1,
+        )
+    return value
+
+
+T.os.stat = foreign_status_stat
+try:
+    code, _, err = run(
+        root, "verify", "--kit", foreign_kit,
+        "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+    )
+finally:
+    T.os.stat = real_stat
+assert code != 0 and "controlled by another user" in err
+ok("verify rejects foreign-owned kit descendants")
+for name, flag, value, reason in (
+    ("a relative rootfs", "--rootfs-stage", "rootfs-relative", "absolute"),
+    ("a noncanonical rootfs", "--rootfs-stage", f"{rootfs}/", "canonical"),
+    ("a root rootfs", "--rootfs-stage", "/", "must not be /"),
+    ("a symlinked rootfs", "--rootfs-stage", parent / "viadir", "symlink"),
+):
+    args = {"--rootfs-stage": rootfs, "--rootfs-manifest": manifest, "--module-stage": stage_a}
+    args[flag] = value
+    argv = ["assemble", *(x for k, v in args.items() for x in (k, v)), "--out", work / f"never-{name[:4]}"]
+    expect_fail(name, root, argv, reason)
+expect_fail("a relative manifest", root, ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", "MANIFEST",
+            "--module-stage", stage_a, "--out", work / "never-m"], "absolute", work / "never-m")
+expect_fail("an output inside the module stage", root, ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+            "--module-stage", stage_a, "--out", stage_a / "kit"], "inside an input tree")
+expect_fail("an output inside the rootfs", root, ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+            "--module-stage", stage_a, "--out", rootfs / "kit"], "inside an input tree")
+expect_fail("an existing kit output", root, ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+            "--module-stage", stage_a, "--out", kit_a], "already exists")
+
+# Simulate a bind alias of a rootfs subdirectory without mounting anything.
+# Directory identity, not pathname spelling, must reject it before creation.
+alias_parent = fresh("alias-parent")
+alias_out = alias_parent / "kit-alias"
+aliased_target = rootfs / "usr/share"
+aliased_target_fd = os.open(aliased_target, os.O_RDONLY | os.O_DIRECTORY)
+real_open_components = T.open_trusted_output_parent
+def aliased_open_components(parts, label):
+    if label == "output parent":
+        return os.dup(aliased_target_fd)
+    return real_open_components(parts, label)
+T.open_trusted_output_parent = aliased_open_components
+try:
+    expect_fail(
+        "an output parent aliased inside the rootfs",
+        root,
+        ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+         "--module-stage", stage_a, "--out", alias_out],
+        "aliases a directory inside an input tree",
+        alias_out,
+    )
+finally:
+    T.open_trusted_output_parent = real_open_components
+    os.close(aliased_target_fd)
+assert not (aliased_target / alias_out.name).exists()
+ok("path rules hold")
+
+
+# ---- rootfs rejections --------------------------------------------------------------
+def rootfs_case(name, reason, mutate, manifest_mutate=None):
+    tree, mani = make_rootfs(fx)
+    mutate(tree)
+    if manifest_mutate:
+        mani.write_text(manifest_mutate(mani.read_text()))
+    out = tree.parent / "kit"
+    expect_fail(name, root, ["assemble", "--rootfs-stage", tree, "--rootfs-manifest", mani,
+                             "--module-stage", stage_a, "--out", out], reason, out)
+
+
+def write(path, data=b""):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+rootfs_case("a bootable manifest", "non-bootable stage marker", lambda t: None,
+            lambda text: text.replace("# Omarchy Mobile root STAGE", "# Omarchy Mobile root image", 1))
+rootfs_case("a manifest lacking a line", "MANIFEST lacks", lambda t: None, lambda text: text.replace("rootfs package profile: myron\n", ""))
+rootfs_case("a wrong device boot method", "device.conf lacks", lambda t: (t / "usr/share/omamobile/device.conf").write_text("BOOT_METHOD=fastboot\n"))
+rootfs_case(
+    "a non-UTF-8 device contract",
+    "not UTF-8",
+    lambda t: (t / "usr/share/omamobile/device.conf").write_bytes(
+        b"BOOT_METHOD=external-android\nROOTFS_INTEGRATION=external-contract\n\xff\n"
+    ),
+)
+rootfs_case("a missing required file", "missing or unsafe", lambda t: (t / "usr/bin/omamobile-myron-kernel-verify").unlink())
+rootfs_case("a rootfs kernel reference that differs", "differs from the deployment contract",
+            lambda t: (t / "usr/share/omamobile/myron-kernel-contract/reference.json").write_bytes(b"{}\n"))
+rootfs_case("a rootfs stage contract that differs", "differs from the deployment contract",
+            lambda t: (t / "usr/share/omamobile/myron-kernel-contract/stage-contract.json").write_bytes(b"{}\n"))
+rootfs_case("a rootfs GPU profile reference that differs", "differs from the deployment contract",
+            lambda t: (t / "usr/share/omamobile/myron-gpu-profile/reference.json").write_bytes(b"{}\n"))
+rootfs_case("a kernel module payload", "kernel modules in the stage", lambda t: write(t / "usr/lib/modules/6.12/x"))
+rootfs_case("a kernel module file", "boot payload", lambda t: write(t / "opt/x.ko.zst"))
+rootfs_case("a boot image", "boot payload", lambda t: write(t / "boot/boot.img"))
+rootfs_case("a vendor path", "vendor or activation path", lambda t: (t / "vendor").mkdir())
+rootfs_case("a dangling vendor symlink", "vendor or activation path", lambda t: (t / "vendor").symlink_to("/nonexistent-x"))
+rootfs_case("a runtime asset directory", "vendor or activation path", lambda t: write(t / "var/lib/omamobile/myron-assets/x"))
+rootfs_case("a GPU activation unit", "vendor or activation path", lambda t: write(t / "etc/systemd/system/omamobile-myron-gpu.service"))
+rootfs_case("an ancestor symlink of an activation path", "unsafe ancestor",
+            lambda t: ((t / "etc/systemd/system").rmdir(), (t / "etc/systemd").rmdir(), (t / "etc/systemd").symlink_to("/tmp")))
+rootfs_case("a firmware subdirectory", "firmware entry is not a regular file", lambda t: (t / "usr/lib/firmware/qcom").mkdir())
+rootfs_case("a firmware symlink", "firmware entry is not a regular file",
+            lambda t: ((t / "usr/lib/firmware/regulatory.db").unlink(), (t / "usr/lib/firmware/regulatory.db").symlink_to("/dev/null")))
+rootfs_case("an extra firmware file", "allowlist", lambda t: write(t / "usr/lib/firmware/private.bin"))
+rootfs_case("an unmerged /lib", "system library alias", lambda t: write(t / "lib/firmware/x"))
+rootfs_case("a redirected /lib", "system library alias", lambda t: (t / "lib").symlink_to("usr/local/lib"))
+rootfs_case("a modules symlink", "not a real directory", lambda t: (t / "usr/lib/modules").symlink_to("/nonexistent-x"))
+rootfs_case("a Myron session reference", "GPU", lambda t: write(t / "etc/systemd/system/x.service", b"ExecStart=/usr/bin/omamobile-myron-session\n"))
+rootfs_case("a changed GPU payload", "SHA-256 differs", lambda t: (t / "usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so").open("ab").write(b"x"))
+
+mesa_limit_tree, mesa_limit_manifest = make_rootfs(fx)
+G = T.gpu()
+real_mesa_limit = G.MAX_MESA_FILE_BYTES
+G.MAX_MESA_FILE_BYTES = 8
+try:
+    expect_fail(
+        "a Mesa payload beyond the component byte limit",
+        root,
+        ["assemble", "--rootfs-stage", mesa_limit_tree, "--rootfs-manifest", mesa_limit_manifest,
+         "--module-stage", stage_a, "--out", mesa_limit_tree.parent / "kit"],
+        "Mesa snapshot payload SHA-256 differs",
+        mesa_limit_tree.parent / "kit",
+    )
+finally:
+    G.MAX_MESA_FILE_BYTES = real_mesa_limit
+
+deep_tree, deep_manifest = make_rootfs(fx)
+deep = deep_tree / "etc/systemd/system"
+for number in range(G.MAX_SCAN_DEPTH + 1):
+    deep /= f"d{number}"
+deep.mkdir(parents=True)
+expect_fail(
+    "an activation subtree beyond the component depth limit",
+    root,
+    ["assemble", "--rootfs-stage", deep_tree, "--rootfs-manifest", deep_manifest,
+     "--module-stage", stage_a, "--out", deep_tree.parent / "kit"],
+    "depth safety limit",
+    deep_tree.parent / "kit",
+)
+
+symlink_scope_tree, symlink_scope_manifest = make_rootfs(fx)
+(symlink_scope_tree / "opt/x11").mkdir(parents=True)
+(symlink_scope_tree / "opt/x11/Xsession").write_text(
+    "export LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu\n"
+)
+(symlink_scope_tree / "etc/X11").symlink_to("../opt/x11")
+expect_fail(
+    "a symlinked activation-scope ancestor",
+    root,
+    ["assemble", "--rootfs-stage", symlink_scope_tree, "--rootfs-manifest", symlink_scope_manifest,
+     "--module-stage", stage_a, "--out", symlink_scope_tree.parent / "kit"],
+    "non-directory ancestor",
+    symlink_scope_tree.parent / "kit",
+)
+
+empty_activation_tree, empty_activation_manifest = make_rootfs(fx)
+(empty_activation_tree / "etc/environment").write_bytes(b"")
+empty_activation_kit = empty_activation_tree.parent / "kit"
+expect_ok(
+    root,
+    "assemble", "--rootfs-stage", empty_activation_tree,
+    "--rootfs-manifest", empty_activation_manifest,
+    "--module-stage", stage_a, "--out", empty_activation_kit,
+)
+assert empty_activation_kit.is_dir()
+ok("GPU snapshot preserves component limits, ancestor rules, and empty files")
+
+# GPU validation must consume the bytes/hashes captured by the rootfs digest
+# pass. Restoring a corrupted file just before validation cannot make it pass.
+snapshot_tree, snapshot_manifest = make_rootfs(fx)
+snapshot_asset = snapshot_tree / "usr/share/omamobile/myron-gpu-profile/profile.env"
+qualified_asset = snapshot_asset.read_bytes()
+snapshot_asset.write_bytes(b"corrupt\n")
+G = T.gpu()
+real_validate_reference = G.validate_reference
+validate_calls = [0]
+
+
+def restoring_validate_reference(data):
+    validate_calls[0] += 1
+    if validate_calls[0] == 2:
+        snapshot_asset.write_bytes(qualified_asset)
+    return real_validate_reference(data)
+
+
+G.validate_reference = restoring_validate_reference
+try:
+    expect_fail(
+        "GPU bytes restored after the rootfs snapshot",
+        root,
+        ["assemble", "--rootfs-stage", snapshot_tree, "--rootfs-manifest", snapshot_manifest,
+         "--module-stage", stage_a, "--out", snapshot_tree.parent / "kit"],
+        "GPU profile asset differs",
+        snapshot_tree.parent / "kit",
+    )
+finally:
+    G.validate_reference = real_validate_reference
+assert snapshot_asset.read_bytes() == qualified_asset
+ok("GPU checks use the same captured snapshot as the rootfs digest")
+rootfs_case("an SDDM GPU override", "GPU", lambda t: write(t / "etc/sddm.conf.d/20-myron.conf", b"[General]\nGreeterEnvironment=LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu\n"))
+rootfs_case("a FIFO", "special file", lambda t: os.mkfifo(t / "opt-fifo"))
+rootfs_case("a hardlink", "hard links", lambda t: os.link(t / "usr/share/omamobile/device-myron/version", t / "opt-link"))
+rootfs_case("a selector collision", "collides", lambda t: write(t / "usr/local/sbin/myron-attempt79-module-dir"))
+rootfs_case("a module directory collision", "collides",
+            lambda t: (t / "usr/local/lib/myron-gki-module-sets").mkdir(parents=True))
+rootfs_case("a non-directory ancestor of the overlay", "ancestor", lambda t: (t / "usr/local").symlink_to("/tmp"))
+expect_fail("a missing manifest", root, ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", work / "no.MANIFEST",
+            "--module-stage", stage_a, "--out", work / "never-nm"], "cannot be opened safely", work / "never-nm")
+
+# ---- module stage rejections ---------------------------------------------------------
+notes = fx["reference"]["kernel"]["notes_sha256"]
+mdir = f"usr/local/lib/myron-gki-module-sets/{notes}"
+
+
+def stage_case(name, reason, mutate):
+    clone = fresh("stagecase") / "stage"
+    shutil.copytree(stage_a, clone, symlinks=True)
+    mutate(clone)
+    out = clone.parent / "kit"
+    expect_fail(name, root, ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+                             "--module-stage", clone, "--out", out], reason, out)
+
+
+stage_case("a module with a changed mode", "file mode differs", lambda s: os.chmod(s / mdir / "alpha.ko", 0o600))
+stage_case("a selector with a changed mode", "file mode differs", lambda s: os.chmod(s / "usr/local/sbin/myron-attempt79-module-dir", 0o644))
+stage_case("a directory with a changed mode", "directory mode differs", lambda s: os.chmod(s / "usr/local", 0o700))
+stage_case("a missing module", "file set differs", lambda s: (s / mdir / "beta.ko").unlink())
+stage_case("an extra module", "file set differs", lambda s: write(s / mdir / "gamma.ko", b"vermagic=test-release \n"))
+stage_case("the forbidden rmnet_core module", "file set differs", lambda s: write(s / mdir / "rmnet_core.ko", b"x"))
+stage_case("an extra file", "file set differs", lambda s: write(s / "usr/local/sbin/previous-module-dir.sh", b"x"))
+stage_case("archive metadata", "file set differs", lambda s: write(s / "manifest.json", b"{}"))
+stage_case("an extra directory", "directory set differs", lambda s: (s / "usr/lib").mkdir())
+stage_case("an empty /usr/lib/modules", "directory set differs", lambda s: (s / "usr/lib/modules").mkdir(parents=True))
+stage_case("a symlinked module", "symlink", lambda s: ((s / mdir / "beta.ko").unlink(), (s / mdir / "beta.ko").symlink_to("alpha.ko")))
+stage_case("a hardlinked module", "hard links", lambda s: ((s / mdir / "beta.ko").unlink(), os.link(s / mdir / "alpha.ko", s / mdir / "beta.ko")))
+stage_case("a FIFO in the stage", "special file", lambda s: os.mkfifo(s / "fifo"))
+stage_case("a changed selector", "qualified candidate selector", lambda s: (s / "usr/local/sbin/myron-attempt79-module-dir").write_bytes(b"#!/bin/sh\nexit 2\n"))
+stage_case("a module without the kernel release", "exact kernel release", lambda s: (s / mdir / "alpha.ko").write_bytes(b"nope"))
+stage_case("a symlinked directory", "symlink", lambda s: (shutil.rmtree(s / "usr/local/lib"), (s / "usr/local/lib").symlink_to("/tmp")))
+# a module that is plausible alone but not the qualified archive's bytes
+clone = fresh("proof") / "stage"
+shutil.copytree(stage_a, clone)
+(clone / mdir / "alpha.ko").write_bytes(b"module-alpha\0vermagic=test-release SMP\0 changed")
+expect_fail("a module differing from the qualified archive", root,
+            ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest, "--module-stage", clone,
+             "--assets", archive, "--out", clone.parent / "kit"], "qualified archive", clone.parent / "kit")
+code, _, err = run_exact(
+    root, "assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+    "--module-stage", stage_a, "--out", clone.parent / "kit-without-archive",
+)
+assert code != 0 and "--assets" in err
+ok("archive proof is mandatory for assembly, verification, and gating")
+
+# ---- mount identity and concurrent growth -------------------------------------------
+real_mount_id = K.mount_id_for_fd
+
+
+def fake_mount_id(descriptor, label):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    return 424242 if target.endswith("/usr/local/lib") else real_mount_id(descriptor, label)
+
+
+K.mount_id_for_fd = fake_mount_id
+try:
+    expect_fail("a module stage crossing a same-device mount", root,
+                ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+                 "--module-stage", stage_a, "--out", work / "never-mount"], "mount point", work / "never-mount")
+finally:
+    K.mount_id_for_fd = real_mount_id
+
+real_read = os.read
+grown = [False]
+
+
+def growing_read(descriptor, count):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    if target.endswith("/alpha.ko") and not grown[0]:
+        grown[0] = True
+        with open(target, "ab") as stream:
+            stream.write(b"more")
+    return real_read(descriptor, count)
+
+
+os.read = growing_read
+try:
+    clone = fresh("growth") / "stage"
+    shutil.copytree(stage_a, clone)
+    expect_fail("a module that grows while being read", root,
+                ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+                 "--module-stage", clone, "--out", clone.parent / "kit"], "while being read", clone.parent / "kit")
+finally:
+    os.read = real_read
+
+# ---- failed runs leave nothing but unrelated files untouched --------------------------
+cleanup = fresh("cleanup")
+keep = cleanup / ".out.tmp-someoneelse"
+keep.mkdir()
+(keep / "precious").write_text("keep")
+
+# A failure during the first temp-directory mount check leaves no empty temp.
+real_mount_id = K.mount_id_for_fd
+failed_initial_mount = [False]
+def failing_initial_mount(descriptor, label):
+    if label == "temp directory" and not failed_initial_mount[0]:
+        failed_initial_mount[0] = True
+        raise K.ContractError("injected initial mount lookup failure")
+    return real_mount_id(descriptor, label)
+K.mount_id_for_fd = failing_initial_mount
+try:
+    expect_fail(
+        "an initial temp verification failure",
+        root,
+        ["stage-modules", "--assets", archive, "--out", cleanup / "out"],
+        "injected initial mount lookup failure",
+        cleanup / "out",
+    )
+finally:
+    K.mount_id_for_fd = real_mount_id
+assert sorted(p.name for p in cleanup.iterdir()) == [".out.tmp-someoneelse"]
+
+# mkdir mode is normalized through the newly-created name, so a restrictive
+# process umask neither weakens privacy nor leaks a mode-000 temp directory.
+old_umask = os.umask(0o700)
+try:
+    umask_out = cleanup / "umask-out"
+    result = expect_ok(root, "stage-modules", "--assets", archive, "--out", umask_out)
+finally:
+    os.umask(old_umask)
+assert result["status"] == "staged"
+assert stat.S_IMODE(umask_out.stat().st_mode) == 0o755
+assert not any(p.name.startswith(".umask-out.tmp-") for p in cleanup.iterdir())
+shutil.rmtree(umask_out)
+ok("restrictive umask leaves no private temp directory")
+
+directory_open_out = cleanup / "directory-open-out"
+real_open = os.open
+
+
+def failing_directory_open(path, flags, *args, **kwargs):
+    if path == "child" and flags & os.O_DIRECTORY:
+        raise OSError(errno.EMFILE, "injected directory open failure")
+    return real_open(path, flags, *args, **kwargs)
+
+
+T.os.open = failing_directory_open
+try:
+    try:
+        T.publish(
+            str(directory_open_out), [], frozenset(),
+            [("child", "dir", 0o755, None)], lambda path, descriptor: None,
+        )
+    except T.DeploymentError as error:
+        assert "injected directory open failure" in str(error)
+    else:
+        raise AssertionError("injected directory-open failure accepted")
+finally:
+    T.os.open = real_open
+assert not os.path.lexists(directory_open_out)
+assert not any(p.name.startswith(".directory-open-out.tmp-") for p in cleanup.iterdir())
+ok("failed child-directory open leaves no temp tree")
+
+directory_chmod_out = cleanup / "directory-chmod-out"
+real_fchmod = os.fchmod
+fd_count_before = len(os.listdir("/proc/self/fd"))
+
+
+def failing_directory_fchmod(descriptor, mode):
+    if os.readlink(f"/proc/self/fd/{descriptor}").endswith("/child"):
+        raise OSError(errno.EIO, "injected directory chmod failure")
+    return real_fchmod(descriptor, mode)
+
+
+T.os.fchmod = failing_directory_fchmod
+try:
+    try:
+        T.publish(
+            str(directory_chmod_out), [], frozenset(),
+            [("child", "dir", 0o755, None)], lambda path, descriptor: None,
+        )
+    except T.DeploymentError as error:
+        assert "injected directory chmod failure" in str(error)
+    else:
+        raise AssertionError("injected directory-chmod failure accepted")
+finally:
+    T.os.fchmod = real_fchmod
+assert not os.path.lexists(directory_chmod_out)
+assert not any(p.name.startswith(".directory-chmod-out.tmp-") for p in cleanup.iterdir())
+assert len(os.listdir("/proc/self/fd")) == fd_count_before
+ok("failed child-directory chmod closes its descriptor")
+
+metadata_out = cleanup / "metadata-out"
+real_stat = os.stat
+stat_failed = [False]
+
+
+def failing_created_stat(path, *args, **kwargs):
+    if path == "child" and kwargs.get("dir_fd") is not None and not stat_failed[0]:
+        stat_failed[0] = True
+        raise OSError(errno.EIO, "injected first directory stat failure")
+    return real_stat(path, *args, **kwargs)
+
+
+T.os.stat = failing_created_stat
+try:
+    try:
+        T.publish(
+            str(metadata_out), [], frozenset(),
+            [("child", "dir", 0o755, None)], lambda path, descriptor: None,
+        )
+    except T.DeploymentError as error:
+        assert "injected first directory stat failure" in str(error)
+    else:
+        raise AssertionError("injected first directory stat failure accepted")
+finally:
+    T.os.stat = real_stat
+assert not os.path.lexists(metadata_out)
+assert not any(p.name.startswith(".metadata-out.tmp-") for p in cleanup.iterdir())
+
+file_metadata_out = cleanup / "file-metadata-out"
+real_fstat = os.fstat
+file_fstat_failed = [False]
+fd_count_before = len(os.listdir("/proc/self/fd"))
+
+
+def failing_created_file_fstat(descriptor):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    if target.endswith("/payload") and not file_fstat_failed[0]:
+        file_fstat_failed[0] = True
+        raise OSError(errno.EIO, "injected first file fstat failure")
+    return real_fstat(descriptor)
+
+
+T.os.fstat = failing_created_file_fstat
+try:
+    try:
+        T.publish(
+            str(file_metadata_out), [], frozenset(),
+            [("payload", "file", 0o600, b"x")], lambda path, descriptor: None,
+        )
+    except T.DeploymentError as error:
+        assert "injected first file fstat failure" in str(error)
+    else:
+        raise AssertionError("injected first file fstat failure accepted")
+finally:
+    T.os.fstat = real_fstat
+assert not os.path.lexists(file_metadata_out)
+assert not any(p.name.startswith(".file-metadata-out.tmp-") for p in cleanup.iterdir())
+assert len(os.listdir("/proc/self/fd")) == fd_count_before
+ok("initial child metadata failures leave no temp or descriptor")
+
+# Replacing the freshly-created name before its first open must not make
+# cleanup traverse or delete the substituted directory.
+victim = cleanup / "victim-before-open"
+victim.mkdir()
+(victim / "precious").write_text("keep")
+real_open = os.open
+open_race = {}
+
+
+def racing_open(path, flags, *args, **kwargs):
+    dir_fd = kwargs.get("dir_fd")
+    if (
+        not open_race
+        and isinstance(path, str)
+        and path.startswith(".out.tmp-")
+        and dir_fd is not None
+        and Path(os.readlink(f"/proc/self/fd/{dir_fd}")) == cleanup
+    ):
+        held = path + ".created"
+        os.rename(path, held, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.rename(victim.name, path, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        open_race.update(candidate=path, held=held)
+    return real_open(path, flags, *args, **kwargs)
+
+
+T.os.open = racing_open
+try:
+    code, _, err = run(root, "stage-modules", "--assets", archive, "--out", cleanup / "out")
+finally:
+    T.os.open = real_open
+assert code != 0 and "changed while being opened" in err
+assert not os.path.lexists(cleanup / "out")
+assert (cleanup / open_race["candidate"] / "precious").read_text() == "keep"
+os.rename(cleanup / open_race["candidate"], victim)
+(cleanup / open_race["held"]).rmdir()
+shutil.rmtree(victim)
+ok("a temp replacement before first open preserves unrelated contents")
+
+# A nested directory replaced between mkdir and open is rejected before chmod
+# or writes touch the substituted directory.
+child_victim = cleanup / "child-victim"
+child_victim.mkdir(mode=0o700)
+(child_victim / "precious").write_text("keep")
+real_open = os.open
+child_race = {}
+
+
+def racing_child_open(path, flags, *args, **kwargs):
+    dir_fd = kwargs.get("dir_fd")
+    if not child_race and path == "usr" and dir_fd is not None:
+        root_path = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+        if root_path.name.startswith(".out.tmp-"):
+            os.rename(root_path / "usr", root_path / "usr.created")
+            os.rename(child_victim, root_path / "usr")
+            child_race["root"] = root_path
+    return real_open(path, flags, *args, **kwargs)
+
+
+T.os.open = racing_child_open
+try:
+    code, _, err = run(root, "stage-modules", "--assets", archive, "--out", cleanup / "out")
+finally:
+    T.os.open = real_open
+assert code != 0 and "output directory changed" in err
+assert (child_race["root"] / "usr" / "precious").read_text() == "keep"
+assert stat.S_IMODE((child_race["root"] / "usr").stat().st_mode) == 0o700
+os.rename(child_race["root"] / "usr", child_victim)
+(child_race["root"] / "usr.created").rmdir()
+child_race["root"].rmdir()
+shutil.rmtree(child_victim)
+ok("a nested output-directory replacement is rejected before mutation")
+
+real_rename = T.rename_noreplace
+
+
+def failing_rename(*args):
+    raise T.DeploymentError("injected publish failure")
+
+
+T.rename_noreplace = failing_rename
+try:
+    expect_fail("a failed publish", root, ["stage-modules", "--assets", archive, "--out", cleanup / "out"],
+                "injected", cleanup / "out")
+    expect_fail("a failed kit publish", root, ["assemble", "--rootfs-stage", rootfs, "--rootfs-manifest", manifest,
+                "--module-stage", stage_a, "--out", cleanup / "out"], "injected", cleanup / "out")
+finally:
+    T.rename_noreplace = real_rename
+assert sorted(p.name for p in cleanup.iterdir()) == [".out.tmp-someoneelse"]
+assert (keep / "precious").read_text() == "keep"
+
+# Replacing the verified source inside renameat2 must not report success or
+# clean the unrelated object that reached the output name.
+swap_target = cleanup / "swap-target"
+swap_target.mkdir()
+(swap_target / "precious").write_text("keep")
+publish_race = {}
+
+
+def racing_rename(parent_fd, old, new):
+    held = old + ".verified"
+    os.rename(old, held, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    os.symlink(str(swap_target), old, dir_fd=parent_fd)
+    publish_race["held"] = held
+    real_rename(parent_fd, old, new)
+
+
+T.rename_noreplace = racing_rename
+try:
+    code, _, _ = run(root, "stage-modules", "--assets", archive, "--out", cleanup / "out")
+finally:
+    T.rename_noreplace = real_rename
+assert code != 0
+assert (cleanup / "out").is_symlink()
+assert (swap_target / "precious").read_text() == "keep"
+(cleanup / "out").unlink()
+(cleanup / publish_race["held"]).rmdir()
+shutil.rmtree(swap_target)
+ok("a temp replacement during publication cannot publish or delete unrelated contents")
+
+# A replacement after the published directory is opened is caught by the
+# final by-name identity check. Verification of the detached fd is not enough.
+detached_out = cleanup / "detached-out"
+detached_held = cleanup / "detached-held"
+publish_checks = [0]
+
+
+def detach_during_verify(path, descriptor):
+    publish_checks[0] += 1
+    tree = T.walk_tree(descriptor, T.STAGE_LIMITS, allow_symlinks=False, keep_data=True)
+    assert tree.data["payload"] == b"x"
+    if publish_checks[0] == 2:
+        os.rename(detached_out, detached_held)
+        detached_out.mkdir()
+        (detached_out / "precious").write_text("keep")
+
+
+try:
+    T.publish(
+        str(detached_out), [], frozenset(),
+        [("payload", "file", 0o600, b"x")], detach_during_verify,
+    )
+except T.DeploymentError as error:
+    assert "changed after verification" in str(error)
+else:
+    raise AssertionError("detached published directory accepted")
+assert (detached_out / "precious").read_text() == "keep"
+shutil.rmtree(detached_out)
+detached_held.rmdir()
+ok("a post-open published-directory replacement cannot return success")
+
+# An ancestor writable by another user can move the otherwise-private parent;
+# reject that ancestry before creating any output.
+ancestry_base = cleanup / "ancestry"
+ancestry_parent = ancestry_base / "parent"
+ancestry_parent.mkdir(parents=True)
+ancestry_base.chmod(0o777)
+ancestry_out = ancestry_parent / "kit"
+try:
+    T.publish(
+        str(ancestry_out), [], frozenset(),
+        [("payload", "file", 0o600, b"x")], lambda path, descriptor: None,
+    )
+except T.DeploymentError as error:
+    assert "ancestry is writable" in str(error)
+else:
+    raise AssertionError("other-user-writable output ancestry accepted")
+assert not os.path.lexists(ancestry_out)
+ancestry_parent.rmdir()
+ancestry_base.chmod(0o700)
+ancestry_base.rmdir()
+ok("other-user-writable output ancestry is rejected before publication")
+
+real_fstat = os.fstat
+ancestry_fstat_calls = [0]
+fd_count_before = len(os.listdir("/proc/self/fd"))
+
+
+def failing_ancestry_fstat(descriptor):
+    ancestry_fstat_calls[0] += 1
+    if ancestry_fstat_calls[0] == 2:
+        raise OSError(errno.EIO, "injected ancestry fstat failure")
+    return real_fstat(descriptor)
+
+
+T.os.fstat = failing_ancestry_fstat
+try:
+    try:
+        T.open_trusted_output_parent(T.split_canonical(str(cleanup), "test")[:-1], "test")
+    except T.DeploymentError as error:
+        assert "injected ancestry fstat failure" in str(error)
+    else:
+        raise AssertionError("injected ancestry fstat failure accepted")
+finally:
+    T.os.fstat = real_fstat
+assert len(os.listdir("/proc/self/fd")) == fd_count_before
+
+alias_fd = os.open(cleanup, os.O_RDONLY | os.O_DIRECTORY)
+alias_fstat_calls = [0]
+fd_count_before = len(os.listdir("/proc/self/fd"))
+
+
+def failing_alias_fstat(descriptor):
+    alias_fstat_calls[0] += 1
+    if alias_fstat_calls[0] == 2:
+        raise OSError(errno.EIO, "injected alias fstat failure")
+    return real_fstat(descriptor)
+
+
+T.os.fstat = failing_alias_fstat
+try:
+    try:
+        T.reject_protected_directory_alias(alias_fd, frozenset({(-1, -1)}))
+    except OSError as error:
+        assert "injected alias fstat failure" in str(error)
+    else:
+        raise AssertionError("injected alias fstat failure accepted")
+finally:
+    T.os.fstat = real_fstat
+    os.close(alias_fd)
+assert len(os.listdir("/proc/self/fd")) == fd_count_before - 1
+ok("ancestry metadata failures close every opened descriptor")
+real_write = T.write_spec
+
+
+def partial_write(root_fd, spec, created=None):
+    real_write(root_fd, spec[: len(spec) // 2], created)
+    raise T.DeploymentError("injected write failure")
+
+
+T.write_spec = partial_write
+try:
+    expect_fail("a failed partial write", root, ["stage-modules", "--assets", archive, "--out", cleanup / "out"],
+                "injected", cleanup / "out")
+finally:
+    T.write_spec = real_write
+assert sorted(p.name for p in cleanup.iterdir()) == [".out.tmp-someoneelse"]
+real_verify = K.verify_stage_tree
+K.verify_stage_tree = lambda plan, path: (_ for _ in ()).throw(K.ContractError("injected verify failure"))
+try:
+    expect_fail("a failed completed-tree verification", root,
+                ["stage-modules", "--assets", archive, "--out", cleanup / "out"], "injected", cleanup / "out")
+finally:
+    K.verify_stage_tree = real_verify
+assert sorted(p.name for p in cleanup.iterdir()) == [".out.tmp-someoneelse"]
+ok("failed runs remove only their own temp directory")
+
+# ---- tampered kits are rejected by verify and gate -----------------------------------
+def kit_case(name, reason, mutate, rootfs_mutate=None):
+    clone = fresh("kitcase")
+    kit = clone / "kit"
+    shutil.copytree(kit_a, kit, symlinks=True)
+    mutate(kit)
+    tree, mani = rootfs, manifest
+    if rootfs_mutate:
+        tree, mani = make_rootfs(fx)
+        rootfs_mutate(tree, mani)
+    for command in ("verify", "gate"):
+        code, out, err = run(root, command, "--kit", kit, "--rootfs-stage", tree, "--rootfs-manifest", mani)
+        assert code != 0, f"{name}: {command} accepted"
+        assert reason in err, f"{name}: {command} wrong reason: {err.strip()}"
+        assert "artifact_verified" not in out, f"{name}: {command} reported a verified artifact"
+    ok(f"{name} is rejected by verify and gate")
+
+
+def edit_json(relative, function):
+    def mutate(kit):
+        target = kit / relative
+        document = json.loads(target.read_text())
+        function(document)
+        target.write_bytes(T.render_json(document))
+    return mutate
+
+
+kit_case("an authorization claim in status.json", "claims deployment_authorized", edit_json("status.json", lambda d: d.update(deployment_authorized=True)))
+kit_case("an authorization claim in kit.json", "claims deployment_authorized", edit_json("kit.json", lambda d: d["status"].update(deployment_authorized=True)))
+kit_case("a flashable claim", "claims flashable", edit_json("status.json", lambda d: d.update(flashable=True)))
+kit_case("an integer standing for an authorization claim", "claims deployment_authorized", edit_json("status.json", lambda d: d.update(deployment_authorized=1)))
+kit_case("an omitted blocker in status.json", "blocker list differs", edit_json("status.json", lambda d: d["blockers"].pop()))
+kit_case("an omitted blocker in kit.json", "blocker list differs", edit_json("kit.json", lambda d: d["status"]["blockers"].pop()))
+kit_case("an unknown status field", "status fields differ", edit_json("status.json", lambda d: d.update(extra=True)))
+kit_case("an unknown kit.json field", "differs at kit.json", edit_json("kit.json", lambda d: d.update(extra=True)))
+kit_case("a changed runtime feature set", "differs at kit.json", edit_json("kit.json", lambda d: d["runtime"].update(required_features=["gpu"])))
+kit_case("a changed runtime manifest identity", "differs at kit.json", edit_json("kit.json", lambda d: d["runtime"].update(manifest_sha256="0" * 64)))
+kit_case("a changed rootfs digest", "differs at kit.json", edit_json("kit.json", lambda d: d["rootfs"].update(digest="0" * 64)))
+kit_case("a duplicate key in status.json", "duplicate JSON key", lambda k: (k / "status.json").write_text('{"a": 1, "a": 2}'))
+kit_case("a changed module", "qualified archive", lambda k: (k / "overlay" / mdir / "alpha.ko").write_bytes(b"vermagic=test-release \nx"))
+kit_case("a changed module mode", "file mode differs", lambda k: os.chmod(k / "overlay" / mdir / "alpha.ko", 0o600))
+kit_case("a changed contract copy", "differs at", lambda k: (k / "contracts/kernel-contract.json").write_bytes(b"{}\n"))
+kit_case("a changed SHA256SUMS", "differs at SHA256SUMS", lambda k: (k / "SHA256SUMS").write_text("0" * 64 + "  kit.json\n"))
+kit_case("a missing SHA256SUMS", "missing paths", lambda k: (k / "SHA256SUMS").unlink())
+kit_case("an extra kit file", "unexpected paths", lambda k: write(k / "extra", b"x"))
+kit_case("a copied rootfs file", "differs from the stage contract", lambda k: write(k / "overlay/usr/share/x", b"x"))
+kit_case("a kit symlink", "symlink", lambda k: (k / "link").symlink_to("kit.json"))
+kit_case("a kit hardlink", "hard links", lambda k: os.link(k / "kit.json", k / "again"))
+kit_case("a kit FIFO", "special file", lambda k: os.mkfifo(k / "fifo"))
+kit_case("a kit directory mode", "differs at", lambda k: os.chmod(k / "contracts", 0o700))
+kit_case("a rootfs changed after assembly", "kit differs at", lambda k: None,
+         lambda t, m: write(t / "opt/added", b"x"))
+kit_case("a manifest changed after assembly", "kit differs at", lambda k: None,
+         lambda t, m: m.write_text(m.read_text() + "extra\n"))
+code, _, err = run(root, "verify", "--kit", work / "no-such-kit", "--rootfs-stage", rootfs)
+assert code != 0
+code, _, err = run(root, "verify", "--kit", "relative", "--rootfs-stage", rootfs)
+assert code != 0 and "absolute" in err
+ok("verify and gate recompute everything")
+
+# ---- no input mutated by any rejected run ------------------------------------------------
+assert (rootfs_before, rootfs_data) == snapshot(rootfs)
+assert stage_before == snapshot(stage_a)
+assert digest(archive.read_bytes()) == archive_before
+ok("rejected runs mutate no input")
+PY
+pass "myron-deployment suite"

@@ -152,6 +152,16 @@ def build_tree(plan, payload, directory, destination):
 
 base, directory, payload, archive, reference_bytes, stage_bytes, contracts = make_fixture("main")
 plan = module.build_stage_plan(contracts, archive)
+assert plan == module.build_stage_plan_bytes(contracts, archive.read_bytes())
+assert module.read_module_payload_bytes(
+    contracts.reference,
+    archive.read_bytes(),
+    contracts.stage["layout"]["selector"]["destination"],
+) == module.read_module_payload(
+    contracts.reference,
+    archive,
+    contracts.stage["layout"]["selector"]["destination"],
+)
 assert plan["status"] == "planned" and plan["activation_mode"] == "disabled"
 assert [e["destination"] for e in plan["files"]] == sorted(e["destination"] for e in plan["files"])
 assert len(plan["files"]) == 1 + 2
@@ -378,6 +388,74 @@ else:
     raise AssertionError("regular-file mount identity change accepted")
 finally:
     module.mount_id_for_fd = original_mount_id
+
+# A directory descriptor remains locally owned until its post-open metadata
+# checks complete. Failure there must not leak it.
+child_fstat_tree = good_tree("child-fstat-leak")
+original_fstat = module.os.fstat
+child_fstat_calls = [0]
+descriptors_before = len(os.listdir("/proc/self/fd"))
+
+
+def failing_child_fstat(descriptor):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    if target.endswith("/usr"):
+        child_fstat_calls[0] += 1
+        if child_fstat_calls[0] == 2:
+            raise OSError(5, "injected child fstat failure")
+    return original_fstat(descriptor)
+
+
+module.os.fstat = failing_child_fstat
+try:
+    module.verify_stage_tree(plan, str(child_fstat_tree))
+except module.ContractError as error:
+    assert "injected child fstat failure" in str(error)
+else:
+    raise AssertionError("injected child fstat failure accepted")
+finally:
+    module.os.fstat = original_fstat
+assert len(os.listdir("/proc/self/fd")) == descriptors_before
+
+# A path changed from a regular file to a FIFO between lstat and open must be
+# rejected by the O_PATH type check before any data-open occurs.
+special_dir = fresh("special-before-data-open")
+special_file = special_dir / "file"
+special_file.write_bytes(b"x")
+special_file.chmod(0o644)
+special_directory_fd = os.open(special_dir, os.O_RDONLY | os.O_DIRECTORY)
+special_mount_id = module.mount_id_for_fd(special_directory_fd, "test")
+original_open = module.os.open
+special_state = {"swapped": False, "data_opened": False}
+
+
+def special_racing_open(path, flags, *args, **kwargs):
+    if path == "file" and flags & os.O_PATH and not special_state["swapped"]:
+        special_file.unlink()
+        os.mkfifo(special_file)
+        special_state["swapped"] = True
+    if isinstance(path, str) and path.startswith("/proc/self/fd/") and special_state["swapped"]:
+        special_state["data_opened"] = True
+    return original_open(path, flags, *args, **kwargs)
+
+
+module.os.open = special_racing_open
+try:
+    module.hash_regular_at(
+        special_directory_fd,
+        "file",
+        "special replacement",
+        {"mode": "0644", "size": 1, "sha256": sha(b"x")},
+        special_mount_id,
+    )
+except module.ContractError as error:
+    assert "not a regular file" in str(error)
+else:
+    raise AssertionError("special replacement accepted")
+finally:
+    module.os.open = original_open
+    os.close(special_directory_fd)
+assert special_state["swapped"] and not special_state["data_opened"]
 
 # Growth after hash_regular_at validates size but before sha256_descriptor's
 # fstat is rejected before content reads begin.

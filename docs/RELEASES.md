@@ -97,7 +97,12 @@ which writes a non-bootable package tree and MANIFEST: no image, checksum,
 kernel, modules, or proprietary payload. `ROOTFS_PACKAGE_PROFILE=myron` keeps
 Panfrost and unqualified device packages out of that tree. Rootfs images stay
 disabled until the verified external contract is paired with a notes-keyed
-module/runtime staging design.
+module/runtime staging design. `tools/myron-deployment` (Phase 2.5) builds a
+laptop-only deployment-candidate kit binding the stage, module overlay, kernel
+contract, GPU profile and runtime-manifest identity; its gate always refuses.
+The kit is not bootable, flashable, image-ready, an atomic-snapshot proof,
+hardware-qualified or a deployment authorization, and no release ships it
+([DEPLOYMENT-GATE](myron/DEPLOYMENT-GATE.md)).
 
 ### 3.2 Keys to add later
 

@@ -375,11 +375,8 @@ def verify_assets(root_descriptor: int, reference: dict) -> None:
             raise ProfileError(f"profile asset SHA-256 differs: {name}")
 
 
-def verify_mesa_reference(root_descriptor: int, reference: dict) -> None:
-    relative = Path(reference["mesa"]["reference"]).relative_to("/")
-    mesa = strict_json(
-        read_beneath(root_descriptor, relative, "Mesa reference"), "Mesa reference"
-    )
+def validate_mesa_reference(data: bytes, reference: dict) -> None:
+    mesa = strict_json(data, "Mesa reference")
     if set(mesa) != {"activation", "build", "package", "reference", "schema", "source"}:
         raise ProfileError("Mesa reference fields differ")
     if type(mesa.get("schema")) is not int or mesa["schema"] != 1:
@@ -400,6 +397,13 @@ def verify_mesa_reference(root_descriptor: int, reference: dict) -> None:
         }
     ):
         raise ProfileError("Mesa package activation is not disabled")
+
+
+def verify_mesa_reference(root_descriptor: int, reference: dict) -> None:
+    relative = Path(reference["mesa"]["reference"]).relative_to("/")
+    validate_mesa_reference(
+        read_beneath(root_descriptor, relative, "Mesa reference"), reference
+    )
 
 
 def sha256_beneath(

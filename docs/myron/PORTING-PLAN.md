@@ -105,6 +105,15 @@ Implemented in the metadata-only contract package:
   writer, extraction, `depmod`, module install, boot work, or hardware or
   deployment authorization.
 
+Phase 2.5 (laptop-only, done): `device/myron/deployment-contract.json` and
+`tools/myron-deployment` stage the module overlay writer-side and assemble a
+deterministic deployment-candidate kit bound to the rootfs stage, kernel
+contract, GPU profile and runtime-manifest identity. Its gate always refuses
+deployment with seven permanent blockers; the kit is not bootable, flashable,
+image-ready, an atomic-snapshot proof, hardware-qualified or an authorization
+([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)). It runs no `depmod` and no external
+command, and nothing has been built from the real archive.
+
 Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
 host-key revalidation before another live read, and translation of the vendor
 module boot order. The generic rootfs builder remains blocked because its

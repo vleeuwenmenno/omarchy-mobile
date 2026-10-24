@@ -161,6 +161,12 @@ The staged approach is:
 
 No Arch package may own or overwrite the proven boot images during phases 0-3.
 
+Phase 2.5's `tools/myron-deployment` (a laptop tool, not a package) writes the
+module overlay only into a new directory it publishes atomically, and its kit
+binds the kernel contract; it is not a boot mechanism, not bootable, flashable
+or image-ready, and never authorizes deployment
+([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)).
+
 The Phase 2 package follows that rule: it installs only a Python verifier,
 contract JSON, documentation, license, and version. It has no systemd unit,
 pacman hook, module payload, firmware, Image, DTB/DTBO, or partition writer.

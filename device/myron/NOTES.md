@@ -21,6 +21,16 @@ bytes. The release-marker and hash proof is not full ABI, import, provider or
 load-order proof. There is still no stage writer, extraction, `depmod`, module
 install, boot work, or hardware/deployment authorization.
 
+Phase 2.5 adds `device/myron/deployment-contract.json` and the laptop-only
+`tools/myron-deployment` (`show`, `stage-modules`, `assemble`, `verify`,
+`gate`). It stages the exact qualified module overlay (selector plus seven
+modules) and binds the rootfs stage (by digest and manifest hash, not copied),
+kernel contract, GPU profile and private runtime-manifest identity into a
+deterministic kit, and its gate always refuses deployment. The kit is not
+bootable, flashable or image-ready, is no atomic-snapshot proof, is not
+hardware-qualified, and is no authorization; no kit has been built from the real
+archive. See [DEPLOYMENT-GATE.md](../../docs/myron/DEPLOYMENT-GATE.md).
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,
