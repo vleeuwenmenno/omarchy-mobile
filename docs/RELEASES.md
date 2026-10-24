@@ -123,6 +123,13 @@ quiescence, atomicity and rollback stay `not-proven`; all authority flags stay
 false and all seven blockers remain. It is not a filesystem snapshot or
 restore mechanism and copies no payload bytes
 ([SNAPSHOT-GATE](myron/SNAPSHOT-GATE.md)).
+`tools/myron-preflight` 0.1.0 (Phase 2.10) adds the final offline refusal
+artifact before a hardware-read approval boundary. It re-verifies the kit and
+snapshot, binds their identities, maps every blocker to its future evidence,
+and declares seven bounded/redacted read IDs. It executes none of them,
+collects no evidence, contacts no phone, preserves all blockers and sets every
+hardware-read/deployment authority flag false
+([PREFLIGHT-GATE](myron/PREFLIGHT-GATE.md)).
 
 ### 3.2 Keys to add later
 

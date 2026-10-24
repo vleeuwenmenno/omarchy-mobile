@@ -94,3 +94,7 @@ A real capture still needs a quiescence witness, filesystem/storage identity,
 an immutable generation, an independently reviewed restore mechanism, and an
 attended restored-tree qualification. This phase supplies the artifact shape
 and acceptance predicate only; it clears no deployment blocker.
+
+Phase 2.10's [PREFLIGHT-GATE.md](PREFLIGHT-GATE.md) consumes this identity and
+the deployment kit to produce a refusal-only request for the next evidence
+boundary. It does not change this format or grant hardware-read permission.

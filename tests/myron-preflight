@@ -1,0 +1,419 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the refusal-only Myron hardware-read preflight request.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+python3 -m py_compile tools/myron-preflight || fail "tool parses"
+grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http)|os\.(system|popen|exec|spawn|fork)|posix_spawn' tools/myron-preflight \
+  && fail "tool references process, network, or broad-copy facilities"
+pass "tool parses and has no process, network, or broad-copy facility"
+
+tools/myron-preflight show > "$tmp/show.json" || fail "repository preflight contract failed"
+python3 - "$tmp/show.json" <<'PY' || exit 1
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["kind"] == "myron-hardware-read-preflight-contract"
+assert value["format_version"] == "0.1.0"
+assert value["capture_schema"] == "myron-capture-evidence-v1"
+assert len(value["blockers"]) == 7
+assert value["request"] == {
+    "accepts_real_evidence": False,
+    "collects_evidence": False,
+    "contents": "evidence-gaps-and-bounded-read-plan-only",
+    "decision": "refused-pending-live-evidence",
+    "executes_operations": False,
+    "kind": "myron-hardware-read-approval-request",
+}
+assert all(flag is False for flag in value["authority"].values())
+PY
+pass "repository contract is canonical and authorizes nothing"
+
+mkdir "$tmp/fixture"
+MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
+  || { cat "$tmp/snapshot-suite.log" >&2; fail "snapshot fixture export"; }
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+P = load("preflight_tool_test", repo / "tools/myron-preflight")
+S = P.snapshot()
+D = P.deploy()
+paths = {key: Path(value) for key, value in json.loads(
+    (work / "fixture/paths.json").read_text()
+).items()}
+contracts_root = paths["contracts_root"]
+contracts = D.load_contracts(contracts_root)
+_, snapshot_contract_bytes, snapshot_contract_sha256 = S.load_snapshot_contract(
+    contracts_root, contracts
+)
+preflight_contract = P.expected_preflight_contract(contracts, snapshot_contract_sha256)
+target = contracts_root / P.PREFLIGHT_CONTRACT_PATH
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_bytes(D.render_json(preflight_contract))
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+counter = [0]
+
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{name}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+def invoke(*arguments):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = P.main([str(value) for value in arguments], contracts_root=contracts_root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def common_args(kit=None, snapshot=None, rootfs=None, manifest=None, archive=None):
+    return (
+        "--kit", kit or paths["kit"],
+        "--snapshot", snapshot or paths["snapshot"],
+        "--rootfs-stage", rootfs or paths["rootfs"],
+        "--rootfs-manifest", manifest or paths["manifest"],
+        "--assets", archive or paths["archive"],
+        "--runtime-assets", "none",
+        "--vmlinux-symvers", "none",
+        "--module-symvers", "none",
+    )
+
+
+def expect_ok(*arguments):
+    code, out, err = invoke(*arguments)
+    assert code == 0, (arguments, err)
+    return json.loads(out)
+
+
+def expect_fail(name, arguments, *outputs):
+    code, out, err = invoke(*arguments)
+    assert code != 0, f"{name}: accepted\n{out}"
+    for output in outputs:
+        assert not os.path.lexists(output), f"{name}: left output {output}"
+    ok(f"{name} is rejected")
+
+
+def walk(path):
+    descriptor = D.open_canonical_dir(str(path), "test tree")
+    try:
+        tree = D.walk_tree(
+            descriptor, D.STAGE_LIMITS, allow_symlinks=False, keep_data=True
+        )
+    finally:
+        os.close(descriptor)
+    return tree.entries, tree.data
+
+
+# Deterministic exact five-file refusal artifact.
+request_a = work / "request-a"
+request_b = work / "request-b"
+result = expect_ok("assess", *common_args(), "--out", request_a)
+expect_ok("assess", *common_args(), "--out", request_b)
+assert walk(request_a) == walk(request_b)
+entries, data = walk(request_a)
+assert sorted(e.path for e in entries if e.kind == "file") == [
+    "SHA256SUMS", "STATUS.txt", "contracts/preflight-contract.json",
+    "request.json", "status.json",
+]
+assert {e.path for e in entries if e.kind == "dir"} == {".", "contracts"}
+assert result["decision"] == "refused-pending-live-evidence"
+assert result["blocker_count"] == 7 and result["requested_read_count"] == 7
+assert all(result[flag] is False for flag in P.AUTHORITY_FLAGS)
+request = json.loads(data["request.json"])
+assert request["execution"] == {"operations": [], "evidence_collected": []}
+assert request["decision"] == {
+    "deployment_authorized": False,
+    "hardware_read_authorized": False,
+    "human_approval_required": True,
+    "reason": "all-seven-blockers-open",
+    "status": "refused-pending-live-evidence",
+}
+assert [row["blocker"] for row in request["evidence"]] == D.BLOCKERS
+assert all(row["state"] == "missing" for row in request["evidence"])
+assert all(
+    item["blocker_cleared"] is False
+    for row in request["evidence"] for item in row["closure"]
+)
+assert [row["id"] for row in request["requested_reads"]] == [
+    "R1-identity-and-slot", "R2-gpt-and-recovery-inventory",
+    "R3-boot-image-headers", "R4-dtb-dtbo-selection",
+    "R5-module-load-order", "R6-storage-and-mount-model",
+    "R7-kernel-identity-revalidation",
+]
+assert all(row["read_only"] is True and row["max_bytes"] <= 1024 * 1024
+           for row in request["requested_reads"])
+assert all(row["never_emits"] == P.NEVER_EMITS for row in request["requested_reads"])
+r7 = request["requested_reads"][-1]
+assert r7["targets"] == [
+    "/sys/kernel/notes hash-only",
+    "/proc/version release-only",
+    "allowlisted-kernel-command-line",
+    "allowlisted-bootconfig",
+]
+assert r7["emits"] == [
+    "kernel-release", "notes-sha256", "allowlisted-cmdline",
+    "allowlisted-bootconfig-keys",
+]
+assert "config-sha256" not in r7["emits"]
+assert r7["field_policy"] == {
+    "bootconfig": {
+        "entries": P.R7_BOOTCONFIG_ALLOWLIST,
+        "unknown_keys": "reject",
+    },
+    "kernel_command_line": {
+        "entries": P.R7_CMDLINE_ALLOWLIST,
+        "unknown_keys": "reject",
+    },
+}
+assert all(row["field_policy"] == {} for row in request["requested_reads"][:-1])
+assert request["forbidden_operations"] == P.FORBIDDEN_OPERATIONS
+assert not any(marker in b"".join(data.values()) for marker in (b"vermagic=", b"SECRET"))
+ok("assess is deterministic and emits only a bounded refusal/read plan")
+
+verified = expect_ok("verify", *common_args(), "--request", request_a)
+assert verified["status"] == "verified" and verified["decision"] == P.DECISION
+assert all(verified[flag] is False for flag in P.AUTHORITY_FLAGS)
+ok("verify recomputes kit, snapshot, request, blockers and refusal state")
+
+# Static contract hashes really bind the current synthetic component contracts.
+contract = json.loads(data["contracts/preflight-contract.json"])
+assert contract["components"]["deployment_contract"]["sha256"] == digest(
+    (contracts_root / D.DEPLOYMENT_CONTRACT_PATH).read_bytes()
+)
+assert contract["components"]["snapshot_contract"]["sha256"] == digest(
+    (contracts_root / S.SNAPSHOT_CONTRACT_PATH).read_bytes()
+)
+ok("preflight contract pins deployment and snapshot contracts")
+
+
+def write_snapshot(path, document):
+    for relative, kind, mode, contents in S.snapshot_spec(
+        snapshot_contract_bytes, document
+    ):
+        target = path / relative
+        if kind == "dir":
+            target.mkdir(parents=True, exist_ok=True)
+            target.chmod(mode)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents)
+            target.chmod(mode)
+
+
+# A replacement after the first verification must match every verified binding,
+# not merely the kit and rootfs digests.
+race_snapshot = fresh("snapshot-binding-race") / "snapshot"
+shutil.copytree(paths["snapshot"], race_snapshot)
+original_command_verify = S.command_verify
+
+
+def swap_bindings_after_verify(*args, **kwargs):
+    result = original_command_verify(*args, **kwargs)
+    value = json.loads((race_snapshot / "snapshot.json").read_text())
+    value["bindings"]["runtime"] = {
+        "status": "verified", "asset_count": 1, "digest": "1" * 64,
+    }
+    value["bindings"]["abi"] = {
+        "status": "staged-set-consistent",
+        "scope": D.ABI_SCOPE,
+        "module_count": 1,
+        "digest": "2" * 64,
+    }
+    write_snapshot(race_snapshot, value)
+    return result
+
+
+S.command_verify = swap_bindings_after_verify
+try:
+    expect_fail(
+        "post-verification snapshot binding replacement",
+        ["assess", *common_args(snapshot=race_snapshot),
+         "--out", work / "binding-race-output"],
+        work / "binding-race-output",
+    )
+finally:
+    S.command_verify = original_command_verify
+
+# Appending a checksum entry after the exact snapshot read must fail the final
+# identity pass even though snapshot.json and its own checksum stay unchanged.
+race_snapshot = fresh("snapshot-checksum-race") / "snapshot"
+shutil.copytree(paths["snapshot"], race_snapshot)
+original_read_snapshot = S.read_snapshot
+read_count = [0]
+
+
+def append_checksum_after_read(*args, **kwargs):
+    result = original_read_snapshot(*args, **kwargs)
+    read_count[0] += 1
+    if read_count[0] == 2:
+        with (race_snapshot / "SHA256SUMS").open("ab") as stream:
+            stream.write(("0" * 64 + "  unexpected\n").encode("ascii"))
+    return result
+
+
+S.read_snapshot = append_checksum_after_read
+try:
+    expect_fail(
+        "post-read snapshot checksum replacement",
+        ["assess", *common_args(snapshot=race_snapshot),
+         "--out", work / "checksum-race-output"],
+        work / "checksum-race-output",
+    )
+finally:
+    S.read_snapshot = original_read_snapshot
+ok("snapshot generation and complete checksum closure stay bound across rereads")
+
+# Regenerate checksum closure after semantic tampering so validators are tested,
+# not merely the outer checksum mismatch.
+def tampered_request(name, mutate):
+    clone = fresh("request-tamper") / "request"
+    shutil.copytree(request_a, clone)
+    value = json.loads((clone / "request.json").read_text())
+    mutate(value)
+    (clone / "request.json").write_bytes(D.render_json(value))
+    files = [
+        "STATUS.txt", "contracts/preflight-contract.json", "request.json", "status.json"
+    ]
+    (clone / "SHA256SUMS").write_text("".join(
+        f"{digest((clone / path).read_bytes())}  {path}\n" for path in files
+    ))
+    expect_fail(name, ["verify", *common_args(), "--request", clone])
+
+
+tampered_request("unknown request field", lambda v: v.update(extra=True))
+tampered_request("boolean request schema", lambda v: v.update(schema=True))
+tampered_request("hardware-read authorization claim",
+                 lambda v: v["status"].update(hardware_read_authorized=True))
+tampered_request("deployment authorization claim",
+                 lambda v: v["decision"].update(deployment_authorized=True))
+tampered_request("execution operation", lambda v: v["execution"]["operations"].append("R1"))
+tampered_request("collected evidence", lambda v: v["execution"]["evidence_collected"].append("x"))
+tampered_request("removed blocker", lambda v: v["status"]["blockers"].pop())
+tampered_request("reordered blocker", lambda v: v["status"]["blockers"].reverse())
+tampered_request("cleared blocker", lambda v: v["evidence"][0]["closure"][0].update(blocker_cleared=True))
+tampered_request("unbounded read", lambda v: v["requested_reads"][0].update(max_bytes=2**31))
+tampered_request("identifier emission", lambda v: v["requested_reads"][0]["never_emits"].remove("serial"))
+tampered_request(
+    "widened R7 command-line allowlist",
+    lambda v: v["requested_reads"][-1]["field_policy"]["kernel_command_line"]
+    .update(unknown_keys="accept"),
+)
+tampered_request("changed kit hash", lambda v: v["artifacts"]["deployment_kit"].update(sha256="0" * 64))
+tampered_request("changed snapshot hash", lambda v: v["artifacts"]["snapshot"].update(sha256="0" * 64))
+ok("semantic tampering cannot claim evidence, execution, or authority")
+
+clone = fresh("noncanonical") / "request"
+shutil.copytree(request_a, clone)
+(clone / "request.json").write_text(json.dumps(request))
+expect_fail("non-canonical request JSON", ["verify", *common_args(), "--request", clone])
+clone = fresh("bad-sums") / "request"
+shutil.copytree(request_a, clone)
+(clone / "SHA256SUMS").write_text("0" * 64 + "  request.json\n")
+expect_fail("changed checksum closure", ["verify", *common_args(), "--request", clone])
+
+for name, mutate in (
+    ("request symlink", lambda c: ((c / "status.json").unlink(),
+                                   (c / "status.json").symlink_to("request.json"))),
+    ("request hardlink", lambda c: ((c / "status.json").unlink(),
+                                    os.link(c / "request.json", c / "status.json"))),
+    ("request special file", lambda c: ((c / "status.json").unlink(),
+                                        os.mkfifo(c / "status.json"))),
+):
+    clone = fresh("unsafe-request") / "request"
+    shutil.copytree(request_a, clone)
+    mutate(clone)
+    expect_fail(name, ["verify", *common_args(), "--request", clone])
+ok("unsafe request-tree entries fail closed")
+
+# Input and publication safety.
+bad_snapshot = fresh("bad-snapshot") / "snapshot"
+shutil.copytree(paths["snapshot"], bad_snapshot)
+(bad_snapshot / "snapshot.json").write_bytes(b"{}\n")
+expect_fail("changed snapshot", ["verify", *common_args(snapshot=bad_snapshot),
+                                  "--request", request_a])
+bad_kit = fresh("bad-kit") / "kit"
+shutil.copytree(paths["kit"], bad_kit)
+(bad_kit / "status.json").write_bytes(b"{}\n")
+expect_fail("changed kit", ["verify", *common_args(kit=bad_kit), "--request", request_a])
+existing = work / "existing"
+existing.mkdir()
+expect_fail("existing output", ["assess", *common_args(), "--out", existing])
+inside = paths["rootfs"] / "preflight-output"
+expect_fail("output inside rootfs", ["assess", *common_args(), "--out", inside], inside)
+unsafe_parent = work / "unsafe-parent"
+unsafe_parent.mkdir()
+unsafe_parent.chmod(0o777)
+try:
+    expect_fail("unsafe output parent",
+                ["assess", *common_args(), "--out", unsafe_parent / "request"],
+                unsafe_parent / "request")
+finally:
+    unsafe_parent.chmod(0o700)
+ok("changed inputs and unsafe publication paths are rejected")
+
+# No 0.1.0 option can submit evidence or authorize a read.
+code, out, err = invoke("assess", *common_args(), "--evidence", work / "evidence",
+                        "--out", work / "never")
+assert code != 0 and not os.path.lexists(work / "never")
+ok("real evidence input is unavailable in 0.1.0")
+
+# Process-spawn primitives remain unused even if present in the interpreter.
+def boom(*args, **kwargs):
+    raise AssertionError("process spawn attempted")
+
+
+saved = (os.system, os.fork, os.posix_spawn, os.execv, os.execvp)
+os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 5
+try:
+    expect_ok("verify", *common_args(), "--request", request_a)
+finally:
+    os.system, os.fork, os.posix_spawn, os.execv, os.execvp = saved
+ok("preflight verification spawns no process")
+PY
+
+pass "myron preflight refusal tests passed"

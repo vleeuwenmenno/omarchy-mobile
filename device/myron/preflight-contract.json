@@ -1,0 +1,44 @@
+{
+  "authority": {
+    "atomic_snapshot_proof": false,
+    "atomicity_proven": false,
+    "bootable": false,
+    "deployment_authorized": false,
+    "flashable": false,
+    "hardware_qualified": false,
+    "hardware_read_authorized": false,
+    "image_ready": false,
+    "rollback_proven": false
+  },
+  "blockers": [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization"
+  ],
+  "capture_schema": "myron-capture-evidence-v1",
+  "components": {
+    "deployment_contract": {
+      "path": "device/myron/deployment-contract.json",
+      "sha256": "77aeb784326943ce9bcfa76de599d04502370a333d234561b477f269d9ebaee9"
+    },
+    "snapshot_contract": {
+      "path": "device/myron/snapshot-contract.json",
+      "sha256": "aa13be36bef71ebbc10095c2f450a8093c6e4c592d6752ae6e55029ec6f98c24"
+    }
+  },
+  "format_version": "0.1.0",
+  "kind": "myron-hardware-read-preflight-contract",
+  "request": {
+    "accepts_real_evidence": false,
+    "collects_evidence": false,
+    "contents": "evidence-gaps-and-bounded-read-plan-only",
+    "decision": "refused-pending-live-evidence",
+    "executes_operations": false,
+    "kind": "myron-hardware-read-approval-request"
+  },
+  "schema": 1
+}

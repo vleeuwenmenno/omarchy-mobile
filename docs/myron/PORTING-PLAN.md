@@ -153,6 +153,15 @@ digest while still reporting `atomicity_proven: false` and
 capture or restore, clears no blocker and authorizes nothing
 ([SNAPSHOT-GATE.md](SNAPSHOT-GATE.md)).
 
+Phase 2.10 (laptop-only, mechanism done):
+`device/myron/preflight-contract.json` and `tools/myron-preflight` 0.1.0 bind a
+re-verified kit and snapshot into a refusal-only hardware-read approval
+request. The request maps all seven open blockers to their real evidence
+producer and declares seven bounded, redacted future read operations, but its
+execution and collected-evidence lists are empty and every authority flag is
+false. It contacts no phone and is not approval
+([PREFLIGHT-GATE.md](PREFLIGHT-GATE.md)).
+
 Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
 host-key revalidation before another live read, and translation of the vendor
 module boot order. The generic rootfs builder remains blocked because its
@@ -287,13 +296,13 @@ Future build gates:
 
 ## Next implementation task
 
-Finish Phase 2 by reproducing the qualified VT kernel outputs from the pinned
-source lock and recorded toolchain requirements, then translate the complete
-vendor-module boot order into an offline Arch staging design. Extend the
-snapshot format only after a real quiescent capture and restore method can bind
-owners, xattrs, file capabilities and storage generation; version 1 tree
-digests deliberately do not cover those properties. After that, define a
-boot-chain capture and independently approved hardware preflight that consumes
-the stable kit and snapshot identities. Do not deploy, activate services,
-import Attempt105's Alpine binaries, or use Pixel `/usr/lib/modules` or
-installer assumptions.
+Offline refusal tooling is now complete through the preflight request. Next,
+assemble a **real** kit and snapshot candidate from the owner-supplied qualified
+archive, runtime tree and symvers pair, then generate and independently review
+its preflight request SHA-256. That work stays offline. The following boundary
+is explicit human approval for one bounded read-only recovery/SSH evidence
+session implementing `R1`–`R7`; it is not deployment approval. Source-lock
+reproduction, complete vendor-module ordering, real capture/restore, boot-chain
+design, hardware qualification and independent deployment authorization still
+follow. Do not deploy, activate services, import Attempt105's Alpine binaries,
+or use Pixel `/usr/lib/modules` or installer assumptions.

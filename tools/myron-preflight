@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Build and verify a non-authorizing Myron hardware-read preflight request."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+if __name__ == "__main__":
+    _here = os.path.dirname(os.path.realpath(__file__))
+    sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _here]
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import re
+
+sys.dont_write_bytecode = True
+
+VERSION = "0.1.0"
+REPO = Path(__file__).resolve().parent.parent
+SNAPSHOT_TOOL = REPO / "tools/myron-snapshot"
+PREFLIGHT_CONTRACT_PATH = "device/myron/preflight-contract.json"
+CONTRACT_KIND = "myron-hardware-read-preflight-contract"
+REQUEST_KIND = "myron-hardware-read-approval-request"
+CAPTURE_SCHEMA = "myron-capture-evidence-v1"
+DECISION = "refused-pending-live-evidence"
+HEX256 = re.compile(r"[0-9a-f]{64}")
+AUTHORITY_FLAGS = (
+    "hardware_read_authorized",
+    "deployment_authorized",
+    "bootable",
+    "flashable",
+    "image_ready",
+    "atomic_snapshot_proof",
+    "atomicity_proven",
+    "rollback_proven",
+    "hardware_qualified",
+)
+FORBIDDEN_OPERATIONS = [
+    "phone-contact",
+    "ssh",
+    "adb",
+    "fastboot",
+    "reboot",
+    "slot-change",
+    "partition-write",
+    "flash",
+    "erase",
+    "format",
+    "mount",
+    "module-load",
+    "service-restart",
+    "package-install",
+    "network-access",
+]
+NEVER_EMITS = [
+    "serial",
+    "imei",
+    "meid",
+    "mac",
+    "ssid",
+    "android_id",
+    "partition_uuid",
+    "disk_guid",
+    "raw_payload",
+    "kernel_bytes",
+    "ramdisk_bytes",
+    "firmware_bytes",
+    "module_bytes",
+]
+STOP_CONDITIONS = [
+    "identity-mismatch",
+    "two-source-disagreement",
+    "bound-exceeded",
+    "unstable-read",
+    "write-attempt",
+]
+R7_CMDLINE_ALLOWLIST = [
+    {
+        "key": "androidboot.slot_suffix",
+        "value_type": "enum",
+        "allowed_values": ["_a", "_b"],
+    },
+    {
+        "key": "androidboot.slot",
+        "value_type": "enum",
+        "allowed_values": ["a", "b"],
+    },
+    {
+        "key": "bootconfig",
+        "value_type": "flag",
+        "allowed_values": ["present"],
+    },
+]
+R7_BOOTCONFIG_ALLOWLIST = [
+    {
+        "key": "androidboot.slot_suffix",
+        "value_type": "enum",
+        "allowed_values": ["_a", "_b"],
+    },
+    {
+        "key": "androidboot.slot",
+        "value_type": "enum",
+        "allowed_values": ["a", "b"],
+    },
+    {
+        "key": "androidboot.verifiedbootstate",
+        "value_type": "enum",
+        "allowed_values": ["green", "yellow", "orange", "red"],
+    },
+    {
+        "key": "androidboot.hardware",
+        "value_type": "enum",
+        "allowed_values": ["myron"],
+    },
+    {
+        "key": "androidboot.product.vendor.device",
+        "value_type": "enum",
+        "allowed_values": ["myron"],
+    },
+]
+STATUS_TEXT = (
+    "Omarchy Mobile Myron hardware-read approval request (offline only)\n"
+    "\n"
+    "hardware_read_authorized: false\n"
+    "deployment_authorized: false\n"
+    "decision: refused-pending-live-evidence\n"
+    "This artifact executes no operation, collects no evidence, contacts no\n"
+    "phone, and authorizes neither hardware reads nor deployment. It binds a\n"
+    "verified kit and snapshot to a declarative evidence-gap/read plan only.\n"
+).encode("ascii")
+
+
+class PreflightError(Exception):
+    """Preflight input or evidence differs from the reviewed refusal contract."""
+
+
+_snapshot = None
+
+
+def snapshot():
+    global _snapshot
+    if _snapshot is None:
+        try:
+            loader = importlib.machinery.SourceFileLoader("myron_snapshot", str(SNAPSHOT_TOOL))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+        except (OSError, SyntaxError) as error:
+            raise PreflightError(f"cannot load the snapshot verifier: {error}") from error
+        if module.VERSION != "0.1.0" or module.deploy().VERSION != "0.3.0":
+            raise PreflightError("unsupported snapshot or deployment verifier version")
+        _snapshot = module
+    return _snapshot
+
+
+def deploy():
+    return snapshot().deploy()
+
+
+def authority() -> dict:
+    return {flag: False for flag in AUTHORITY_FLAGS}
+
+
+def status_document() -> dict:
+    d = deploy()
+    return {
+        "artifact": REQUEST_KIND,
+        "blockers": list(d.BLOCKERS),
+        **authority(),
+    }
+
+
+def expected_preflight_contract(contracts, snapshot_contract_sha256: str) -> dict:
+    d = deploy()
+    s = snapshot()
+    return {
+        "schema": 1,
+        "kind": CONTRACT_KIND,
+        "format_version": VERSION,
+        "components": {
+            "deployment_contract": {
+                "path": d.DEPLOYMENT_CONTRACT_PATH,
+                "sha256": contracts.deployment_sha256,
+            },
+            "snapshot_contract": {
+                "path": s.SNAPSHOT_CONTRACT_PATH,
+                "sha256": snapshot_contract_sha256,
+            },
+        },
+        "capture_schema": CAPTURE_SCHEMA,
+        "request": {
+            "kind": REQUEST_KIND,
+            "contents": "evidence-gaps-and-bounded-read-plan-only",
+            "decision": DECISION,
+            "accepts_real_evidence": False,
+            "executes_operations": False,
+            "collects_evidence": False,
+        },
+        "blockers": list(d.BLOCKERS),
+        "authority": authority(),
+    }
+
+
+def load_preflight_contract(
+    contracts_root: Path, contracts, snapshot_contract_sha256: str
+) -> tuple[dict, bytes, str]:
+    d = deploy()
+    data = d.read_file(
+        f"{contracts_root}/{PREFLIGHT_CONTRACT_PATH}",
+        "preflight contract",
+        d.MAX_SMALL_BYTES,
+    )
+    value = d.strict_json(data, "preflight contract")
+    expected = expected_preflight_contract(contracts, snapshot_contract_sha256)
+    if not d.kernel().strict_equal(value, expected):
+        raise PreflightError("preflight contract differs from its derived form")
+    if data != d.render_json(expected):
+        raise PreflightError("preflight contract is not canonical")
+    return value, data, d.sha256_bytes(data)
+
+
+def closure(
+    evidence_id: str,
+    kind: str,
+    producer: str,
+    operations: list[str],
+    accepts: list[str],
+) -> dict:
+    return {
+        "id": evidence_id,
+        "kind": kind,
+        "producer": producer,
+        "operations": operations,
+        "accepts": accepts,
+        "blocker_cleared": False,
+    }
+
+
+def evidence_plan() -> list[dict]:
+    d = deploy()
+    rows = [
+        (
+            d.BLOCKERS[0], "source-lock-pinned-output-reproduction-missing", False, "none",
+            [closure(
+                "clean-source-rebuild-v1", "offline-build", "offline", [],
+                ["source-lock-sha256", "toolchain-identity", "image-sha256", "config-sha256",
+                 "notes-sha256", "vmlinux-symvers-sha256", "module-symvers-sha256"],
+            )],
+        ),
+        (
+            d.BLOCKERS[1], "synthetic-parser-and-staged-set-only", True, "hardware-read",
+            [
+                closure(
+                    "real-archive-abi-v1", "offline-verify", "offline", [],
+                    ["real-parser-qualified", "vendor-module-inventory", "imports", "exports",
+                     "symbol-crcs", "provider-map", "declared-order"],
+                ),
+                closure(
+                    "live-load-order-v1", "live-read", "approved-read-only-session",
+                    ["R5-module-load-order"],
+                    ["module-names", "load-order-index", "taint-flags", "order-matches-declared"],
+                ),
+            ],
+        ),
+        (
+            d.BLOCKERS[2], "no-real-owner-supplied-runtime-tree-bound", False, "none",
+            [closure(
+                "real-runtime-tree-bind-v1", "offline-bind", "offline", [],
+                ["manifest-sha256", "runtime-digest", "asset-count", "feature-closure"],
+            )],
+        ),
+        (
+            d.BLOCKERS[3], "metadata-candidate-only", False, "deployment",
+            [closure(
+                "snapshot-capture-restore-v1", "attended-deployment", "attended-deployment", [],
+                ["quiescence-witness", "storage-generation", "capture-digest", "restore-result",
+                 "restored-owner-xattr-capability-digest", "restored-tree-digest"],
+            )],
+        ),
+        (
+            d.BLOCKERS[4], "boot-chain-not-captured", True, "hardware-read",
+            [closure(
+                "boot-chain-capture-v1", "live-read", "approved-read-only-session",
+                ["R1-identity-and-slot", "R2-gpt-and-recovery-inventory",
+                 "R3-boot-image-headers", "R4-dtb-dtbo-selection",
+                 "R6-storage-and-mount-model", "R7-kernel-identity-revalidation"],
+                ["device-identity", "slot-state", "partition-inventory", "boot-header-fields",
+                 "dtb-dtbo-selection", "root-storage-model", "kernel-identity"],
+            )],
+        ),
+        (
+            d.BLOCKERS[5], "candidate-never-booted-or-probed", False, "deployment",
+            [closure(
+                "hardware-qualification-v1", "attended-boot", "attended-deployment", [],
+                ["bounded-boot-result", "rescue-link", "display", "touch", "gpu", "wifi",
+                 "charging", "modem", "gnss", "audio", "thermal", "rollback-result"],
+            )],
+        ),
+        (
+            d.BLOCKERS[6], "no-independent-human-authorization", False, "independent-review",
+            [closure(
+                "independent-deployment-review-v1", "independent-review",
+                "independent-reviewer", [],
+                ["request-sha256", "review-record", "explicit-operation-scope",
+                 "expiry-or-one-shot-boundary", "human-decision"],
+            )],
+        ),
+    ]
+    return [
+        {
+            "blocker": blocker,
+            "state": "missing",
+            "current": current,
+            "live_read_required": live_read,
+            "approval_gate": gate,
+            "closure": items,
+        }
+        for blocker, current, live_read, gate, items in rows
+    ]
+
+
+def read_operation(
+    operation_id: str,
+    purpose: list[str],
+    max_bytes: int,
+    targets: list[str],
+    emits: list[str],
+    field_policy: dict | None = None,
+) -> dict:
+    return {
+        "id": operation_id,
+        "purpose": purpose,
+        "transport": "approved-read-only-recovery-session",
+        "read_only": True,
+        "max_bytes": max_bytes,
+        "targets": targets,
+        "emits": emits,
+        "field_policy": field_policy or {},
+        "never_emits": list(NEVER_EMITS),
+        "stop_conditions": list(STOP_CONDITIONS),
+    }
+
+
+def requested_reads() -> list[dict]:
+    d = deploy()
+    boot = d.BLOCKERS[4]
+    module = d.BLOCKERS[1]
+    return [
+        read_operation(
+            "R1-identity-and-slot", [boot], 64 * 1024,
+            ["bootloader-current-slot", "ro.boot.slot_suffix", "ro.boot.slot",
+             "verified-boot-state", "device-tree-compatible"],
+            ["codename", "soc", "compatible-prefix", "current-slot", "slot-suffix",
+             "verified-boot-state", "sources-agree"],
+        ),
+        read_operation(
+            "R2-gpt-and-recovery-inventory", [boot], 1024 * 1024,
+            ["read-only-gpt-header-and-entry-array", "recovery-partition-presence"],
+            ["partition-name", "size-bytes", "bootable-flag", "slot-suffix",
+             "recovery-present"],
+        ),
+        read_operation(
+            "R3-boot-image-headers", [boot], 64 * 1024,
+            ["boot_* header", "init_boot_* header", "vendor_boot_* header",
+             "vendor_kernel_boot_* header", "dtbo_* header", "recovery_* header"],
+            ["partition-name", "header-version", "page-size", "os-version",
+             "component-sizes", "component-offsets", "segment-count", "header-sha256",
+             "absent"],
+        ),
+        read_operation(
+            "R4-dtb-dtbo-selection", [boot], 64 * 1024,
+            ["live-bootconfig-dt-selection-fields", "live-device-tree-compatible-prefix",
+             "dtbo-header-selection-fields"],
+            ["dtb-count", "selected-board-id", "selected-board-revision",
+             "dtbo-entry-count", "compatible-prefix", "selection-source"],
+        ),
+        read_operation(
+            "R5-module-load-order", [module], 1024 * 1024,
+            ["/proc/modules names-order-taint-only"],
+            ["module-names", "load-order-index", "taint-flags", "order-matches-declared"],
+        ),
+        read_operation(
+            "R6-storage-and-mount-model", [boot], 64 * 1024,
+            ["root-mount-by-gpt-name", "root-filesystem-statistics"],
+            ["root-source-gpt-name", "filesystem-type", "mount-options", "block-size",
+             "rounded-total-bytes", "rounded-free-bytes"],
+        ),
+        read_operation(
+            "R7-kernel-identity-revalidation", [boot], 1024 * 1024,
+            ["/sys/kernel/notes hash-only", "/proc/version release-only",
+             "allowlisted-kernel-command-line", "allowlisted-bootconfig"],
+            ["kernel-release", "notes-sha256", "allowlisted-cmdline",
+             "allowlisted-bootconfig-keys"],
+            {
+                "kernel_command_line": {
+                    "unknown_keys": "reject",
+                    "entries": R7_CMDLINE_ALLOWLIST,
+                },
+                "bootconfig": {
+                    "unknown_keys": "reject",
+                    "entries": R7_BOOTCONFIG_ALLOWLIST,
+                },
+            },
+        ),
+    ]
+
+
+def redaction_policy() -> dict:
+    return {
+        "identifiers": "excluded",
+        "private_bytes": "excluded",
+        "raw_payload": "excluded",
+        "emitted": (
+            "allowlisted header fields, enums, booleans, counts, sizes, and sha256 "
+            "of declared bounded reads"
+        ),
+    }
+
+
+def require_hash(value, label: str, *, nullable: bool = False) -> None:
+    if nullable and value is None:
+        return
+    if type(value) is not str or not HEX256.fullmatch(value):
+        raise PreflightError(f"{label} is not a SHA-256 digest")
+
+
+def snapshot_artifact_identity(
+    path: str,
+    contract_bytes: bytes,
+    expected_document: dict,
+    expected_identity: tuple[int, int],
+) -> str:
+    d = deploy()
+    descriptor, identity = d.open_trusted_artifact(path, "snapshot identity")
+    try:
+        tree = d.walk_tree(
+            descriptor,
+            d.STAGE_LIMITS,
+            allow_symlinks=False,
+            keep_data=True,
+            trusted_ownership=True,
+            label="snapshot identity",
+        )
+    finally:
+        os.close(descriptor)
+    if identity != expected_identity:
+        raise PreflightError("snapshot identity changed after verification")
+    d.diff_entries(
+        tree.entries,
+        d.spec_entries(snapshot().snapshot_spec(contract_bytes, expected_document)),
+        "snapshot identity",
+    )
+    sums = tree.data.get("SHA256SUMS")
+    document_bytes = tree.data.get("snapshot.json")
+    if sums is None or document_bytes is None:
+        raise PreflightError("snapshot identity files are missing")
+    document = d.strict_json(document_bytes, "snapshot identity document")
+    if not d.kernel().strict_equal(document, expected_document):
+        raise PreflightError("snapshot document changed after verification")
+    d.recheck_trusted_artifact(path, identity, "snapshot identity")
+    return d.sha256_bytes(sums)
+
+
+def request_document(
+    contracts,
+    contract_sha256: str,
+    snapshot_document: dict,
+    snapshot_sha256: str,
+) -> dict:
+    d = deploy()
+    s = snapshot()
+    bindings = snapshot_document["bindings"]
+    document = {
+        "schema": 1,
+        "kind": REQUEST_KIND,
+        "format_version": VERSION,
+        "contract_sha256": contract_sha256,
+        "artifacts": {
+            "deployment_kit": {
+                "format_version": d.VERSION,
+                "sha256": bindings["kit"]["sha256"],
+            },
+            "snapshot": {
+                "format_version": s.VERSION,
+                "sha256": snapshot_sha256,
+                "rootfs_digest": bindings["rootfs"]["digest"],
+                "rootfs_manifest_sha256": bindings["rootfs"]["manifest_sha256"],
+                "archive_sha256": bindings["archive_sha256"],
+                "runtime_status": bindings["runtime"]["status"],
+                "runtime_asset_count": bindings["runtime"]["asset_count"],
+                "runtime_digest": bindings["runtime"]["digest"],
+                "abi_status": bindings["abi"]["status"],
+                "abi_scope": bindings["abi"]["scope"],
+                "abi_module_count": bindings["abi"]["module_count"],
+                "abi_digest": bindings["abi"]["digest"],
+            },
+        },
+        "decision": {
+            "status": DECISION,
+            "reason": "all-seven-blockers-open",
+            "human_approval_required": True,
+            "hardware_read_authorized": False,
+            "deployment_authorized": False,
+        },
+        "execution": {"operations": [], "evidence_collected": []},
+        "evidence": evidence_plan(),
+        "requested_reads": requested_reads(),
+        "forbidden_operations": list(FORBIDDEN_OPERATIONS),
+        "redaction": redaction_policy(),
+        "status": status_document(),
+    }
+    return validate_request_document(document, contracts, contract_sha256)
+
+
+def validate_request_document(value, contracts, contract_sha256: str) -> dict:
+    d = deploy()
+    s = snapshot()
+    if type(value) is not dict or set(value) != {
+        "schema", "kind", "format_version", "contract_sha256", "artifacts", "decision",
+        "execution", "evidence", "requested_reads", "forbidden_operations", "redaction",
+        "status",
+    }:
+        raise PreflightError("preflight request fields differ")
+    if type(value["schema"]) is not int or value["schema"] != 1:
+        raise PreflightError("preflight request schema differs")
+    if value["kind"] != REQUEST_KIND or value["format_version"] != VERSION:
+        raise PreflightError("preflight request identity differs")
+    if value["contract_sha256"] != contract_sha256:
+        raise PreflightError("preflight request contract hash differs")
+    artifacts = value["artifacts"]
+    if type(artifacts) is not dict or set(artifacts) != {"deployment_kit", "snapshot"}:
+        raise PreflightError("preflight artifact bindings differ")
+    kit = artifacts["deployment_kit"]
+    if type(kit) is not dict or set(kit) != {"format_version", "sha256"}:
+        raise PreflightError("preflight kit binding fields differ")
+    if kit["format_version"] != d.VERSION:
+        raise PreflightError("preflight kit format differs")
+    require_hash(kit["sha256"], "preflight kit hash")
+    snap = artifacts["snapshot"]
+    expected_snapshot_fields = {
+        "format_version", "sha256", "rootfs_digest", "rootfs_manifest_sha256",
+        "archive_sha256", "runtime_status", "runtime_asset_count", "runtime_digest",
+        "abi_status", "abi_scope", "abi_module_count", "abi_digest",
+    }
+    if type(snap) is not dict or set(snap) != expected_snapshot_fields:
+        raise PreflightError("preflight snapshot binding fields differ")
+    if snap["format_version"] != s.VERSION:
+        raise PreflightError("preflight snapshot format differs")
+    for name in ("sha256", "rootfs_digest", "rootfs_manifest_sha256", "archive_sha256"):
+        require_hash(snap[name], f"preflight snapshot {name}")
+    if snap["archive_sha256"] != contracts.reference["module_assets"]["archive_sha256"]:
+        raise PreflightError("preflight archive identity differs from the contract")
+    if snap["runtime_status"] not in ("not-bound", "verified"):
+        raise PreflightError("preflight runtime status differs")
+    if type(snap["runtime_asset_count"]) is not int or snap["runtime_asset_count"] < 0:
+        raise PreflightError("preflight runtime asset count differs")
+    require_hash(snap["runtime_digest"], "preflight runtime digest", nullable=True)
+    if snap["abi_status"] not in ("not-bound", "staged-set-consistent"):
+        raise PreflightError("preflight ABI status differs")
+    if snap["abi_scope"] != d.ABI_SCOPE:
+        raise PreflightError("preflight ABI scope differs")
+    if type(snap["abi_module_count"]) is not int or snap["abi_module_count"] < 0:
+        raise PreflightError("preflight ABI module count differs")
+    require_hash(snap["abi_digest"], "preflight ABI digest", nullable=True)
+    expected_decision = {
+        "status": DECISION,
+        "reason": "all-seven-blockers-open",
+        "human_approval_required": True,
+        "hardware_read_authorized": False,
+        "deployment_authorized": False,
+    }
+    if not d.kernel().strict_equal(value["decision"], expected_decision):
+        raise PreflightError("preflight decision differs")
+    if not d.kernel().strict_equal(
+        value["execution"], {"operations": [], "evidence_collected": []}
+    ):
+        raise PreflightError("preflight execution must remain empty")
+    for actual, expected, label in (
+        (value["evidence"], evidence_plan(), "evidence plan"),
+        (value["requested_reads"], requested_reads(), "requested reads"),
+        (value["forbidden_operations"], FORBIDDEN_OPERATIONS, "forbidden operations"),
+        (value["redaction"], redaction_policy(), "redaction policy"),
+        (value["status"], status_document(), "status"),
+    ):
+        if not d.kernel().strict_equal(actual, expected):
+            raise PreflightError(f"preflight {label} differs")
+    return value
+
+
+def request_spec(contract_bytes: bytes, document: dict) -> list:
+    d = deploy()
+    files = {
+        "contracts/preflight-contract.json": contract_bytes,
+        "request.json": d.render_json(document),
+        "status.json": d.render_json(status_document()),
+        "STATUS.txt": STATUS_TEXT,
+    }
+    files["SHA256SUMS"] = "".join(
+        f"{d.sha256_bytes(files[path])}  {path}\n" for path in sorted(files)
+    ).encode("ascii")
+    spec = [("contracts", "dir", 0o755, None)]
+    spec += [(path, "file", 0o644, data) for path, data in files.items()]
+    spec.sort(key=lambda item: item[0].encode("utf-8"))
+    return spec
+
+
+def read_request(path: str, contracts, contract_bytes: bytes, contract_sha256: str):
+    d = deploy()
+    descriptor, identity = d.open_trusted_artifact(path, "preflight request")
+    try:
+        tree = d.walk_tree(
+            descriptor,
+            d.STAGE_LIMITS,
+            allow_symlinks=False,
+            keep_data=True,
+            trusted_ownership=True,
+            label="preflight request",
+        )
+    finally:
+        os.close(descriptor)
+    raw = tree.data.get("request.json")
+    if raw is None:
+        raise PreflightError("preflight request has no request.json")
+    document = d.strict_json(raw, "request.json")
+    if raw != d.render_json(document):
+        raise PreflightError("request.json is not canonical")
+    validate_request_document(document, contracts, contract_sha256)
+    d.diff_entries(tree.entries, d.spec_entries(request_spec(contract_bytes, document)), "preflight request")
+    d.recheck_trusted_artifact(path, identity, "preflight request")
+    return document, tree.directory_ids, identity
+
+
+def assess_inputs(
+    contracts,
+    snapshot_contract_bytes: bytes,
+    snapshot_contract_sha256: str,
+    contract_sha256: str,
+    args,
+):
+    s = snapshot()
+    verified = s.command_verify(
+        contracts, snapshot_contract_bytes, snapshot_contract_sha256, args
+    )
+    if verified.get("status") != "verified" or verified.get("deployment_authorized") is not False:
+        raise PreflightError("snapshot did not produce refusal-preserving verified evidence")
+    report = s.verify_deployment(contracts, args)
+    expected_snapshot = s.snapshot_document(
+        contracts, snapshot_contract_sha256, report, args.kit
+    )
+    snap_document, snap_ids, snap_identity = s.read_snapshot(
+        args.snapshot, contracts, snapshot_contract_bytes, snapshot_contract_sha256
+    )
+    if not deploy().kernel().strict_equal(snap_document, expected_snapshot):
+        raise PreflightError("snapshot changed after verification")
+    snap_sha256 = snapshot_artifact_identity(
+        args.snapshot, snapshot_contract_bytes, snap_document, snap_identity
+    )
+    document = request_document(contracts, contract_sha256, snap_document, snap_sha256)
+    if document["artifacts"]["deployment_kit"]["sha256"] != verified["kit_sha256"]:
+        raise PreflightError("verified kit identity differs from the snapshot binding")
+    if document["artifacts"]["snapshot"]["rootfs_digest"] != verified["rootfs_digest"]:
+        raise PreflightError("verified rootfs digest differs from the snapshot binding")
+    return document, snap_ids
+
+
+def command_assess(
+    contracts,
+    snapshot_contract_bytes: bytes,
+    snapshot_contract_sha256: str,
+    contract_bytes: bytes,
+    contract_sha256: str,
+    args,
+) -> dict:
+    d = deploy()
+    s = snapshot()
+    document, snap_ids = assess_inputs(
+        contracts, snapshot_contract_bytes, snapshot_contract_sha256, contract_sha256, args
+    )
+    spec = request_spec(contract_bytes, document)
+    expected = d.spec_entries(spec)
+    protected, input_ids = s.protected_inputs(args)
+    protected = [*protected, args.snapshot]
+    protected_ids = frozenset(set(input_ids) | set(snap_ids))
+
+    def verify_built(temporary_path: str, descriptor: int) -> None:
+        tree = d.walk_tree(
+            descriptor, d.STAGE_LIMITS, allow_symlinks=False, label="preflight request"
+        )
+        d.diff_entries(tree.entries, expected, "preflight request")
+
+    d.publish(args.out, protected, protected_ids, spec, verify_built)
+    sums = next(data for path, kind, mode, data in spec if path == "SHA256SUMS")
+    return {
+        "status": "assessed",
+        "decision": DECISION,
+        "request_sha256": d.sha256_bytes(sums),
+        "kit_sha256": document["artifacts"]["deployment_kit"]["sha256"],
+        "snapshot_sha256": document["artifacts"]["snapshot"]["sha256"],
+        "blocker_count": len(d.BLOCKERS),
+        "requested_read_count": len(document["requested_reads"]),
+        **authority(),
+    }
+
+
+def command_verify(
+    contracts,
+    snapshot_contract_bytes: bytes,
+    snapshot_contract_sha256: str,
+    contract_bytes: bytes,
+    contract_sha256: str,
+    args,
+) -> dict:
+    d = deploy()
+    s = snapshot()
+    expected, snap_ids = assess_inputs(
+        contracts, snapshot_contract_bytes, snapshot_contract_sha256, contract_sha256, args
+    )
+    document, request_ids, identity = read_request(
+        args.request, contracts, contract_bytes, contract_sha256
+    )
+    if not d.kernel().strict_equal(document, expected):
+        raise PreflightError("preflight request differs from re-verified inputs")
+    protected, input_ids = s.protected_inputs(args)
+    if any(d.paths_overlap(args.request, path) for path in [*protected, args.snapshot]):
+        raise PreflightError("preflight request overlaps an input")
+    if set(request_ids) & (set(input_ids) | set(snap_ids)):
+        raise PreflightError("preflight request aliases an input tree")
+    d.recheck_trusted_artifact(args.request, identity, "preflight request")
+    return {
+        "status": "verified",
+        "decision": DECISION,
+        "kit_sha256": document["artifacts"]["deployment_kit"]["sha256"],
+        "snapshot_sha256": document["artifacts"]["snapshot"]["sha256"],
+        "blocker_count": len(d.BLOCKERS),
+        "requested_read_count": len(document["requested_reads"]),
+        **authority(),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("show", help="print the offline refusal contract")
+    assess = commands.add_parser("assess", help="write a refusal-only hardware-read request")
+    snapshot().add_deployment_arguments(assess)
+    assess.add_argument("--snapshot", required=True)
+    assess.add_argument("--out", required=True)
+    verify = commands.add_parser("verify", help="recompute every preflight request binding")
+    snapshot().add_deployment_arguments(verify)
+    verify.add_argument("--snapshot", required=True)
+    verify.add_argument("--request", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    d = deploy()
+    s = snapshot()
+    root = contracts_root or REPO
+    try:
+        contracts = d.load_contracts(root)
+        snapshot_contract, snapshot_contract_bytes, snapshot_contract_sha256 = (
+            s.load_snapshot_contract(root, contracts)
+        )
+        contract, contract_bytes, contract_sha256 = load_preflight_contract(
+            root, contracts, snapshot_contract_sha256
+        )
+        if args.command == "show":
+            result = contract
+        else:
+            args.rootfs_manifest = args.rootfs_manifest or args.rootfs_stage + ".MANIFEST"
+            if args.command == "assess":
+                result = command_assess(
+                    contracts, snapshot_contract_bytes, snapshot_contract_sha256,
+                    contract_bytes, contract_sha256, args,
+                )
+            else:
+                result = command_verify(
+                    contracts, snapshot_contract_bytes, snapshot_contract_sha256,
+                    contract_bytes, contract_sha256, args,
+                )
+    except (PreflightError, s.SnapshotError, *d.handled_errors()) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

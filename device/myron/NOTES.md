@@ -67,6 +67,16 @@ accepts only `not-captured` and `not-proven` evidence, preserves all seven
 blockers, copies no payload bytes and performs no capture, restore or deploy.
 See [SNAPSHOT-GATE.md](../../docs/myron/SNAPSHOT-GATE.md).
 
+Phase 2.10 adds `device/myron/preflight-contract.json` and
+`tools/myron-preflight` 0.1.0. It re-verifies a kit and snapshot and produces a
+five-file, metadata-only hardware-read approval request. Seven declarative read
+IDs carry strict byte bounds, emitted-field allowlists, identifier/private-byte
+redaction and stop conditions. The execution and evidence lists remain empty,
+all seven blockers remain missing, every authority flag is false, and the tool
+contacts no phone. It is the offline artifact needed before requesting a
+separate read-only session, not permission for that session or for deployment.
+See [PREFLIGHT-GATE.md](../../docs/myron/PREFLIGHT-GATE.md).
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,

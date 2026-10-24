@@ -583,6 +583,33 @@ try:
 finally:
     os.system, os.fork, os.posix_spawn, os.execv, os.execvp = saved
 ok("verify and rollback rehearsal spawn no process")
+
+# Optional synthetic-fixture export for downstream refusal-gate tests. The
+# normal suite does not set this and still leaves only its mktemp tree.
+export_name = os.environ.get("MYRON_SNAPSHOT_FIXTURE_OUT")
+if export_name:
+    export_root = Path(export_name)
+    export_root.mkdir(parents=True, exist_ok=True)
+    contracts_out = export_root / "contracts-root"
+    rootfs_out = export_root / "rootfs"
+    manifest_out = export_root / "rootfs.MANIFEST"
+    kit_out = export_root / "kit"
+    snapshot_out = export_root / "snapshot"
+    shutil.copytree(fixture["root"], contracts_out)
+    shutil.copytree(rootfs, rootfs_out, symlinks=True)
+    shutil.copy2(rootfs_manifest, manifest_out)
+    shutil.copytree(kit, kit_out)
+    shutil.copytree(snapshot_a, snapshot_out)
+    archive_out = export_root / "assets.tar.gz"
+    shutil.copy2(fixture["archive"], archive_out)
+    (export_root / "paths.json").write_text(json.dumps({
+        "contracts_root": str(contracts_out),
+        "rootfs": str(rootfs_out),
+        "manifest": str(manifest_out),
+        "kit": str(kit_out),
+        "snapshot": str(snapshot_out),
+        "archive": str(archive_out),
+    }, indent=2, sort_keys=True) + "\n")
 PY
 
 pass "myron snapshot candidate tests passed"
