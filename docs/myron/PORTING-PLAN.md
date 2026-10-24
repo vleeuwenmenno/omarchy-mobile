@@ -143,6 +143,16 @@ clear `module-abi-import-and-load-order-not-verified`. Activation, the
 unverified overlay order, all seven blockers and gate refusal remain unchanged
 ([DEPLOYMENT-GATE.md](DEPLOYMENT-GATE.md)).
 
+Phase 2.9 (laptop-only, mechanism done): `device/myron/snapshot-contract.json`
+and `tools/myron-snapshot` 0.1.0 bind a fully re-verified deployment kit to its
+pre-deployment rootfs digest in a deterministic, metadata-only snapshot
+candidate. A read-only rollback rehearsal accepts only the same version-1 tree
+digest while still reporting `atomicity_proven: false` and
+`rollback_proven: false`. Version 0.1.0 permits only `not-captured`,
+`not-proven` quiescence and `not-proven` rollback states; it performs no
+capture or restore, clears no blocker and authorizes nothing
+([SNAPSHOT-GATE.md](SNAPSHOT-GATE.md)).
+
 Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
 host-key revalidation before another live read, and translation of the vendor
 module boot order. The generic rootfs builder remains blocked because its
@@ -278,12 +288,12 @@ Future build gates:
 ## Next implementation task
 
 Finish Phase 2 by reproducing the qualified VT kernel outputs from the pinned
-source lock and recorded toolchain requirements, then translate the vendor
-module boot order into an offline Arch staging design. Keep rootfs generation
-blocked until that design preserves the notes-keyed selector and private
-runtime-asset contract without importing
-Pixel `/usr/lib/modules` assumptions. The isolated glibc Mesa source package
-now builds offline, and its activation-disabled session profile can verify a
-staged root without opening GPU hardware. Next, stage both in an offline Myron
-rootfs and define the separately approved live equivalence runner; do not
-deploy them or import Attempt105's Alpine binaries.
+source lock and recorded toolchain requirements, then translate the complete
+vendor-module boot order into an offline Arch staging design. Extend the
+snapshot format only after a real quiescent capture and restore method can bind
+owners, xattrs, file capabilities and storage generation; version 1 tree
+digests deliberately do not cover those properties. After that, define a
+boot-chain capture and independently approved hardware preflight that consumes
+the stable kit and snapshot identities. Do not deploy, activate services,
+import Attempt105's Alpine binaries, or use Pixel `/usr/lib/modules` or
+installer assumptions.

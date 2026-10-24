@@ -1,0 +1,588 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the metadata-only Myron snapshot/rollback candidate.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+python3 -m py_compile tools/myron-snapshot || fail "tool parses"
+grep -Eq '^(import|from) (subprocess|shutil)|os\.(system|popen|exec|spawn|fork)|posix_spawn' tools/myron-snapshot \
+  && fail "tool references process-spawning or broad-copy facilities"
+pass "tool parses and spawns nothing"
+
+tools/myron-snapshot show > "$tmp/show.json" || fail "repository snapshot contract failed"
+python3 - "$tmp/show.json" <<'PY' || exit 1
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["kind"] == "myron-snapshot-candidate-contract"
+assert value["format_version"] == "0.1.0"
+assert len(value["blockers"]) == 7
+assert value["snapshot"]["capture_status"] == "not-captured"
+assert value["snapshot"]["quiescence"] == "not-proven"
+assert value["rollback"]["status"] == "not-proven"
+for flag in (
+    "atomicity_proven", "rollback_proven", "deployment_authorized", "bootable",
+    "flashable", "image_ready", "hardware_qualified", "atomic_snapshot_proof",
+):
+    assert value[flag] is False
+PY
+pass "repository snapshot contract is canonical and refuses every authority claim"
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+D = load("snapshot_deploy_test", repo / "tools/myron-deployment")
+S = load("snapshot_tool_test", repo / "tools/myron-snapshot")
+K = D.kernel()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical(value):
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+counter = [0]
+
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{name}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+def make_fixture():
+    base = fresh("fixture")
+    release = "snapshot-test-release"
+    notes = b"snapshot-test-notes\n"
+    image = b"snapshot-test-image\n"
+    config = b"snapshot-test-config\n"
+    modules = ["alpha", "beta"]
+    module_directory = f"/usr/local/lib/myron-gki-module-sets/{digest(notes)}"
+    payload = {
+        "candidate-module-dir.sh": b"#!/bin/sh\nexit 0\n",
+        "previous-module-dir.sh": b"#!/bin/sh\nexit 1\n",
+        "kernel-notes.bin": notes,
+        **{
+            f"modules/{name}.ko": f"module-{name}\0vermagic={release} SMP\0".encode()
+            for name in modules
+        },
+    }
+    manifest = {
+        "phase": "inactive-staging-payload-only",
+        "candidate_image_sha256": digest(image),
+        "candidate_config_sha256": digest(config),
+        "candidate_notes_sha256": digest(notes),
+        "module_directory": module_directory,
+        "selector_destination": "/usr/local/sbin/myron-attempt79-module-dir",
+        "files": {name: digest(data) for name, data in sorted(payload.items())},
+    }
+    payload["manifest.json"] = canonical(manifest)
+    payload["SHA256SUMS"] = "".join(
+        f"{digest(data)}  {name}\n" for name, data in sorted(payload.items())
+    ).encode()
+    archive = base / "assets.tar.gz"
+    with archive.open("wb") as output:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as zipped:
+            with tarfile.open(fileobj=zipped, mode="w") as bundle:
+                for name, data in sorted(payload.items()):
+                    info = tarfile.TarInfo("fixture/" + name)
+                    info.size = len(data)
+                    info.mode = 0o644
+                    bundle.addfile(info, io.BytesIO(data))
+    runtime_manifest = (
+        "target\tsha256\tprovenance\tredistribution\tfeature\n"
+        "/usr/local/lib/myron-gpu/test\t" + "1" * 64 + "\tstock-extracted\textract-only\tgpu\n"
+        "/usr/local/lib/myron-wifi/test\t" + "2" * 64 + "\tstock-extracted\textract-only\twifi\n"
+        "/usr/local/lib/myron-touch/test\t" + "3" * 64 + "\tstock-extracted\textract-only\ttouch\n"
+    ).encode()
+    reference = {
+        "schema": 1,
+        "device": {
+            "codename": "myron", "compatible": "qcom,canoe-mtp", "soc": "sm8850",
+            "model_contains": "Myron", "boot_method": "external-android",
+        },
+        "kernel": {
+            "release": release,
+            "gki_source_revision": "0" * 40,
+            "image_sha256": digest(image),
+            "notes_sha256": digest(notes),
+            "config_sha256": digest(config),
+            "vmlinux_symvers_sha256": "5" * 64,
+            "module_symvers_sha256": "6" * 64,
+        },
+        "source": {
+            "lock_sha256": "2" * 64,
+            "manifest_sha256": "3" * 64,
+            "patches": {"0001-test.patch": "4" * 64},
+        },
+        "module_assets": {
+            "archive_sha256": digest(archive.read_bytes()),
+            "root": "fixture",
+            "module_directory": module_directory,
+            "candidate_selector_sha256": digest(payload["candidate-module-dir.sh"]),
+            "previous_selector_sha256": digest(payload["previous-module-dir.sh"]),
+            "forbidden_modules": ["rmnet_core"],
+            "modules": modules,
+        },
+        "runtime_assets": {"manifest_sha256": digest(runtime_manifest)},
+        "activation": {
+            "mode": "disabled",
+            "source_lock_reproduction": "not_verified",
+            "device_qualification": "reference_evidence_only",
+        },
+        "payload": {"kind": "metadata-only"},
+        "provenance": {
+            "reference_repository_base_commit": "1" * 40,
+            "reference_worktree_state": "synthetic",
+            "qualification": "test",
+            "status": "metadata-only",
+        },
+    }
+    reference_bytes = canonical(reference)
+    stage = K.expected_stage_contract(reference, digest(reference_bytes))
+    stage_bytes = canonical(stage)
+    gpu_bytes = (repo / D.GPU_REFERENCE_PATH).read_bytes()
+    contracts_root = base / "contracts-root"
+    for relative, data in (
+        (D.KERNEL_REFERENCE_PATH, reference_bytes),
+        (D.STAGE_CONTRACT_PATH, stage_bytes),
+        (D.GPU_REFERENCE_PATH, gpu_bytes),
+    ):
+        target = contracts_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    deployment = D.expected_deployment_contract(
+        reference, digest(reference_bytes), digest(stage_bytes), digest(gpu_bytes)
+    )
+    target = contracts_root / D.DEPLOYMENT_CONTRACT_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(D.render_json(deployment))
+    contracts = D.load_contracts(contracts_root)
+    snapshot_contract = S.expected_snapshot_contract(contracts)
+    target = contracts_root / S.SNAPSHOT_CONTRACT_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(D.render_json(snapshot_contract))
+    return {
+        "base": base,
+        "root": contracts_root,
+        "archive": archive,
+        "reference": reference,
+        "reference_bytes": reference_bytes,
+        "stage_bytes": stage_bytes,
+    }
+
+
+def make_rootfs(fixture):
+    base = fresh("rootfs")
+    tree = base / "omamobile-rootfs-stage-synthetic-aarch64"
+    (tree / "etc/systemd/system").mkdir(parents=True)
+    for script in (
+        "packages/omamobile-device-myron/install",
+        "packages/omamobile-myron-kernel-contract/install",
+        "packages/omamobile-myron-gpu-profile/install",
+        "packages/omamobile-myron-gpu-profile/test/stage-mesa-fixture",
+    ):
+        subprocess.run([str(repo / script), str(tree)], check=True, stdout=subprocess.DEVNULL)
+    share = tree / "usr/share/omamobile/myron-kernel-contract"
+    (share / "reference.json").write_bytes(fixture["reference_bytes"])
+    (share / "stage-contract.json").write_bytes(fixture["stage_bytes"])
+    (tree / "usr/lib/firmware").mkdir(parents=True)
+    (tree / "usr/lib/firmware/regulatory.db").write_bytes(b"")
+    (tree / "usr/lib/firmware/regulatory.db.p7s").write_bytes(b"")
+    manifest = Path(str(tree) + ".MANIFEST")
+    manifest.write_text(
+        "# Omarchy Mobile root STAGE (not bootable, not an image)\n"
+        "version: synthetic\n"
+        "rootfs integration: external-contract\n"
+        "rootfs package profile: myron\n"
+        "package closure: required present; forbidden absent\n"
+        "kernel modules: none (external contract, no module payload)\n"
+        "boot payload: none; proprietary payload: none\n"
+    )
+    return tree, manifest
+
+
+def invoke(module, root, *arguments):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = module.main([str(item) for item in arguments], contracts_root=root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def deploy_ok(root, *arguments):
+    code, out, err = invoke(D, root, *arguments)
+    assert code == 0, err
+    return json.loads(out)
+
+
+def snapshot_args(kit, rootfs, manifest, archive):
+    return (
+        "--kit", kit,
+        "--rootfs-stage", rootfs,
+        "--rootfs-manifest", manifest,
+        "--assets", archive,
+        "--runtime-assets", "none",
+        "--vmlinux-symvers", "none",
+        "--module-symvers", "none",
+    )
+
+
+def snapshot_ok(root, *arguments):
+    code, out, err = invoke(S, root, *arguments)
+    assert code == 0, err
+    return json.loads(out)
+
+
+def snapshot_fail(name, root, arguments, *outputs):
+    code, out, err = invoke(S, root, *arguments)
+    assert code != 0, f"{name}: accepted\n{out}"
+    for output in outputs:
+        assert not os.path.lexists(output), f"{name}: left output {output}"
+    ok(f"{name} is rejected")
+
+
+def walk(path, *, allow_symlinks=False):
+    descriptor = D.open_canonical_dir(str(path), "test tree")
+    try:
+        tree = D.walk_tree(
+            descriptor, D.ROOTFS_LIMITS, allow_symlinks=allow_symlinks, keep_data=True
+        )
+    finally:
+        os.close(descriptor)
+    return tree.entries, tree.data
+
+
+fixture = make_fixture()
+rootfs, rootfs_manifest = make_rootfs(fixture)
+stage = work / "module-stage"
+deploy_ok(fixture["root"], "stage-modules", "--assets", fixture["archive"], "--out", stage)
+kit = work / "kit"
+deploy_ok(
+    fixture["root"], "assemble",
+    "--rootfs-stage", rootfs, "--rootfs-manifest", rootfs_manifest,
+    "--module-stage", stage, "--assets", fixture["archive"],
+    "--runtime-assets", "none", "--vmlinux-symvers", "none",
+    "--module-symvers", "none", "--out", kit,
+)
+base_args = snapshot_args(kit, rootfs, rootfs_manifest, fixture["archive"])
+
+# Deterministic exact closure.
+snapshot_a = work / "snapshot-a"
+snapshot_b = work / "snapshot-b"
+bound = snapshot_ok(fixture["root"], "bind", *base_args, "--out", snapshot_a)
+snapshot_ok(fixture["root"], "bind", *base_args, "--out", snapshot_b)
+assert walk(snapshot_a) == walk(snapshot_b)
+entries, data = walk(snapshot_a)
+assert sorted(e.path for e in entries if e.kind == "file") == [
+    "SHA256SUMS", "STATUS.txt", "contracts/snapshot-contract.json",
+    "snapshot.json", "status.json",
+]
+assert {e.path for e in entries if e.kind == "dir"} == {".", "contracts"}
+assert bound["capture_status"] == "not-captured"
+assert bound["atomicity_proven"] is False and bound["rollback_proven"] is False
+assert bound["deployment_authorized"] is False
+document = json.loads(data["snapshot.json"])
+assert document["status"]["blockers"] == D.BLOCKERS
+assert document["capture"] == {
+    "generation": 0, "method": "synthetic-offline", "quiescence": "not-proven",
+    "source_kind": "directory", "status": "not-captured",
+}
+assert not any(marker in b"".join(data.values()) for marker in (b"vermagic=", b"SECRET"))
+ok("bind is deterministic and writes only five refusal-preserving metadata files")
+
+verified = snapshot_ok(fixture["root"], "verify", *base_args, "--snapshot", snapshot_a)
+assert verified["status"] == "verified" and verified["deployment_authorized"] is False
+ok("verify recomputes the deployment kit and every snapshot binding")
+
+# A manifest path replaced after kit verification must never become the bound
+# identity. The already-verified kit is the source of that generation's hash.
+manifest_a = rootfs_manifest.read_bytes()
+manifest_b = manifest_a + b"replacement-after-verification\n"
+real_verify_deployment = S.verify_deployment
+replaced = [False]
+
+
+def replace_manifest_after_verify(contracts, args):
+    report = real_verify_deployment(contracts, args)
+    if not replaced[0]:
+        replaced[0] = True
+        rootfs_manifest.write_bytes(manifest_b)
+    return report
+
+
+S.verify_deployment = replace_manifest_after_verify
+manifest_race_snapshot = work / "snapshot-manifest-race"
+try:
+    result = snapshot_ok(
+        fixture["root"], "bind", *base_args, "--out", manifest_race_snapshot
+    )
+finally:
+    S.verify_deployment = real_verify_deployment
+    rootfs_manifest.write_bytes(manifest_a)
+assert result["status"] == "bound"
+_, race_data = walk(manifest_race_snapshot)
+race_document = json.loads(race_data["snapshot.json"])
+assert race_document["bindings"]["rootfs"]["manifest_sha256"] == digest(manifest_a)
+assert race_document["bindings"]["rootfs"]["manifest_sha256"] != digest(manifest_b)
+snapshot_ok(
+    fixture["root"], "verify", *base_args, "--snapshot", manifest_race_snapshot
+)
+ok("manifest replacement after verification cannot alter the kit-bound identity")
+
+# Keeping the old checksum list while replacing kit.json after verification
+# must not let the replacement supply a new manifest identity.
+kit_document_a = (kit / "kit.json").read_bytes()
+real_verify_deployment = S.verify_deployment
+replaced = [False]
+
+
+def replace_kit_document_after_verify(contracts, args):
+    report = real_verify_deployment(contracts, args)
+    if not replaced[0]:
+        replaced[0] = True
+        value = json.loads(kit_document_a)
+        value["rootfs"]["manifest_sha256"] = "0" * 64
+        (kit / "kit.json").write_bytes(D.render_json(value))
+    return report
+
+
+S.verify_deployment = replace_kit_document_after_verify
+kit_race_snapshot = work / "snapshot-kit-race"
+try:
+    snapshot_fail(
+        "kit.json replacement after verification", fixture["root"],
+        ["bind", *base_args, "--out", kit_race_snapshot], kit_race_snapshot,
+    )
+finally:
+    S.verify_deployment = real_verify_deployment
+    (kit / "kit.json").write_bytes(kit_document_a)
+ok("post-verification kit replacement cannot alter bound rootfs evidence")
+
+# Read-only rollback rehearsal: match is not proof; any content or metadata drift fails.
+rollback = fresh("rollback") / "tree"
+shutil.copytree(rootfs, rollback, symlinks=True)
+result = snapshot_ok(
+    fixture["root"], "rehearse-rollback", "--snapshot", snapshot_a, "--tree", rollback
+)
+assert result["status"] == "digest-match"
+assert result["atomicity_proven"] is False and result["rollback_proven"] is False
+(rollback / "tmp").mkdir(mode=0o777)
+(rollback / "tmp").chmod(0o1777)
+code, out, err = invoke(
+    S, fixture["root"], "rehearse-rollback", "--snapshot", snapshot_a, "--tree", rollback
+)
+assert code == 1 and not err and json.loads(out)["status"] == "digest-mismatch"
+(rollback / "tmp").rmdir()
+
+
+def mismatch(name, mutate):
+    clone = fresh("rollback-mismatch") / "tree"
+    shutil.copytree(rootfs, clone, symlinks=True)
+    mutate(clone)
+    code, out, err = invoke(
+        S, fixture["root"], "rehearse-rollback", "--snapshot", snapshot_a, "--tree", clone
+    )
+    assert code == 1 and not err, (name, out, err)
+    value = json.loads(out)
+    assert value["status"] == "digest-mismatch"
+    assert value["atomicity_proven"] is False and value["rollback_proven"] is False
+
+
+mismatch("changed byte", lambda t: (t / "usr/share/omamobile/device-myron/version").write_bytes(b"changed\n"))
+mismatch("changed mode", lambda t: os.chmod(t / "usr/share/omamobile/device-myron/version", 0o600))
+mismatch("added file", lambda t: (t / "extra").write_bytes(b"x"))
+mismatch("removed file", lambda t: (t / "usr/share/omamobile/device-myron/version").unlink())
+mismatch("unfollowed symlink", lambda t: (t / "escape").symlink_to("/etc/passwd"))
+ok("rollback rehearsal matches only a byte-and-mode-identical tree and proves nothing")
+
+for name, mutation in (
+    ("hardlink", lambda t: os.link(t / "usr/share/omamobile/device-myron/version", t / "linked")),
+    ("special file", lambda t: os.mkfifo(t / "fifo")),
+):
+    clone = fresh("unsafe-tree") / "tree"
+    shutil.copytree(rootfs, clone, symlinks=True)
+    mutation(clone)
+    snapshot_fail(
+        name, fixture["root"],
+        ["rehearse-rollback", "--snapshot", snapshot_a, "--tree", clone],
+    )
+
+# Strict document and authority refusal. The checksum mismatch cannot mask the
+# stronger document validator because snapshot.json is parsed first.
+def tampered_snapshot(name, mutate):
+    clone = fresh("snapshot-tamper") / "snapshot"
+    shutil.copytree(snapshot_a, clone)
+    value = json.loads((clone / "snapshot.json").read_text())
+    mutate(value)
+    (clone / "snapshot.json").write_bytes(D.render_json(value))
+    files = [
+        "STATUS.txt", "contracts/snapshot-contract.json", "snapshot.json", "status.json"
+    ]
+    (clone / "SHA256SUMS").write_text("".join(
+        f"{digest((clone / path).read_bytes())}  {path}\n" for path in files
+    ))
+    snapshot_fail(
+        name, fixture["root"], ["verify", *base_args, "--snapshot", clone]
+    )
+
+
+tampered_snapshot("unknown snapshot field", lambda v: v.update(extra=True))
+tampered_snapshot("boolean snapshot schema", lambda v: v.update(schema=True))
+tampered_snapshot("floating snapshot schema", lambda v: v.update(schema=1.0))
+tampered_snapshot("boolean capture generation", lambda v: v["capture"].update(generation=False))
+tampered_snapshot("floating capture generation", lambda v: v["capture"].update(generation=0.0))
+tampered_snapshot("false atomicity claim", lambda v: v["status"].update(atomicity_proven=True))
+tampered_snapshot("false rollback claim", lambda v: v["status"].update(rollback_proven=True))
+tampered_snapshot("false deployment claim", lambda v: v["status"].update(deployment_authorized=True))
+tampered_snapshot("changed capture status", lambda v: v["capture"].update(status="captured"))
+tampered_snapshot("changed quiescence", lambda v: v["capture"].update(quiescence="proven"))
+tampered_snapshot("changed rollback status", lambda v: v["rollback"].update(status="proven"))
+tampered_snapshot("changed blocker", lambda v: v["status"]["blockers"].pop())
+tampered_snapshot("changed contract hash", lambda v: v.update(contract_sha256="0" * 64))
+tampered_snapshot("changed runtime digest", lambda v: v["bindings"]["runtime"].update(digest="0" * 64))
+tampered_snapshot("changed ABI scope", lambda v: v["bindings"]["abi"].update(scope="full"))
+ok("strict snapshot schema rejects tamper and every authority claim")
+
+# Non-canonical JSON and checksum closure tamper.
+clone = fresh("snapshot-noncanonical") / "snapshot"
+shutil.copytree(snapshot_a, clone)
+(clone / "snapshot.json").write_text(json.dumps(document))
+snapshot_fail("non-canonical snapshot JSON", fixture["root"], ["verify", *base_args, "--snapshot", clone])
+clone = fresh("snapshot-sums") / "snapshot"
+shutil.copytree(snapshot_a, clone)
+(clone / "SHA256SUMS").write_bytes(b"0" * 64 + b"  snapshot.json\n")
+snapshot_fail("changed checksum closure", fixture["root"], ["verify", *base_args, "--snapshot", clone])
+
+# Deployment input tamper is caught before a snapshot can be bound or verified.
+bad_archive = fresh("bad-archive") / "assets.tar.gz"
+bad_archive.write_bytes(fixture["archive"].read_bytes() + b"x")
+snapshot_fail(
+    "changed module archive", fixture["root"],
+    ["verify", *snapshot_args(kit, rootfs, rootfs_manifest, bad_archive), "--snapshot", snapshot_a],
+)
+bad_manifest = fresh("bad-manifest") / "rootfs.MANIFEST"
+bad_manifest.write_bytes(rootfs_manifest.read_bytes() + b"changed\n")
+snapshot_fail(
+    "changed rootfs manifest", fixture["root"],
+    ["verify", *snapshot_args(kit, rootfs, bad_manifest, fixture["archive"]), "--snapshot", snapshot_a],
+)
+bad_rootfs = fresh("bad-rootfs") / "rootfs"
+shutil.copytree(rootfs, bad_rootfs, symlinks=True)
+(bad_rootfs / "opt-drift").write_bytes(b"drift")
+snapshot_fail(
+    "changed rootfs", fixture["root"],
+    ["verify", *snapshot_args(kit, bad_rootfs, rootfs_manifest, fixture["archive"]), "--snapshot", snapshot_a],
+)
+bad_kit = fresh("bad-kit") / "kit"
+shutil.copytree(kit, bad_kit)
+(bad_kit / "status.json").write_bytes(b"{}\n")
+snapshot_fail(
+    "changed deployment kit", fixture["root"],
+    ["verify", *snapshot_args(bad_kit, rootfs, rootfs_manifest, fixture["archive"]), "--snapshot", snapshot_a],
+)
+ok("kit, rootfs, manifest and archive changes fail closed")
+
+# Output safety and input preservation.
+existing = work / "existing"
+existing.mkdir()
+snapshot_fail(
+    "existing output", fixture["root"], ["bind", *base_args, "--out", existing]
+)
+inside = rootfs / "snapshot-output"
+snapshot_fail(
+    "output inside rootfs", fixture["root"], ["bind", *base_args, "--out", inside], inside
+)
+unsafe_parent = work / "unsafe-parent"
+unsafe_parent.mkdir()
+unsafe_parent.chmod(0o777)
+try:
+    snapshot_fail(
+        "unsafe output parent", fixture["root"],
+        ["bind", *base_args, "--out", unsafe_parent / "snapshot"],
+        unsafe_parent / "snapshot",
+    )
+finally:
+    unsafe_parent.chmod(0o700)
+ok("publication refuses existing, overlapping and unsafe output paths")
+
+# A distinct valid kit/rootfs generation cannot verify snapshot A.
+rootfs_b, manifest_b = make_rootfs(fixture)
+(rootfs_b / "opt-generation-b").write_bytes(b"generation-b")
+stage_b = work / "module-stage-b"
+deploy_ok(fixture["root"], "stage-modules", "--assets", fixture["archive"], "--out", stage_b)
+kit_b = work / "kit-b"
+deploy_ok(
+    fixture["root"], "assemble",
+    "--rootfs-stage", rootfs_b, "--rootfs-manifest", manifest_b,
+    "--module-stage", stage_b, "--assets", fixture["archive"],
+    "--runtime-assets", "none", "--vmlinux-symvers", "none",
+    "--module-symvers", "none", "--out", kit_b,
+)
+snapshot_fail(
+    "snapshot from another generation", fixture["root"],
+    ["verify", *snapshot_args(kit_b, rootfs_b, manifest_b, fixture["archive"]),
+     "--snapshot", snapshot_a],
+)
+ok("snapshot A cannot verify against a distinct valid kit generation")
+
+# The tool itself never spawns a process.
+def boom(*args, **kwargs):
+    raise AssertionError("process spawn attempted")
+
+
+saved = (os.system, os.fork, os.posix_spawn, os.execv, os.execvp)
+os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 5
+try:
+    snapshot_ok(fixture["root"], "verify", *base_args, "--snapshot", snapshot_a)
+    snapshot_ok(
+        fixture["root"], "rehearse-rollback", "--snapshot", snapshot_a, "--tree", rollback
+    )
+finally:
+    os.system, os.fork, os.posix_spawn, os.execv, os.execvp = saved
+ok("verify and rollback rehearsal spawn no process")
+PY
+
+pass "myron snapshot candidate tests passed"

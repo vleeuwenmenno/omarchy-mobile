@@ -115,6 +115,14 @@ the exact archive and symvers pair into `kit.json`; it copies no symvers or full
 symbol table, leaves vendor modules and order unverified, preserves all seven
 blockers, and still always refuses deployment. No real archive/symvers set has
 been bound.
+`tools/myron-snapshot` 0.1.0 (Phase 2.9) builds a separate deterministic
+five-file metadata candidate only after re-verifying the complete kit. It binds
+the kit identity and pre-deployment rootfs digest and provides a read-only
+digest rehearsal for a candidate rollback tree. Capture stays `not-captured`;
+quiescence, atomicity and rollback stay `not-proven`; all authority flags stay
+false and all seven blockers remain. It is not a filesystem snapshot or
+restore mechanism and copies no payload bytes
+([SNAPSHOT-GATE](myron/SNAPSHOT-GATE.md)).
 
 ### 3.2 Keys to add later
 

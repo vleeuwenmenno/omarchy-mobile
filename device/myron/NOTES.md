@@ -57,6 +57,16 @@ remain unverified, module order remains `unverified`, activation remains
 disabled, all seven blockers stay unchanged, and the gate still refuses. No
 real archive or symvers pair has been bound.
 
+Phase 2.9 adds `device/myron/snapshot-contract.json` and the laptop-only
+`tools/myron-snapshot` 0.1.0. It re-verifies every deployment-kit input, then
+binds only the kit identity, rootfs digest/manifest, archive hash, runtime
+summary and ABI summary into a deterministic five-file metadata artifact. Its
+read-only rollback rehearsal compares a candidate tree with the bound rootfs
+digest but always reports atomicity and rollback as unproven. Version 0.1.0
+accepts only `not-captured` and `not-proven` evidence, preserves all seven
+blockers, copies no payload bytes and performs no capture, restore or deploy.
+See [SNAPSHOT-GATE.md](../../docs/myron/SNAPSHOT-GATE.md).
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,

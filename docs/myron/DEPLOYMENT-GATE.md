@@ -182,6 +182,12 @@ seven-item blocker list. The gate reports `abi_status`, `abi_scope`,
   filesystem snapshot. They must be quiescent while a command runs. This is why
   `atomic-snapshot-and-rollback-not-proven` remains a permanent blocker.
 
+Phase 2.9 adds a separate metadata-only snapshot candidate around a fully
+re-verified kit and its pre-deployment rootfs digest. Its rollback rehearsal is
+read-only and deliberately cannot record a capture, quiescence, atomicity or
+successful restore. It does not alter this kit format or clear the blocker.
+See [SNAPSHOT-GATE.md](SNAPSHOT-GATE.md).
+
 ## Permanent blockers
 
 The gate refuses while these hold, and this tool can clear none of them:

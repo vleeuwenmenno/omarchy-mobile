@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Build and verify a non-authorizing Myron snapshot candidate (v0.1)."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+if __name__ == "__main__":
+    _here = os.path.dirname(os.path.realpath(__file__))
+    sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _here]
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import re
+
+sys.dont_write_bytecode = True
+
+VERSION = "0.1.0"
+REPO = Path(__file__).resolve().parent.parent
+DEPLOYMENT_TOOL = REPO / "tools/myron-deployment"
+SNAPSHOT_CONTRACT_PATH = "device/myron/snapshot-contract.json"
+SNAPSHOT_KIND = "myron-snapshot-candidate"
+CONTRACT_KIND = "myron-snapshot-candidate-contract"
+SNAPSHOT_ALGORITHM = "myron-snapshot-candidate-v1-sha256"
+ROLLBACK_ALGORITHM = "myron-rollback-rehearsal-v1-sha256"
+CAPTURE_METHOD = "synthetic-offline"
+CAPTURE_STATUS = "not-captured"
+QUIESCENCE_STATUS = "not-proven"
+ROLLBACK_STATUS = "not-proven"
+ACCEPTANCE = (
+    "restored rootfs tree digest equals the bound pre-deployment rootfs digest; "
+    "overlay files absent"
+)
+SNAPSHOT_FLAGS = (
+    "atomicity_proven",
+    "rollback_proven",
+    "deployment_authorized",
+    "bootable",
+    "flashable",
+    "image_ready",
+    "hardware_qualified",
+    "atomic_snapshot_proof",
+)
+HEX256 = re.compile(r"[0-9a-f]{64}")
+STATUS_TEXT = (
+    "Omarchy Mobile Myron snapshot candidate (laptop-only)\n"
+    "\n"
+    "atomicity_proven: false\n"
+    "rollback_proven: false\n"
+    "deployment_authorized: false\n"
+    "This metadata-only artifact is NOT a filesystem snapshot, restore, bootable\n"
+    "image, flashable image, hardware qualification or deployment authorization.\n"
+    "It binds a verified kit and a pre-deployment rootfs digest. All permanent\n"
+    "blockers remain in status.json.\n"
+).encode("ascii")
+
+
+class SnapshotError(Exception):
+    """Snapshot input or evidence differs from the reviewed refusal contract."""
+
+
+_deployment = None
+
+
+def deploy():
+    global _deployment
+    if _deployment is None:
+        try:
+            loader = importlib.machinery.SourceFileLoader("myron_deployment", str(DEPLOYMENT_TOOL))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+        except (OSError, SyntaxError) as error:
+            raise SnapshotError(f"cannot load the deployment verifier: {error}") from error
+        if module.VERSION != "0.3.0":
+            raise SnapshotError(
+                f"unsupported deployment verifier {module.VERSION}; expected 0.3.0"
+            )
+        _deployment = module
+    return _deployment
+
+
+def expected_snapshot_contract(contracts) -> dict:
+    d = deploy()
+    return {
+        "schema": 1,
+        "kind": CONTRACT_KIND,
+        "format_version": VERSION,
+        "components": {
+            "deployment_contract": {
+                "path": d.DEPLOYMENT_CONTRACT_PATH,
+                "sha256": contracts.deployment_sha256,
+            }
+        },
+        "snapshot": {
+            "kind": SNAPSHOT_KIND,
+            "algorithm": SNAPSHOT_ALGORITHM,
+            "contents": "metadata-and-hash-bindings-only",
+            "capture_method": CAPTURE_METHOD,
+            "capture_status": CAPTURE_STATUS,
+            "quiescence": QUIESCENCE_STATUS,
+        },
+        "rollback": {
+            "algorithm": ROLLBACK_ALGORITHM,
+            "status": ROLLBACK_STATUS,
+            "acceptance": ACCEPTANCE,
+        },
+        "blockers": list(d.BLOCKERS),
+        **{flag: False for flag in SNAPSHOT_FLAGS},
+    }
+
+
+def load_snapshot_contract(contracts_root: Path, contracts) -> tuple[dict, bytes, str]:
+    d = deploy()
+    path = f"{contracts_root}/{SNAPSHOT_CONTRACT_PATH}"
+    data = d.read_file(path, "snapshot contract", d.MAX_SMALL_BYTES)
+    value = d.strict_json(data, "snapshot contract")
+    expected = expected_snapshot_contract(contracts)
+    if not d.kernel().strict_equal(value, expected):
+        raise SnapshotError("snapshot contract differs from its derived form")
+    if data != d.render_json(expected):
+        raise SnapshotError("snapshot contract is not in canonical form")
+    return value, data, d.sha256_bytes(data)
+
+
+def status_document() -> dict:
+    d = deploy()
+    return {
+        "artifact": SNAPSHOT_KIND,
+        "blockers": list(d.BLOCKERS),
+        **{flag: False for flag in SNAPSHOT_FLAGS},
+    }
+
+
+def require_hash(value, label: str, *, nullable: bool = False):
+    if nullable and value is None:
+        return
+    if type(value) is not str or not HEX256.fullmatch(value):
+        raise SnapshotError(f"{label} is not a SHA-256 digest")
+
+
+def require_count(value, label: str) -> None:
+    if type(value) is not int or value < 0:
+        raise SnapshotError(f"{label} is not a non-negative integer")
+
+
+def validate_bindings(bindings, contracts) -> dict:
+    d = deploy()
+    if type(bindings) is not dict or set(bindings) != {
+        "kit", "rootfs", "archive_sha256", "runtime", "abi"
+    }:
+        raise SnapshotError("snapshot bindings fields differ")
+
+    kit = bindings["kit"]
+    if type(kit) is not dict or set(kit) != {"format_version", "sha256"}:
+        raise SnapshotError("snapshot kit binding fields differ")
+    if kit["format_version"] != d.VERSION:
+        raise SnapshotError("snapshot kit format version differs")
+    require_hash(kit["sha256"], "snapshot kit hash")
+
+    rootfs = bindings["rootfs"]
+    if type(rootfs) is not dict or set(rootfs) != {
+        "digest", "digest_algorithm", "manifest_sha256"
+    }:
+        raise SnapshotError("snapshot rootfs binding fields differ")
+    if rootfs["digest_algorithm"] != d.ROOTFS_DIGEST_ALGORITHM:
+        raise SnapshotError("snapshot rootfs digest algorithm differs")
+    require_hash(rootfs["digest"], "snapshot rootfs digest")
+    require_hash(rootfs["manifest_sha256"], "snapshot rootfs manifest hash")
+
+    if bindings["archive_sha256"] != contracts.reference["module_assets"]["archive_sha256"]:
+        raise SnapshotError("snapshot archive binding differs from the deployment contract")
+
+    runtime = bindings["runtime"]
+    if type(runtime) is not dict or set(runtime) != {"status", "asset_count", "digest"}:
+        raise SnapshotError("snapshot runtime binding fields differ")
+    if runtime["status"] not in ("not-bound", "verified"):
+        raise SnapshotError("snapshot runtime status differs")
+    require_count(runtime["asset_count"], "snapshot runtime asset count")
+    if runtime["status"] == "not-bound":
+        if runtime["asset_count"] != 0 or runtime["digest"] is not None:
+            raise SnapshotError("snapshot not-bound runtime evidence differs")
+    else:
+        if runtime["asset_count"] == 0:
+            raise SnapshotError("snapshot verified runtime evidence is empty")
+        require_hash(runtime["digest"], "snapshot runtime digest")
+
+    abi = bindings["abi"]
+    if type(abi) is not dict or set(abi) != {
+        "status", "scope", "module_count", "digest"
+    }:
+        raise SnapshotError("snapshot ABI binding fields differ")
+    if abi["scope"] != d.ABI_SCOPE or abi["status"] not in (
+        "not-bound", "staged-set-consistent"
+    ):
+        raise SnapshotError("snapshot ABI status or scope differs")
+    require_count(abi["module_count"], "snapshot ABI module count")
+    if abi["status"] == "not-bound":
+        if abi["module_count"] != 0 or abi["digest"] is not None:
+            raise SnapshotError("snapshot not-bound ABI evidence differs")
+    else:
+        if abi["module_count"] == 0:
+            raise SnapshotError("snapshot bound ABI evidence is empty")
+        require_hash(abi["digest"], "snapshot ABI digest")
+    return bindings
+
+
+def validate_snapshot_document(value, contracts, contract_sha256: str) -> dict:
+    d = deploy()
+    if type(value) is not dict or set(value) != {
+        "schema", "kind", "format_version", "contract_sha256", "bindings",
+        "capture", "rollback", "status",
+    }:
+        raise SnapshotError("snapshot document fields differ")
+    if type(value["schema"]) is not int or value["schema"] != 1 or value["kind"] != SNAPSHOT_KIND:
+        raise SnapshotError("snapshot identity differs")
+    if value["format_version"] != VERSION:
+        raise SnapshotError("snapshot format version differs")
+    if value["contract_sha256"] != contract_sha256:
+        raise SnapshotError("snapshot contract hash differs")
+    validate_bindings(value["bindings"], contracts)
+
+    capture = value["capture"]
+    expected_capture = {
+        "method": CAPTURE_METHOD,
+        "source_kind": "directory",
+        "quiescence": QUIESCENCE_STATUS,
+        "status": CAPTURE_STATUS,
+        "generation": 0,
+    }
+    if not d.kernel().strict_equal(capture, expected_capture):
+        raise SnapshotError("snapshot capture evidence may only be synthetic and not-captured")
+
+    rollback = value["rollback"]
+    if type(rollback) is not dict or set(rollback) != {
+        "algorithm", "status", "acceptance", "expected_rootfs_digest"
+    }:
+        raise SnapshotError("snapshot rollback fields differ")
+    expected_digest = value["bindings"]["rootfs"]["digest"]
+    if rollback != {
+        "algorithm": ROLLBACK_ALGORITHM,
+        "status": ROLLBACK_STATUS,
+        "acceptance": ACCEPTANCE,
+        "expected_rootfs_digest": expected_digest,
+    }:
+        raise SnapshotError("snapshot rollback evidence differs")
+
+    if not d.kernel().strict_equal(value["status"], status_document()):
+        raise SnapshotError("snapshot status or permanent blockers differ")
+    for flag in SNAPSHOT_FLAGS:
+        if value["status"].get(flag) is not False:
+            raise SnapshotError(f"snapshot claims {flag}; authorization is refused")
+    if value["status"]["blockers"] != d.BLOCKERS:
+        raise SnapshotError("snapshot blocker list differs")
+    return value
+
+
+def verified_kit_rootfs_binding(kit: str, report: dict) -> dict:
+    """Read the manifest identity from the exact kit identity just verified.
+
+    Never reread the mutable external manifest after deployment verification:
+    the kit's canonical checksum identity is what binds that input generation.
+    """
+    d = deploy()
+    descriptor, identity = d.open_trusted_artifact(kit, "verified kit binding")
+    try:
+        tree = d.walk_tree(
+            descriptor,
+            d.STAGE_LIMITS,
+            allow_symlinks=False,
+            keep_data=True,
+            trusted_ownership=True,
+            label="verified kit binding",
+        )
+    finally:
+        os.close(descriptor)
+    sums = tree.data.get("SHA256SUMS")
+    document_bytes = tree.data.get("kit.json")
+    if sums is None or d.sha256_bytes(sums) != report["kit_sha256"]:
+        raise SnapshotError("verified kit identity changed before snapshot binding")
+    if document_bytes is None:
+        raise SnapshotError("verified kit has no kit.json")
+    checksum_line = f"{d.sha256_bytes(document_bytes)}  kit.json\n".encode("ascii")
+    if checksum_line not in sums.splitlines(keepends=True):
+        raise SnapshotError("verified kit kit.json differs from its verified checksum identity")
+    document = d.strict_json(document_bytes, "verified kit kit.json")
+    if document_bytes != d.render_json(document):
+        raise SnapshotError("verified kit kit.json is not canonical")
+    rootfs = document.get("rootfs")
+    if type(rootfs) is not dict:
+        raise SnapshotError("verified kit has no rootfs binding")
+    manifest_sha256 = rootfs.get("manifest_sha256")
+    require_hash(manifest_sha256, "verified kit rootfs manifest hash")
+    if rootfs.get("digest") != report["rootfs_digest"]:
+        raise SnapshotError("verified kit rootfs digest changed before snapshot binding")
+    d.recheck_trusted_artifact(kit, identity, "verified kit binding")
+    return {
+        "digest": report["rootfs_digest"],
+        "digest_algorithm": d.ROOTFS_DIGEST_ALGORITHM,
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def bindings_from_report(contracts, report: dict, kit: str) -> dict:
+    d = deploy()
+    return {
+        "kit": {"format_version": d.VERSION, "sha256": report["kit_sha256"]},
+        "rootfs": verified_kit_rootfs_binding(kit, report),
+        "archive_sha256": contracts.reference["module_assets"]["archive_sha256"],
+        "runtime": {
+            "status": report["runtime_status"],
+            "asset_count": report["runtime_asset_count"],
+            "digest": report["runtime_digest"],
+        },
+        "abi": {
+            "status": report["abi_status"],
+            "scope": report["abi_scope"],
+            "module_count": report["abi_module_count"],
+            "digest": report["abi_digest"],
+        },
+    }
+
+
+def snapshot_document(contracts, contract_sha256: str, report: dict, kit: str) -> dict:
+    bindings = bindings_from_report(contracts, report, kit)
+    document = {
+        "schema": 1,
+        "kind": SNAPSHOT_KIND,
+        "format_version": VERSION,
+        "contract_sha256": contract_sha256,
+        "bindings": bindings,
+        "capture": {
+            "method": CAPTURE_METHOD,
+            "source_kind": "directory",
+            "quiescence": QUIESCENCE_STATUS,
+            "status": CAPTURE_STATUS,
+            "generation": 0,
+        },
+        "rollback": {
+            "algorithm": ROLLBACK_ALGORITHM,
+            "status": ROLLBACK_STATUS,
+            "acceptance": ACCEPTANCE,
+            "expected_rootfs_digest": bindings["rootfs"]["digest"],
+        },
+        "status": status_document(),
+    }
+    return validate_snapshot_document(document, contracts, contract_sha256)
+
+
+def snapshot_spec(contract_bytes: bytes, document: dict) -> list:
+    d = deploy()
+    files = {
+        "contracts/snapshot-contract.json": contract_bytes,
+        "snapshot.json": d.render_json(document),
+        "status.json": d.render_json(status_document()),
+        "STATUS.txt": STATUS_TEXT,
+    }
+    sums = "".join(
+        f"{d.sha256_bytes(files[path])}  {path}\n" for path in sorted(files)
+    ).encode("ascii")
+    files["SHA256SUMS"] = sums
+    spec = [("contracts", "dir", 0o755, None)]
+    spec += [(path, "file", 0o644, data) for path, data in files.items()]
+    spec.sort(key=lambda item: item[0].encode("utf-8"))
+    return spec
+
+
+def read_snapshot(path: str, contracts, contract_bytes: bytes, contract_sha256: str):
+    d = deploy()
+    descriptor, identity = d.open_trusted_artifact(path, "snapshot candidate")
+    try:
+        tree = d.walk_tree(
+            descriptor,
+            d.STAGE_LIMITS,
+            allow_symlinks=False,
+            keep_data=True,
+            trusted_ownership=True,
+            label="snapshot candidate",
+        )
+    finally:
+        os.close(descriptor)
+    raw = tree.data.get("snapshot.json")
+    if raw is None:
+        raise SnapshotError("snapshot candidate has no snapshot.json")
+    document = d.strict_json(raw, "snapshot.json")
+    if raw != d.render_json(document):
+        raise SnapshotError("snapshot.json is not in canonical form")
+    validate_snapshot_document(document, contracts, contract_sha256)
+    expected = snapshot_spec(contract_bytes, document)
+    d.diff_entries(tree.entries, d.spec_entries(expected), "snapshot candidate")
+    d.recheck_trusted_artifact(path, identity, "snapshot candidate")
+    return document, tree.directory_ids, identity
+
+
+def collect_directory_ids(
+    path: str, limits, label: str, *, allow_symlinks: bool, trusted_ownership: bool
+) -> frozenset:
+    d = deploy()
+    descriptor, identity = d.open_trusted_artifact(path, label)
+    try:
+        tree = d.walk_tree(
+            descriptor,
+            limits,
+            allow_symlinks=allow_symlinks,
+            trusted_ownership=trusted_ownership,
+            label=label,
+        )
+    finally:
+        os.close(descriptor)
+    d.recheck_trusted_artifact(path, identity, label)
+    return tree.directory_ids
+
+
+def verify_deployment(contracts, args) -> dict:
+    d = deploy()
+    report = d.command_verify(
+        contracts,
+        args.kit,
+        args.rootfs_stage,
+        args.rootfs_manifest,
+        args.assets,
+        d.runtime_input(args.runtime_assets, args.runtime_manifest),
+        d.abi_input(args.vmlinux_symvers, args.module_symvers),
+    )
+    if report.get("status") != "verified" or report.get("deployment_authorized") is not False:
+        raise SnapshotError("deployment kit did not produce refusal-preserving verified evidence")
+    return report
+
+
+def protected_inputs(args) -> tuple[list[str], frozenset]:
+    d = deploy()
+    paths = [args.kit, args.rootfs_stage]
+    ids = set(collect_directory_ids(
+        args.kit, d.STAGE_LIMITS, "kit", allow_symlinks=False, trusted_ownership=True
+    ))
+    ids.update(
+        collect_directory_ids(
+            args.rootfs_stage, d.ROOTFS_LIMITS, "rootfs stage", allow_symlinks=True,
+            trusted_ownership=False,
+        )
+    )
+    if args.runtime_assets != d.RUNTIME_NONE:
+        paths.append(args.runtime_assets)
+        ids.update(
+            collect_directory_ids(
+                args.runtime_assets,
+                d.RUNTIME_LIMITS,
+                "runtime assets root",
+                allow_symlinks=False,
+                trusted_ownership=True,
+            )
+        )
+    return paths, frozenset(ids)
+
+
+def command_show(contract: dict) -> dict:
+    return contract
+
+
+def command_bind(contracts, contract_bytes: bytes, contract_sha256: str, args) -> dict:
+    d = deploy()
+    report = verify_deployment(contracts, args)
+    document = snapshot_document(
+        contracts, contract_sha256, report, args.kit
+    )
+    spec = snapshot_spec(contract_bytes, document)
+    expected = d.spec_entries(spec)
+    protected, protected_ids = protected_inputs(args)
+
+    def verify_built(temporary_path: str, descriptor: int) -> None:
+        tree = d.walk_tree(
+            descriptor, d.STAGE_LIMITS, allow_symlinks=False, label="snapshot candidate"
+        )
+        d.diff_entries(tree.entries, expected, "snapshot candidate")
+
+    d.publish(args.out, protected, protected_ids, spec, verify_built)
+    return {
+        "status": "bound",
+        "snapshot_sha256": d.sha256_bytes(
+            next(data for path, kind, mode, data in spec if path == "SHA256SUMS")
+        ),
+        "kit_sha256": report["kit_sha256"],
+        "rootfs_digest": report["rootfs_digest"],
+        "capture_status": CAPTURE_STATUS,
+        "quiescence": QUIESCENCE_STATUS,
+        "atomicity_proven": False,
+        "rollback_proven": False,
+        "deployment_authorized": False,
+    }
+
+
+def command_verify(contracts, contract_bytes: bytes, contract_sha256: str, args) -> dict:
+    d = deploy()
+    report = verify_deployment(contracts, args)
+    document, snapshot_ids, identity = read_snapshot(
+        args.snapshot, contracts, contract_bytes, contract_sha256
+    )
+    expected = snapshot_document(
+        contracts, contract_sha256, report, args.kit
+    )
+    if document != expected:
+        raise SnapshotError("snapshot bindings differ from the re-verified deployment inputs")
+    protected, input_ids = protected_inputs(args)
+    if d.paths_overlap(args.snapshot, args.kit) or d.paths_overlap(
+        args.snapshot, args.rootfs_stage
+    ):
+        raise SnapshotError("snapshot candidate overlaps a deployment input")
+    if set(snapshot_ids) & set(input_ids):
+        raise SnapshotError("snapshot candidate aliases a deployment input tree")
+    d.recheck_trusted_artifact(args.snapshot, identity, "snapshot candidate")
+    snapshot_tree = collect_directory_ids(
+        args.snapshot, d.STAGE_LIMITS, "snapshot candidate", allow_symlinks=False,
+        trusted_ownership=True,
+    )
+    if set(snapshot_tree) & set(input_ids):
+        raise SnapshotError("snapshot candidate aliases a deployment input tree")
+    return {
+        "status": "verified",
+        "kit_sha256": report["kit_sha256"],
+        "rootfs_digest": report["rootfs_digest"],
+        "capture_status": CAPTURE_STATUS,
+        "quiescence": QUIESCENCE_STATUS,
+        "atomicity_proven": False,
+        "rollback_proven": False,
+        "deployment_authorized": False,
+    }
+
+
+def command_rehearse_rollback(
+    contracts, contract_bytes: bytes, contract_sha256: str, snapshot: str, tree_path: str
+) -> tuple[dict, bool]:
+    d = deploy()
+    if d.paths_overlap(snapshot, tree_path):
+        raise SnapshotError("rollback rehearsal tree overlaps the snapshot candidate")
+    document, snapshot_ids, identity = read_snapshot(
+        snapshot, contracts, contract_bytes, contract_sha256
+    )
+    descriptor, tree_identity = d.open_trusted_artifact(tree_path, "rollback rehearsal tree")
+    try:
+        tree = d.walk_tree(
+            descriptor,
+            d.ROOTFS_LIMITS,
+            allow_symlinks=True,
+            trusted_ownership=False,
+            label="rollback rehearsal tree",
+        )
+    finally:
+        os.close(descriptor)
+    if set(snapshot_ids) & set(tree.directory_ids):
+        raise SnapshotError("rollback rehearsal tree aliases the snapshot candidate")
+    d.recheck_trusted_artifact(tree_path, tree_identity, "rollback rehearsal tree")
+    d.recheck_trusted_artifact(snapshot, identity, "snapshot candidate")
+    expected = document["rollback"]["expected_rootfs_digest"]
+    actual = d.tree_digest(tree.entries)
+    matched = actual == expected
+    return ({
+        "status": "digest-match" if matched else "digest-mismatch",
+        "algorithm": ROLLBACK_ALGORITHM,
+        "expected_digest": expected,
+        "actual_digest": actual,
+        "entry_count": len(tree.entries),
+        "atomicity_proven": False,
+        "rollback_proven": False,
+        "deployment_authorized": False,
+    }, matched)
+
+
+def add_deployment_arguments(sub) -> None:
+    d = deploy()
+    sub.add_argument("--kit", required=True)
+    sub.add_argument("--rootfs-stage", required=True)
+    sub.add_argument("--rootfs-manifest")
+    sub.add_argument("--assets", required=True)
+    sub.add_argument("--runtime-assets", required=True)
+    sub.add_argument("--runtime-manifest")
+    d.add_abi_arguments(sub)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("show", help="print the refusal-preserving snapshot contract")
+    bind = commands.add_parser("bind", help="bind a fully re-verified kit into a new candidate")
+    add_deployment_arguments(bind)
+    bind.add_argument("--out", required=True)
+    verify = commands.add_parser("verify", help="recompute every snapshot candidate binding")
+    add_deployment_arguments(verify)
+    verify.add_argument("--snapshot", required=True)
+    rehearsal = commands.add_parser(
+        "rehearse-rollback", help="compare a read-only tree with the bound pre-deployment digest"
+    )
+    rehearsal.add_argument("--snapshot", required=True)
+    rehearsal.add_argument("--tree", required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    d = deploy()
+    root = contracts_root or REPO
+    matched = True
+    try:
+        contracts = d.load_contracts(root)
+        contract, contract_bytes, contract_sha256 = load_snapshot_contract(root, contracts)
+        if args.command == "show":
+            result = command_show(contract)
+        elif args.command == "bind":
+            args.rootfs_manifest = args.rootfs_manifest or args.rootfs_stage + ".MANIFEST"
+            result = command_bind(contracts, contract_bytes, contract_sha256, args)
+        elif args.command == "verify":
+            args.rootfs_manifest = args.rootfs_manifest or args.rootfs_stage + ".MANIFEST"
+            result = command_verify(contracts, contract_bytes, contract_sha256, args)
+        else:
+            result, matched = command_rehearse_rollback(
+                contracts, contract_bytes, contract_sha256, args.snapshot, args.tree
+            )
+    except (SnapshotError, *d.handled_errors()) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if matched else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,41 @@
+{
+  "atomic_snapshot_proof": false,
+  "atomicity_proven": false,
+  "blockers": [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization"
+  ],
+  "bootable": false,
+  "components": {
+    "deployment_contract": {
+      "path": "device/myron/deployment-contract.json",
+      "sha256": "77aeb784326943ce9bcfa76de599d04502370a333d234561b477f269d9ebaee9"
+    }
+  },
+  "deployment_authorized": false,
+  "flashable": false,
+  "format_version": "0.1.0",
+  "hardware_qualified": false,
+  "image_ready": false,
+  "kind": "myron-snapshot-candidate-contract",
+  "rollback": {
+    "acceptance": "restored rootfs tree digest equals the bound pre-deployment rootfs digest; overlay files absent",
+    "algorithm": "myron-rollback-rehearsal-v1-sha256",
+    "status": "not-proven"
+  },
+  "rollback_proven": false,
+  "schema": 1,
+  "snapshot": {
+    "algorithm": "myron-snapshot-candidate-v1-sha256",
+    "capture_method": "synthetic-offline",
+    "capture_status": "not-captured",
+    "contents": "metadata-and-hash-bindings-only",
+    "kind": "myron-snapshot-candidate",
+    "quiescence": "not-proven"
+  }
+}
