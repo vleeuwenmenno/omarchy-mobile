@@ -1046,12 +1046,11 @@ def pin_reads(directory: int, root, root_mount: int) -> list:
 def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> None:
     """The listing, the directory and every pinned file still match what admission recorded.
 
-    The interval is bracketed on both sides: the directory and listing are checked, then every
-    file (descriptor and name), then the directory again, then every file a second time, then the
-    directory a last time. A change to any file or to the directory made while this function runs
-    lands after one observation of that state and before another, so the two sides disagree and
-    it is refused. This is best-effort detection, not a guarantee: a change after a file's final
-    observation is out of reach (any finite sequence of observations has a final one), and a
+    The interval is sampled repeatedly: the directory and listing are checked, then every file
+    (descriptor and name), then the directory again, then every file a second time, then the
+    directory a last time. A difference observed by a later pass is refused. This is
+    best-effort detection, not a guarantee: a change after a file's final observation is out of
+    reach (any finite sequence of observations has a final one), and a
     write through a pre-existing writable shared mapping alters bytes without moving mtime,
     ctime or size. The semantics are therefore only these: every gather yields an internally
     validated snapshot of the exact bytes actually read from the pinned descriptors, and

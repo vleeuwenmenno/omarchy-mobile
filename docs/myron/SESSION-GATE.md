@@ -230,10 +230,14 @@ broad-copy facility. The reads tree has its own flat reader (see Synthetic reads
 trees use the deployment tool's trusted tree reader, and publication uses its
 `publish` (private same-parent temp directory, `renameat2(RENAME_NOREPLACE)`).
 The request and reads are protected inputs: an output inside, equal to or
-aliasing either is refused, and both are re-read and the rehearsal recomputed
-inside `verify_built`, which also runs the collector's `read_capture` on the
-built tree, so a byte that changes before publication, or a collector rejection,
-aborts the run and leaves no output.
+aliasing either is refused, and both are gathered again with the rehearsal
+recomputed inside `verify_built`, which also runs the collector's `read_capture`
+on the built tree. A difference observed by that gather, or a collector
+rejection, aborts the run and normally leaves no output. The descriptor-read
+snapshot limitation above still applies: a source change after its final
+observation can yield the already-bound snapshot, and a publication failure
+whose identity-bound cleanup also fails can leave an output while reporting
+failure.
 
 ## Limitations and boundary
 
