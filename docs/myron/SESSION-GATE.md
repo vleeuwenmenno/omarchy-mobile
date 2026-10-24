@@ -69,9 +69,28 @@ before the read has passed:
    an end-of-file probe and an unchanged-metadata check per file;
 5. the listing, the directory and every name are checked once more.
 
-A missing, extra or metadata-unsafe file therefore stops the read at zero payload
-bytes. A file that changes while it is read fails as unstable (grew, shrank,
-changed, was replaced), not later as a manifest mismatch.
+A missing, extra or metadata-unsafe file that is visible before traversal
+therefore stops the read at zero payload bytes. A file that visibly changes while
+it is read fails as unstable (grew, shrank, changed, was replaced), not later as
+a manifest mismatch.
+
+**Limitation (read this).** Each gather is an internally validated
+*descriptor-read snapshot*: the exact bytes consumed from the pinned
+descriptors, every one hashed and bound by `reads.json`. It is **not** an atomic
+filesystem snapshot, does not exclude writers, and does not claim the
+caller-owned source equals those bytes at return. The settle passes (steps 3 and
+5, each a double file pass) are best-effort detection: any finite sequence of
+observations has a final one, so a change after a file's final observation is
+not seen, and a write through a writable shared mapping that was dirtied before
+admission changes bytes without changing mtime, ctime or size. Consequences:
+
+- a defect detected before payload traversal costs zero payload bytes;
+- a race first observable during or after traversal may consume bounded bytes
+  (at most 4 MiB) and then rejects with no output;
+- a race that lands after the captured bytes' final observation can yield the
+  already-bound snapshot of those bytes, so the artifact is valid evidence of
+  what was read, not of the source's current state;
+- a later `verify-rehearsal` against the changed source rejects.
 
 Other rules:
 
@@ -82,7 +101,9 @@ Other rules:
   file (the contract lists each);
 - JSON is strict, canonical, ASCII, at most 8 levels deep, with no duplicate
   keys, floats, non-finite numbers or booleans where integers belong;
-- the files and the tree must not change while they are read.
+- the files and the tree must not change while they are read; this is a
+  requirement on the caller and a best-effort check, not an enforced guarantee
+  (see the limitation above).
 
 Diagnostics never echo an input value: they name a file, field or rule, so an
 identifier planted in an input cannot leak through an error. The same holds for
@@ -225,6 +246,14 @@ aborts the run and leaves no output.
 - The R7 projections are deliberately narrow, not full command-line or
   bootconfig parsers.
 - The dependency imports are version-pinned, not byte-pinned.
+- The reads are a validated descriptor-read snapshot, not an atomic or
+  writer-excluded filesystem snapshot; a mutation first observable after
+  payload traversal can consume bounded bytes, and a later verification against
+  a changed source rejects (see Synthetic reads).
+- Publication is durable only if `fsync` of the output parent succeeds; a
+  failure there is a `publish-rejected` refusal with a best-effort removal of
+  the just-published output. If that removal also fails the output can remain
+  while the command reports failure.
 
 A passing rehearsal says only that the adapter and the collector agree on
 synthetic structure. A live transport, a real format parser and the human

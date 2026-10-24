@@ -1752,6 +1752,185 @@ settle_file_mutation("payload made group-writable during the rehearse admission 
 no_leftovers("settle file mutation")
 ok("chmod and in-place writes during a settle refuse: zero payload bytes in admission, no success after the read")
 
+# Phase 2.13 R4: the guarantee is a validated descriptor-read snapshot, never an atomic or
+# current-at-return source. Mutations that land after a file's already-checked observation in the
+# SECOND per-file settle pass (the second reads.json name stat) are either rejected after bounded
+# payload bytes (admission settle) or yield the already-hashed pre-mutation snapshot (final
+# gathers), and a later unhooked verification against the changed source rejects. Nothing here
+# asserts atomicity, writer exclusion or zero bytes for a race the code cannot see.
+descriptors_before = len(os.listdir("/proc/self/fd"))
+baseline_tree = walk(rehearsal_a)
+
+
+def second_pass_mutation(label, command, nth, mutate, admission):
+    base = fresh("second-pass") / "reads"
+    write_reads(base)
+    state = {"calls": 0, "inside": False, "names": 0, "fired": []}
+    real_stat = os.stat
+
+    def wrap_settle(original):
+        def patched(*a, **kw):
+            state["calls"] += 1
+            state["inside"] = True
+            try:
+                return original(*a, **kw)
+            finally:
+                state["inside"] = False
+        return patched
+
+    def stat_hook(path, *a, **kw):
+        if state["inside"] and state["calls"] == nth and path == "reads.json":
+            state["names"] += 1
+            if state["names"] == 2:  # second per-file pass, after r7-release.txt was checked
+                state["fired"].append(True)
+                mutate(base)
+        return real_stat(path, *a, **kw)
+
+    if command == "rehearse":
+        out = work / f"second-pass-out-{counter[0]}"
+        arguments = ["rehearse", "--request", request, "--reads", base, "--out", out]
+    else:
+        out = rehearsal_a
+        arguments = ["verify-rehearsal", "--request", request, "--reads", base, "--rehearsal", rehearsal_a]
+    os.stat = stat_hook
+    try:
+        with payload_counter(base) as counted:
+            code, stdout, stderr = with_patch(S, "settle_reads", wrap_settle, lambda: invoke(*arguments))
+    finally:
+        os.stat = real_stat
+    assert state["fired"], f"{label}: the injection never ran"
+    if admission:
+        # the admission settle missed it: bounded payload bytes were consumed, the later settle refuses
+        assert code != 0 and not stdout, f"{label}: accepted"
+        assert 0 < counted[0] <= 4 * 1024 * 1024, f"{label}: {counted[0]} payload bytes"
+        assert "rehearsed" not in stderr and "verified" not in stderr
+        if command == "rehearse":
+            assert not os.path.lexists(out), f"{label}: left output"
+    else:
+        # past the captured bytes' final observation: the already-bound snapshot may be produced...
+        assert code == 0, f"{label}: {stderr}"
+        if command == "rehearse":
+            assert walk(out) == baseline_tree, f"{label}: artifact differs from the validated snapshot"
+        # ...but the source changed, so an immediate unhooked verification rejects it
+        verify_against = out if command == "rehearse" else rehearsal_a
+        code2, stdout2, _ = invoke("verify-rehearsal", "--request", request, "--reads", base,
+                                   "--rehearsal", verify_against)
+        assert code2 != 0 and not stdout2, f"{label}: the changed source verified"
+    ok(f"{label}: " + ("rejected after bounded payload, no output" if admission
+                       else "bound snapshot only; later verification rejects the changed source"))
+
+
+for command, nth, admission in (("rehearse", 1, True), ("verify-rehearsal", 1, True),
+                                ("rehearse", 6, False), ("verify-rehearsal", 4, False)):
+    where = "admission settle" if admission else f"final {command} gather settle"
+    second_pass_mutation(f"second-pass chmod after r7-release.txt was checked ({where})", command, nth,
+                         lambda base: (base / "r7-release.txt").chmod(0o755), admission)
+    second_pass_mutation(f"second-pass same-size rewrite after r7-release.txt was checked ({where})", command,
+                         nth, rewrite_in_place, admission)
+no_leftovers("second-pass mutation")
+assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
+
+# A writable shared mapping dirtied before admission rewrites bytes with no metadata change, even
+# between os.read and the end-of-file probe. Metadata passes cannot see it: the artifact binds the
+# bytes actually read, and a later unhooked verification against the mutated source rejects.
+import mmap
+
+
+def mapped_mutation(command, nth):
+    base = fresh("mmap-source") / "reads"
+    write_reads(base)
+    victim = base / "r4-selection.json"
+    out = work / f"mmap-out-{counter[0]}"
+    calls, fired = [0], []
+    with victim.open("r+b") as stream, mmap.mmap(stream.fileno(), 0) as mapping:
+        mapping[0] = mapping[0]  # fault a writable page now; later stores need no write fault
+        before = D.fingerprint(victim.stat())
+        marker = b'"dtb_count": 2'
+        assert marker in mapping[:], "the fixture changed: the mapped mutation has no target"
+        real_read = os.read
+
+        def mutating_read(descriptor, count):
+            data = real_read(descriptor, count)
+            if data and os.readlink(f"/proc/self/fd/{descriptor}") == str(victim):
+                calls[0] += 1
+                if calls[0] == nth:
+                    mapping[mapping[:].index(marker) + len(marker) - 1] = ord("3")
+                    fired.append(True)
+                    assert D.fingerprint(victim.stat()) == before, "the mapped store moved the metadata"
+            return data
+
+        if command == "rehearse":
+            arguments = ["rehearse", "--request", request, "--reads", base, "--out", out]
+        else:
+            arguments = ["verify-rehearsal", "--request", request, "--reads", base,
+                         "--rehearsal", rehearsal_a]
+        os.read = mutating_read
+        try:
+            code, stdout, stderr = invoke(*arguments)
+        finally:
+            os.read = real_read
+        assert fired, f"{command}: the mapped mutation never ran"
+        assert D.fingerprint(victim.stat()) == before
+        assert code == 0, f"{command}: {stderr}"  # the bound snapshot was produced from the bytes read
+        if command == "rehearse":
+            assert walk(out) == baseline_tree, "artifact differs from the validated pre-mutation snapshot"
+        verify_against = out if command == "rehearse" else rehearsal_a
+        code2, stdout2, _ = invoke("verify-rehearsal", "--request", request, "--reads", base,
+                                   "--rehearsal", verify_against)
+        assert code2 != 0 and not stdout2, f"{command}: the mutated source verified"
+    ok(f"mapped same-metadata rewrite during {command}: bound snapshot only; later verification rejects")
+
+
+mapped_mutation("rehearse", 3)
+mapped_mutation("verify-rehearsal", 2)
+no_leftovers("mapped mutation")
+assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
+
+# Parent-directory fsync failure (shared deployment publish): the session reports its fixed
+# publish-rejected diagnostic, leaves no output or temp directory and never touches an existing path.
+import errno
+
+real_fsync = os.fsync
+parent_path = str(work)
+
+
+def one_shot_parent_fsync(fired):
+    def failing(descriptor):
+        if not fired and os.readlink(f"/proc/self/fd/{descriptor}") == parent_path:
+            fired.append(True)
+            raise OSError(errno.EIO, f"injected parent fsync failure {CN}")
+        return real_fsync(descriptor)
+    return failing
+
+
+fsync_out = work / "session-fsync-out"
+fired = []
+os.fsync = one_shot_parent_fsync(fired)
+try:
+    code, stdout, stderr = invoke("rehearse", *args(), "--out", fsync_out)
+finally:
+    os.fsync = real_fsync
+assert fired and code == 1 and not stdout, (code, stdout, stderr)
+assert stderr == "ERROR: rehearsal could not be published safely (code publish-rejected)\n", stderr
+assert CN not in stderr and "fsync" not in stderr and "EIO" not in stderr
+assert not os.path.lexists(fsync_out)
+no_leftovers("parent fsync failure")
+existing_session_out = work / "session-fsync-existing"
+existing_session_out.mkdir()
+(existing_session_out / "precious").write_text("keep")
+fired = []
+os.fsync = one_shot_parent_fsync(fired)
+try:
+    code, stdout, stderr = invoke("rehearse", *args(), "--out", existing_session_out)
+finally:
+    os.fsync = real_fsync
+assert code != 0 and not stdout and not fired
+assert (existing_session_out / "precious").read_text() == "keep"
+assert sorted(os.listdir(existing_session_out)) == ["precious"]
+no_leftovers("existing output")
+assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
+ok("a parent-directory fsync failure is a fixed publish-rejected refusal with no output and no leftovers")
+
 # Every dependency exception class is sanitized at the rehearsal boundary, not only two of them.
 for label, error in (
     ("contract error", K.ContractError(f"unexpected file /{CN}")),

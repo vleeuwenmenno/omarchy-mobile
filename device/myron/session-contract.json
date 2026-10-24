@@ -356,7 +356,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-session-impl.py",
-    "sha256": "ed7cc212fb597476840c143e8247e3790a8e28d905d9ffc17363775ffbe886cc"
+    "sha256": "da6a28677d65ae0a8f40dfd192048bc263d6e53e187da6706fba860c5c012407"
   },
   "input": {
     "closure": [
@@ -1048,7 +1048,9 @@
     "R7 command line and bootconfig are deliberately narrow projections, not full parsers",
     "bytes_read is fixture accounting only: it counts consumed fixture payload bytes",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
-    "the session contract pins the session implementation bytes; the collector implementation is bound only through the capture contract"
+    "the session contract pins the session implementation bytes; the collector implementation is bound only through the capture contract",
+    "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot: the caller-owned source can diverge after any file's final observation, a writable shared mapping can change bytes without changing metadata, and a later verify against a changed source rejects",
+    "a concurrent mutation first observable after payload traversal can consume bounded bytes (at most 4 MiB) before rejection; zero payload bytes is promised only for a defect detected before traversal"
   ],
   "live": false,
   "non_goals": [

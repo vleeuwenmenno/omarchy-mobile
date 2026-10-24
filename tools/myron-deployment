@@ -1992,7 +1992,9 @@ def publish(
     verify_built,
 ) -> None:
     """Write SPEC under a private same-parent temp directory, verify it, and
-    atomically publish it to the nonexistent canonical absolute OUT."""
+    atomically publish it to the nonexistent canonical absolute OUT. Returns only after the
+    parent directory fsync succeeded; a failure there raises DeploymentError and removes the
+    just-published output by identity (best effort)."""
     parts = split_canonical(out, "output path")
     for path in protected:
         if out == path or out.startswith(path + "/"):
@@ -2100,6 +2102,14 @@ def publish(
                     raise DeploymentError("canonical published output differs from verified output")
             finally:
                 os.close(canonical_parent)
+            # The rename is durable only once the parent directory entry is. A failure here is
+            # never success: the except path removes the just-published output by identity.
+            try:
+                os.fsync(parent_fd)
+            except OSError as error:
+                raise DeploymentError(
+                    f"cannot make the published output durable: {error.strerror}"
+                ) from error
             published = True
         except BaseException:
             if not published:
@@ -2124,10 +2134,6 @@ def publish(
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-        try:
-            os.fsync(parent_fd)
-        except OSError:
-            pass
     finally:
         os.close(parent_fd)
 

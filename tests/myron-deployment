@@ -1230,6 +1230,91 @@ shutil.rmtree(detached_out)
 detached_held.rmdir()
 ok("a post-open published-directory replacement cannot return success")
 
+# A failed fsync of the output parent after the rename is never success: publish raises a handled
+# DeploymentError and removes the just-published output by identity. A failure of that removal
+# keeps the original durability error.
+real_fsync = os.fsync
+fd_count_before = len(os.listdir("/proc/self/fd"))
+
+
+def parent_fsync_failure(fired):
+    parent_path = str(cleanup)
+
+    def failing(descriptor):
+        if not fired and os.readlink(f"/proc/self/fd/{descriptor}") == parent_path:
+            fired.append(True)
+            raise OSError(errno.EIO, "injected parent fsync failure")
+        return real_fsync(descriptor)
+    return failing
+
+
+for label, fail_removal in (("removal succeeds", False), ("removal fails too", True)):
+    durable_out = cleanup / f"durable-out-{int(fail_removal)}"
+    fired, builds = [], []
+    real_rmdir = os.rmdir
+
+    def refusing_rmdir(path, *args, **kwargs):
+        if fail_removal and path == durable_out.name:
+            raise OSError(errno.EIO, "injected removal failure")
+        return real_rmdir(path, *args, **kwargs)
+
+    T.os.fsync = parent_fsync_failure(fired)
+    T.os.rmdir = refusing_rmdir
+    try:
+        try:
+            T.publish(
+                str(durable_out), [], frozenset(),
+                [("payload", "file", 0o600, b"x")], lambda path, descriptor: builds.append(path),
+            )
+        except T.DeploymentError as error:
+            assert "cannot make the published output durable" in str(error), error
+            assert isinstance(error.__cause__, OSError) and error.__cause__.errno == errno.EIO
+        else:
+            raise AssertionError(f"parent fsync failure returned success ({label})")
+    finally:
+        T.os.fsync, T.os.rmdir = real_fsync, real_rmdir
+    assert fired and len(builds) == 2, (fired, builds)
+    if fail_removal:
+        # residual limit: the failing filesystem also refused the removal, the error was kept
+        assert os.path.isdir(durable_out)
+        shutil.rmtree(durable_out)
+    else:
+        assert not os.path.lexists(durable_out), "the published output was left behind"
+    assert not any(p.name.startswith(f".{durable_out.name}.tmp-") for p in cleanup.iterdir())
+    assert len(os.listdir("/proc/self/fd")) == fd_count_before
+
+# A pre-existing path is refused before any fsync and is never touched or removed.
+existing_out = cleanup / "durable-existing"
+existing_out.mkdir()
+(existing_out / "precious").write_text("keep")
+fired = []
+T.os.fsync = parent_fsync_failure(fired)
+try:
+    try:
+        T.publish(str(existing_out), [], frozenset(), [("payload", "file", 0o600, b"x")],
+                  lambda path, descriptor: None)
+    except T.DeploymentError as error:
+        assert "already exists" in str(error)
+    else:
+        raise AssertionError("pre-existing output accepted")
+finally:
+    T.os.fsync = real_fsync
+assert (existing_out / "precious").read_text() == "keep" and sorted(os.listdir(existing_out)) == ["precious"]
+shutil.rmtree(existing_out)
+
+# A command that publishes through it reports the failure, with no output.
+durable_cli_out = cleanup / "durable-cli-out"
+fired = []
+T.os.fsync = parent_fsync_failure(fired)
+try:
+    expect_fail("a parent fsync failure after the rename", root,
+                ["stage-modules", "--assets", archive, "--out", durable_cli_out], "durable", durable_cli_out)
+finally:
+    T.os.fsync = real_fsync
+assert fired and not os.path.lexists(durable_cli_out)
+assert not any(p.name.startswith(".durable-cli-out.tmp-") for p in cleanup.iterdir())
+ok("a failed parent-directory fsync never returns success and removes only the just-published output")
+
 # An ancestor writable by another user can move the otherwise-private parent;
 # reject that ancestry before creating any output.
 ancestry_base = cleanup / "ancestry"

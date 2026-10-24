@@ -220,6 +220,8 @@ LIMITATIONS = [
     "bytes_read is fixture accounting only: it counts consumed fixture payload bytes",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the session contract pins the session implementation bytes; the collector implementation is bound only through the capture contract",
+    "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot: the caller-owned source can diverge after any file's final observation, a writable shared mapping can change bytes without changing metadata, and a later verify against a changed source rejects",
+    "a concurrent mutation first observable after payload traversal can consume bounded bytes (at most 4 MiB) before rejection; zero payload bytes is promised only for a defect detected before traversal",
 ]
 NON_GOALS = [
     "real acquisition from a device",
@@ -1048,10 +1050,14 @@ def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> N
     file (descriptor and name), then the directory again, then every file a second time, then the
     directory a last time. A change to any file or to the directory made while this function runs
     lands after one observation of that state and before another, so the two sides disagree and
-    it is refused. Only a change after the final observation of one file, before this function
-    returns, is out of reach: no syscall sequence can close that, and the contract promises
-    stability while read, not an atomic snapshot. Content is not rehashed: an in-place write
-    moves mtime, ctime or size, and ctime cannot be set from userspace."""
+    it is refused. This is best-effort detection, not a guarantee: a change after a file's final
+    observation is out of reach (any finite sequence of observations has a final one), and a
+    write through a pre-existing writable shared mapping alters bytes without moving mtime,
+    ctime or size. The semantics are therefore only these: every gather yields an internally
+    validated snapshot of the exact bytes actually read from the pinned descriptors, and
+    reads.json hashes bind every one of those bytes. The caller-owned source path is not
+    claimed to equal that snapshot at return, nor to be atomic or writer-excluded; a later
+    verify against a changed source rejects. Content is not rehashed here."""
     d = deploy()
 
     def directory_unchanged() -> None:
@@ -1079,7 +1085,10 @@ def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> N
 
 
 def read_pinned(item: Held) -> bytes:
-    """Exactly the stat size from the captured descriptor, then a stability check."""
+    """Exactly the stat size from the captured descriptor, then a metadata stability check.
+
+    A write through a shared mapping can change bytes after os.read returns without changing
+    the fingerprint, so the bytes returned are the validated snapshot, not proof of the source."""
     d = deploy()
     pinned = d.fingerprint(item.opened)
     if d.fingerprint(os.fstat(item.descriptor)) != pinned:
@@ -1119,7 +1128,11 @@ def check_manifest(raw: bytes, files: dict, env: Environment, request_sha256: st
 def read_reads(path: str, env: Environment, request_sha256: str) -> Reads:
     """Admit the flat tree in order: exact closure, then every descriptor's metadata, then a
     re-listing, and only then the payload bytes, from the pinned descriptors, with the names
-    revalidated afterwards. A missing, extra or unsafe file stops the read at zero payload bytes."""
+    revalidated afterwards. A missing, extra or unsafe file visible before traversal stops the read
+    at zero payload bytes. A mutation first observable during or after traversal may consume
+    bounded bytes and is then rejected, or, if it lands after a file's final observation, yields
+    the already-hashed snapshot of the bytes actually read (see settle_reads): the source is not
+    claimed current at return, and a later verification against a changed source rejects."""
     d = deploy()
     descriptor, identity = d.open_trusted_artifact(path, "synthetic reads")
     held = []

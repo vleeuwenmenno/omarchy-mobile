@@ -66,6 +66,15 @@ and require every kit descendant to be root- or invoking-user-owned and not
 writable by group/other. They re-open the canonical path after verification to
 confirm the inode did not change.
 
+Publication is reported successful only after `fsync` of the output parent
+succeeds. If that `fsync` fails (for example `EIO`), `publish` raises a
+`DeploymentError` instead of returning, and removes the just-published output
+only if the name still resolves to the inode this run created; a pre-existing
+path is never touched. The durability error is never swallowed. Residual
+limit: if that best-effort removal also fails (the filesystem is already
+failing), the output may remain on disk even though the command reported
+failure, and the removal itself is not made durable.
+
 ## The kit
 
 `contracts/` (the four canonical JSON files), `overlay/` (the module overlay at
