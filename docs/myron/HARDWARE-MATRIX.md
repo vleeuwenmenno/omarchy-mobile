@@ -1,0 +1,99 @@
+<!-- SPDX-License-Identifier: MIT -->
+# Myron feature-preservation matrix
+
+Snapshot: 2026-10-24. Status describes the postmarketOS reference, not Arch.
+Every working row is a regression-protected requirement for the port.
+
+Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
+`BROKEN`, `UNKNOWN`.
+
+## Display, input, and graphics
+
+| Feature | Status | Evidence and Arch acceptance |
+| --- | --- | --- |
+| Internal OLED / DSI | VERIFIED_WORKING | DSI-1 drove Plasma and native Hyprland. Arch must light the internal panel through msm_drm without software rendering. |
+| Resolution / refresh | VERIFIED_WORKING | Kernel exposes 1200x2608 at 60/90/120 Hz; 60 Hz native Hyprland and 120 Hz recovered Plasma were observed. |
+| Touchscreen | VERIFIED_WORKING | `focaltech_ts` event7; physical touch and bounded native Hyprland input capture passed. |
+| Buttons | VERIFIED_WORKING | Power and volume inputs present and used in the reference shell. |
+| Brightness | VERIFIED_WORKING | `panel0-backlight`, range 0-16383; Plasma control proven. |
+| DisplayPort | PRESENT_UNTESTED | card0-DP-1 exists and was disconnected during audit. |
+| Rotation / motion sensors | BROKEN | No accelerometer/gyro integration; only ADC IIO devices appeared live. |
+| Haptics | PRESENT_UNTESTED | `qcom-hv-haptics` input device exists; no attended vibration test recorded. |
+| Qualcomm DRM/KMS | VERIFIED_WORKING | card0 is msm_drm/qcom SDE; direct native Hyprland modeset passed. |
+| KGSL | VERIFIED_WORKING | `/dev/kgsl-3d0`, Adreno840v2; KWin/Hyprland and apps opened it. |
+| Turnip / Vulkan | VERIFIED_WORKING | Attempt105 selected Adreno 840 MESA_TURNIP. |
+| Zink / OpenGL / GLES | VERIFIED_WORKING | EGL GBM, Wayland, surfaceless, and device paths reported Zink on Turnip. |
+| GBM / EGL | VERIFIED_WORKING | Custom libgbm and libEGL were mapped by compositors and validated by eglinfo. |
+| DMA-BUF sharing | EXPERIMENTAL | Working compositor/app paths imply basic sharing; KWin needs udmabuf isolation and no standalone matrix is recorded. |
+| Explicit / implicit sync | PRESENT_UNTESTED | Calibrated timestamp support is disabled for KGSL; sync correctness needs dedicated soak/probes. |
+
+## Connectivity and location
+
+| Feature | Status | Evidence and Arch acceptance |
+| --- | --- | --- |
+| Wi-Fi | VERIFIED_WORKING | Connected, DHCP/DNS/IPv4 internet and full NetworkManager connectivity. Preserve stock-extracted modules/firmware and service order. |
+| Bluetooth controller | PARTIAL | Firmware/NVM, hci0, and BlueZ registration passed; discovery times out. |
+| USB networking / SSH | VERIFIED_WORKING | USB NCM rescue and key-based SSH proven; WLAN SSH also works. Arch needs an independent rescue link. |
+| SIM detection | VERIFIED_WORKING | ModemManager exposes an active registered modem without recording identifiers. |
+| LTE / 5G registration | VERIFIED_WORKING | Home registration with LTE and 5G NR observed. |
+| Mobile data | VERIFIED_WORKING | One-shot boot activation, IPv4 browsing, streaming, and a 64 MiB transfer passed. Reconnect is unsafe. |
+| Mobile reconnect | BROKEN | Reopening stock IPA can panic `ipam.ko`; reboot is the current recovery. |
+| SMS | BROKEN | Not implemented. |
+| Voice calls | BROKEN | Telephony and call audio are not implemented. |
+| GNSS / GPS | VERIFIED_WORKING | Patched ModemManager/GeoClue produced a 31-satellite fix and stopped GPS after client exit. |
+| NFC | BROKEN | No live NFC class device and no integration. |
+
+## Audio
+
+| Feature | Status | Evidence and Arch acceptance |
+| --- | --- | --- |
+| Speaker output | PARTIAL | Regular PulseAudio clients played through built-in speakers for 42 seconds after reboot; clean-rootfs and safety qualification remain. |
+| Earpiece | UNKNOWN | No verified call/earpiece route. |
+| Microphones | PARTIAL | Raw built-in capture produced nonzero samples twice; PipeWire app path and quality remain open. |
+| Headphones / USB audio | PRESENT_UNTESTED | No attended route test recorded. |
+| Bluetooth audio | BROKEN | Bluetooth pairing is not working. |
+| Audio routing | EXPERIMENTAL | Pulse bridge and speaker graph work on the live reference; transitions, mute, suspend/resume, and clean build remain open. |
+| Qualcomm DSP / AudioReach | EXPERIMENTAL | Audio service active; AudioReach configs, graph manager/services, DSP modules, firmware, and calibration are required. |
+| PipeWire / WirePlumber | PARTIAL | Installed, but SSH `wpctl` showed no sink/source in that remote context; application playback evidence comes from dedicated tests. |
+
+## Power
+
+| Feature | Status | Evidence and Arch acceptance |
+| --- | --- | --- |
+| Battery percentage | VERIFIED_WORKING | Live battery supply reported capacity, temperature, voltage, and current; UPower may invert charging state. |
+| Charging | VERIFIED_WORKING | Battery authentication and about 45 W from a 65 W PD source were proven; release soak remains open. |
+| USB-C power detection | VERIFIED_WORKING | USB_PD supply online with voltage/current readings. |
+| Thermal sensors | VERIFIED_WORKING | GPU qualification gates track named CPU/GPU/battery sensors and enforce limits. |
+| CPU/GPU scaling | PRESENT_UNTESTED | Required GPU governor modules exist; no Arch policy or full scaling matrix yet. |
+| Screen-off behavior | PARTIAL | DSI can be disabled while locked; current PIN path can hang. |
+| Suspend/resume | PRESENT_UNTESTED | Kernel advertises freeze, mem, disk and s2idle/deep; production suspend not validated. |
+| Deep sleep | PRESENT_UNTESTED | Advertised but not qualified. |
+| Wake sources | UNKNOWN | No systematic wake-source matrix. |
+
+## Other hardware
+
+| Feature | Status | Evidence and Arch acceptance |
+| --- | --- | --- |
+| Cameras | PARTIAL | Qualcomm request manager/sync and 27 subdevices were proven earlier; current userspace exposes no video/media nodes and no frame capture. |
+| Flashlight / torch | VERIFIED_WORKING | Plasma toggle and intensity slider passed after reboot. |
+| Fingerprint | BROKEN | Not integrated. |
+| Accelerometer | BROKEN | Not integrated. |
+| Gyroscope | BROKEN | Not integrated. |
+| Proximity | BROKEN | Not integrated. |
+| Ambient light | BROKEN | Not integrated. |
+| Storage | VERIFIED_WORKING | Persistent ext4 `pmos_root`; current public install path intentionally absent. |
+| RTC / time | PARTIAL | PMIC RTC counter exists; counter-offset bootstrap plus Chrony works, writable wall-clock RTC does not. |
+| Lock authentication | BROKEN | PIN submission currently waits indefinitely despite compositor stability. |
+
+## Evidence sources
+
+- `../myron-postmarketos/README.md`
+- `../myron-postmarketos/config/myron-rootfs-feature-matrix.tsv`
+- `../myron-postmarketos/docs/STATUS.md`
+- `../myron-postmarketos/docs/AUDIO_INPUT_OUTPUT.md`
+- `../myron-postmarketos/experiments/systemd-native-hyprland/experiment.md`
+- read-only live audit on 2026-10-24
+
+Arch status for every row remains `UNKNOWN` until a built rootfs or booted
+system passes the same probe. A graphical boot alone cannot advance unrelated
+hardware rows.
