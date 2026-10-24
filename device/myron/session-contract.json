@@ -356,7 +356,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-session-impl.py",
-    "sha256": "bfba47e47e4bb056ee7de0c073d6ca4bc8ddd79e5ca6bda340c9d5161775f4aa"
+    "sha256": "ed7cc212fb597476840c143e8247e3790a8e28d905d9ffc17363775ffbe886cc"
   },
   "input": {
     "closure": [

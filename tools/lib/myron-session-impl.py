@@ -1042,7 +1042,16 @@ def pin_reads(directory: int, root, root_mount: int) -> list:
 
 
 def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> None:
-    """The listing, the directory and every name still match the pinned descriptors."""
+    """The listing, the directory and every pinned file still match what admission recorded.
+
+    The interval is bracketed on both sides: the directory and listing are checked, then every
+    file (descriptor and name), then the directory again, then every file a second time, then the
+    directory a last time. A change to any file or to the directory made while this function runs
+    lands after one observation of that state and before another, so the two sides disagree and
+    it is refused. Only a change after the final observation of one file, before this function
+    returns, is out of reach: no syscall sequence can close that, and the contract promises
+    stability while read, not an atomic snapshot. Content is not rehashed: an in-place write
+    moves mtime, ctime or size, and ctime cannot be set from userspace."""
     d = deploy()
 
     def directory_unchanged() -> None:
@@ -1050,18 +1059,23 @@ def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> N
         if d.fingerprint(os.fstat(directory)) != root_before:
             raise SessionError(f"synthetic reads directory changed {when}")
 
+    def files_unchanged() -> None:
+        for item in held:
+            pinned = d.fingerprint(item.opened)
+            if d.fingerprint(os.fstat(item.descriptor)) != pinned:
+                raise SessionError(f"synthetic reads file {item.name} changed {when}")
+            try:
+                current = os.stat(item.name, dir_fd=directory, follow_symlinks=False)
+            except OSError as error:
+                raise SessionError(f"synthetic reads file {item.name} was removed {when}") from error
+            if d.fingerprint(current) != pinned:
+                raise SessionError(f"synthetic reads file {item.name} was replaced {when}")
+
     directory_unchanged()
-    for item in held:
-        pinned = d.fingerprint(item.opened)
-        if d.fingerprint(os.fstat(item.descriptor)) != pinned:
-            raise SessionError(f"synthetic reads file {item.name} changed {when}")
-        try:
-            current = os.stat(item.name, dir_fd=directory, follow_symlinks=False)
-        except OSError as error:
-            raise SessionError(f"synthetic reads file {item.name} was removed {when}") from error
-        if d.fingerprint(current) != pinned:
-            raise SessionError(f"synthetic reads file {item.name} was replaced {when}")
-    directory_unchanged()  # a mutation during the name checks above is caught here
+    files_unchanged()
+    directory_unchanged()  # a directory change during the first file pass is caught here
+    files_unchanged()  # a file change during the first pass or the listing is caught here
+    directory_unchanged()  # a directory change during the second file pass
 
 
 def read_pinned(item: Held) -> bytes:
@@ -1532,7 +1546,11 @@ def command_rehearse(env: Environment, args) -> dict:
         if built.capture_sha256 != capture_digest(spec):
             raise SessionError("built capture differs from the rehearsed capture")
 
-    d.publish(args.out, protected, protected_ids, spec, verify_built)
+    try:
+        d.publish(args.out, protected, protected_ids, spec, verify_built)
+    except d.handled_errors():
+        # Reviewed dependency classes only: their text can carry the caller's output path or names.
+        raise SessionError("rehearsal could not be published safely (code publish-rejected)") from None
     return result_summary("rehearsed", env, inputs, spec)
 
 

@@ -1680,6 +1680,78 @@ settle_mutation("file added during the final settle's name checks (verify-rehear
 no_leftovers("settle mutation")
 ok("directory mutations during the settle name checks refuse; admission reads zero payload bytes")
 
+
+# File mutations (chmod, in-place writes) during a settle's own per-file loop never change the
+# directory fingerprint: the second per-file pass has to catch them, in admission and at the end.
+def settle_file_mutation(label, nth, command, mutate, match, zero):
+    base = fresh("settle-file") / "reads"
+    write_reads(base)
+    state = {"calls": 0, "inside": False, "fired": []}
+    real_stat = os.stat
+
+    def wrap_settle(original):
+        def patched(*a, **kw):
+            state["calls"] += 1
+            state["inside"] = True
+            try:
+                return original(*a, **kw)
+            finally:
+                state["inside"] = False
+        return patched
+
+    def stat_hook(path, *a, **kw):
+        # reads.json sorts last: every other file was already checked when this fires
+        if state["inside"] and state["calls"] == nth and path == "reads.json" and not state["fired"]:
+            state["fired"].append(True)
+            mutate(base)
+        return real_stat(path, *a, **kw)
+
+    if command == "rehearse":
+        out = work / f"settle-file-out-{counter[0]}"
+        arguments, outputs = ["rehearse", "--request", request, "--reads", base, "--out", out], (out,)
+    else:
+        arguments = ["verify-rehearsal", "--request", request, "--reads", base, "--rehearsal", rehearsal_a]
+        outputs = ()
+    os.stat = stat_hook
+    try:
+        if zero:
+            err = with_patch(S, "settle_reads", wrap_settle, lambda: expect_fail(
+                label, arguments, *outputs, match=match, untouched=base))
+        else:
+            with payload_counter(base) as counted:
+                err = with_patch(S, "settle_reads", wrap_settle, lambda: expect_fail(
+                    label, arguments, *outputs, match=match))
+            assert counted[0] > 0, f"{label}: the payload was never read, so the final settle was not exercised"
+    finally:
+        os.stat = real_stat
+    assert state["fired"], f"{label}: the injection never ran"
+    assert "rehearsed" not in err and "verified" not in err
+
+
+def rewrite_in_place(base):
+    victim = base / "r7-release.txt"
+    data = bytearray(victim.read_bytes())
+    data[0] ^= 0x01  # same size: only mtime and ctime move
+    with victim.open("r+b") as stream:
+        stream.write(bytes(data))
+
+
+for command, nth, when, zero in (("rehearse", 1, "during admission", True),
+                                 ("rehearse", 2, "while being read", False),
+                                 ("verify-rehearsal", 1, "during admission", True),
+                                 ("verify-rehearsal", 2, "while being read", False)):
+    settle_file_mutation(f"already-checked payload chmod during the {command} settle ({when})", nth, command,
+                         lambda base: (base / "r7-release.txt").chmod(0o755),
+                         f"synthetic reads file r7-release.txt changed {when}", zero)
+    settle_file_mutation(f"already-checked payload rewritten in place during the {command} settle ({when})",
+                         nth, command, rewrite_in_place,
+                         f"synthetic reads file r7-release.txt changed {when}", zero)
+settle_file_mutation("payload made group-writable during the rehearse admission settle", 1, "rehearse",
+                     lambda base: (base / "r1-source-a.json").chmod(0o666),
+                     "synthetic reads file r1-source-a.json changed during admission", True)
+no_leftovers("settle file mutation")
+ok("chmod and in-place writes during a settle refuse: zero payload bytes in admission, no success after the read")
+
 # Every dependency exception class is sanitized at the rehearsal boundary, not only two of them.
 for label, error in (
     ("contract error", K.ContractError(f"unexpected file /{CN}")),
@@ -1869,6 +1941,7 @@ for stage in (1, 2):
                                    absent=("injected capture rejection",)))
 no_leftovers("collector rejection")
 # the published-path verification removes a published output when it fails
+PUBLISH_CODE = "rehearsal could not be published safely (code publish-rejected)"
 real_publish = D.publish
 out = work / "publish-race"
 
@@ -1887,12 +1960,87 @@ def racing_publish(out_path, protected, ids, spec, verify_built):
 D.publish = racing_publish
 try:
     expect_fail("failure after the atomic rename removes the output", ["rehearse", *args(), "--out", out],
-                out, match="injected failure after publication")
+                out, match=PUBLISH_CODE, absent=("injected failure after publication",))
 finally:
     D.publish = real_publish
 no_leftovers("publication race")
 expect_ok("rehearse", *args(), "--out", work / "after-races")
 ok("request, reads and collector rejection races leave no output and no temp tree")
+
+# Publication failures never name the caller's output path: one fixed single-line diagnostic,
+# empty stdout, and the existing output is neither modified nor removed.
+PRIVATE_NAME_CANARY = "PRIVATE_NAME_CANARY"
+
+
+def publish_refused(label, out, *, snapshot=None):
+    code, stdout, err = invoke("rehearse", *args(), "--out", out)
+    assert code != 0, f"{label}: accepted"
+    assert stdout == "", f"{label}: stdout is not empty"
+    assert err == f"ERROR: {PUBLISH_CODE}\n", f"{label}: unexpected diagnostic {err!r}"
+    assert PRIVATE_NAME_CANARY not in err
+    if snapshot is not None:
+        assert walk(snapshot[0])[1] == snapshot[1], f"{label}: the existing output was modified"
+    no_leftovers(label)
+    ok(f"{label}: fixed value-free publish diagnostic")
+
+
+existing = work / PRIVATE_NAME_CANARY
+existing.mkdir()
+(existing / f"{PRIVATE_NAME_CANARY}.txt").write_text("kept")
+publish_refused("existing output directory named by a canary", existing, snapshot=(existing, walk(existing)[1]))
+filled = work / f"{PRIVATE_NAME_CANARY}-parent"
+filled.mkdir()
+publish_refused("output parent missing", filled / "missing" / PRIVATE_NAME_CANARY)
+publish_refused("output name with a control character", f"{work}/bad\x01{PRIVATE_NAME_CANARY}")
+publish_refused("output name with a newline", f"{work}/bad\n{PRIVATE_NAME_CANARY}")
+publish_refused("output name past the length bound", f"{work}/{PRIVATE_NAME_CANARY}" + "x" * 220)
+publish_refused("relative output path", f"relative-{PRIVATE_NAME_CANARY}")
+publish_refused("output path with dot components", f"{work}/./{PRIVATE_NAME_CANARY}")
+loose = work / f"{PRIVATE_NAME_CANARY}-loose"
+loose.mkdir()
+loose.chmod(0o777)
+publish_refused("group- and world-writable output parent", loose / "out")
+loose.chmod(0o700)
+(work / f"{PRIVATE_NAME_CANARY}-link").symlink_to(filled)
+publish_refused("output parent behind a symlink", work / f"{PRIVATE_NAME_CANARY}-link" / "out")
+# every reviewed dependency class raised from publication is sanitized; others stay visible
+for label, error in (
+    ("deployment error", D.DeploymentError(f"cannot publish /{PRIVATE_NAME_CANARY}\nsecond line")),
+    ("contract error", K.ContractError(f"unexpected /{PRIVATE_NAME_CANARY}")),
+    ("value error", ValueError(f"unexpected /{PRIVATE_NAME_CANARY}")),
+    ("os error", OSError(28, "No space left on device", f"/{PRIVATE_NAME_CANARY}")),
+):
+    def raising_publish(original, error=error):
+        def patched(*a, **kw):
+            raise error
+        return patched
+
+    out = work / f"canary-publish-{counter[0]}"
+    counter[0] += 1
+    with_patch(D, "publish", raising_publish, lambda: publish_refused(f"{label} from publication", out))
+    assert not os.path.lexists(out)
+
+
+def programmer_error(original):
+    def patched(*a, **kw):
+        raise RuntimeError("internal bug marker")
+    return patched
+
+
+out = work / "canary-publish-bug"
+real_publish_attr = D.publish
+D.publish = programmer_error(real_publish_attr)
+try:
+    try:
+        invoke("rehearse", *args(), "--out", out)
+    except RuntimeError as error:
+        assert str(error) == "internal bug marker"
+    else:
+        raise AssertionError("a programmer error was swallowed by the publication sanitizer")
+finally:
+    D.publish = real_publish_attr
+expect_ok("rehearse", *args(), "--out", work / "after-publish-sanitizing")
+ok("publication failures are sanitized to one fixed line while programmer errors stay visible")
 
 # --- no process, no network ---------------------------------------------------------
 
