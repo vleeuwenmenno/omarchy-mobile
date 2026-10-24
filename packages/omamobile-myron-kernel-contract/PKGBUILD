@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=omamobile-myron-kernel-contract
+pkgver=$(cat "${startdir:-.}/version")
+pkgrel=1
+pkgdesc="Read-only verification contract for the qualified Xiaomi myron downstream kernel"
+arch=(any)
+url="https://github.com/derekross/omarchy-mobile"
+license=(MIT)
+depends=(python)
+
+check() {
+  "$startdir/test/all"
+}
+
+package() {
+  "$startdir/install" "$pkgdir"
+}

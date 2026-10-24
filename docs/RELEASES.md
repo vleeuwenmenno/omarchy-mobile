@@ -92,7 +92,8 @@ Android GKI kernel, vendor modules, firmware, and current slot arrangement are
 not represented by the Pixel image builder. Its descriptor and inert device
 package permit offline package work, while every rootfs, image, flash, push,
 and installer command fails before container or phone access. Rootfs support
-stays disabled until a compatible external-kernel/module input exists.
+stays disabled until the verified external contract is paired with a
+notes-keyed module/runtime staging design.
 
 ### 3.2 Keys to add later
 
@@ -112,7 +113,7 @@ bin/omamobile images                    # cheetah
 DEVICE=panther bin/omamobile images     # device/panther/device.conf
 ```
 
-`DEVICE` must be a bare codename. `bin/lineage-ref` reads the same variable for its LineageOS target. Commands that don't depend on a device (`kernel`, `modules`, `modules-push`, `kexec`, `fastboot`, `kernel-shell`) don't read the descriptor. `capture` doesn't need one either, since a new device has no descriptor until after its captures.
+`DEVICE` must be a bare codename. `bin/lineage-ref` reads the same variable for its LineageOS target. Source/build commands that do not transition a phone (`kernel`, `modules`, `kernel-shell`) do not read the descriptor. `modules-push`, `kexec`, and `fastboot` do read it and refuse unsupported `BOOT_METHOD` values before phone access. `capture` does not need one, since a new device has no descriptor until after its captures.
 
 What `bin/omamobile` checks, so a wrong descriptor fails the build rather than the phone:
 

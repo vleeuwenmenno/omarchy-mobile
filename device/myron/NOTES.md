@@ -5,6 +5,10 @@ Status (2026-10-24): reference userspace audited; native Hyprland passed on
 the downstream kernel; Arch rootfs integration is build-only. No Omarchy
 Mobile image has been built, booted, installed, or flashed.
 
+Phase 2 now provides an activation-disabled, metadata-only kernel contract.
+It verifies externally supplied qualified VT artifacts and the private runtime
+asset manifest; it does not install or load any hardware payload.
+
 ## Verified reference facts
 
 - [V] The live device tree identifies the board as a Myron design based on

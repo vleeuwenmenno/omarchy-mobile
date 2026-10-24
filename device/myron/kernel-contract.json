@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "device": {
+    "codename": "myron",
+    "compatible": "qcom,canoe-mtp",
+    "soc": "sm8850",
+    "model_contains": "Myron",
+    "boot_method": "external-android"
+  },
+  "kernel": {
+    "release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k",
+    "gki_source_revision": "5a0e85dd9db068df8f0cdff9be76fe4211bd8af9",
+    "image_sha256": "9dc9d4a00544af130e04b534cb566e26329dbaa9b2f0e6596ad52c1e657d9e09",
+    "notes_sha256": "8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
+    "config_sha256": "33b6eaf87b7ca2d0d06dd10dbe2a4ce3d58e50ad804d6b385cd5f953e2fe3b95",
+    "vmlinux_symvers_sha256": "aaf3fa84f4ccbab54327eee5a7fed7903e3f79af9ab53fdffe5165b27f2fa9f1",
+    "module_symvers_sha256": "d5507f9cfb0ba26541dd7c76e077601da89e0ab650ec69acaf854b62ee247f37"
+  },
+  "source": {
+    "lock_sha256": "fdf5ce28910e227bf8d22f08234d3023283e020542b38c3b9fba694f0d285f91",
+    "manifest_sha256": "a08766933b4082d81e87a48d0f49dc11c47129ce087de9194b84291d80dc9112",
+    "patches": {
+      "0001-bluetooth-qca-preinitialized-ibs.patch": "21eba92d87356b41115b5bbfd90943d1f3ae331fe4c0522d498e1ce7c1bda399",
+      "0002-bluetooth-qca-vote-msm-geni-uart-clock.patch": "b3be02fc2c92c81542e570df02a42777ae1e7ac9bf7d5f6e4f204142ec2d32ac",
+      "0003-gki-export-rmnet-module.patch": "4d95dd11c1a002f94a25a36953a1c0303132b4c2c1af57d8291baa0176da5e6c",
+      "0007-ipc-export-namespace-symbols.patch": "7ed11e94e5d242b24e5bec1213810a1b38d31a55817c29c74e8d2709d5ac54ac"
+    }
+  },
+  "module_assets": {
+    "archive_sha256": "342139d347edcb1a0bcb37498eead80657b307709920666fc7fae40e0dcd3496",
+    "root": "systemd-vt-assets",
+    "module_directory": "/usr/local/lib/myron-gki-module-sets/8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
+    "candidate_selector_sha256": "cd732438d7865c876f49dc4845939d39d455ea4a6bf7a4fd5aa75aea84449f96",
+    "previous_selector_sha256": "4d5d2934130d80d8620229b9c17f36f969a6450a6a2ee1a953447547512fc748",
+    "forbidden_modules": [
+      "rmnet_core"
+    ],
+    "modules": [
+      "bluetooth",
+      "btbcm",
+      "btqca",
+      "hci_uart",
+      "pwrseq-core",
+      "rfkill",
+      "rmnet"
+    ]
+  },
+  "runtime_assets": {
+    "manifest_sha256": "6e4cd92a61b246c52255ccdbea8cc6280d6ceecdae12d083417f220fe6b90fbc"
+  },
+  "activation": {
+    "mode": "disabled",
+    "source_lock_reproduction": "not_verified",
+    "device_qualification": "reference_evidence_only"
+  },
+  "payload": {
+    "kind": "metadata-only"
+  },
+  "provenance": {
+    "reference_repository_base_commit": "a19c29b25a5e87d18a8234159694844a485fd497",
+    "reference_worktree_state": "dirty-uncommitted; exact recorded hashes are authoritative",
+    "qualification": "systemd-vt",
+    "status": "metadata-only; no binary payload is distributed"
+  }
+}

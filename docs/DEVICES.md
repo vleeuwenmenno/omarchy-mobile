@@ -70,4 +70,4 @@ Devices we'd like to support, with the closest starting point. Open an issue to 
 | Pixel 10 family | mustang (10 Pro XL) | laguna (Tensor G5) | 10 Pro XL (mustang): stock facts, contributors welcome ([#18](https://github.com/derekross/omarchy-mobile/issues/18)) |
 | Pixel 11 Pro | grizzly | malibu (Tensor G6) | stock facts, contributors welcome ([#26](https://github.com/derekross/omarchy-mobile/issues/26)) |
 | POCO F3 | alioth | SM8250 (Snapdragon 870) | the first non-Pixel port: a guarded installer and root image in review ([#25](https://github.com/derekross/omarchy-mobile/pull/25)) |
-| POCO F8 Ultra | myron | SM8850 | downstream Android GKI reference port: postmarketOS hardware baseline and native Hyprland verified; Arch package/rootfs skeleton only, with image and installer paths intentionally disabled ([notes](../device/myron/NOTES.md)) |
+| POCO F8 Ultra | myron | SM8850 | downstream Android GKI reference port: postmarketOS hardware baseline and native Hyprland verified; Arch skeleton plus activation-disabled kernel contract, with rootfs/image/installer paths intentionally disabled ([notes](../device/myron/NOTES.md)) |

@@ -1,0 +1,296 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the metadata-only Myron kernel contract.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+
+bash -n install || fail "install parses"
+python3 -m py_compile \
+  bin/omamobile-myron-kernel-verify || fail "verifier parses"
+pass "scripts parse"
+
+bin/omamobile-myron-kernel-verify show > "$tmp/reference.out" \
+  || fail "production reference validates"
+python3 - "$tmp/reference.out" <<'PY' || exit 1
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data["device"]["codename"] == "myron"
+assert data["device"]["soc"] == "sm8850"
+assert data["device"]["boot_method"] == "external-android"
+assert data["kernel"]["release"] == "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
+assert data["activation"]["mode"] == "disabled"
+assert data["provenance"]["status"] == "metadata-only; no binary payload is distributed"
+PY
+pass "production reference is exact metadata"
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+
+package = Path(sys.argv[1])
+work = Path(sys.argv[2])
+loader = importlib.machinery.SourceFileLoader(
+    "myron_contract", str(package / "bin/omamobile-myron-kernel-verify")
+)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+artifacts = {
+    "image": b"synthetic-image\n",
+    "notes": b"synthetic-notes\n",
+    "config": b"synthetic-config\n",
+    "vmlinux_symvers": b"synthetic-vmlinux-symvers\n",
+    "module_symvers": b"synthetic-module-symvers\n",
+}
+paths = {}
+for name, data in artifacts.items():
+    path = work / name
+    path.write_bytes(data)
+    paths[name] = path
+
+modules = ["alpha", "beta"]
+module_directory = f"/usr/local/lib/myron-gki-module-sets/{digest(artifacts['notes'])}"
+payload = {
+    "candidate-module-dir.sh": b"#!/bin/sh\nexit 0\n",
+    "previous-module-dir.sh": b"#!/bin/sh\nexit 1\n",
+    "kernel-notes.bin": artifacts["notes"],
+    **{
+        f"modules/{name}.ko": f"module-{name}\0vermagic=test-release SMP preempt mod_unload aarch64\0".encode()
+        for name in modules
+    },
+}
+manifest = {
+    "phase": "inactive-staging-payload-only",
+    "candidate_image_sha256": digest(artifacts["image"]),
+    "candidate_config_sha256": digest(artifacts["config"]),
+    "candidate_notes_sha256": digest(artifacts["notes"]),
+    "module_directory": module_directory,
+    "files": {name: digest(data) for name, data in sorted(payload.items())},
+}
+payload["manifest.json"] = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+payload["SHA256SUMS"] = "".join(
+    f"{digest(data)}  {name}\n"
+    for name, data in sorted(payload.items())
+).encode()
+archive_path = work / "assets.tar.gz"
+with archive_path.open("wb") as output:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as zipped:
+        with tarfile.open(fileobj=zipped, mode="w") as archive:
+            for name, data in sorted(payload.items()):
+                info = tarfile.TarInfo("fixture/" + name)
+                info.size = len(data)
+                info.mode = 0o644
+                archive.addfile(info, io.BytesIO(data))
+paths["assets"] = archive_path
+
+runtime_root = work / "root"
+gpu = runtime_root / "usr/local/lib/myron-gpu/firmware/gpu.bin"
+wifi = runtime_root / "usr/lib/firmware/wifi.bin"
+gpu.parent.mkdir(parents=True)
+wifi.parent.mkdir(parents=True)
+gpu.write_bytes(b"gpu\n")
+wifi.write_bytes(b"wifi\n")
+runtime_manifest = work / "runtime.tsv"
+runtime_manifest.write_text(
+    "target\tsha256\tprovenance\tredistribution\tfeature\n"
+    f"/usr/local/lib/myron-gpu/firmware/gpu.bin\t{digest(gpu.read_bytes())}\tstock-extracted\textract-only\tgpu\n"
+    f"/usr/lib/firmware/wifi.bin\t{digest(wifi.read_bytes())}\tstock-extracted\textract-only\twifi\n"
+)
+
+reference = {
+    "schema": 1,
+    "device": {
+        "codename": "myron", "compatible": "qcom,canoe-mtp", "soc": "sm8850",
+        "model_contains": "Myron", "boot_method": "external-android",
+    },
+    "kernel": {
+        "release": "test-release",
+        "gki_source_revision": "0" * 40,
+        "image_sha256": digest(artifacts["image"]),
+        "notes_sha256": digest(artifacts["notes"]),
+        "config_sha256": digest(artifacts["config"]),
+        "vmlinux_symvers_sha256": digest(artifacts["vmlinux_symvers"]),
+        "module_symvers_sha256": digest(artifacts["module_symvers"]),
+    },
+    "source": {
+        "lock_sha256": "2" * 64,
+        "manifest_sha256": "3" * 64,
+        "patches": {"0001-test.patch": "4" * 64},
+    },
+    "module_assets": {
+        "archive_sha256": digest(archive_path.read_bytes()),
+        "root": "fixture",
+        "module_directory": module_directory,
+        "candidate_selector_sha256": digest(payload["candidate-module-dir.sh"]),
+        "previous_selector_sha256": digest(payload["previous-module-dir.sh"]),
+        "forbidden_modules": ["rmnet_core"],
+        "modules": modules,
+    },
+    "runtime_assets": {"manifest_sha256": digest(runtime_manifest.read_bytes())},
+    "activation": {
+        "mode": "disabled",
+        "source_lock_reproduction": "not_verified",
+        "device_qualification": "reference_evidence_only",
+    },
+    "payload": {"kind": "metadata-only"},
+    "provenance": {
+        "reference_repository_base_commit": "1" * 40,
+        "reference_worktree_state": "synthetic fixture",
+        "qualification": "test",
+        "status": "metadata-only",
+    },
+}
+
+result = module.verify_kernel_inputs(reference, paths)
+assert result["status"] == "verified" and result["module_count"] == 2
+assert result["activation_mode"] == "disabled"
+assert module.verify_runtime_assets(reference, runtime_manifest, runtime_root, {"gpu"})["asset_count"] == 1
+assert module.verify_runtime_assets(reference, runtime_manifest, runtime_root, set())["asset_count"] == 2
+
+oversized_archive = work / "oversized.tar.gz"
+with oversized_archive.open("wb") as stream:
+    stream.truncate(module.MAX_ARCHIVE_BYTES + 1)
+try:
+    module.verify_module_archive(reference, oversized_archive)
+except module.ContractError as error:
+    assert "safety limit" in str(error)
+else:
+    raise AssertionError("oversized archive was accepted")
+oversized_manifest = work / "oversized.tsv"
+with oversized_manifest.open("wb") as stream:
+    stream.truncate(module.MAX_MANIFEST_BYTES + 1)
+try:
+    module.parse_runtime_manifest(oversized_manifest, "0" * 64)
+except module.ContractError as error:
+    assert "safety limit" in str(error)
+else:
+    raise AssertionError("oversized runtime manifest was accepted")
+
+fifo = work / "manifest.fifo"
+os.mkfifo(fifo)
+try:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(package / "bin/omamobile-myron-kernel-verify"),
+            "verify-runtime",
+            "--manifest", str(fifo),
+            "--root", str(runtime_root),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+except subprocess.TimeoutExpired as error:
+    raise AssertionError("FIFO input blocked instead of failing closed") from error
+assert result.returncode == 1 and "not a regular file" in result.stderr
+try:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(package / "bin/omamobile-myron-kernel-verify"),
+            "verify-kernel",
+            "--image", str(fifo),
+            "--notes", str(paths["notes"]),
+            "--config", str(paths["config"]),
+            "--vmlinux-symvers", str(paths["vmlinux_symvers"]),
+            "--module-symvers", str(paths["module_symvers"]),
+            "--assets", str(paths["assets"]),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+except subprocess.TimeoutExpired as error:
+    raise AssertionError("kernel FIFO input blocked instead of failing closed") from error
+assert result.returncode == 1 and "not a regular file" in result.stderr
+
+outside = work / "outside"
+outside.mkdir()
+(outside / "escape.bin").write_bytes(b"escape\n")
+escape_root = work / "escape-root"
+(escape_root / "usr/local").mkdir(parents=True)
+(escape_root / "usr/local/lib").symlink_to(outside, target_is_directory=True)
+escape_manifest = work / "escape.tsv"
+escape_manifest.write_text(
+    "target\tsha256\tprovenance\tredistribution\tfeature\n"
+    f"/usr/local/lib/escape.bin\t{digest((outside / 'escape.bin').read_bytes())}"
+    "\tstock-extracted\textract-only\tgpu\n"
+)
+escape_reference = json.loads(json.dumps(reference))
+escape_reference["runtime_assets"]["manifest_sha256"] = digest(escape_manifest.read_bytes())
+try:
+    module.verify_runtime_assets(escape_reference, escape_manifest, escape_root, {"gpu"})
+except module.ContractError:
+    pass
+else:
+    raise AssertionError("runtime asset traversal followed an escaping directory symlink")
+
+bad_reference = dict(reference)
+bad_reference["unexpected"] = True
+try:
+    module.validate_reference(bad_reference)
+except module.ContractError:
+    pass
+else:
+    raise AssertionError("unknown reference field was accepted")
+
+paths["image"].write_bytes(b"wrong\n")
+try:
+    module.verify_kernel_inputs(reference, paths)
+except module.ContractError:
+    pass
+else:
+    raise AssertionError("changed Image was accepted")
+gpu.write_bytes(b"wrong\n")
+try:
+    module.verify_runtime_assets(reference, runtime_manifest, runtime_root, {"gpu"})
+except module.ContractError:
+    pass
+else:
+    raise AssertionError("changed runtime asset was accepted")
+PY
+pass "verifier accepts exact fixtures and rejects changed bytes"
+
+./install "$tmp/stage"
+if [[ -f ../../device/myron/kernel-contract.json ]]; then
+  cmp -s reference.json ../../device/myron/kernel-contract.json \
+    || fail "package reference drifted from canonical device contract"
+fi
+"$tmp/stage/usr/bin/omamobile-myron-kernel-verify" show > "$tmp/installed-reference.out" \
+  || fail "staged verifier cannot find its staged reference"
+printf '%s\n' \
+  usr/bin/omamobile-myron-kernel-verify \
+  usr/share/doc/omamobile-myron-kernel-contract/README.md \
+  usr/share/licenses/omamobile-myron-kernel-contract/LICENSE \
+  usr/share/omamobile/myron-kernel-contract/reference.json \
+  usr/share/omamobile/myron-kernel-contract/version > "$tmp/expected-files"
+(cd "$tmp/stage" && find . -type f -print | sed 's#^\./##' | sort) > "$tmp/actual-files"
+cmp -s "$tmp/expected-files" "$tmp/actual-files" \
+  || { diff -u "$tmp/expected-files" "$tmp/actual-files" >&2 || true; fail "package stages unexpected files"; }
+if find "$tmp/stage" -type f \( -name '*.ko' -o -name '*.img' -o -name '*.bin' -o -name '*.fw' \) | grep -q .; then
+  fail "package stages a binary hardware payload"
+fi
+if find "$tmp/stage" \( -path '*/systemd/system/*' -o -path '*/pacman.d/hooks/*' \) | grep -q .; then
+  fail "package stages an activation path"
+fi
+pass "package stages metadata and read-only verifier only"

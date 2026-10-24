@@ -1,0 +1,52 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Repository integration checks for the inert Myron kernel contract.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+cmp -s device/myron/kernel-contract.json \
+  packages/omamobile-myron-kernel-contract/reference.json \
+  || fail "canonical and packaged contracts differ"
+grep -qx 'BOOT_METHOD=external-android' device/myron/device.conf \
+  || fail "Myron boot method is no longer external-android"
+grep -qx 'ROOTFS_PACKAGES="omamobile-myron-kernel-contract"' device/myron/device.conf \
+  || fail "Myron descriptor does not request the verifier package"
+pass "descriptor selects the exact metadata contract and remains fail closed"
+
+mkdir -p "$tmp/fakes"
+: > "$tmp/calls"
+for command in ssh scp adb fastboot docker mount pacman systemctl; do
+  printf '#!/bin/sh\nprintf "%%s\\n" "%s $*" >> "$CALLS"\nexit 97\n' "$command" \
+    > "$tmp/fakes/$command"
+  chmod +x "$tmp/fakes/$command"
+done
+CALLS="$tmp/calls" PATH="$tmp/fakes:$PATH" \
+  tools/verify-myron-kernel-contract show > "$tmp/reference.json" \
+  || fail "read-only contract display failed"
+[[ ! -s $tmp/calls ]] || fail "contract display invoked an external system tool"
+python3 - "$tmp/reference.json" <<'PY' || exit 1
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data["payload"] == {"kind": "metadata-only"}
+assert data["activation"]["mode"] == "disabled"
+assert data["activation"]["source_lock_reproduction"] == "not_verified"
+assert data["module_assets"]["forbidden_modules"] == ["rmnet_core"]
+assert data["device"]["boot_method"] == "external-android"
+PY
+pass "contract is read-only, metadata-only, and activation-disabled"
+
+packages/omamobile-myron-kernel-contract/install "$tmp/stage"
+while IFS= read -r -d '' file; do
+  magic=$(od -An -tx1 -N8 "$file" | tr -d ' \n')
+  case $magic in
+    7f454c46*|1f8b08*|28b52ffd*|fd377a585a00*|504b0304*|414e44524f494421*|4d5a*)
+      fail "contract package contains binary/archive magic: ${file#$tmp/stage/}"
+      ;;
+  esac
+done < <(find "$tmp/stage" -type f -print0)
+pass "contract package contains no kernel, module, firmware, image, or archive payload"

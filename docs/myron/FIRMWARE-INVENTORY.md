@@ -37,8 +37,8 @@ An eventual Myron provisioner must:
 
 Canonical reference metadata is
 `../myron-postmarketos/config/myron-runtime-assets.tsv`. The current file has
-83 pinned asset records spanning stock extraction, source-built outputs, and a
-repository-generated manifest.
+105 pinned asset records: 98 stock-extracted inputs, six source-built outputs,
+and one repository-generated manifest.
 
 ## GPU firmware observed live
 

@@ -1,0 +1,22 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stage metadata and read-only verifiers only. No service, hook, kernel,
+# module, firmware, boot image, or partition writer is installed.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+destination=${1:?Usage: ./install DESTDIR}
+[[ $destination == /* && $destination != "/" ]] || {
+  echo "Use an absolute staging directory" >&2
+  exit 1
+}
+
+install -Dm755 bin/omamobile-myron-kernel-verify \
+  "$destination/usr/bin/omamobile-myron-kernel-verify"
+install -Dm644 reference.json \
+  "$destination/usr/share/omamobile/myron-kernel-contract/reference.json"
+install -Dm644 README.md \
+  "$destination/usr/share/doc/omamobile-myron-kernel-contract/README.md"
+install -Dm644 LICENSE \
+  "$destination/usr/share/licenses/omamobile-myron-kernel-contract/LICENSE"
+install -Dm644 version \
+  "$destination/usr/share/omamobile/myron-kernel-contract/version"

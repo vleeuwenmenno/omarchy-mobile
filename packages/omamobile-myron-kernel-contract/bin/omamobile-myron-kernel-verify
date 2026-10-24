@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Verify exact external Myron kernel, module, and runtime-asset inputs."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import sys
+import tarfile
+
+
+HEX256 = re.compile(r"[0-9a-f]{64}")
+FEATURE = re.compile(r"[a-z0-9][a-z0-9-]*")
+MODULE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_REFERENCE_BYTES = 1024 * 1024
+
+
+class ContractError(Exception):
+    """An input differs from the reviewed contract."""
+
+
+def strict_json(data: str | bytes, label: str) -> dict:
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ContractError(f"{label} contains duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(data, object_pairs_hook=object_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"{label} is invalid JSON") from error
+    if not isinstance(value, dict):
+        raise ContractError(f"{label} must be a JSON object")
+    return value
+
+
+def open_regular(path: Path | str, label: str, *, directory_fd: int | None = None) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags, dir_fd=directory_fd)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ContractError(f"{label} is unavailable: {path}: {error.strerror}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ContractError(f"{label} is not a regular file: {path}")
+    return descriptor
+
+
+def sha256_descriptor(descriptor: int, label: str) -> str:
+    digest = hashlib.sha256()
+    try:
+        size = os.fstat(descriptor).st_size
+    except OSError as error:
+        os.close(descriptor)
+        raise ContractError(f"{label} metadata is unavailable: {error.strerror}") from error
+    with os.fdopen(descriptor, "rb") as stream:
+        remaining = size
+        while remaining:
+            block = stream.read(min(1024 * 1024, remaining))
+            if not block:
+                raise ContractError(f"{label} changed size while being read")
+            digest.update(block)
+            remaining -= len(block)
+        if stream.read(1):
+            raise ContractError(f"{label} changed size while being read")
+    return digest.hexdigest()
+
+
+def sha256_regular(path: Path, label: str) -> str:
+    return sha256_descriptor(open_regular(path, label), label)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_limited_regular(path: Path, label: str, limit: int) -> bytes:
+    descriptor = open_regular(path, label)
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if metadata.st_size > limit:
+            raise ContractError(f"{label} exceeds the {limit}-byte safety limit")
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ContractError(f"{label} exceeds the {limit}-byte safety limit")
+    return data
+
+
+def require_hash(path: Path, expected: str, label: str) -> None:
+    actual = sha256_regular(path, label)
+    if actual != expected:
+        raise ContractError(f"{label} SHA-256 differs: expected {expected}, got {actual}")
+
+
+def safe_member(name: str) -> bool:
+    path = PurePosixPath(name)
+    return bool(name) and not path.is_absolute() and ".." not in path.parts and "\x00" not in name
+
+
+def expected_asset_members(reference: dict) -> set[str]:
+    assets = reference["module_assets"]
+    root = assets["root"]
+    fixed = {
+        f"{root}/SHA256SUMS",
+        f"{root}/candidate-module-dir.sh",
+        f"{root}/kernel-notes.bin",
+        f"{root}/manifest.json",
+        f"{root}/previous-module-dir.sh",
+    }
+    return fixed | {f"{root}/modules/{name}.ko" for name in assets["modules"]}
+
+
+def parse_sums(data: bytes) -> dict[str, str]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ContractError("module SHA256SUMS is not UTF-8") from error
+    result: dict[str, str] = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if "  " not in line:
+            raise ContractError(f"invalid SHA256SUMS line {number}")
+        digest, name = line.split("  ", 1)
+        if not HEX256.fullmatch(digest) or not safe_member(name) or name in result:
+            raise ContractError(f"invalid SHA256SUMS entry on line {number}")
+        result[name] = digest
+    return result
+
+
+def validate_reference(reference: dict) -> None:
+    expected_top = {
+        "schema", "device", "kernel", "source", "module_assets", "runtime_assets",
+        "activation", "payload", "provenance",
+    }
+    if set(reference) != expected_top:
+        raise ContractError("reference top-level fields differ")
+    if reference.get("schema") != 1:
+        raise ContractError("unsupported reference schema")
+    if reference.get("device") != {
+        "codename": "myron",
+        "compatible": "qcom,canoe-mtp",
+        "soc": "sm8850",
+        "model_contains": "Myron",
+        "boot_method": "external-android",
+    }:
+        raise ContractError("reference does not identify the reviewed Myron target")
+    if reference.get("activation") != {
+        "mode": "disabled",
+        "source_lock_reproduction": "not_verified",
+        "device_qualification": "reference_evidence_only",
+    }:
+        raise ContractError("reference activation must remain disabled")
+    if reference.get("payload") != {"kind": "metadata-only"}:
+        raise ContractError("reference payload is not metadata-only")
+    expected_fields = {
+        "kernel": {
+            "release", "gki_source_revision", "image_sha256", "notes_sha256",
+            "config_sha256", "vmlinux_symvers_sha256", "module_symvers_sha256",
+        },
+        "module_assets": {
+            "archive_sha256", "root", "module_directory",
+            "candidate_selector_sha256", "previous_selector_sha256",
+            "forbidden_modules", "modules",
+        },
+        "runtime_assets": {"manifest_sha256"},
+        "source": {"lock_sha256", "manifest_sha256", "patches"},
+        "provenance": {
+            "reference_repository_base_commit", "reference_worktree_state",
+            "qualification", "status",
+        },
+    }
+    for section, fields in expected_fields.items():
+        if not isinstance(reference.get(section), dict) or set(reference[section]) != fields:
+            raise ContractError(f"reference {section} fields differ")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(reference["kernel"]["gki_source_revision"])):
+        raise ContractError("reference has invalid GKI source revision")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(reference["provenance"]["reference_repository_base_commit"])):
+        raise ContractError("reference has invalid repository commit")
+    source = reference["source"]
+    if (
+        not HEX256.fullmatch(str(source["lock_sha256"]))
+        or not HEX256.fullmatch(str(source["manifest_sha256"]))
+        or not isinstance(source["patches"], dict)
+        or not source["patches"]
+        or any(
+            not isinstance(name, str)
+            or not re.fullmatch(r"[0-9]{4}-[a-z0-9_-]+\.patch", name)
+            or not HEX256.fullmatch(str(digest))
+            for name, digest in source["patches"].items()
+        )
+    ):
+        raise ContractError("reference source provenance differs")
+    modules = reference["module_assets"]["modules"]
+    forbidden = reference["module_assets"]["forbidden_modules"]
+    if (
+        not isinstance(modules, list)
+        or not modules
+        or any(not isinstance(name, str) for name in modules)
+        or len(modules) != len(set(modules))
+        or any(not MODULE.fullmatch(name) for name in modules)
+        or not isinstance(forbidden, list)
+        or forbidden != ["rmnet_core"]
+        or set(modules) & set(forbidden)
+    ):
+        raise ContractError("reference module allowlist or conflict set differs")
+    kernel = reference["kernel"]
+    assets = reference["module_assets"]
+    if (
+        not isinstance(kernel["release"], str)
+        or not re.fullmatch(r"[0-9A-Za-z._+-]+", kernel["release"])
+        or not isinstance(assets["root"], str)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", assets["root"])
+        or assets["module_directory"]
+        != f"/usr/local/lib/myron-gki-module-sets/{kernel['notes_sha256']}"
+    ):
+        raise ContractError("reference release or module-set path differs")
+    for section, names in {
+        "kernel": (
+            "image_sha256",
+            "notes_sha256",
+            "config_sha256",
+            "vmlinux_symvers_sha256",
+            "module_symvers_sha256",
+        ),
+        "module_assets": (
+            "archive_sha256",
+            "candidate_selector_sha256",
+            "previous_selector_sha256",
+        ),
+        "runtime_assets": ("manifest_sha256",),
+    }.items():
+        values = reference.get(section)
+        if not isinstance(values, dict):
+            raise ContractError(f"reference lacks {section}")
+        for name in names:
+            if not HEX256.fullmatch(str(values.get(name, ""))):
+                raise ContractError(f"reference has invalid {section}.{name}")
+
+
+def verify_module_archive(reference: dict, archive_path: Path) -> dict[str, str]:
+    assets = reference["module_assets"]
+    kernel = reference["kernel"]
+    archive_data = read_limited_regular(
+        archive_path, "module asset archive", MAX_ARCHIVE_BYTES
+    )
+    actual_archive_hash = sha256_bytes(archive_data)
+    if actual_archive_hash != assets["archive_sha256"]:
+        raise ContractError(
+            "module asset archive SHA-256 differs: "
+            f"expected {assets['archive_sha256']}, got {actual_archive_hash}"
+        )
+    expected = expected_asset_members(reference)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as archive:
+            members = archive.getmembers()
+            names = [member.name for member in members]
+            if len(names) != len(set(names)) or set(names) != expected:
+                raise ContractError("module asset archive member set differs")
+            if any(not member.isfile() or not safe_member(member.name) for member in members):
+                raise ContractError("module asset archive contains a non-file or unsafe member")
+            if sum(member.size for member in members) > MAX_ARCHIVE_BYTES:
+                raise ContractError("module asset archive expands beyond the safety limit")
+            payload: dict[str, bytes] = {}
+            root = assets["root"] + "/"
+            for member in members:
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise ContractError(f"cannot read module asset member: {member.name}")
+                payload[member.name[len(root):]] = stream.read()
+    except (OSError, tarfile.TarError) as error:
+        raise ContractError(f"cannot read module asset archive: {error}") from error
+
+    sums = parse_sums(payload["SHA256SUMS"])
+    summed_names = set(payload) - {"SHA256SUMS"}
+    manifest_names = summed_names - {"manifest.json"}
+    if set(sums) != summed_names:
+        raise ContractError("module SHA256SUMS member set differs")
+    for name, expected_hash in sums.items():
+        if sha256_bytes(payload[name]) != expected_hash:
+            raise ContractError(f"module asset member hash differs: {name}")
+
+    manifest = strict_json(payload["manifest.json"], "module asset manifest")
+    required_manifest = {
+        "phase": "inactive-staging-payload-only",
+        "candidate_image_sha256": kernel["image_sha256"],
+        "candidate_config_sha256": kernel["config_sha256"],
+        "candidate_notes_sha256": kernel["notes_sha256"],
+        "module_directory": assets["module_directory"],
+    }
+    for key, value in required_manifest.items():
+        if manifest.get(key) != value:
+            raise ContractError(f"module asset manifest differs at {key}")
+    if manifest.get("files") != {name: sha256_bytes(payload[name]) for name in sorted(manifest_names)}:
+        raise ContractError("module asset manifest file hashes differ")
+    if sha256_bytes(payload["kernel-notes.bin"]) != kernel["notes_sha256"]:
+        raise ContractError("module asset kernel notes differ")
+    if sha256_bytes(payload["candidate-module-dir.sh"]) != assets["candidate_selector_sha256"]:
+        raise ContractError("candidate module selector differs")
+    if sha256_bytes(payload["previous-module-dir.sh"]) != assets["previous_selector_sha256"]:
+        raise ContractError("previous module selector differs")
+    release_marker = b"vermagic=" + kernel["release"].encode("ascii")
+    for name in assets["modules"]:
+        module = payload[f"modules/{name}.ko"]
+        if release_marker + b" " not in module and release_marker + b"\0" not in module:
+            raise ContractError(f"module does not carry the exact kernel release: {name}")
+    return {name: sums[f"modules/{name}.ko"] for name in assets["modules"]}
+
+
+def verify_kernel_inputs(reference: dict, paths: dict[str, Path]) -> dict:
+    validate_reference(reference)
+    kernel = reference["kernel"]
+    for key, label, expected_key in (
+        ("image", "kernel Image", "image_sha256"),
+        ("notes", "kernel notes", "notes_sha256"),
+        ("config", "kernel configuration", "config_sha256"),
+        ("vmlinux_symvers", "vmlinux.symvers", "vmlinux_symvers_sha256"),
+        ("module_symvers", "kernel_aarch64_Module.symvers", "module_symvers_sha256"),
+    ):
+        require_hash(paths[key], kernel[expected_key], label)
+    module_hashes = verify_module_archive(reference, paths["assets"])
+    return {
+        "status": "verified",
+        "activation_mode": reference["activation"]["mode"],
+        "device": reference["device"]["codename"],
+        "kernel_release": kernel["release"],
+        "kernel_notes_sha256": kernel["notes_sha256"],
+        "module_count": len(module_hashes),
+    }
+
+
+def parse_runtime_manifest(path: Path, expected_hash: str) -> list[dict[str, str]]:
+    try:
+        data = read_limited_regular(path, "runtime asset manifest", MAX_MANIFEST_BYTES)
+        actual_hash = sha256_bytes(data)
+        if actual_hash != expected_hash:
+            raise ContractError(
+                f"runtime asset manifest SHA-256 differs: expected {expected_hash}, got {actual_hash}"
+            )
+        stream = io.StringIO(data.decode("utf-8"), newline="")
+        reader = csv.DictReader(stream, delimiter="\t")
+        expected_fields = ["target", "sha256", "provenance", "redistribution", "feature"]
+        if reader.fieldnames != expected_fields:
+            raise ContractError("runtime asset manifest header differs")
+        rows = list(reader)
+    except (OSError, UnicodeDecodeError, csv.Error) as error:
+        raise ContractError(f"cannot read runtime asset manifest: {error}") from error
+    if not rows:
+        raise ContractError("runtime asset manifest is empty")
+    seen: set[str] = set()
+    for number, row in enumerate(rows, 2):
+        if set(row) != set(expected_fields) or any(value is None for value in row.values()):
+            raise ContractError(f"runtime asset column count differs on line {number}")
+        target = row["target"]
+        target_path = PurePosixPath(target)
+        if (
+            not target_path.is_absolute()
+            or ".." in target_path.parts
+            or target in seen
+            or not target.startswith(("/usr/lib/", "/usr/local/", "/usr/sbin/"))
+        ):
+            raise ContractError(f"unsafe or duplicate runtime target on line {number}")
+        if not HEX256.fullmatch(row["sha256"]):
+            raise ContractError(f"invalid runtime hash on line {number}")
+        if not FEATURE.fullmatch(row["feature"]):
+            raise ContractError(f"invalid runtime feature on line {number}")
+        if row["provenance"] not in {"stock-extracted", "source-built", "repo-generated"}:
+            raise ContractError(f"invalid runtime provenance on line {number}")
+        allowed_pair = {
+            "stock-extracted": "extract-only",
+            "source-built": "build-output",
+            "repo-generated": "source",
+        }
+        if row["redistribution"] != allowed_pair[row["provenance"]]:
+            raise ContractError(f"invalid redistribution policy on line {number}")
+        seen.add(target)
+    return rows
+
+
+def verify_runtime_assets(reference: dict, manifest_path: Path, root: Path, features: set[str]) -> dict:
+    validate_reference(reference)
+    rows = parse_runtime_manifest(manifest_path, reference["runtime_assets"]["manifest_sha256"])
+    try:
+        root = root.resolve(strict=True)
+        root_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            root_flags |= os.O_NOFOLLOW
+        root_descriptor = os.open(root, root_flags)
+        if not stat.S_ISDIR(os.fstat(root_descriptor).st_mode):
+            os.close(root_descriptor)
+            raise ContractError(f"runtime root is not a directory: {root}")
+    except OSError as error:
+        raise ContractError(f"runtime root is unavailable: {root}: {error.strerror}") from error
+    try:
+        available = {row["feature"] for row in rows}
+        unknown = features - available
+        if unknown:
+            raise ContractError(f"runtime manifest has no requested feature: {', '.join(sorted(unknown))}")
+        selected = rows if not features else [row for row in rows if row["feature"] in features]
+        for row in selected:
+            parts = PurePosixPath(row["target"]).parts[1:]
+            current = os.dup(root_descriptor)
+            try:
+                directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_DIRECTORY
+                if hasattr(os, "O_NOFOLLOW"):
+                    directory_flags |= os.O_NOFOLLOW
+                for part in parts[:-1]:
+                    next_descriptor = os.open(part, directory_flags, dir_fd=current)
+                    os.close(current)
+                    current = next_descriptor
+                descriptor = open_regular(
+                    parts[-1], f"runtime asset {row['target']}", directory_fd=current
+                )
+                actual = sha256_descriptor(descriptor, f"runtime asset {row['target']}")
+            except OSError as error:
+                raise ContractError(
+                    f"runtime asset is unavailable or crosses a symlink: {row['target']}: {error.strerror}"
+                ) from error
+            finally:
+                os.close(current)
+            if actual != row["sha256"]:
+                raise ContractError(f"runtime asset SHA-256 differs: {row['target']}")
+    finally:
+        os.close(root_descriptor)
+    return {
+        "status": "verified",
+        "activation_mode": reference["activation"]["mode"],
+        "device": reference["device"]["codename"],
+        "asset_count": len(selected),
+        "features": sorted(features or available),
+    }
+
+
+def load_reference() -> dict:
+    prefix = Path(__file__).resolve().parent.parent
+    candidates = (
+        prefix / "reference.json",
+        prefix / "share/omamobile/myron-kernel-contract/reference.json",
+        Path("/usr/share/omamobile/myron-kernel-contract/reference.json"),
+    )
+    for path in candidates:
+        if path.exists() or path.is_symlink():
+            try:
+                data = read_limited_regular(path, "kernel contract reference", MAX_REFERENCE_BYTES)
+                reference = strict_json(data, "kernel contract reference")
+            except UnicodeDecodeError as error:
+                raise ContractError(f"cannot read kernel contract reference: {error}") from error
+            validate_reference(reference)
+            return reference
+    raise ContractError("kernel contract reference is unavailable")
+
+
+def parser() -> argparse.ArgumentParser:
+    command = argparse.ArgumentParser(description=__doc__)
+    subcommands = command.add_subparsers(dest="command", required=True)
+    subcommands.add_parser("show", help="print reviewed metadata; no files are changed")
+    kernel = subcommands.add_parser("verify-kernel", help="verify an external qualified kernel/module set")
+    kernel.add_argument("--image", type=Path, required=True)
+    kernel.add_argument("--notes", type=Path, required=True)
+    kernel.add_argument("--config", type=Path, required=True)
+    kernel.add_argument("--vmlinux-symvers", type=Path, required=True)
+    kernel.add_argument("--module-symvers", type=Path, required=True)
+    kernel.add_argument("--assets", type=Path, required=True)
+    runtime = subcommands.add_parser("verify-runtime", help="verify private runtime assets read-only")
+    runtime.add_argument("--manifest", type=Path, required=True)
+    runtime.add_argument("--root", type=Path, required=True)
+    runtime.add_argument("--features", default="", help="comma-separated feature names; default: all")
+    return command
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        reference = load_reference()
+        if args.command == "show":
+            print(json.dumps(reference, indent=2, sort_keys=True))
+            return 0
+        if args.command == "verify-kernel":
+            result = verify_kernel_inputs(reference, {
+                "image": args.image,
+                "notes": args.notes,
+                "config": args.config,
+                "vmlinux_symvers": args.vmlinux_symvers,
+                "module_symvers": args.module_symvers,
+                "assets": args.assets,
+            })
+        else:
+            features = set()
+            if args.features:
+                parts = args.features.split(",")
+                if any(not FEATURE.fullmatch(part) for part in parts) or len(parts) != len(set(parts)):
+                    raise ContractError("--features must contain unique comma-separated feature names")
+                features = set(parts)
+            result = verify_runtime_assets(reference, args.manifest, args.root, features)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except ContractError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

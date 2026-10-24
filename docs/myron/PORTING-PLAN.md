@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Myron Omarchy Mobile porting plan
 
-Status (2026-10-24): phase 0 audit and phase 1 inert skeleton implemented.
-No Arch image has booted and no live phone state was changed.
+Status (2026-10-24): phase 0 audit, phase 1 inert skeleton, and the metadata-only
+part of phase 2 are implemented. No Arch image has booted and no live phone
+state was changed.
 
 ## Goal
 
@@ -82,6 +83,22 @@ Translate reference modules in dependency order:
 Each translated module gets an Arch package or device-package subcomponent,
 an offline rootfs test, a read-only live probe, and a rollback record. No
 module is selected by `uname -r` alone.
+
+Implemented in the metadata-only contract package:
+
+- exact qualified VT Image, notes, configuration, and both symbol-table hashes;
+- exact seven-module asset archive, member allowlist, internal manifest, release
+  marker, selector, and `rmnet_core` conflict checks;
+- exact private runtime-asset manifest identity and per-feature read-only hash
+  verification;
+- explicit `activation.mode=disabled` while source-lock reproduction remains
+  unverified;
+- no Image, module, firmware, vendor binary, service, hook, or writer payload.
+
+Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
+host-key revalidation before another live read, and translation of the vendor
+module boot order. The generic rootfs builder remains blocked because its
+`/usr/lib/modules` model is incompatible with Myron's notes-keyed module sets.
 
 ## Phase 3: Arch Linux ARM rootfs
 
@@ -190,9 +207,10 @@ Future build gates:
 
 ## Next implementation task
 
-Build the Arch kernel-contract and graphics-source package drafts using only
-public source and metadata. Do not package vendor modules/firmware or boot
-images. Build the Myron device package in the aarch64 package container. Before
-an offline rootfs dependency pass, add a verified external-kernel/module input
-that can relax the current fail-closed rootfs refusal without admitting Pixel
-inputs.
+Finish Phase 2 by reproducing the qualified VT kernel outputs from the pinned
+source lock and recorded toolchain requirements, then translate the vendor
+module boot order into an offline Arch staging design. Keep rootfs generation
+blocked until that design preserves the notes-keyed selector and private
+runtime-asset contract without importing
+Pixel `/usr/lib/modules` assumptions. In parallel, draft the glibc Mesa source
+package from reconciled Attempt105 sources; do not import its Alpine binaries.

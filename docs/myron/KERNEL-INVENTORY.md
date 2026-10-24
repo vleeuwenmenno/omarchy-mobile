@@ -22,6 +22,41 @@ Kleaf, toolchain, mkbootimg, and build dependencies, but explicitly says the
 original toolchain identity and accepted output reproduction are not yet
 verified. It is a bootstrap seed, not a release-qualified kernel recipe.
 
+## Qualified VT contract
+
+Phase 2 records the latest systemd/VT-qualified downstream pair as metadata in
+`device/myron/kernel-contract.json`. The package
+`omamobile-myron-kernel-contract` verifies external inputs but distributes none
+of their bytes.
+
+| Input | Qualified SHA-256 |
+| --- | --- |
+| Raw `Image` | `9dc9d4a00544af130e04b534cb566e26329dbaa9b2f0e6596ad52c1e657d9e09` |
+| ELF `.notes` payload | `8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608` |
+| Full kernel configuration | `33b6eaf87b7ca2d0d06dd10dbe2a4ce3d58e50ad804d6b385cd5f953e2fe3b95` |
+| `vmlinux.symvers` | `aaf3fa84f4ccbab54327eee5a7fed7903e3f79af9ab53fdffe5165b27f2fa9f1` |
+| `kernel_aarch64_Module.symvers` | `d5507f9cfb0ba26541dd7c76e077601da89e0ab650ec69acaf854b62ee247f37` |
+| VT module asset archive | `342139d347edcb1a0bcb37498eead80657b307709920666fc7fae40e0dcd3496` |
+| Runtime asset manifest | `6e4cd92a61b246c52255ccdbea8cc6280d6ceecdae12d083417f220fe6b90fbc` |
+
+The verifier requires all five kernel/ABI files and the exact asset archive.
+It validates the archive allowlist, internal checksums and manifest, exact
+release marker in all seven GKI modules, notes-keyed selector, and the explicit
+`rmnet_core` conflict. Runtime firmware and vendor assets remain private and
+are accepted only through the exact 105-row manifest.
+
+Source provenance records the exact source-lock and stamped-manifest hashes
+plus the four patches used by the qualified build path (Bluetooth
+preinitialization, GENI clock voting, in-tree RMNET export, and IPC namespace
+exports). Those hashes describe the accepted dirty reference checkout; they do
+not claim a clean independent rebuild.
+
+This does not make the source lock reproducible: the reference checkout is
+dirty, and its lock still labels original toolchain identity and accepted
+output reproduction unverified. The contract therefore fixes activation to
+`disabled`. A live re-read was also withheld because SSH presented a changed
+host key; the local trust record was not modified or bypassed.
+
 `linux-xiaomi-myron-android` is only a postmarketOS rootfs compatibility
 marker. Its `/boot/vmlinuz-*` is text saying not to flash it. The real Image,
 DTB/DTBO, vendor modules, and Android boot images remain externally managed.
@@ -112,3 +147,7 @@ The staged approach is:
 5. only then implement a Myron-specific kernel/image package.
 
 No Arch package may own or overwrite the proven boot images during phases 0-3.
+
+The Phase 2 package follows that rule: it installs only a Python verifier,
+contract JSON, documentation, license, and version. It has no systemd unit,
+pacman hook, module payload, firmware, Image, DTB/DTBO, or partition writer.
