@@ -153,8 +153,8 @@ The standalone package check and an extracted-root test with the Mesa artifact
 passed. Exact unsigned development artifact:
 
 ```text
-omamobile-myron-gpu-profile-0.1.0-1-any.pkg.tar.zst
-SHA-256 2dd6c981013668bdbac65dcfa3ec4955ea9e0e3fd5d01421dff9ef45993814d7
+omamobile-myron-gpu-profile-0.1.1-1-any.pkg.tar.zst
+SHA-256 6f02c0ac292888d6be619c228afdca04d04db64e5ddf644533846d0a00641784
 ```
 
 ## Equivalence test ladder

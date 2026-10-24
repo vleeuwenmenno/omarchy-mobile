@@ -30,7 +30,7 @@
   },
   "package": {
     "name": "omamobile-myron-gpu-profile",
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "provenance": {
     "device_qualification": "none",

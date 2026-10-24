@@ -4,11 +4,13 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
-mkdir -p "$t/repo/bin" "$t/repo/tools/lib" "$t/repo/device/probe" "$t/bin" "$t/bundle/images"
+mkdir -p "$t/repo/bin" "$t/repo/tools/lib" "$t/repo/device/probe" "$t/repo/rootfs" "$t/bin" "$t/bundle/images"
 cp bin/omamobile "$t/repo/bin/"
 cp tools/install-phone "$t/repo/tools/"
 cp tools/build-rootfs "$t/repo/tools/"
 cp tools/lib/alarm.sh "$t/repo/tools/lib/"
+cp rootfs/packages.base rootfs/packages.omamobile \
+  rootfs/packages.base.myron rootfs/packages.omamobile.myron "$t/repo/rootfs/"
 cp tools/install-phone "$t/bundle/install"
 # shellcheck disable=SC2016 # fixture evaluated by the child, not this test
 printf 'DEVICE=${DEVICE:-probe}\nSRC_DIR=/no-sources-needed\n' > "$t/repo/omamobile.conf"
@@ -76,3 +78,304 @@ grep -q 'unsupported BOOT_METHOD=external-android; rootfs builds require a suppo
   || fail "myron rootfs build fails for the wrong reason"
 [[ ! -e $t/calls ]] || fail "myron rootfs refusal started a container"
 echo 'ok - the shipped myron descriptor cannot build a rootfs with Pixel kernel/module inputs'
+
+# --stage-only is the one rootfs path for external-contract devices. It passes
+# the boot-method gate, then stops at the missing repository (the fixture has
+# no out/repo) before any container or phone command.
+rm -f "$t/calls"
+if DEVICE=myron "$t/repo/tools/build-rootfs" --version stage-test --stage-only > "$t/log" 2>&1; then
+  fail "myron stage-only succeeds without a repository"
+fi
+grep -q 'no \[omamobile\] repository in out/repo' "$t/log" \
+  || fail "myron stage-only does not stop at the missing repository"
+if grep -q 'unsupported BOOT_METHOD\|no kernel build\|no .*modules-' "$t/log"; then
+  fail "myron stage-only hits the kernel/module requirements"
+fi
+[[ ! -e $t/calls && ! -e $t/repo/out ]] || fail "myron stage-only reached a container or wrote output"
+echo 'ok - myron --stage-only passes the gate and stops at the missing repository before docker'
+
+# Normal android-v4 devices cannot stage, and external-contract needs --stage-only.
+mkdir -p "$t/repo/device/probe"
+printf 'CODENAME=probe\nPACKAGE=probe\nBOOT_METHOD=android-v4\nBOOT_IMAGES=""\nUFS_RW=""\n' > "$t/repo/device/probe/device.conf"
+if DEVICE=probe "$t/repo/tools/build-rootfs" --version stage-test --stage-only > "$t/log" 2>&1; then
+  fail "android-v4 accepts --stage-only"
+fi
+grep -q -- '--stage-only needs BOOT_METHOD=external-android and ROOTFS_INTEGRATION=external-contract' "$t/log" \
+  || fail "android-v4 --stage-only fails for the wrong reason"
+printf 'CODENAME=probe\nPACKAGE=probe\nBOOT_METHOD=android-v4\nROOTFS_INTEGRATION=bogus\nBOOT_IMAGES=""\nUFS_RW=""\n' > "$t/repo/device/probe/device.conf"
+if DEVICE=probe "$t/repo/tools/build-rootfs" --version stage-test > "$t/log" 2>&1; then
+  fail "rootfs builder accepts an unknown ROOTFS_INTEGRATION"
+fi
+grep -q 'invalid ROOTFS_INTEGRATION=bogus' "$t/log" || fail "unknown ROOTFS_INTEGRATION fails for the wrong reason"
+printf 'CODENAME=probe\nPACKAGE=probe\nBOOT_METHOD=android-v4\nROOTFS_PACKAGE_PROFILE=../bad\nBOOT_IMAGES=""\nUFS_RW=""\n' > "$t/repo/device/probe/device.conf"
+if DEVICE=probe "$t/repo/tools/build-rootfs" --version stage-test > "$t/log" 2>&1; then
+  fail "rootfs builder accepts an unsafe ROOTFS_PACKAGE_PROFILE"
+fi
+grep -q 'invalid ROOTFS_PACKAGE_PROFILE' "$t/log" || fail "unsafe ROOTFS_PACKAGE_PROFILE fails for the wrong reason"
+printf 'CODENAME=probe\nPACKAGE=probe\nBOOT_METHOD=android-v4\nROOTFS_PACKAGE_PROFILE=bogus\nBOOT_IMAGES=""\nUFS_RW=""\n' > "$t/repo/device/probe/device.conf"
+if DEVICE=probe "$t/repo/tools/build-rootfs" --version stage-test > "$t/log" 2>&1; then
+  fail "rootfs builder accepts an unsupported ROOTFS_PACKAGE_PROFILE"
+fi
+grep -q 'unsupported ROOTFS_PACKAGE_PROFILE=bogus' "$t/log" || fail "unsupported package profile fails for the wrong reason"
+[[ ! -e $t/calls && ! -e $t/repo/out ]] || fail "stage-only refusal reached a container"
+echo 'ok - stage-only and invalid rootfs contracts are rejected before docker'
+
+# Exercise the host-side successful stage branch with a fake container. This
+# proves mount selection, candidate validation, and final output naming without
+# Docker, pacstrap, an image tool, or network access.
+cat > "$t/repo/tools/lib/alarm.sh" <<'SH'
+ALARM_CACHE=${ALARM_CACHE:?}
+ALARM_TARBALL=$ALARM_CACHE/tarball
+OMARCHY_CHANNEL=stable
+alarm_die() { echo "error: $*" >&2; exit 1; }
+alarm_say() { echo "==> $*"; }
+alarm_fetch() { :; }
+alarm_build_image() { echo fake-aarch64-builder; }
+SH
+mkdir -p "$t/cache" "$t/repo/out/repo/aarch64" "$t/repo/tests"
+printf fixture > "$t/cache/tarball"
+: > "$t/repo/out/repo/aarch64/omamobile.db"
+cat > "$t/repo/tests/rootfs-stage" <<'SH'
+#!/bin/sh
+echo "rootfs-stage $*" >> "$CALLS"
+exit 0
+SH
+chmod +x "$t/repo/tests/rootfs-stage"
+cat > "$t/bin/git" <<'SH'
+#!/bin/sh
+if [ "$1" = rev-parse ]; then echo deadbeef0000; fi
+exit 0
+SH
+chmod +x "$t/bin/git"
+cat > "$t/bin/docker" <<'SH'
+#!/bin/bash
+echo "docker $*" >> "$CALLS"
+if [[ $1 == volume && $2 == create ]]; then echo fixture-volume; exit 0; fi
+if [[ $1 == volume && $2 == rm ]]; then exit 0; fi
+if [[ $1 == run ]]; then
+  previous= output=
+  for argument; do
+    if [[ $previous == -v && $argument == *:/out ]]; then output=${argument%:/out}; fi
+    previous=$argument
+  done
+  [[ -n $output ]] || exit 91
+  mkdir -p "$output/stage"
+  [[ ${INJECT_BOOT:-0} != 1 ]] || : > "$output/stage/boot.img"
+  printf '# Omarchy Mobile root STAGE (not bootable, not an image)\n' > "$output/MANIFEST"
+  exit 0
+fi
+exit 92
+SH
+chmod +x "$t/bin/docker"
+rm -f "$t/calls"
+ALARM_CACHE="$t/cache" DEVICE=myron "$t/repo/tools/build-rootfs" \
+  --version host-success --stage-only > "$t/log" 2>&1 || fail "mocked stage build failed"
+stage="$t/repo/out/omamobile-rootfs-stage-host-success-aarch64"
+[[ -d $stage && -f $stage.MANIFEST ]] || fail "mocked stage output is missing"
+[[ ! -e $stage.img && ! -e $stage.img.zst && ! -e $stage.img.zst.sha256 ]] ||
+  fail "mocked stage emitted an image"
+grep -q '^docker run ' "$t/calls" || fail "mocked stage did not reach the container boundary"
+grep -q '^rootfs-stage ' "$t/calls" || fail "mocked stage candidate was not validated"
+echo 'ok - successful stage branch validates and publishes only a tree and MANIFEST'
+
+# Publication is no-clobber: a same-version rerun refuses before any container
+# and leaves the earlier stage and manifest untouched.
+mv "$stage" "$stage.first"; mv "$stage.MANIFEST" "$stage.MANIFEST.first"
+mkdir "$stage"; echo sentinel-tree > "$stage/sentinel"; echo sentinel-manifest > "$stage.MANIFEST"
+rm -f "$t/calls"
+if ALARM_CACHE="$t/cache" DEVICE=myron "$t/repo/tools/build-rootfs" \
+    --version host-success --stage-only > "$t/log" 2>&1; then
+  fail "same-version stage rerun overwrote an existing stage"
+fi
+grep -q 'already exists' "$t/log" || fail "same-version collision fails for the wrong reason"
+[[ ! -e $t/calls ]] || fail "same-version collision started docker or validation"
+[[ $(cat "$stage/sentinel") == sentinel-tree && $(cat "$stage.MANIFEST") == sentinel-manifest ]] ||
+  fail "same-version collision touched the earlier stage"
+# Only the manifest present (no tree): still refused, and left alone
+rm -rf "$stage"
+if ALARM_CACHE="$t/cache" DEVICE=myron "$t/repo/tools/build-rootfs" \
+    --version host-success --stage-only > "$t/log" 2>&1; then
+  fail "stage rerun overwrote a lone manifest"
+fi
+[[ $(cat "$stage.MANIFEST") == sentinel-manifest && ! -e $t/calls ]] ||
+  fail "lone-manifest collision touched the manifest or started docker"
+rm -f "$stage.MANIFEST"; rm -rf "$stage.first" "$stage.MANIFEST.first"
+echo 'ok - same-version stage collision preserves the earlier stage and starts no container'
+
+# If a tree appears after the final pre-publication check, leave both it and
+# the already-published manifest untouched. Unlinking the manifest by pathname
+# would risk deleting a concurrent writer's replacement.
+race_stage="$t/repo/out/omamobile-rootfs-stage-publish-race-aarch64"
+cat > "$t/bin/ln" <<'SH'
+#!/bin/bash
+/usr/bin/ln "$@"
+mkdir -- "$FAIL_STAGE"
+SH
+chmod +x "$t/bin/ln"
+if FAIL_STAGE="$race_stage" ALARM_CACHE="$t/cache" DEVICE=myron \
+    "$t/repo/tools/build-rootfs" --version publish-race --stage-only > "$t/log" 2>&1; then
+  fail "stage publication accepts a tree appearing during publication"
+fi
+grep -q 'cannot publish.*publish-race' "$t/log" || fail "publication race fails for the wrong reason"
+[[ -d $race_stage && -f $race_stage.MANIFEST ]] ||
+  fail "publication race removed the unexpected tree or published manifest"
+grep -q '^# Omarchy Mobile root STAGE' "$race_stage.MANIFEST" ||
+  fail "publication race changed the published manifest"
+rm -rf "$race_stage" "$race_stage.MANIFEST" "$t/bin/ln"
+echo 'ok - failed tree publication preserves its published MANIFEST and unexpected tree'
+
+# A concurrent writer may replace MANIFEST after the hard link succeeds and
+# before tree publication fails. Failure handling must never unlink that
+# replacement by pathname.
+race_stage="$t/repo/out/omamobile-rootfs-stage-manifest-replace-race-aarch64"
+cat > "$t/bin/ln" <<'SH'
+#!/bin/bash
+/usr/bin/ln "$@" || exit
+last=${!#}
+rm -f -- "$last"
+printf 'concurrent-writer\n' > "$last"
+mkdir -- "$FAIL_STAGE"
+SH
+chmod +x "$t/bin/ln"
+if FAIL_STAGE="$race_stage" ALARM_CACHE="$t/cache" DEVICE=myron \
+    "$t/repo/tools/build-rootfs" --version manifest-replace-race --stage-only > "$t/log" 2>&1; then
+  fail "stage publication accepts a concurrently replaced MANIFEST"
+fi
+grep -q 'cannot publish.*manifest-replace-race' "$t/log" ||
+  fail "MANIFEST replacement race fails for the wrong reason"
+[[ -d $race_stage && -f $race_stage.MANIFEST ]] ||
+  fail "MANIFEST replacement race removed concurrent output"
+[[ $(cat "$race_stage.MANIFEST") == concurrent-writer ]] ||
+  fail "MANIFEST replacement race changed concurrent output"
+rm -rf "$race_stage" "$race_stage.MANIFEST" "$t/bin/ln"
+echo 'ok - failed tree publication preserves a concurrently replaced MANIFEST'
+
+# A directory or symlink-to-directory racing into the MANIFEST name must not
+# turn ln's destination into a directory and let the build report success.
+manifest_stage="$t/repo/out/omamobile-rootfs-stage-manifest-dir-race-aarch64"
+cat > "$t/bin/ln" <<'SH'
+#!/bin/bash
+last=${!#}
+mkdir -- "$last"
+exec /usr/bin/ln "$@"
+SH
+chmod +x "$t/bin/ln"
+if ALARM_CACHE="$t/cache" DEVICE=myron "$t/repo/tools/build-rootfs" \
+    --version manifest-dir-race --stage-only > "$t/log" 2>&1; then
+  fail "stage publication accepts a MANIFEST directory race"
+fi
+grep -q 'cannot publish.*MANIFEST' "$t/log" || fail "MANIFEST directory race fails for the wrong reason"
+[[ ! -e $manifest_stage && -d $manifest_stage.MANIFEST ]] ||
+  fail "MANIFEST directory race published a tree or removed the racing directory"
+rm -rf "$manifest_stage.MANIFEST" "$t/bin/ln"
+
+manifest_stage="$t/repo/out/omamobile-rootfs-stage-manifest-link-race-aarch64"
+manifest_target="$t/manifest-race-target"
+mkdir "$manifest_target"
+cat > "$t/bin/ln" <<'SH'
+#!/bin/bash
+last=${!#}
+/usr/bin/ln -s -- "$MANIFEST_TARGET" "$last"
+exec /usr/bin/ln "$@"
+SH
+chmod +x "$t/bin/ln"
+if MANIFEST_TARGET="$manifest_target" ALARM_CACHE="$t/cache" DEVICE=myron \
+    "$t/repo/tools/build-rootfs" --version manifest-link-race --stage-only > "$t/log" 2>&1; then
+  fail "stage publication accepts a MANIFEST symlink-to-directory race"
+fi
+grep -q 'cannot publish.*MANIFEST' "$t/log" || fail "MANIFEST symlink race fails for the wrong reason"
+[[ ! -e $manifest_stage && -L $manifest_stage.MANIFEST ]] ||
+  fail "MANIFEST symlink race published a tree or removed the racing symlink"
+rm -f "$manifest_stage.MANIFEST" "$t/bin/ln"
+rm -rf "$manifest_target"
+echo 'ok - MANIFEST directory races cannot publish a stage'
+
+# Overlapping same-version builds must never share a candidate pathname. Build
+# A pauses after validating safe bytes; build B then writes an unsafe candidate
+# and pauses before rejecting it. A must still publish only its own safe tree.
+cp "$t/repo/tests/rootfs-stage" "$t/rootfs-stage.base"
+cat > "$t/repo/tests/rootfs-stage" <<'SH'
+#!/bin/bash
+set -eu
+tree=$1
+wait_for() {
+  for _ in {1..1000}; do
+    [[ -e $1 ]] && return 0
+    sleep 0.01
+  done
+  return 1
+}
+case ${RACE_ROLE:-} in
+  A)
+    [[ ! -e $tree/boot.img ]] || exit 81
+    : > "$RACE_SYNC/a-validated"
+    wait_for "$RACE_SYNC/release-a" || exit 82
+    ;;
+  B)
+    : > "$RACE_SYNC/b-at-validator"
+    wait_for "$RACE_SYNC/release-b" || exit 83
+    [[ ! -e $tree/boot.img ]] || exit 84
+    ;;
+esac
+echo "rootfs-stage $*" >> "$CALLS"
+SH
+chmod +x "$t/repo/tests/rootfs-stage"
+race_sync="$t/overlap-sync"
+mkdir "$race_sync"
+RACE_ROLE=A RACE_SYNC="$race_sync" ALARM_CACHE="$t/cache" DEVICE=myron \
+  "$t/repo/tools/build-rootfs" --version overlap-race --stage-only \
+  > "$t/overlap-a.log" 2>&1 &
+race_a=$!
+for _ in {1..1000}; do
+  [[ -e $race_sync/a-validated ]] && break
+  sleep 0.01
+done
+[[ -e $race_sync/a-validated ]] || fail "overlap build A did not reach validation"
+RACE_ROLE=B RACE_SYNC="$race_sync" INJECT_BOOT=1 ALARM_CACHE="$t/cache" DEVICE=myron \
+  "$t/repo/tools/build-rootfs" --version overlap-race --stage-only \
+  > "$t/overlap-b.log" 2>&1 &
+race_b=$!
+for _ in {1..1000}; do
+  [[ -e $race_sync/b-at-validator ]] && break
+  sleep 0.01
+done
+[[ -e $race_sync/b-at-validator ]] || fail "overlap build B did not reach validation"
+: > "$race_sync/release-a"
+wait "$race_a" || { cat "$t/overlap-a.log" >&2; fail "safe overlap build A failed"; }
+overlap_stage="$t/repo/out/omamobile-rootfs-stage-overlap-race-aarch64"
+[[ -d $overlap_stage && -f $overlap_stage.MANIFEST && ! -e $overlap_stage/boot.img ]] ||
+  fail "overlap build A published another build's unvalidated candidate"
+: > "$race_sync/release-b"
+if wait "$race_b"; then
+  fail "unsafe overlap build B passed validation"
+fi
+mv "$t/rootfs-stage.base" "$t/repo/tests/rootfs-stage"
+rm -rf "$overlap_stage" "$overlap_stage.MANIFEST" "$race_sync"
+echo 'ok - overlapping same-version builds use private validated candidates'
+
+# The Myron profile only fits the Myron stage, in both directions
+rm -f "$t/calls"
+mkdir -p "$t/repo/device/probe"
+printf 'CODENAME=probe\nPACKAGE=probe\nBOOT_METHOD=external-android\nROOTFS_INTEGRATION=external-contract\nROOTFS_PACKAGE_PROFILE=myron\nBOOT_IMAGES=""\nUFS_RW=""\n' > "$t/repo/device/probe/device.conf"
+if ALARM_CACHE="$t/cache" DEVICE=probe "$t/repo/tools/build-rootfs" --version profile-test --stage-only > "$t/log" 2>&1; then
+  fail "the myron profile is accepted for another device"
+fi
+grep -q 'ROOTFS_PACKAGE_PROFILE=myron needs DEVICE=myron' "$t/log" || fail "profile/device mismatch fails for the wrong reason"
+cp "$t/repo/device/myron/device.conf" "$t/myron.conf.orig"
+sed -i '/^ROOTFS_PACKAGE_PROFILE=/d' "$t/repo/device/myron/device.conf"
+if ALARM_CACHE="$t/cache" DEVICE=myron "$t/repo/tools/build-rootfs" --version profile-test --stage-only > "$t/log" 2>&1; then
+  fail "a myron stage accepts the default profile"
+fi
+grep -q 'a myron stage needs ROOTFS_PACKAGE_PROFILE=myron' "$t/log" || fail "myron default-profile fails for the wrong reason"
+cp "$t/myron.conf.orig" "$t/repo/device/myron/device.conf"
+[[ ! -e $t/calls && ! -e $t/repo/out/omamobile-rootfs-stage-profile-test-aarch64 ]] ||
+  fail "profile mismatch reached docker or published output"
+# Direct build-inside invocation fails closed before touching pacman
+for bad in "DEVICE=cheetah STAGE_ONLY=1 ROOTFS_INTEGRATION=external-contract ROOTFS_PACKAGE_PROFILE=myron" \
+           "DEVICE=myron STAGE_ONLY=0 ROOTFS_INTEGRATION=kernel-modules ROOTFS_PACKAGE_PROFILE=myron" \
+           "DEVICE=myron STAGE_ONLY=1 ROOTFS_INTEGRATION=external-contract ROOTFS_PACKAGE_PROFILE=default"; do
+  # shellcheck disable=SC2086 # intentional word splitting of NAME=value pairs
+  if env $bad bash rootfs/build-inside > "$t/log" 2>&1; then fail "build-inside accepts: $bad"; fi
+  grep -q 'myron' "$t/log" || fail "build-inside rejects '$bad' for the wrong reason"
+done
+echo 'ok - the myron profile is bound to the myron stage-only contract, in both scripts'

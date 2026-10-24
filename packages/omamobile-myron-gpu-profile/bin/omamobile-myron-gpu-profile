@@ -47,15 +47,28 @@ ENVIRONMENT = {
     "VK_DRIVER_FILES": "/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json",
 }
 GLOBAL_ACTIVATION_PATHS = (
+    "etc/X11/Xsession",
+    "etc/X11/Xsession.d",
+    "etc/X11/xinit/xinitrc",
+    "etc/X11/xinit/xinitrc.d",
+    "etc/bash.bashrc",
+    "etc/csh.cshrc",
+    "etc/csh.login",
     "etc/environment",
     "etc/environment.d",
+    "etc/fish/config.fish",
+    "etc/fish/conf.d",
     "etc/ld.so.conf",
     "etc/ld.so.conf.d",
     "etc/ld.so.preload",
     "etc/pacman.d/hooks",
+    "etc/pam.d",
     "etc/profile",
     "etc/profile.d",
+    "etc/sddm.conf",
+    "etc/sddm.conf.d",
     "etc/security/pam_env.conf",
+    "etc/skel",
     "etc/systemd/system.conf",
     "etc/systemd/system.conf.d",
     "etc/systemd/system.control",
@@ -73,6 +86,10 @@ GLOBAL_ACTIVATION_PATHS = (
     "etc/vulkan/icd.d",
     "etc/vulkan/implicit_layer.d",
     "etc/xdg/systemd/user",
+    "etc/xprofile",
+    "etc/zprofile",
+    "etc/zsh",
+    "etc/zshenv",
     "run/environment.d",
     "run/systemd/system.conf",
     "run/systemd/system.conf.d",
@@ -92,11 +109,14 @@ GLOBAL_ACTIVATION_PATHS = (
     "run/systemd/user-environment-generators",
     "run/udev/rules.d",
     "usr/lib/environment.d",
+    "usr/lib/pam.d",
+    "usr/lib/sddm/sddm.conf.d",
     "usr/lib/systemd/system.conf",
     "usr/lib/systemd/system.conf.d",
     "usr/lib/systemd/system",
     "usr/lib/systemd/system-generators",
     "usr/lib/systemd/system-environment-generators",
+    "usr/lib/systemd/profile.d",
     "usr/lib/systemd/user.conf.d",
     "usr/lib/systemd/user.conf",
     "usr/lib/systemd/user",
@@ -109,14 +129,24 @@ GLOBAL_ACTIVATION_PATHS = (
     "usr/local/lib/systemd/system",
     "usr/local/lib/systemd/system-generators",
     "usr/local/lib/systemd/system-environment-generators",
+    "usr/local/lib/systemd/profile.d",
     "usr/local/lib/systemd/user",
     "usr/local/lib/systemd/user.conf",
     "usr/local/lib/systemd/user.conf.d",
     "usr/local/lib/systemd/user-generators",
     "usr/local/lib/systemd/user-environment-generators",
     "usr/local/lib/udev/rules.d",
+    "usr/local/etc/profile",
+    "usr/local/etc/xprofile",
+    "usr/local/share/fish/vendor_conf.d",
+    "usr/local/share/wayland-sessions",
+    "usr/local/share/xsessions",
     "usr/share/libalpm/hooks",
+    "usr/share/fish/vendor_conf.d",
+    "usr/share/sddm/scripts",
     "usr/share/systemd/user",
+    "usr/share/wayland-sessions",
+    "usr/share/xsessions",
     "usr/share/vulkan/explicit_layer.d",
     "usr/share/vulkan/icd.d",
     "usr/share/vulkan/implicit_layer.d",
@@ -129,6 +159,7 @@ ACTIVATION_MARKERS = (
     b"/usr/lib/omamobile/myron-gpu",
     b"freedreno-kgsl.json",
     b"/usr/share/omamobile/myron-gpu-profile/profile.env",
+    b"omamobile-myron-session",
 )
 
 
@@ -283,7 +314,7 @@ def validate_reference(data: bytes) -> dict:
         raise ProfileError("profile reference fields or schema differ")
     if reference.get("package") != {
         "name": "omamobile-myron-gpu-profile",
-        "version": "0.1.0",
+        "version": "0.1.1",
     }:
         raise ProfileError("profile package identity differs")
     if reference.get("mesa") != {
@@ -593,11 +624,7 @@ def symlink_selects_private(
         descriptor = open_beneath(root_descriptor, relative, "global activation symlink")
     except ProfileError as error:
         raise ProfileError(f"global activation symlink is broken: {link}") from error
-    try:
-        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise ProfileError(f"global activation symlink selects a directory: {link}")
-    finally:
-        os.close(descriptor)
+    os.close(descriptor)
     return False
 
 

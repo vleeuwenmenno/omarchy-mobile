@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=omamobile-apps-myron
+pkgver=$(cat "${startdir:-.}/version")
+pkgrel=1
+pkgdesc="Myron-safe mobile app dependency profile without unqualified camera or NFC"
+arch=(any)
+url="https://github.com/derekross/omarchy-mobile"
+license=(MIT)
+provides=(omamobile-apps)
+conflicts=(omamobile-apps)
+depends=(gnome-maps geoclue)
+
+check() {
+  "$startdir/test/all"
+}
+
+package() {
+  "$startdir/install" "$pkgdir"
+}

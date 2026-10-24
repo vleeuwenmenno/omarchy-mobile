@@ -91,9 +91,13 @@ Xiaomi myron is an `external-android` reference port. Its working downstream
 Android GKI kernel, vendor modules, firmware, and current slot arrangement are
 not represented by the Pixel image builder. Its descriptor and inert device
 package permit offline package work, while every rootfs, image, flash, push,
-and installer command fails before container or phone access. Rootfs support
-stays disabled until the verified external contract is paired with a
-notes-keyed module/runtime staging design.
+and installer command fails before container or phone access, except
+`tools/build-rootfs --stage-only` (`ROOTFS_INTEGRATION=external-contract`),
+which writes a non-bootable package tree and MANIFEST: no image, checksum,
+kernel, modules, or proprietary payload. `ROOTFS_PACKAGE_PROFILE=myron` keeps
+Panfrost and unqualified device packages out of that tree. Rootfs images stay
+disabled until the verified external contract is paired with a notes-keyed
+module/runtime staging design.
 
 ### 3.2 Keys to add later
 

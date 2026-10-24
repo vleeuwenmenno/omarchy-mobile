@@ -30,6 +30,7 @@
 # to the whole userdata partition on the first boot.
 #
 #   tools/build-rootfs [--version V] [--allow-missing "PKG..."] [--keep-raw]
+#                      [--stage-only]
 #     DEVICE       device/<codename>/device.conf (default cheetah)
 #     KERNEL_OUT   kernel build with modules-<release>.tar.zst
 #                  (default ~/android/mainline/out-int: bin/omamobile modules)
@@ -37,6 +38,13 @@
 #                       (say "mesa hyprland libcamera libcamera-ipa
 #                       gst-plugin-libcamera vulkan-panfrost" for a test image
 #                       without the slow builds; the MANIFEST lists them)
+#     --stage-only      only for ROOTFS_INTEGRATION=external-contract devices
+#                       (myron): writes out/omamobile-rootfs-stage-<version>-
+#                       aarch64/ and its MANIFEST. A package-resolution stage,
+#                       not an image: not bootable, no kernel or modules, no
+#                       checksum, no smoke test, no proprietary payload
+#                       An existing stage or MANIFEST of the same version is never
+#                       replaced: the build refuses (use another --version)
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 ROOT=$PWD
@@ -45,13 +53,14 @@ source tools/lib/alarm.sh
 DEVICE=${DEVICE:-cheetah}
 KERNEL_OUT=${KERNEL_OUT:-$HOME/android/mainline/out-int}
 VERSION=$(date +%Y.%m.%d)
-ALLOW_MISSING="" KEEP_RAW=0
+ALLOW_MISSING="" KEEP_RAW=0 STAGE_ONLY=0
 while (($#)); do
   case $1 in
     --version) VERSION=${2:?}; shift ;;
     --allow-missing) ALLOW_MISSING=${2:?}; shift ;;
     --keep-raw) KEEP_RAW=1 ;;
-    -h|--help) sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --stage-only) STAGE_ONLY=1 ;;
+    -h|--help) sed -n '3,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) alarm_die "unknown argument $1" ;;
   esac
   shift
@@ -69,26 +78,94 @@ if grep -q '^BOOT_METHOD=' "$conf"; then
 else
   BOOT_METHOD=android-v4
 fi
-[[ $BOOT_METHOD == android-v4 ]] ||
-  alarm_die "$conf: unsupported BOOT_METHOD=$BOOT_METHOD; rootfs builds require a supported kernel/module integration"
+if grep -q '^ROOTFS_INTEGRATION=' "$conf"; then
+  ROOTFS_INTEGRATION=$(sed -n \
+    -e 's/^ROOTFS_INTEGRATION=\([a-z0-9][a-z0-9-]*\)$/\1/p' \
+    -e 's/^ROOTFS_INTEGRATION="\([a-z0-9][a-z0-9-]*\)"$/\1/p' "$conf")
+  [[ -n $ROOTFS_INTEGRATION && $ROOTFS_INTEGRATION != *$'\n'* ]] ||
+    alarm_die "$conf: invalid ROOTFS_INTEGRATION"
+else
+  ROOTFS_INTEGRATION=kernel-modules
+fi
+if grep -q '^ROOTFS_PACKAGE_PROFILE=' "$conf"; then
+  ROOTFS_PACKAGE_PROFILE=$(sed -n \
+    -e 's/^ROOTFS_PACKAGE_PROFILE=\([a-z0-9][a-z0-9-]*\)$/\1/p' \
+    -e 's/^ROOTFS_PACKAGE_PROFILE="\([a-z0-9][a-z0-9-]*\)"$/\1/p' "$conf")
+  [[ -n $ROOTFS_PACKAGE_PROFILE && $ROOTFS_PACKAGE_PROFILE != *$'\n'* ]] ||
+    alarm_die "$conf: invalid ROOTFS_PACKAGE_PROFILE"
+else
+  ROOTFS_PACKAGE_PROFILE=default
+fi
+case $ROOTFS_PACKAGE_PROFILE in
+  default|myron) ;;
+  *) alarm_die "$conf: unsupported ROOTFS_PACKAGE_PROFILE=$ROOTFS_PACKAGE_PROFILE" ;;
+esac
+[[ $ROOTFS_INTEGRATION == kernel-modules || $ROOTFS_INTEGRATION == external-contract ]] ||
+  alarm_die "$conf: invalid ROOTFS_INTEGRATION=$ROOTFS_INTEGRATION"
+if ((STAGE_ONLY)); then
+  [[ $BOOT_METHOD == external-android && $ROOTFS_INTEGRATION == external-contract ]] ||
+    alarm_die "$conf: --stage-only needs BOOT_METHOD=external-android and ROOTFS_INTEGRATION=external-contract"
+else
+  [[ $BOOT_METHOD == android-v4 ]] ||
+    alarm_die "$conf: unsupported BOOT_METHOD=$BOOT_METHOD; rootfs builds require a supported kernel/module integration"
+  [[ $ROOTFS_INTEGRATION == kernel-modules ]] ||
+    alarm_die "$conf: ROOTFS_INTEGRATION=$ROOTFS_INTEGRATION needs --stage-only"
+fi
+# The Myron package profile is bound to the Myron stage in both directions
+if [[ $ROOTFS_PACKAGE_PROFILE == myron ]]; then
+  [[ $DEVICE == myron && $STAGE_ONLY == 1 && $ROOTFS_INTEGRATION == external-contract ]] ||
+    alarm_die "$conf: ROOTFS_PACKAGE_PROFILE=myron needs DEVICE=myron, --stage-only and ROOTFS_INTEGRATION=external-contract"
+elif [[ $DEVICE == myron && $STAGE_ONLY == 1 ]]; then
+  alarm_die "$conf: a myron stage needs ROOTFS_PACKAGE_PROFILE=myron, not $ROOTFS_PACKAGE_PROFILE"
+fi
 DEVICE_PACKAGE=$(sed -n 's/^PACKAGE=\([a-z0-9-]*\)$/\1/p' "$conf")
 [[ -n $DEVICE_PACKAGE ]] || alarm_die "$conf has no PACKAGE"
 ROOTFS_PACKAGES=$(sed -n 's/^ROOTFS_PACKAGES="\(.*\)"$/\1/p' "$conf")
 [[ $ROOTFS_PACKAGES =~ ^[a-z0-9\ -]*$ ]] || alarm_die "$conf: ROOTFS_PACKAGES may hold only package names"
+base_list=rootfs/packages.base
+ours_list=rootfs/packages.omamobile
+if [[ $ROOTFS_PACKAGE_PROFILE != default ]]; then
+  base_list+=.$ROOTFS_PACKAGE_PROFILE
+  ours_list+=.$ROOTFS_PACKAGE_PROFILE
+fi
+[[ -f $base_list && -f $ours_list ]] ||
+  alarm_die "$conf: missing rootfs package profile '$ROOTFS_PACKAGE_PROFILE'"
 
 repo=out/repo/aarch64
 [[ -f $repo/omamobile.db ]] ||
   alarm_die "no [omamobile] repository in out/repo: build it first with tools/build-packages (or tools/repo-build)"
-[[ -f $KERNEL_OUT/include/config/kernel.release ]] || alarm_die "no kernel build in $KERNEL_OUT (KERNEL_OUT=...)"
-release=$(cat "$KERNEL_OUT/include/config/kernel.release")
-modules=$KERNEL_OUT/modules-$release.tar.zst
-[[ -f $modules ]] || alarm_die "no $modules: run KERNEL_OUT=$KERNEL_OUT bin/omamobile modules"
+release="" modules=""
+if ((!STAGE_ONLY)); then
+  [[ -f $KERNEL_OUT/include/config/kernel.release ]] || alarm_die "no kernel build in $KERNEL_OUT (KERNEL_OUT=...)"
+  release=$(cat "$KERNEL_OUT/include/config/kernel.release")
+  modules=$KERNEL_OUT/modules-$release.tar.zst
+  [[ -f $modules ]] || alarm_die "no $modules: run KERNEL_OUT=$KERNEL_OUT bin/omamobile modules"
+fi
 
 name=omamobile-rootfs-$VERSION-aarch64
+((!STAGE_ONLY)) || name=omamobile-rootfs-stage-$VERSION-aarch64
 out=$ROOT/out
 mkdir -p "$out"
-work=$out/.rootfs-$VERSION
-rm -rf "$work"; mkdir -p "$work"
+# VERSION matched ^[0-9A-Za-z._-]+$ above; refuse names that are only dots
+[[ $VERSION != . && $VERSION != .. && $VERSION != -* ]] || alarm_die "bad version '$VERSION'"
+# A stage generation is never replaced: refuse before any work or container
+if ((STAGE_ONLY)); then
+  for existing in "$out/$name" "$out/$name.MANIFEST"; do
+    [[ ! -e $existing && ! -L $existing ]] ||
+      alarm_die "$existing already exists; remove it deliberately or use another --version"
+  done
+  # Each invocation owns a private candidate. Two same-version builds may
+  # overlap before no-clobber publication; sharing a pathname would let one
+  # process validate and then publish bytes written by the other.
+  work=$(mktemp -d -- "$out/.rootfs-stage-$VERSION.XXXXXXXX") ||
+    alarm_die "cannot create a private stage workspace"
+else
+  work=$out/.rootfs-$VERSION
+  [[ $work == "$out"/.rootfs-* ]] || alarm_die "unsafe work path $work"
+  rm -rf -- "$work"
+  mkdir -p "$work"
+fi
+[[ $work == "$out"/.rootfs-* && -d $work ]] || alarm_die "unsafe work path $work"
 
 alarm_fetch
 image=$(alarm_build_image "$ROOT")
@@ -98,18 +175,61 @@ cleanup() { docker volume rm -f "$volume" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 start=$(date +%s)
-alarm_say "Building $name for $DEVICE (kernel $release)"
+if ((STAGE_ONLY)); then
+  alarm_say "Staging $name for $DEVICE (external contract, not an image)"
+else
+  alarm_say "Building $name for $DEVICE (kernel $release)"
+fi
 commit=$(git rev-parse --short=12 HEAD)$(git diff --quiet HEAD -- rootfs packages tools device 2>/dev/null || echo "-dirty")
+mount_modules=()
+((STAGE_ONLY)) || mount_modules=(-v "$modules:/modules:ro")
 docker run --rm --privileged --platform linux/arm64 \
-  -v "$ROOT:/src:ro" -v "$ROOT/out/repo:/repo:ro" -v "$modules:/modules:ro" \
+  -v "$ROOT:/src:ro" -v "$ROOT/out/repo:/repo:ro" "${mount_modules[@]}" \
   -v "$volume:/target" -v "$work:/out" -v "$ALARM_CACHE/pkg:/var/cache/pacman/pkg" \
   -e VERSION="$VERSION" -e DEVICE="$DEVICE" -e DEVICE_PACKAGE="$DEVICE_PACKAGE" \
   -e ROOTFS_PACKAGES="$ROOTFS_PACKAGES" \
-  -e KERNEL_RELEASE="$release" -e MODULES_SHA256="$(sha256sum < "$modules" | cut -d' ' -f1)" \
+  -e ROOTFS_PACKAGE_PROFILE="$ROOTFS_PACKAGE_PROFILE" \
+  -e ROOTFS_INTEGRATION="$ROOTFS_INTEGRATION" -e STAGE_ONLY="$STAGE_ONLY" \
+  -e KERNEL_RELEASE="$release" -e MODULES_SHA256="${modules:+$(sha256sum < "$modules" | cut -d' ' -f1)}" \
   -e GIT_COMMIT="$commit" -e ALARM_SHA256="$(sha256sum < "$ALARM_TARBALL" | cut -d' ' -f1)" \
   -e OMARCHY_CHANNEL="$OMARCHY_CHANNEL" -e ALLOW_MISSING="$ALLOW_MISSING" \
   -e OUT_UID="$(id -u)" -e OUT_GID="$(id -g)" \
   "$image" bash /src/rootfs/build-inside
+
+if ((STAGE_ONLY)); then
+  # Validate the completed candidate before publishing a new generation.
+  candidate=$work/$name
+  candidate_manifest=$candidate.MANIFEST
+  mv -- "$work/stage" "$candidate"
+  cp "$work/MANIFEST" "$candidate_manifest"
+  tests/rootfs-stage "$candidate"
+  # Publish a new generation only: no earlier stage or manifest is removed or
+  # replaced. Manifest first (a hard link fails if the name exists), the
+  # validated tree last, so no tree is ever visible without its manifest.
+  stage=$out/$name
+  final_manifest=$out/$name.MANIFEST
+  [[ $stage == "$out"/omamobile-rootfs-stage-*-aarch64 && -d $candidate ]] ||
+    alarm_die "no stage tree produced in $work"
+  for existing in "$stage" "$final_manifest"; do
+    [[ ! -e $existing && ! -L $existing ]] ||
+      alarm_die "$existing appeared during the build; the candidate stays in $work"
+  done
+  ln -T -- "$candidate_manifest" "$final_manifest" ||
+    alarm_die "cannot publish $final_manifest; the candidate stays in $work"
+  if ! mv -T -n -- "$candidate" "$stage" || [[ -e $candidate ]]; then
+    # Do not unlink the manifest here. Another writer can replace that path
+    # between the failed tree publication and cleanup; deleting by pathname
+    # could then remove output we do not own. A lone manifest is safe and
+    # makes the failed generation explicit; same-version reruns refuse it.
+    alarm_die "cannot publish $stage; the candidate stays in $work and the published manifest is retained"
+  fi
+  rm -rf -- "$work"
+  echo
+  echo "stage tree: $stage (not bootable, not an image, no kernel or modules)"
+  echo "manifest:   $out/$name.MANIFEST"
+  echo "staged in $(( ($(date +%s) - start) / 60 )) min"
+  exit 0
+fi
 
 alarm_say "Compressing"
 zstd -q -T0 -12 -f "$work/rootfs.img" -o "$out/$name.img.zst"

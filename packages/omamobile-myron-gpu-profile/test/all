@@ -11,6 +11,7 @@ trap 'rm -rf "$tmp"' EXIT
 export PYTHONPYCACHEPREFIX="$tmp/pycache"
 
 bash -n install || fail "install parses"
+bash -n test/stage-mesa-fixture || fail "Mesa fixture helper parses"
 python3 -m py_compile bin/omamobile-myron-gpu-profile \
   || fail "profile command parses"
 python3 -m json.tool reference.json >/dev/null || fail "reference parses"
@@ -88,81 +89,7 @@ for forbidden in \
 done
 pass "installed package contains only inert private data"
 
-python3 - "$tmp/root" <<'PY'
-from pathlib import Path
-import hashlib
-import json
-import sys
-
-root = Path(sys.argv[1])
-prefix = root / "usr/lib/omamobile/myron-gpu"
-(prefix / "dri").mkdir(parents=True)
-names = [
-    "dri/libdril_dri.so",
-    "libEGL.so.1.0.0",
-    "libGLESv2.so.2.0.0",
-    "libgallium-26.2.2.so",
-    "libgbm.so.1.0.0",
-    "libvulkan_freedreno.so",
-]
-header = bytearray(64)
-header[:6] = b"\x7fELF\x02\x01"
-header[18:20] = (183).to_bytes(2, "little")
-for name in names:
-    path = prefix / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(header + name.encode())
-(prefix / "freedreno-kgsl.json").write_text(json.dumps({
-    "ICD": {
-        "api_version": "1.4.354",
-        "library_arch": "64",
-        "library_path": "/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so",
-    },
-    "file_format_version": "1.0.1",
-}, indent=4, sort_keys=True) + "\n")
-links = {
-    "dri/zink_dri.so": "libdril_dri.so",
-    "libEGL.so": "libEGL.so.1",
-    "libEGL.so.1": "libEGL.so.1.0.0",
-    "libGLESv2.so": "libGLESv2.so.2",
-    "libGLESv2.so.2": "libGLESv2.so.2.0.0",
-    "libgbm.so": "libgbm.so.1",
-    "libgbm.so.1": "libgbm.so.1.0.0",
-}
-for name, target in links.items():
-    (prefix / name).symlink_to(target)
-regular = ["freedreno-kgsl.json", *names]
-(prefix / "SHA256SUMS").write_text("".join(
-    f"{hashlib.sha256((prefix / name).read_bytes()).hexdigest()}  {name}\n"
-    for name in regular
-))
-PY
-mkdir -p "$tmp/root/usr/share/omamobile/myron-gpu"
-if [[ -x ../mesa-myron-zink-turnip/omamobile-myron-gpu-verify ]]; then
-  cp ../mesa-myron-zink-turnip/reference.json \
-    "$tmp/root/usr/share/omamobile/myron-gpu/reference.json"
-else
-  python3 - "$tmp/root" <<'PY'
-from pathlib import Path
-import json
-import sys
-
-root = Path(sys.argv[1])
-reference = root / "usr/share/omamobile/myron-gpu/reference.json"
-reference.write_text(json.dumps({
-    "activation": {"mode": "disabled", "system_loader_registration": False},
-    "build": {},
-    "package": {
-        "name": "mesa-myron-zink-turnip",
-        "prefix": "/usr/lib/omamobile/myron-gpu",
-        "version": "26.2.2",
-    },
-    "reference": {},
-    "schema": 1,
-    "source": {},
-}) + "\n")
-PY
-fi
+test/stage-mesa-fixture "$tmp/root"
 "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static --root "$tmp/root" \
   > "$tmp/verified.out" || fail "exact static profile was rejected"
 python3 - "$tmp/verified.out" <<'PY' || exit 1
@@ -218,6 +145,10 @@ fi
 rm "$tmp/root/etc/systemd/system/myron-gpu.service"
 
 for activation_file in \
+  etc/X11/Xsession.d/90-myron \
+  etc/X11/xinit/xinitrc.d/90-myron.sh \
+  etc/sddm.conf.d/20-myron.conf \
+  etc/xprofile \
   etc/vulkan/icd.d/myron.json \
   etc/ld.so.preload \
   etc/pacman.d/hooks/myron.hook \
@@ -230,7 +161,10 @@ for activation_file in \
   run/systemd/system.control/myron.service \
   run/systemd/transient/myron.service \
   usr/lib/systemd/system.conf \
+  usr/lib/sddm/sddm.conf.d/20-myron.conf \
   usr/lib/systemd/user.conf \
+  usr/share/wayland-sessions/myron.desktop \
+  usr/share/xsessions/myron.desktop \
   usr/share/systemd/user/myron.service \
   usr/local/lib/systemd/system.conf.d/myron-gpu.conf; do
   mkdir -p "$tmp/root/$(dirname "$activation_file")"
@@ -269,6 +203,20 @@ ln -s second.service "$tmp/root/etc/systemd/system/first.service"
 rm "$tmp/root/etc/systemd/system/first.service" \
   "$tmp/root/etc/systemd/system/second.service" \
   "$tmp/root/usr/lib/systemd/system/base.service"
+
+mkdir -p "$tmp/root/usr/lib/systemd/profile.d" "$tmp/root/etc/profile.d"
+printf '# safe systemd shell integration\n' \
+  > "$tmp/root/usr/lib/systemd/profile.d/70-systemd-shell-extra.sh"
+ln -s ../../usr/lib/systemd/profile.d/70-systemd-shell-extra.sh \
+  "$tmp/root/etc/profile.d/70-systemd-shell-extra.sh"
+mkdir -p "$tmp/root/etc/systemd/user" "$tmp/root/etc/xdg/systemd"
+rmdir "$tmp/root/etc/xdg/systemd/user" 2>/dev/null || true
+ln -s ../../systemd/user "$tmp/root/etc/xdg/systemd/user"
+"$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static --root "$tmp/root" \
+  >/dev/null || fail "standard systemd profile and user aliases were rejected"
+rm "$tmp/root/etc/profile.d/70-systemd-shell-extra.sh" \
+  "$tmp/root/etc/xdg/systemd/user" \
+  "$tmp/root/usr/lib/systemd/profile.d/70-systemd-shell-extra.sh"
 
 sentinel="$tmp/staged-verifier-ran"
 printf '#!/bin/sh\ntouch %s\n' "$sentinel" \

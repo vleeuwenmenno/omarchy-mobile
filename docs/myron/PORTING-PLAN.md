@@ -117,6 +117,28 @@ installer. Required changes:
 Rootfs success means package resolution, staged files, unit dependencies,
 licenses, and static tests pass. It does not mean the phone boots.
 
+First safe step (done): `ROOTFS_INTEGRATION=external-contract` in the Myron
+descriptor and `tools/build-rootfs --stage-only`. It resolves and installs the
+Myron packages into a tree, `out/omamobile-rootfs-stage-<version>-aarch64/`,
+with a MANIFEST. The stage is not bootable, not image-ready, and not
+hardware-qualified. It has no kernel, modules, boot payload, ext4 image,
+`.img.zst`, checksum, or smoke test, and no proprietary or vendor payload
+(firmware, calibration, runtime assets). It activates no custom GPU or session
+service. Without `--stage-only`, Myron still refuses the rootfs build. A stage
+generation never overwrites the same version: choose a new version or remove
+the previous output deliberately.
+`tests/rootfs-stage` inspects a stage tree read-only.
+
+`ROOTFS_PACKAGE_PROFILE=myron` replaces the shared Pixel-oriented package
+lists for this stage. It explicitly includes NetworkManager, ModemManager,
+libqmi, GeoClue, PipeWire/WirePlumber, Chrony, BlueZ, Hyprland, and the isolated
+Myron Mesa/profile packages. Panfrost and unqualified camera, fingerprint, and
+NFC packages remain excluded. `omamobile-apps-myron` satisfies the shell's app
+profile with Maps and GeoClue only, and the stage builder rejects a resolved
+dependency closure containing the generic app profile, camera/libcamera, NFC,
+fingerprint, or Panfrost packages. This is package-selection evidence only;
+none of those hardware paths is claimed working in Arch yet.
+
 ## Phase 4: graphics and shell
 
 Rebuild Mesa for glibc as described in [GPU-STACK.md](GPU-STACK.md). Keep the

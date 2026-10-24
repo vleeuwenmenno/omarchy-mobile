@@ -20,6 +20,10 @@ pass "package descriptor matches device descriptor"
 
 grep -qx 'BOOT_METHOD=external-android' device.conf \
   || fail "descriptor does not fail closed on the external Android boot chain"
+grep -qx 'ROOTFS_INTEGRATION=external-contract' device.conf \
+  || fail "descriptor does not declare the stage-only external contract"
+grep -qx 'ROOTFS_PACKAGE_PROFILE=myron' device.conf \
+  || fail "descriptor does not select the Myron package profile"
 grep -qx 'BOOT_IMAGES=""' device.conf || fail "descriptor names boot images"
 grep -qx 'UFS_RW=""' device.conf || fail "descriptor names writable partitions"
 if grep -Eq '^(DTB|SOC_IDS|DTBO_|VENDOR_|OS_VERSION|OS_PATCH_LEVEL|SIMPLEFB_TRIG_CON|BRINGUP_PROBE)=' device.conf; then

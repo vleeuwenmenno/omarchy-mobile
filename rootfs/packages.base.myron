@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT
+# Arch Linux ARM and Omarchy packages for the non-bootable Myron stage.
+# No generic GPU firmware package: private device firmware is provisioned only
+# after its own provenance and deployment gate.
+base
+sudo
+openssh
+networkmanager
+modemmanager
+libqmi
+geoclue
+pipewire
+wireplumber
+alsa-utils
+upower
+iio-sensor-proxy
+chrony
+bluez
+bluez-utils
+ufw
+iptables-nft
+sddm
+e2fsprogs
+kmod
+python
+polkit
+pciutils
+usbutils
+less
+wireless-regdb
+archlinuxarm-keyring
+omarchy-keyring
+omarchy
+omarchy-settings

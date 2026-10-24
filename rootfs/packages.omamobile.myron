@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# Omarchy Mobile packages for the non-bootable Myron stage. Device metadata
+# and the kernel contract come from PACKAGE/ROOTFS_PACKAGES in device.conf.
+# Unqualified Pixel camera, fingerprint, NFC and Panfrost packages stay out.
+omamobile-keyring
+omamobile-firstboot
+omamobile-omarchy
+omamobile-apps-myron
+omamobile-shell
+omamobile-mirror
+mesa-myron-zink-turnip
+omamobile-myron-gpu-profile
+hyprland

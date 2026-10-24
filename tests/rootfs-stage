@@ -1,0 +1,415 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Read-only check of a stage tree from `tools/build-rootfs --stage-only` for an
+# external-contract device (Xiaomi myron):
+#   tests/rootfs-stage [out/omamobile-rootfs-stage-<version>-aarch64]
+# Without an argument it checks a synthetic tree (and that the checks reject
+# bad ones), so tests/all needs no build. No root, device, or network access;
+# the tree under test is only read.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+# check_stage TREE MANIFEST: prints the first violation and returns 1
+check_stage() {
+  local tree=$1 manifest=$2 p
+  [[ -d $tree ]] || { echo "no stage tree $tree"; return 1; }
+  [[ -f $manifest ]] || { echo "no MANIFEST"; return 1; }
+  if ! p=$(python3 - "$tree" "$manifest" 2>&1 <<'PY'
+import fnmatch
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+manifest = Path(sys.argv[2])
+required = [
+    "usr/share/omamobile/device.conf",
+    "usr/share/omamobile/device-myron/version",
+    "usr/share/omamobile/myron-kernel-contract/reference.json",
+    "usr/bin/omamobile-myron-kernel-verify",
+    "usr/share/omamobile/myron-gpu/reference.json",
+    "usr/share/omamobile/myron-gpu-profile/reference.json",
+    "usr/lib/omamobile/myron-gpu/SHA256SUMS",
+]
+
+def fail(message):
+    raise SystemExit(message)
+
+def open_beneath(root_path, relative, label):
+    if not hasattr(os, "O_PATH") or not hasattr(os, "O_NOFOLLOW"):
+        fail("safe stage inspection needs Linux O_PATH and O_NOFOLLOW")
+    try:
+        current = os.open(
+            root_path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError as error:
+        fail(f"unsafe stage root: {error}")
+    try:
+        parts = Path(relative).parts
+        for number, part in enumerate(parts):
+            try:
+                child = os.open(
+                    part, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current
+                )
+            except OSError as error:
+                fail(f"missing or unsafe {label}: {relative}: {error.strerror}")
+            metadata = os.fstat(child)
+            if number < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                os.close(child)
+                fail(f"unsafe ancestor for {label}: {relative}")
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+def read_beneath(root_path, relative, label):
+    current = open_beneath(root_path, relative, label)
+    try:
+        metadata = os.fstat(current)
+        if not stat.S_ISREG(metadata.st_mode):
+            fail(f"{label} is not a regular file: {relative}")
+        if metadata.st_size > 1024 * 1024:
+            fail(f"{label} is too large: {relative}")
+        descriptor = os.open(
+            f"/proc/self/fd/{current}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            os.close(descriptor)
+            fail(f"{label} changed while being opened: {relative}")
+        with os.fdopen(descriptor, "rb") as stream:
+            data = stream.read(1024 * 1024 + 1)
+        if len(data) > 1024 * 1024:
+            fail(f"{label} is too large: {relative}")
+        return data
+    finally:
+        os.close(current)
+
+for path in required:
+    read_beneath(root, path, "Myron metadata/contract")
+device = read_beneath(root, required[0], "device contract").decode("utf-8")
+manifest_data = read_beneath(manifest.parent, manifest.name, "MANIFEST").decode("utf-8")
+device_lines = set(device.splitlines())
+manifest_lines = set(manifest_data.splitlines())
+for expected in ("BOOT_METHOD=external-android", "ROOTFS_INTEGRATION=external-contract"):
+    if expected not in device_lines:
+        fail(f"device.conf lacks {expected}")
+if not manifest_data.startswith("# Omarchy Mobile root STAGE (not bootable"):
+    fail("MANIFEST lacks the non-bootable stage marker")
+for expected in (
+    "rootfs integration: external-contract",
+    "rootfs package profile: myron",
+    "package closure: required present; forbidden absent",
+    "kernel modules: none (external contract, no module payload)",
+):
+    if expected not in manifest_lines:
+        fail(f"MANIFEST lacks {expected}")
+
+firmware = open_beneath(root, "usr/lib/firmware", "firmware directory")
+try:
+    firmware_metadata = os.fstat(firmware)
+    if not stat.S_ISDIR(firmware_metadata.st_mode):
+        fail("firmware directory is not a real directory")
+    directory = os.open(
+        f"/proc/self/fd/{firmware}", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        opened = os.fstat(directory)
+        if (opened.st_dev, opened.st_ino) != (
+            firmware_metadata.st_dev, firmware_metadata.st_ino
+        ):
+            fail("firmware directory changed while being opened")
+        names = set()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                names.add(entry.name)
+                descriptor = os.open(
+                    entry.name,
+                    os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                try:
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        fail(f"firmware entry is not a regular file: {entry.name}")
+                finally:
+                    os.close(descriptor)
+        expected = {"regulatory.db", "regulatory.db.p7s"}
+        if names != expected:
+            fail("firmware directory differs from regulatory database allowlist")
+    finally:
+        os.close(directory)
+finally:
+    os.close(firmware)
+
+def open_root():
+    try:
+        return os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        fail(f"stage traversal failed at stage root: {error.strerror}")
+
+def traversal_failed(where, error):
+    fail(f"stage traversal failed at {where}: {error.strerror}")
+
+def lstat_beneath(relative):
+    """lstat RELATIVE under the stage without following any symlink; None if absent."""
+    current = open_root()
+    try:
+        parts = Path(relative).parts
+        for number, part in enumerate(parts):
+            try:
+                metadata = os.stat(part, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                traversal_failed(relative, error)
+            if number == len(parts) - 1:
+                return metadata
+            if not stat.S_ISDIR(metadata.st_mode):
+                fail(f"unsafe ancestor for {relative}")
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=current,
+                )
+            except OSError as error:
+                traversal_failed(relative, error)
+            os.close(current)
+            current = child
+    finally:
+        os.close(current)
+
+# On Arch /lib is the usr-merged alias for /usr/lib. Allow it to be absent in
+# minimal fixtures, but never let a real directory or another symlink target
+# create a second firmware/module search path outside the checks below.
+lib_alias = lstat_beneath("lib")
+if lib_alias is not None:
+    descriptor = open_beneath(root, "lib", "system library alias")
+    try:
+        if not stat.S_ISLNK(os.fstat(descriptor).st_mode):
+            fail("system library alias is not a symlink: lib")
+        try:
+            target = os.readlink("", dir_fd=descriptor)
+        except OSError as error:
+            traversal_failed("lib", error)
+        if target != "usr/lib":
+            fail(f"system library alias differs: lib -> {target}")
+    finally:
+        os.close(descriptor)
+
+# Kernel modules: the path may be absent or an empty real directory, never a
+# symlink (escaping or dangling) or anything else.
+modules = lstat_beneath("usr/lib/modules")
+if modules is not None:
+    if not stat.S_ISDIR(modules.st_mode):
+        fail("kernel modules path is not a real directory: usr/lib/modules")
+    parent = open_beneath(root, "usr/lib", "modules parent")
+    try:
+        descriptor = os.open(
+            "modules",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+    except OSError as error:
+        traversal_failed("usr/lib/modules", error)
+    finally:
+        os.close(parent)
+    try:
+        try:
+            entries = os.listdir(descriptor)
+        except OSError as error:
+            traversal_failed("usr/lib/modules", error)
+        if entries:
+            fail("kernel modules in the stage")
+    finally:
+        os.close(descriptor)
+
+# lexists semantics: a dangling symlink at these paths counts as present.
+for path in (
+    "vendor", "odm", "system_ext",
+    "usr/share/omamobile/myron-runtime-assets", "var/lib/omamobile/myron-assets",
+):
+    if lstat_beneath(path) is not None:
+        fail(f"proprietary or vendor path {path}")
+for path in (
+    "etc/systemd/system/omamobile-myron-gpu.service",
+    "etc/systemd/system/omamobile-myron-session.service",
+    "etc/profile.d/omamobile-myron-gpu.sh",
+    "etc/vulkan/icd.d/myron-kgsl.json",
+):
+    if lstat_beneath(path) is not None:
+        fail(f"custom GPU/session activation {path}")
+
+PAYLOAD_NAMES = (
+    ".omamobile-tarball", "modules.dep*", "*.ko", "*.ko.*", "vmlinu[xz]*", "Image",
+    "Image.*", "*.dtb", "*.dtbo", "boot.img", "init_boot.img", "vendor_boot.img",
+    "initramfs*", "*.img", "*.img.zst",
+)
+
+def scan(directory, relative, depth):
+    # Any error while walking is a rejection: an unreadable subtree is unverified.
+    if depth > 256:
+        fail(f"stage traversal failed at {relative}: too deep")
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError as error:
+        traversal_failed(relative or ".", error)
+    for name in names:
+        path = f"{relative}/{name}" if relative else name
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in PAYLOAD_NAMES):
+            fail(f"kernel, module, or boot payload {path}")
+        try:
+            metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+            else:
+                continue
+        except OSError as error:
+            traversal_failed(path, error)
+        try:
+            scan(child, path, depth + 1)
+        finally:
+            os.close(child)
+
+top = open_root()
+try:
+    scan(top, "", 0)
+finally:
+    os.close(top)
+PY
+  ); then
+    echo "$p"; return 1
+  fi
+  if ! tools/verify-myron-gpu-profile verify-static --root "$tree" >/dev/null 2>&1; then
+    echo "GPU profile verification failed"; return 1
+  fi
+  return 0
+}
+
+synthetic() { # DIR
+  local d=$1
+  mkdir -p "$d/tree" "$d/tree/etc/systemd/system"
+  packages/omamobile-device-myron/install "$d/tree"
+  packages/omamobile-myron-kernel-contract/install "$d/tree"
+  packages/omamobile-myron-gpu-profile/install "$d/tree"
+  packages/omamobile-myron-gpu-profile/test/stage-mesa-fixture "$d/tree"
+  mkdir -p "$d/tree/usr/lib/firmware"
+  : > "$d/tree/usr/lib/firmware/regulatory.db"
+  : > "$d/tree/usr/lib/firmware/regulatory.db.p7s"
+  cat > "$d/MANIFEST" <<'M'
+# Omarchy Mobile root STAGE (not bootable, not an image)
+version: synthetic
+stage: non-bootable; not image-ready; not hardware-qualified
+rootfs integration: external-contract
+rootfs package profile: myron
+package closure: required present; forbidden absent
+kernel modules: none (external contract, no module payload)
+boot payload: none; proprietary payload: none
+M
+}
+
+if (($#)); then
+  requested=${1%/}
+  [[ $requested == *omamobile-rootfs-stage-* ]] || fail "$requested is not an omamobile-rootfs-stage tree"
+  stage=$(realpath -e -- "$requested") || fail "no stage tree $requested"
+  if msg=$(check_stage "$stage" "$stage.MANIFEST"); then pass "stage tree $stage"; else fail "$msg"; fi
+  [[ ! -e $stage.img && ! -e $stage.img.zst && ! -e $stage.img.zst.sha256 ]] || fail "an image or checksum sits beside the stage"
+  pass "no image or checksum beside the stage"
+  exit 0
+fi
+
+t=$(mktemp -d)
+# Some mutations remove permissions: restore them so cleanup always works
+trap 'chmod -R u+rwx "$t" 2>/dev/null || true; rm -rf "$t"' EXIT
+for p in modemmanager libqmi geoclue pipewire wireplumber chrony bluez bluez-utils; do
+  grep -qx "$p" rootfs/packages.base.myron || fail "Myron base profile misses $p"
+done
+for p in omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland; do
+  grep -qx "$p" rootfs/packages.omamobile.myron || fail "Myron mobile profile misses $p"
+done
+if grep -Eq '^(omamobile-apps|vulkan-panfrost|omacam|libcamera|libcamera-ipa|pipewire-libcamera|gst-plugin-libcamera|libfprint|neard)$' \
+    rootfs/packages.omamobile.myron; then
+  fail "Myron mobile profile includes an unqualified generic or Pixel package"
+fi
+pass "Myron package profile selects required services and isolated GPU packages"
+
+synthetic "$t"
+if msg=$(check_stage "$t/tree" "$t/MANIFEST"); then pass "synthetic stage tree is accepted"; else fail "synthetic stage: $msg"; fi
+mv "$t/tree" "$t/omamobile-rootfs-stage-synthetic-aarch64"
+mv "$t/MANIFEST" "$t/omamobile-rootfs-stage-synthetic-aarch64.MANIFEST"
+relative=$(realpath --relative-to="$PWD" "$t/omamobile-rootfs-stage-synthetic-aarch64")
+"$0" "$relative" >/dev/null || fail "documented relative stage path is rejected"
+pass "documented relative stage path is accepted"
+
+# Each mutation must be rejected, for its own reason
+reject() { # NAME EXPECT MUTATION...
+  local name=$1 expect=$2 msg; shift 2
+  chmod -R u+rwx "$t/m" 2>/dev/null || true
+  rm -rf "$t/m"; mkdir "$t/m"; synthetic "$t/m"
+  (cd "$t/m" && "$@")
+  if msg=$(check_stage "$t/m/tree" "$t/m/MANIFEST"); then fail "$name is accepted"; fi
+  grep -q "$expect" <<<"$msg" || fail "$name rejected for the wrong reason: $msg"
+  pass "$name is rejected"
+}
+reject "a missing device contract" "missing or unsafe" rm tree/usr/share/omamobile/myron-kernel-contract/reference.json
+reject "a FIFO device contract" "not a regular file" bash -c 'rm tree/usr/share/omamobile/device.conf; mkfifo tree/usr/share/omamobile/device.conf'
+reject "an escaping device symlink" "not a regular file" bash -c 'cp tree/usr/share/omamobile/device.conf outside; rm tree/usr/share/omamobile/device.conf; ln -s "$PWD/outside" tree/usr/share/omamobile/device.conf'
+reject "a device-node symlink" "not a regular file" bash -c 'rm tree/usr/share/omamobile/device.conf; ln -s /dev/null tree/usr/share/omamobile/device.conf'
+reject "a bootable manifest" "non-bootable stage marker" sed -i '1s/.*/# Omarchy Mobile root image/' MANIFEST
+reject "a module payload" "kernel modules in the stage" bash -c 'mkdir -p tree/usr/lib/modules/6.12 && : > tree/usr/lib/modules/6.12/x'
+reject "a kernel module file" "boot payload" bash -c 'mkdir -p tree/opt && : > tree/opt/x.ko.zst'
+reject "a boot image" "boot payload" bash -c 'mkdir -p tree/boot && : > tree/boot/boot.img'
+reject "a vendor path" "proprietary or vendor path" mkdir tree/vendor
+reject "firmware" "firmware entry is not a regular file" bash -c 'mkdir -p tree/usr/lib/firmware/qcom'
+reject "a regulatory symlink" "firmware entry is not a regular file" bash -c 'rm tree/usr/lib/firmware/regulatory.db; ln -s /dev/null tree/usr/lib/firmware/regulatory.db'
+reject "a regulatory directory" "firmware entry is not a regular file" bash -c 'rm tree/usr/lib/firmware/regulatory.db; mkdir tree/usr/lib/firmware/regulatory.db'
+reject "an escaping firmware directory" "firmware directory is not a real directory" bash -c 'mv tree/usr/lib/firmware outside-firmware; ln -s "$PWD/outside-firmware" tree/usr/lib/firmware'
+reject "a GPU activation unit" "custom GPU/session activation" bash -c ': > tree/etc/systemd/system/omamobile-myron-gpu.service'
+reject "a Myron session reference" "GPU profile verification" bash -c 'echo ExecStart=/usr/bin/omamobile-myron-session > tree/etc/systemd/system/x.service'
+reject "an SDDM GPU environment override" "GPU profile verification" \
+  bash -c 'mkdir -p tree/etc/sddm.conf.d; printf "[General]\nGreeterEnvironment=LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu\n" > tree/etc/sddm.conf.d/20-myron.conf'
+reject "a Wayland session GPU launcher" "GPU profile verification" \
+  bash -c 'mkdir -p tree/usr/share/wayland-sessions; printf "[Desktop Entry]\nExec=env VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json Hyprland\n" > tree/usr/share/wayland-sessions/myron.desktop'
+reject "an SDDM xprofile GPU override" "GPU profile verification" \
+  bash -c 'printf "export LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu\n" > tree/etc/xprofile'
+reject "an SDDM xinit hook GPU override" "GPU profile verification" \
+  bash -c 'mkdir -p tree/etc/X11/xinit/xinitrc.d; printf "export LIBGL_DRIVERS_PATH=/usr/lib/omamobile/myron-gpu/dri\n" > tree/etc/X11/xinit/xinitrc.d/90-myron.sh; chmod +x tree/etc/X11/xinit/xinitrc.d/90-myron.sh'
+reject "an SDDM Xsession hook GPU override" "GPU profile verification" \
+  bash -c 'mkdir -p tree/etc/X11/Xsession.d; printf "export VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json\n" > tree/etc/X11/Xsession.d/90-myron'
+reject "a changed GPU payload" "GPU profile verification" bash -c 'printf changed >> tree/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so'
+if ((EUID != 0)); then
+  reject "an unreadable directory holding boot.img" "stage traversal failed" \
+    bash -c 'mkdir -p tree/opt/hidden && : > tree/opt/hidden/boot.img && chmod 000 tree/opt/hidden'
+else
+  echo "skip - unreadable directory test (running as root)"
+fi
+reject "an escaping modules symlink" "kernel modules path is not a real directory" \
+  bash -c 'mkdir -p outside-modules/6.12 && : > outside-modules/6.12/x && rm -rf tree/usr/lib/modules && ln -s "$PWD/outside-modules" tree/usr/lib/modules'
+reject "a dangling modules symlink" "kernel modules path is not a real directory" \
+  bash -c 'rm -rf tree/usr/lib/modules; ln -s /nonexistent-omamobile tree/usr/lib/modules'
+reject "a dangling vendor symlink" "proprietary or vendor path vendor" ln -s /nonexistent-omamobile tree/vendor
+reject "a dangling GPU activation symlink" "custom GPU/session activation" \
+  ln -s /nonexistent-omamobile tree/etc/systemd/system/omamobile-myron-gpu.service
+reject "an unmerged /lib firmware path" "system library alias is not a symlink" \
+  bash -c 'mkdir -p tree/lib/firmware/qcom && : > tree/lib/firmware/qcom/private.bin'
+reject "a redirected /lib firmware path" "system library alias differs" \
+  bash -c 'mkdir -p tree/usr/local/lib/firmware/qcom && : > tree/usr/local/lib/firmware/qcom/private.bin && ln -s usr/local/lib tree/lib'
+# Standard Arch top-level symlinks are not a reason to reject
+accept_symlinks() {
+  rm -rf "$t/m"; mkdir "$t/m"; synthetic "$t/m"
+  ln -s usr/lib "$t/m/tree/lib"; ln -s usr/bin "$t/m/tree/sbin"
+  mkdir -p "$t/m/tree/usr/lib/modules"
+  check_stage "$t/m/tree" "$t/m/MANIFEST" >/dev/null || fail "standard symlinks and an empty modules directory are rejected"
+  pass "standard Arch symlinks and an empty modules directory are accepted"
+}
+accept_symlinks

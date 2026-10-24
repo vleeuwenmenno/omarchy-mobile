@@ -9,6 +9,20 @@ Phase 2 now provides an activation-disabled, metadata-only kernel contract.
 It verifies externally supplied qualified VT artifacts and the private runtime
 asset manifest; it does not install or load any hardware payload.
 
+Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
+--stage-only` writes a package tree and MANIFEST under `out/`. It is not
+bootable, not image-ready, and not hardware-qualified; it carries no kernel,
+modules, boot payload, or proprietary/vendor payload and activates no GPU or
+session service. No image is produced, and a rootfs build without
+`--stage-only` is still refused.
+
+The stage uses `ROOTFS_PACKAGE_PROFILE=myron`: Qualcomm/mobile userspace and
+the isolated Zink/Turnip packages are selected, while Panfrost and unqualified
+camera, fingerprint, and NFC packages are excluded. A Myron-only app provider
+keeps Maps/GeoClue without pulling camera or NFC dependencies; the resolved
+package closure is checked before a stage is emitted. Selection does not claim
+hardware qualification.
+
 ## Verified reference facts
 
 - [V] The live device tree identifies the board as a Myron design based on

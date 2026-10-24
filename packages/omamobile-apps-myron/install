@@ -1,0 +1,12 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+destination=${1:?Usage: ./install DESTDIR}
+[[ $destination == /* && $destination != / ]] || {
+  echo "Use an absolute staging directory" >&2
+  exit 1
+}
+install -Dm644 README.md "$destination/usr/share/doc/omamobile-apps-myron/README.md"
+install -Dm644 LICENSE "$destination/usr/share/licenses/omamobile-apps-myron/LICENSE"
+install -Dm644 version "$destination/usr/share/omamobile/apps-myron/version"
