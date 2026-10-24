@@ -11,6 +11,7 @@ trap 'rm -rf "$tmp"' EXIT
 export PYTHONPYCACHEPREFIX="$tmp/pycache"
 
 bash -n install || fail "install parses"
+bash -n test/abi || fail "ABI test parses"
 python3 -m py_compile \
   bin/omamobile-myron-kernel-verify || fail "verifier parses"
 pass "scripts parse"
@@ -272,6 +273,7 @@ PY
 pass "verifier accepts exact fixtures and rejects changed bytes"
 
 test/stage || fail "stage tests"
+test/abi || fail "ABI tests"
 
 ./install "$tmp/stage"
 if [[ -f ../../device/myron/kernel-contract.json ]]; then

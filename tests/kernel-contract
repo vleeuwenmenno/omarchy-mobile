@@ -69,6 +69,17 @@ done
 [[ -z $(ls -A "$tmp/stage-root") ]] || fail "stage verification wrote into the root"
 pass "stage contract is bound to the reference; stage commands run no external tool and write nothing"
 
+for args in "verify-abi --assets $tmp/not-the-archive --vmlinux-symvers $tmp/not-the-archive --module-symvers $tmp/not-the-archive"; do
+  # shellcheck disable=SC2086
+  if CALLS="$tmp/calls" PATH="$tmp/fakes:$PATH" \
+      tools/verify-myron-kernel-contract $args >"$tmp/abi.out" 2>/dev/null; then
+    fail "verify-abi accepted inputs that are not the qualified ones"
+  fi
+  [[ ! -s $tmp/abi.out ]] || fail "verify-abi printed a result for rejected inputs"
+done
+[[ ! -s $tmp/calls ]] || fail "verify-abi invoked an external system tool"
+pass "verify-abi is bound to the qualified inputs, runs no external tool and writes nothing"
+
 packages/omamobile-myron-kernel-contract/install "$tmp/stage"
 while IFS= read -r -d '' file; do
   magic=$(od -An -tx1 -N8 "$file" | tr -d ' \n')

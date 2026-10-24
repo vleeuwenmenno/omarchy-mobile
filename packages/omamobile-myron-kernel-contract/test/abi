@@ -1,0 +1,702 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the staged-set-only ABI/import/load-order verifier. Every
+# ELF below is generated at test runtime from synthetic bytes: no binary
+# fixture is committed and nothing here is a real kernel module.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+
+python3 -I - "$PWD" "$tmp" <<'PY' || exit 1
+import copy, gzip, hashlib, importlib.machinery, importlib.util, io, json, os
+import struct, subprocess, sys, tarfile
+from pathlib import Path
+
+package = Path(sys.argv[1])
+work = Path(sys.argv[2]) / "abi-tests"
+work.mkdir()
+bin_path = package / "bin/omamobile-myron-kernel-verify"
+loader = importlib.machinery.SourceFileLoader("myron_abi", str(bin_path))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+sha = lambda data: hashlib.sha256(data).hexdigest()
+SELECTOR = "/usr/local/sbin/myron-attempt79-module-dir"
+RELEASE = "test-release"
+VERMAGIC = f"{RELEASE} SMP preempt mod_unload modversions aarch64"
+
+# ---- ELF generator ---------------------------------------------------------
+def build_elf(name, imports=(), exports=(), versions=None, modinfo=None,
+              vermagic=VERMAGIC, e_type=1, machine=183, ei_class=2, ei_data=1,
+              fix=None, extra_sections=(), extra_symbols=()):
+    entries = modinfo if modinfo is not None else [
+        f"name={name}", f"vermagic={vermagic}", "license=GPL"]
+    sections = [(".modinfo", 1, 2, b"".join(e.encode() + b"\0" for e in entries), 0, 0, 0)]
+    for symbol, kind, _crc in exports:
+        suffix = "_gpl" if kind == "EXPORT_SYMBOL_GPL" else ""
+        sections.append((f"___ksymtab{suffix}+{symbol}", 1, 2, b"\0" * 8, 0, 0, 0))
+    sections += list(extra_sections)
+    if versions is not None:
+        data = b"".join(struct.pack("<Q56s", crc, sym.encode()) for sym, crc in versions)
+        sections.append(("__versions", 1, 2, data, 0, 0, 0))
+    strtab = bytearray(b"\0")
+    def add(text):
+        offset = len(strtab)
+        strtab.extend(text.encode() + b"\0")
+        return offset
+    symbols = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0),
+               struct.pack("<IBBHQQ", add("mod.c"), 4, 0, 0xFFF1, 0, 0)]
+    first_global = len(symbols)
+    for index, (symbol, kind, crc) in enumerate(exports):
+        symbols.append(struct.pack("<IBBHQQ", add(f"__ksymtab_{symbol}"), 0x11, 0, 2 + index, 0, 8))
+        if crc is not None:
+            symbols.append(struct.pack("<IBBHQQ", add(f"__crc_{symbol}"), 0x10, 0, 0xFFF1, crc, 0))
+    for symbol, shndx, info, value in extra_symbols:
+        symbols.append(struct.pack("<IBBHQQ", add(symbol), info, 0, shndx, value, 0))
+    for symbol, bind in imports:
+        symbols.append(struct.pack("<IBBHQQ", add(symbol), (2 if bind == "weak" else 1) << 4, 0, 0, 0, 0))
+    count = len(sections)
+    symtab_index, strtab_index, shstr_index = count + 1, count + 2, count + 3
+    sections.append((".symtab", 2, 0, b"".join(symbols), strtab_index, first_global, 24))
+    sections.append((".strtab", 3, 0, bytes(strtab), 0, 0, 0))
+    shstr = bytearray(b"\0")
+    name_offsets = []
+    for section in sections + [(".shstrtab",)]:
+        name_offsets.append(len(shstr))
+        shstr.extend(section[0].encode() + b"\0")
+    sections.append((".shstrtab", 3, 0, bytes(shstr), 0, 0, 0))
+    body = bytearray(64)
+    headers = [struct.pack("<IIQQQQIIQQ", *([0] * 10))]
+    for offset_name, (sec_name, kind, flags, data, link, info, entsize) in zip(name_offsets, sections):
+        while len(body) % 8:
+            body.append(0)
+        headers.append(struct.pack("<IIQQQQIIQQ", offset_name, kind, flags, 0,
+                                   len(body), len(data), link, info, 8, entsize))
+        body.extend(data)
+    while len(body) % 8:
+        body.append(0)
+    shoff = len(body)
+    for header in headers:
+        body.extend(header)
+    ident = b"\x7fELF" + bytes([ei_class, ei_data, 1, 0, 0]) + bytes(7)
+    body[:64] = ident + struct.pack("<HHIQQQIHHHHHH", e_type, machine, 1, 0, 0, shoff, 0,
+                                    64, 0, 0, 64, len(headers), len(headers) - 1)
+    if fix:
+        fix(body)
+    return bytes(body)
+
+def shdr(buf, index, field):
+    shoff = struct.unpack_from("<Q", buf, 40)[0]
+    layout = {"name": (0, "<I"), "type": (4, "<I"), "flags": (8, "<Q"), "offset": (24, "<Q"),
+              "size": (32, "<Q"), "link": (40, "<I"), "info": (44, "<I"), "entsize": (56, "<Q")}
+    delta, fmt = layout[field]
+    return shoff + 64 * index + delta, fmt
+
+def patch(index, field, value):
+    def apply(buf):
+        position, fmt = shdr(buf, index, field)
+        struct.pack_into(fmt, buf, position, value)
+    return apply
+
+def section_index(buf, wanted):
+    shnum = struct.unpack_from("<H", buf, 60)[0]
+    shstrndx = struct.unpack_from("<H", buf, 62)[0]
+    p, f = shdr(buf, shstrndx, "offset")
+    names = struct.unpack_from(f, buf, p)[0]
+    for index in range(1, shnum):
+        p, f = shdr(buf, index, "name")
+        start = names + struct.unpack_from(f, buf, p)[0]
+        if buf[start:buf.index(0, start)].decode() == wanted:
+            return index
+    raise KeyError(wanted)
+
+def patch_named(wanted, field, value):
+    def apply(buf):
+        patch(section_index(buf, wanted), field, value)(buf)
+    return apply
+
+def patch_symbol(index, field, value):
+    def apply(buf):
+        position, fmt = shdr(buf, section_index(buf, ".symtab"), "offset")
+        base = struct.unpack_from(fmt, buf, position)[0] + index * 24
+        delta, value_fmt = {
+            "info": (4, "<B"), "other": (5, "<B"),
+            "value": (8, "<Q"), "size": (16, "<Q"),
+        }[field]
+        struct.pack_into(value_fmt, buf, base + delta, value)
+    return apply
+
+def raw(offset, data):
+    def apply(buf):
+        buf[offset:offset + len(data)] = data
+    return apply
+
+# ---- fixture generator -------------------------------------------------------
+def row(crc, symbol, provider, kind="EXPORT_SYMBOL", namespace=""):
+    return f"0x{crc:08x}\t{symbol}\t{provider}\t{kind}\t{namespace}\n"
+
+def default_spec():
+    return {
+        "declared": ["alpha", "beta", "gamma-mod"],
+        "modules": {
+            "alpha": dict(imports=[("printk", "global")], versions=[("printk", 0xAAAA0001)],
+                          exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001)]),
+            "beta": dict(imports=[("alpha_fn", "global"), ("kernel_fn", "weak")],
+                         versions=[("alpha_fn", 0x11110001), ("kernel_fn", 0xAAAA0002)],
+                         exports=[("beta_fn", "EXPORT_SYMBOL_GPL", None)]),
+            "gamma-mod": dict(imports=[("beta_fn", "global"), ("ns_sym", "global")],
+                              versions=[("beta_fn", 0x22220001), ("ns_sym", 0xAAAA0003)],
+                              modinfo=["name=gamma_mod", f"vermagic={VERMAGIC}",
+                                       "license=GPL", "import_ns=MYNS"],
+                              exports=[]),
+        },
+        "kernel_rows": [row(0xAAAA0001, "printk", "vmlinux"),
+                        row(0xAAAA0002, "kernel_fn", "vmlinux", "EXPORT_SYMBOL_GPL"),
+                        row(0xAAAA0003, "ns_sym", "vmlinux", "EXPORT_SYMBOL_GPL", "MYNS")],
+        "extra_module_rows": [
+            row(0xAAAA0001, "printk", "vmlinux"),
+            row(0x11110001, "alpha_fn", "drivers/x/alpha"),
+            row(0x22220001, "beta_fn", "drivers/x/beta", "EXPORT_SYMBOL_GPL"),
+            row(0x33330001, "other_sym", "drivers/o/other"),
+            row(0x44440001, "rmnet_sym", "drivers/net/rmnet_core"),
+        ],
+        "elf_fix": {},
+        "forbidden_staged": False,
+    }
+
+counter = [0]
+class Fixture:
+    pass
+
+def make(spec=None, *, drop_member=None, extra_member=None, vm_text=None, mod_text=None,
+         payload_override=None):
+    spec = spec or default_spec()
+    counter[0] += 1
+    fx = Fixture()
+    fx.spec = spec
+    notes = b"synthetic-notes\n"
+    directory = f"/usr/local/lib/myron-gki-module-sets/{sha(notes)}"
+    modules = {}
+    for name in spec["declared"]:
+        options = dict(spec["modules"][name])
+        options["fix"] = spec["elf_fix"].get(name)
+        modules[name] = build_elf(name.replace("-", "_"), **options)
+    payload = {
+        "candidate-module-dir.sh": b"#!/bin/sh\nexit 0\n",
+        "previous-module-dir.sh": b"#!/bin/sh\nexit 1\n",
+        "kernel-notes.bin": notes,
+        **{f"modules/{n}.ko": data for n, data in modules.items()},
+    }
+    if drop_member:
+        del payload[drop_member]
+    if extra_member:
+        payload[extra_member] = b"extra"
+    payload.update(payload_override or {})
+    manifest = {
+        "phase": "inactive-staging-payload-only",
+        "candidate_image_sha256": sha(b"image"), "candidate_config_sha256": sha(b"config"),
+        "candidate_notes_sha256": sha(notes), "module_directory": directory,
+        "files": {n: sha(d) for n, d in sorted(payload.items())},
+        "selector_destination": SELECTOR,
+    }
+    payload["manifest.json"] = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    payload["SHA256SUMS"] = "".join(f"{sha(d)}  {n}\n" for n, d in sorted(payload.items())).encode()
+    buffer = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=buffer, mtime=0) as zipped:
+        with tarfile.open(fileobj=zipped, mode="w") as tar:
+            for n, d in sorted(payload.items()):
+                info = tarfile.TarInfo("fixture/" + n)
+                info.size, info.mode = len(d), 0o644
+                tar.addfile(info, io.BytesIO(d))
+    fx.archive = buffer.getvalue()
+    if vm_text is None:
+        vm_text = "".join(spec["kernel_rows"])
+    fx.vm = vm_text if isinstance(vm_text, bytes) else vm_text.encode()
+    mod_rows = "".join(spec["extra_module_rows"])
+    if mod_text is None:
+        mod_text = mod_rows
+    fx.mod = mod_text if isinstance(mod_text, bytes) else mod_text.encode()
+    stage_modules = list(spec["declared"])
+    reference = {
+        "schema": 1,
+        "device": {"codename": "myron", "compatible": "qcom,canoe-mtp", "soc": "sm8850",
+                   "model_contains": "Myron", "boot_method": "external-android"},
+        "kernel": {"release": RELEASE, "gki_source_revision": "0" * 40,
+                   "image_sha256": sha(b"image"), "notes_sha256": sha(notes),
+                   "config_sha256": sha(b"config"),
+                   "vmlinux_symvers_sha256": sha(fx.vm), "module_symvers_sha256": sha(fx.mod)},
+        "source": {"lock_sha256": "2" * 64, "manifest_sha256": "3" * 64,
+                   "patches": {"0001-test.patch": "4" * 64}},
+        "module_assets": {
+            "archive_sha256": sha(fx.archive), "root": "fixture", "module_directory": directory,
+            "candidate_selector_sha256": sha(payload["candidate-module-dir.sh"]),
+            "previous_selector_sha256": sha(payload["previous-module-dir.sh"]),
+            "forbidden_modules": ["rmnet_core"], "modules": stage_modules},
+        "runtime_assets": {"manifest_sha256": "7" * 64},
+        "activation": {"mode": "disabled", "source_lock_reproduction": "not_verified",
+                       "device_qualification": "reference_evidence_only"},
+        "payload": {"kind": "metadata-only"},
+        "provenance": {"reference_repository_base_commit": "1" * 40,
+                       "reference_worktree_state": "synthetic fixture",
+                       "qualification": "test", "status": "metadata-only"},
+    }
+    reference_bytes = (json.dumps(reference, indent=2) + "\n").encode()
+    stage = module.expected_stage_contract(reference, sha(reference_bytes))
+    stage_bytes = (json.dumps(stage, indent=2) + "\n").encode()
+    fx.contracts = module.Contracts(reference, sha(reference_bytes), stage, sha(stage_bytes))
+    return fx
+
+def run(fx, archive=None, vm=None, mod=None):
+    return module.verify_abi_bytes(
+        fx.contracts, fx.archive if archive is None else archive,
+        fx.vm if vm is None else vm, fx.mod if mod is None else mod)
+
+def rejects(label, expected, fx=None, **overrides):
+    fx = fx or make()
+    try:
+        run(fx, **overrides)
+    except module.ContractError as error:
+        options = (expected,) if isinstance(expected, str) else expected
+        assert any(item in str(error) for item in options), f"{label}: wrong error: {error}"
+    else:
+        raise AssertionError(f"{label}: was accepted")
+
+def rejects_spec(label, expected, mutate, **kwargs):
+    spec = default_spec()
+    mutate(spec)
+    rejects(label, expected, make(spec, **kwargs))
+
+# ---- good set ---------------------------------------------------------------
+good = make()
+result = run(good)
+assert result["scope"] == "staged-set-only" and result["vendor_modules"] == "not-verified"
+assert result["activation"] == "disabled" and result["status"] == "staged-set-consistent"
+assert result["archive_sha256"] == sha(good.archive)
+assert result["vmlinux_symvers_sha256"] == sha(good.vm)
+assert result["module_symvers_sha256"] == sha(good.mod)
+assert result["declared_order"] == ["alpha", "beta", "gamma-mod"] == result["resolved_order"]
+assert result["deployment_blocker"] == "unchanged" and "unqualified" in result["parser"]
+text = json.dumps(result)
+for forbidden in ("deployment_authorized", "bootable", "flashable", "image_ready", "image-ready"):
+    assert forbidden not in text, forbidden
+by_name = {m["name"]: m for m in result["modules"]}
+assert by_name["alpha"]["imports"][0]["provider"] == "kernel"
+assert by_name["alpha"]["imports"][0]["crc_status"] == "match"
+assert by_name["alpha"]["license"] == "GPL"
+assert by_name["alpha"]["exports"][0]["crc_status"] == "module-matches-symvers"
+assert by_name["beta"]["imports"][0]["provider"] == "module:alpha"
+assert by_name["beta"]["imports"][1]["bind"] == "weak"
+assert by_name["beta"]["exports"][0]["crc_status"] == "module-has-no-crc"
+assert by_name["beta"]["depends_on"] == ["alpha"]
+assert by_name["gamma-mod"]["versions"] == "present"
+assert by_name["gamma-mod"]["imports"][0]["crc_status"] == "match"
+assert by_name["gamma-mod"]["imports"][1]["namespace"] == "MYNS"
+assert by_name["gamma-mod"]["modinfo_name"] == "gamma_mod"
+assert json.dumps(run(good), sort_keys=True) == json.dumps(result, sort_keys=True)
+changed_stage = copy.deepcopy(good.contracts.stage)
+changed_stage["stage"]["activation"] = "enabled"
+try:
+    module.verify_abi_bytes(
+        module.Contracts(good.contracts.reference, good.contracts.reference_sha256,
+                         changed_stage, good.contracts.stage_sha256),
+        good.archive, good.vm, good.mod)
+except module.ContractError as error:
+    assert "stage contract differs" in str(error)
+else:
+    raise AssertionError("ABI verification accepted a changed stage contract")
+
+# ---- paths: determinism, read-only, no external process --------------------
+paths = {}
+for key, data in (("assets", good.archive), ("vm", good.vm), ("mod", good.mod)):
+    path = work / key
+    path.write_bytes(data)
+    path.chmod(0o444)
+    paths[key] = str(path)
+def snapshot():
+    return {name: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns)
+            for name, p in ((k, Path(v)) for k, v in paths.items())} | {
+        "dir": sorted(os.listdir(work))}
+before = snapshot()
+opened_flags = []
+real_open = os.open
+def spy_open(path, flags, *a, **k):
+    opened_flags.append(flags)
+    return real_open(path, flags, *a, **k)
+def blocked(*a, **k):
+    raise AssertionError("external process or write primitive used")
+saved = {}
+for owner, attr in ((subprocess, "Popen"), (subprocess, "run"), (os, "system"), (os, "fork"),
+                    (os, "posix_spawn"), (os, "execv"), (os, "execve"), (os, "popen"),
+                    (os, "mkdir"), (os, "rename"), (os, "unlink"), (os, "chmod"), (os, "write")):
+    saved[(owner, attr)] = getattr(owner, attr)
+    setattr(owner, attr, blocked)
+os.open = spy_open
+try:
+    first = module.verify_abi_paths(good.contracts, paths["assets"], paths["vm"], paths["mod"])
+    second = module.verify_abi_paths(good.contracts, paths["assets"], paths["vm"], paths["mod"])
+finally:
+    os.open = real_open
+    for (owner, attr), value in saved.items():
+        setattr(owner, attr, value)
+assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True) == json.dumps(result, sort_keys=True)
+write_bits = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+assert opened_flags and all(not flags & write_bits for flags in opened_flags)
+assert snapshot() == before
+source = bin_path.read_text()
+for token in ("import subprocess", "os.system", "os.popen", "mmap", "ctypes", "os.fork", "posix_spawn"):
+    assert token not in source, token
+
+# ---- path handling -------------------------------------------------------------
+def path_rejects(expected, *args):
+    try:
+        module.verify_abi_paths(good.contracts, *args)
+    except module.ContractError as error:
+        assert expected in str(error), str(error)
+    else:
+        raise AssertionError(f"accepted {args}")
+path_rejects("canonical absolute path", "assets", paths["vm"], paths["mod"])
+path_rejects("canonical absolute path", paths["assets"], paths["vm"] + "/../vm", paths["mod"])
+path_rejects("canonical absolute path", paths["assets"], paths["vm"] + "/", paths["mod"])
+link = work / "link"
+link.symlink_to(paths["vm"])
+path_rejects("link", paths["assets"], str(link), paths["mod"])
+(work / "dirlink").symlink_to(work, target_is_directory=True)
+path_rejects("symlink", paths["assets"], str(work / "dirlink" / "vm"), paths["mod"])
+fifo = work / "fifo"
+os.mkfifo(fifo)
+path_rejects("not a regular file", paths["assets"], str(fifo), paths["mod"])
+path_rejects("unavailable", paths["assets"], str(work / "absent"), paths["mod"])
+big = work / "big"
+with big.open("wb") as stream:
+    stream.truncate(module.MAX_SYMVERS_BYTES + 1)
+path_rejects("safety limit", paths["assets"], str(big), paths["mod"])
+Path(paths["vm"]).chmod(0o644)
+Path(paths["vm"]).write_bytes(good.vm + b"x")
+path_rejects("vmlinux.symvers SHA-256 differs", paths["assets"], paths["vm"], paths["mod"])
+Path(paths["vm"]).write_bytes(good.vm)
+
+# ---- exact input binding --------------------------------------------------------
+rejects("wrong vmlinux symvers hash", "vmlinux.symvers SHA-256 differs", vm=good.vm + b"\n")
+rejects("wrong Module.symvers hash", "kernel_aarch64_Module.symvers SHA-256 differs",
+        mod=good.mod + b"\n")
+tampered = bytearray(good.archive)
+tampered[-12] ^= 1
+rejects("changed archive", "archive SHA-256 differs", archive=bytes(tampered))
+rejects("changed archive hash", "archive SHA-256 differs", archive=good.archive + b"\0")
+rejects("missing module member", "member set differs",
+        make(drop_member="modules/beta.ko"))
+rejects("extra module member", "member set differs", make(extra_member="modules/extra.ko"))
+
+# ---- ELF structure -----------------------------------------------------------------
+def elf_case(label, expected, **options):
+    def mutate(spec):
+        mod = spec["modules"]["alpha"]
+        fix = options.pop("fix", None)
+        if fix:
+            spec["elf_fix"]["alpha"] = fix
+        mod.update(options)
+    rejects_spec(label, expected, mutate)
+
+elf_case("not ELF", "not an ELF file", fix=raw(0, b"\x7fELG"))
+elf_case("class 32", "ELFCLASS64", ei_class=1)
+elf_case("big endian", "little-endian", ei_data=2)
+elf_case("wrong machine", "not AArch64", machine=62)
+elf_case("wrong type", "ET_REL", e_type=2)
+elf_case("bad ident version", "identification", fix=raw(6, b"\x02"))
+elf_case("bad osabi", "identification", fix=raw(7, b"\x03"))
+elf_case("e_version", "header fields", fix=raw(20, struct.pack("<I", 2)))
+elf_case("program headers", "header fields", fix=raw(32, struct.pack("<Q", 64)))
+elf_case("shentsize", "section header table", fix=raw(58, struct.pack("<H", 32)))
+elf_case("zero sections", "section header table", fix=raw(60, struct.pack("<H", 0)))
+elf_case("too many sections", "section header table", fix=raw(60, struct.pack("<H", 5000)))
+elf_case("shstrndx range", "name table index", fix=raw(62, struct.pack("<H", 60)))
+elf_case("shoff out of bounds", "out of bounds", fix=raw(40, struct.pack("<Q", 1 << 40)))
+elf_case("shoff in header", "out of bounds", fix=raw(40, struct.pack("<Q", 8)))
+elf_case("shoff beyond file", "out of bounds", fix=lambda b: b.__delitem__(slice(-70, None)))
+elf_case("section offset OOB", "out of bounds", fix=patch_named(".modinfo", "offset", 1 << 40))
+elf_case("section size OOB", "out of bounds", fix=patch_named(".modinfo", "size", 1 << 40))
+elf_case("section offset overflow", "out of bounds",
+         fix=patch_named(".modinfo", "offset", (1 << 64) - 8))
+def overlap(buf):
+    p, f = shdr(buf, section_index(buf, ".symtab"), "offset")
+    patch_named(".strtab", "offset", struct.unpack_from(f, buf, p)[0])(buf)
+elf_case("overlap", "overlaps", fix=overlap)
+elf_case("compressed section", "compressed", fix=patch_named(".modinfo", "flags", 0x802))
+elf_case("malformed RELA section", "relocation sections are unsupported",
+         extra_sections=[(".rela.bad", 4, 0, b"x", 999, 999, 24)])
+elf_case("RELA targeting export evidence", "relocation sections are unsupported",
+         extra_sections=[(".rela.___ksymtab+alpha_fn", 4, 0, bytes(24), 5, 2, 24)])
+elf_case("modinfo wrong type", ".modinfo is not PROGBITS", fix=patch_named(".modinfo", "type", 8))
+elf_case("symtab entsize", ".symtab is malformed", fix=patch_named(".symtab", "entsize", 16))
+elf_case("symtab size", ".symtab is malformed", fix=patch_named(".symtab", "size", 25))
+elf_case("symtab link null", ".symtab is malformed", fix=patch_named(".symtab", "link", 0))
+elf_case("symtab link OOB", ".symtab is malformed", fix=patch_named(".symtab", "link", 999))
+elf_case("symtab link not strtab", ".symtab is malformed", fix=patch_named(".symtab", "link", 1))
+elf_case("additional symtab before", "exactly one SHT_SYMTAB",
+         extra_sections=[(".other_symtab", 2, 0, bytes(24), 0, 1, 24)])
+elf_case("additional symtab after", "exactly one SHT_SYMTAB",
+         fix=patch_named(".strtab", "type", 2))
+elf_case("symtab info", "symbol count", fix=patch_named(".symtab", "info", 999))
+elf_case("symtab info zero", "symbol count", fix=patch_named(".symtab", "info", 0))
+elf_case("section name index", "string index is out of bounds",
+         fix=patch(1, "name", 1 << 30))
+def unterminate(field_name):
+    def apply(buf):
+        p, f = shdr(buf, section_index(buf, field_name), "offset")
+        q, g = shdr(buf, section_index(buf, field_name), "size")
+        offset = struct.unpack_from(f, buf, p)[0]
+        size = struct.unpack_from(g, buf, q)[0]
+        buf[offset + size - 1] = ord("x")
+    return apply
+elf_case("strtab unterminated", "symbol string table is malformed", fix=unterminate(".strtab"))
+elf_case("shstrtab unterminated", "section name table is malformed", fix=unterminate(".shstrtab"))
+elf_case("symbol section OOB", "section index is out of bounds",
+         extra_symbols=[("odd", 200, 0x11, 0)])
+elf_case("symbol xindex", "section index", extra_symbols=[("odd", 0xFFFF, 0x11, 0)])
+elf_case("symbol common", "section index", extra_symbols=[("odd", 0xFFF2, 0x11, 0)])
+elf_case("local after globals", "ordering", extra_symbols=[("loc", 1, 0x01, 0)])
+elf_case("unsupported binding", "unsupported symbol", extra_symbols=[("odd", 1, 0xA1, 0)])
+elf_case("unsupported type", "unsupported symbol", extra_symbols=[("odd", 1, 0x16, 0)])
+elf_case("bad import name", "invalid symbol name", imports=[("bad name", "global")])
+elf_case("duplicate import", "duplicate import", imports=[("printk", "global"), ("printk", "weak")],
+         versions=[("printk", 0xAAAA0001)])
+elf_case("duplicate special section", "duplicate .modinfo",
+         extra_sections=[(".modinfo", 1, 2, b"name=alpha\0", 0, 0, 0)])
+elf_case("export in wrong section", "not in its ___ksymtab section",
+         extra_symbols=[("__ksymtab_stray", 1, 0x11, 0)])
+elf_case("export in ABS", "invalid export record", extra_symbols=[("__ksymtab_stray", 0xFFF1, 0x11, 0)])
+elf_case("export section wrong type", "unsupported export section",
+         fix=patch_named("___ksymtab+alpha_fn", "type", 0))
+elf_case("export section not allocated", "unsupported export section",
+         fix=patch_named("___ksymtab+alpha_fn", "flags", 0))
+elf_case("export section wrong size", "unsupported export section",
+         fix=patch_named("___ksymtab+alpha_fn", "size", 0))
+elf_case("export symbol offset out of bounds", "invalid ___ksymtab record",
+         fix=patch_symbol(2, "value", 1))
+elf_case("export symbol wrong extent", "invalid ___ksymtab record",
+         fix=patch_symbol(2, "size", 0))
+elf_case("export symbol weak binding", "invalid ___ksymtab record",
+         fix=patch_symbol(2, "info", 0x21))
+elf_case("duplicate export section", "export section without exactly one export symbol",
+         extra_sections=[("___ksymtab+alpha_fn", 1, 2, bytes(8), 0, 0, 0)])
+elf_case("orphan export section", "export section without exactly one export symbol",
+         extra_sections=[("___ksymtab+printk", 1, 2, bytes(8), 0, 0, 0)])
+elf_case("crc without export", "CRC record without an export",
+         extra_symbols=[("__crc_stray", 0xFFF1, 0x10, 5)])
+elf_case("crc too wide", "invalid CRC record", exports=[("alpha_fn", "EXPORT_SYMBOL", 1 << 33)])
+elf_case("crc wrong type", "invalid CRC record", fix=patch_symbol(3, "info", 0x11))
+elf_case("crc wrong size", "invalid CRC record", fix=patch_symbol(3, "size", 1))
+elf_case("symbol visibility", "unsupported symbol visibility", fix=patch_symbol(2, "other", 1))
+elf_case("import wrong type", "unsupported symbol record", fix=patch_symbol(4, "info", 0x11))
+elf_case("duplicate export", "duplicate export",
+         exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001), ("alpha_fn", "EXPORT_SYMBOL", 0x11110001)])
+elf_case("imports own export", "imports a symbol it exports",
+         imports=[("alpha_fn", "global")], versions=[("alpha_fn", 0x11110001)])
+
+# ---- .modinfo ----------------------------------------------------------------------------
+def modinfo_case(label, expected, entries):
+    rejects_spec(label, expected, lambda s: s["modules"]["alpha"].update(modinfo=entries))
+modinfo_case("no name", ".modinfo lacks name", [f"vermagic={VERMAGIC}"])
+modinfo_case("no vermagic", (".modinfo lacks vermagic", "exact kernel release"), ["name=alpha"])
+modinfo_case("duplicate name", "duplicate name", ["name=alpha", "name=alpha", f"vermagic={VERMAGIC}"])
+modinfo_case("duplicate vermagic", "duplicate vermagic",
+             ["name=alpha", f"vermagic={VERMAGIC}", f"vermagic={VERMAGIC}"])
+modinfo_case("malformed entry", "malformed entry", ["name=alpha", "garbage", f"vermagic={VERMAGIC}"])
+modinfo_case("empty entry", "malformed entry", ["name=alpha", "", f"vermagic={VERMAGIC}"])
+modinfo_case("bad name", "name is invalid", ["name=al pha", f"vermagic={VERMAGIC}"])
+modinfo_case("wrong name", "differs from the file name", ["name=other", f"vermagic={VERMAGIC}"])
+modinfo_case("wrong release", "kernel release",
+             ["name=alpha", "vermagic=other-release SMP aarch64"])
+modinfo_case("prefix release", "kernel release",
+             ["name=alpha", f"vermagic={RELEASE}x SMP aarch64"])
+modinfo_case("empty vermagic token", "does not start with the kernel release",
+             ["name=alpha", f"vermagic={RELEASE}  SMP"])
+modinfo_case("vermagic disagreement", "disagree on vermagic",
+             ["name=alpha", f"vermagic={RELEASE} SMP mod_unload aarch64"])
+modinfo_case("duplicate import_ns", "import_ns", ["name=alpha", f"vermagic={VERMAGIC}", "import_ns=A", "import_ns=A"])
+modinfo_case("duplicate license", "duplicate license",
+             ["name=alpha", f"vermagic={VERMAGIC}", "license=GPL", "license=GPL"])
+modinfo_case("non-ascii", "not ASCII", ["name=alpha", f"vermagic={VERMAGIC}", "x=é"])
+rejects_spec("modinfo not terminated", ".modinfo is empty",
+             lambda s: s["elf_fix"].update(alpha=patch_named(".modinfo", "size", 0)))
+def strip_nul(buf):
+    p, f = shdr(buf, section_index(buf, ".modinfo"), "offset")
+    q, g = shdr(buf, section_index(buf, ".modinfo"), "size")
+    offset, size = struct.unpack_from(f, buf, p)[0], struct.unpack_from(g, buf, q)[0]
+    buf[offset + size - 1] = ord("x")
+rejects_spec("modinfo unterminated", "not NUL-terminated", lambda s: s["elf_fix"].update(alpha=strip_nul))
+
+# ---- __versions ------------------------------------------------------------------------------
+rejects_spec("versions size", "multiple of 64",
+             lambda s: s["elf_fix"].update(alpha=patch_named("__versions", "size", 63)))
+rejects_spec("versions names differ", "differ from the undefined imports",
+             lambda s: s["modules"]["alpha"].update(versions=[("other", 1)]))
+rejects_spec("versions extra", "differ from the undefined imports",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=[("printk", 0xAAAA0001), ("extra", 1)]))
+rejects_spec("versions duplicate", "duplicate name",
+             lambda s: s["modules"]["alpha"].update(
+                 versions=[("printk", 0xAAAA0001), ("printk", 0xAAAA0001)]))
+rejects_spec("versions wide crc", "malformed entry",
+             lambda s: s["modules"]["alpha"].update(versions=[("printk", 1 << 40)]))
+rejects_spec("versions empty name", "malformed entry",
+             lambda s: s["modules"]["alpha"].update(versions=[("", 1)]))
+rejects_spec("versions garbage after NUL", "malformed entry",
+             lambda s: s["modules"]["alpha"].update(versions=[("pr\0intk", 0xAAAA0001)]))
+rejects_spec("modversions imports without versions", "imports without __versions",
+             lambda s: s["modules"]["alpha"].update(versions=None))
+rejects_spec("unsupported extended versions", "unsupported extended modversions",
+             lambda s: s["modules"]["alpha"].update(
+                 extra_sections=[("__version_ext_names", 1, 2, b"printk\0", 0, 0, 0)]))
+
+# ---- resolution -----------------------------------------------------------------------------------
+rejects_spec("unresolved import", "unresolved import: nowhere",
+             lambda s: s["modules"]["alpha"].update(
+                 imports=[("printk", "global"), ("nowhere", "weak")],
+                 versions=[("printk", 0xAAAA0001), ("nowhere", 1)]))
+rejects_spec("provider outside staged set", "outside the staged set",
+             lambda s: s["modules"]["alpha"].update(
+                 imports=[("other_sym", "global")], versions=[("other_sym", 0x33330001)]))
+rejects_spec("forbidden provider", "forbidden module rmnet_core",
+             lambda s: s["modules"]["alpha"].update(
+                 imports=[("rmnet_sym", "global")], versions=[("rmnet_sym", 0x44440001)]))
+rejects_spec("crc mismatch kernel", "CRC mismatch",
+             lambda s: s["modules"]["alpha"].update(versions=[("printk", 0xDEAD0001)]))
+rejects_spec("crc mismatch module", "CRC mismatch",
+             lambda s: s["modules"]["beta"].update(
+                 versions=[("alpha_fn", 0xDEAD0001), ("kernel_fn", 0xAAAA0002)]))
+rejects_spec("export crc differs", "different CRC",
+             lambda s: s["modules"]["alpha"].update(
+                 exports=[("alpha_fn", "EXPORT_SYMBOL", 0x99990001)]))
+rejects_spec("export type differs", "different export type",
+             lambda s: s["modules"]["alpha"].update(
+                 exports=[("alpha_fn", "EXPORT_SYMBOL_GPL", 0x11110001)]))
+rejects_spec("namespace missing", "without import_ns MYNS",
+             lambda s: s["modules"]["gamma-mod"].update(
+                 modinfo=["name=gamma_mod", f"vermagic={VERMAGIC}", "license=GPL"]))
+rejects_spec("GPL import missing license", "GPL-only symbol kernel_fn with incompatible license missing",
+             lambda s: s["modules"]["beta"].update(
+                 modinfo=["name=beta", f"vermagic={VERMAGIC}"]))
+rejects_spec("GPL import incompatible license", "GPL-only symbol kernel_fn with incompatible license Proprietary",
+             lambda s: s["modules"]["beta"].update(
+                 modinfo=["name=beta", f"vermagic={VERMAGIC}", "license=Proprietary"]))
+rejects_spec("duplicate provider between modules", "duplicate provider for alpha_fn",
+             lambda s: s["modules"]["gamma-mod"].update(
+                 exports=[("alpha_fn", "EXPORT_SYMBOL", None)]))
+rejects_spec("duplicate provider with kernel", "duplicate provider for printk: vmlinux and alpha",
+             lambda s: s["modules"]["alpha"].update(
+                 exports=[("printk", "EXPORT_SYMBOL", None)], imports=[], versions=None))
+rejects_spec("export without symvers row", "has no Module.symvers record",
+             lambda s: s["modules"]["alpha"].update(
+                 exports=[("alpha_fn", "EXPORT_SYMBOL", 0x11110001), ("new_fn", "EXPORT_SYMBOL", None)]))
+rejects_spec("symvers row without export", "does not export it",
+             lambda s: s["extra_module_rows"].append(row(5, "ghost", "drivers/x/alpha")))
+rejects_spec("module symvers vs vmlinux conflict", "conflicts with vmlinux.symvers",
+             lambda s: s["extra_module_rows"].__setitem__(0, row(0xBEEF0001, "printk", "vmlinux")))
+rejects_spec("module symvers symbol vs kernel", "duplicate provider for kernel_fn",
+             lambda s: s["extra_module_rows"].append(row(1, "kernel_fn", "drivers/o/other")))
+
+# dependency cycle and load order
+def cycle(spec):
+    spec["modules"]["alpha"].update(
+        imports=[("beta_fn", "global")], versions=[("beta_fn", 0x22220001)])
+    spec["modules"]["beta"].update(
+        imports=[("alpha_fn", "global")], versions=[("alpha_fn", 0x11110001)])
+rejects_spec("dependency cycle", "dependency cycle among: alpha, beta", cycle)
+def wrong_order(spec):
+    spec["declared"] = ["beta", "alpha", "gamma-mod"]
+rejects_spec("wrong order", "declared order loads beta before its provider alpha", wrong_order)
+def forbidden_staged(spec):
+    spec["declared"].append("rmnet_core")
+    spec["modules"]["rmnet_core"] = dict(imports=[], versions=None, exports=[])
+rejects_spec("forbidden module staged",
+             ("reference module allowlist or conflict set differs", "forbidden module is staged"),
+             forbidden_staged)
+def collide(spec):
+    spec["declared"].append("gamma_mod")
+    spec["modules"]["gamma_mod"] = dict(imports=[], versions=None, exports=[])
+rejects_spec("normalized name collision", "collide after normalization", collide)
+rejects_spec("forbidden modinfo name", "differs from the file name",
+             lambda s: s["modules"]["alpha"].update(
+                 modinfo=["name=rmnet_core", f"vermagic={VERMAGIC}"]))
+
+rejects_spec("gamma before beta", "declared order loads gamma-mod before its provider beta",
+             lambda s: s.update(declared=["alpha", "gamma-mod", "beta"]))
+
+# ---- symvers format ------------------------------------------------------------------------------------
+def symvers_case(label, expected, text, where="vm"):
+    kwargs = {"vm_text": text} if where == "vm" else {"mod_text": text}
+    rejects(label, expected, make(**kwargs))
+good_row = row(0xAAAA0001, "printk", "vmlinux")
+for where in ("vm", "mod"):
+    symvers_case("four fields", "five tab-separated", "0xaaaa0001\tprintk\tvmlinux\tEXPORT_SYMBOL\n", where)
+    symvers_case("six fields", "five tab-separated", good_row[:-1] + "\tx\n", where)
+    symvers_case("no newline", "LF-terminated", good_row[:-1], where)
+    symvers_case("empty", "LF-terminated", "", where)
+    symvers_case("blank line", "five tab-separated", good_row + "\n", where)
+    symvers_case("crlf", "LF-terminated", good_row[:-1] + "\r\n", where)
+    symvers_case("uppercase crc", "invalid CRC", row(0xABCDEF01, "printk", "vmlinux").replace("0xabcdef01", "0xABCDEF01"), where)
+    symvers_case("short crc", "invalid CRC", "0x1\tprintk\tvmlinux\tEXPORT_SYMBOL\t\n", where)
+    symvers_case("bad symbol", "invalid symbol", "0x00000001\t1bad\tvmlinux\tEXPORT_SYMBOL\t\n", where)
+    symvers_case("long symbol", "invalid symbol", row(1, "a" * 56, "vmlinux"), where)
+    symvers_case("bad type", "invalid export type", "0x00000001\tx\tvmlinux\tEXPORT\t\n", where)
+    symvers_case("bad namespace", "invalid namespace", "0x00000001\tx\tvmlinux\tEXPORT_SYMBOL\tn s\n", where)
+    symvers_case("bad provider", "invalid provider", "0x00000001\tx\t\tEXPORT_SYMBOL\t\n", where)
+    symvers_case("duplicate row", "duplicate record for printk", good_row + good_row, where)
+    symvers_case("conflicting row", "conflicting record for printk",
+                 good_row + row(0xAAAA0009, "printk", "vmlinux"), where)
+    symvers_case("NUL byte", "NUL or CR", good_row[:-1] + "\0\n", where)
+rejects("non-UTF8", "is not UTF-8", make(vm_text=b"\xff\xfe\n"))
+rejects("non-UTF8 module symvers", "is not UTF-8", make(mod_text=b"\xff\xfe\n"))
+rejects("kernel symvers non-vmlinux provider", "provider other than vmlinux",
+        make(vm_text=row(1, "printk", "drivers/x/y")))
+rejects("symvers too many rows", "more than",
+        make(vm_text="".join(row(1, f"s{i}", "vmlinux") for i in range(module.MAX_SYMVERS_ROWS + 1))))
+rejects("symvers long line", "is too long", make(vm_text=row(1, "a", "p" * 2000)))
+
+# ---- limits ---------------------------------------------------------------------------------------------
+try:
+    module.parse_module_elf(b"\x7fELF" + bytes(module.MAX_MODULE_BYTES))
+except module.ContractError as error:
+    assert "safety limit" in str(error)
+else:
+    raise AssertionError("oversized module accepted")
+try:
+    module.parse_symvers(b"x" * (module.MAX_SYMVERS_BYTES + 1), "x", kernel=True)
+except module.ContractError as error:
+    assert "safety limit" in str(error)
+else:
+    raise AssertionError("oversized symvers accepted")
+PY
+pass "ABI verifier accepts the good staged set and rejects every malformed or inconsistent variant"
+
+# CLI: wrong inputs fail closed with no output and no external tool.
+cli=(python3 -I bin/omamobile-myron-kernel-verify)
+printf 'x\n' > "$tmp/a"; printf 'y\n' > "$tmp/b"; printf 'z\n' > "$tmp/c"
+mkdir "$tmp/fakes"; : > "$tmp/calls"
+for command in ssh scp adb fastboot docker mount tar pacman depmod modprobe systemctl; do
+  printf '#!/bin/sh\nprintf "%%s\\n" "%s $*" >> "$CALLS"\nexit 97\n' "$command" > "$tmp/fakes/$command"
+  chmod +x "$tmp/fakes/$command"
+done
+for args in "--assets $tmp/c --vmlinux-symvers $tmp/a --module-symvers $tmp/b" \
+            "--assets rel --vmlinux-symvers $tmp/a --module-symvers $tmp/b"; do
+  # shellcheck disable=SC2086
+  if CALLS="$tmp/calls" PATH="$tmp/fakes:$PATH" "${cli[@]}" verify-abi $args > "$tmp/out" 2> "$tmp/err"; then
+    fail "verify-abi accepted wrong inputs"
+  fi
+  [[ ! -s $tmp/out ]] || fail "verify-abi printed output for a rejected input"
+  grep -q '^ERROR: ' "$tmp/err" || fail "verify-abi error is not a deterministic ERROR line"
+done
+[[ ! -s $tmp/calls ]] || fail "verify-abi invoked an external system tool"
+"${cli[@]}" verify-abi --assets "$tmp/c" 2> "$tmp/err1" && fail "missing args accepted"
+"${cli[@]}" verify-kernel --help >/dev/null || fail "verify-kernel parser changed"
+"${cli[@]}" verify-abi --help | grep -q -- '--vmlinux-symvers' || fail "verify-abi help"
+pass "verify-abi CLI fails closed, prints nothing on error and runs no external tool"
+
+[[ $(cat version) == 0.3.0 ]] || fail "package version is not 0.3.0"
+pass "package version is 0.3.0"

@@ -21,6 +21,17 @@ bytes. The release-marker and hash proof is not full ABI, import, provider or
 load-order proof. There is still no stage writer, extraction, `depmod`, module
 install, boot work, or hardware/deployment authorization.
 
+Kernel contract 0.3.0 (Phase 2.6) adds `omamobile-myron-kernel-verify
+verify-abi --assets ARCHIVE --vmlinux-symvers FILE --module-symvers FILE`: a
+read-only, pure-Python, staged-set-only check of module imports, exports, CRCs,
+providers and declared load order against the two exact symvers files. The
+parser handles a synthetic ELF layout only and is unqualified on real modules;
+vendor modules are `not-verified`, activation stays disabled and nothing is
+authorized. It is not integrated into `tools/myron-deployment`: the deployment
+gate still records order status unverified and keeps its blocker until the
+real qualified archive, exact symvers and full vendor module inventory are
+checked.
+
 Phase 2.5 adds `device/myron/deployment-contract.json` and the laptop-only
 `tools/myron-deployment` (`show`, `stage-modules`, `assemble`, `verify`,
 `gate`). It stages the exact qualified module overlay (selector plus seven

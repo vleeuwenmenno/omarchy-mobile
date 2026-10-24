@@ -42,6 +42,17 @@ verifier writes nothing and executes nothing. It stays limited to byte identity
 and the exact release marker: that is not full ABI, import, provider or
 load-order proof, and it does not authorize hardware access or deployment.
 
+Version 0.3.0 adds `omamobile-myron-kernel-verify verify-abi --assets ARCHIVE
+--vmlinux-symvers FILE --module-symvers FILE`, a staged-set-only, offline,
+pure-Python check of the seven modules' `.modinfo` name and vermagic, undefined
+imports, exports, `__versions` CRCs, provider resolution against the two
+symvers files, forbidden `rmnet_core`, dependency cycles and the declared load
+order, including GPL-only symbol license checks. Its ELF reader handles one
+synthetic layout modeled on Linux module
+conventions and is **unqualified on real modules**; vendor modules are
+`not-verified`. The deployment blocker stays until the real qualified archive,
+the exact symvers files and the full vendor module inventory are checked.
+
 | Input | Qualified SHA-256 |
 | --- | --- |
 | Raw `Image` | `9dc9d4a00544af130e04b534cb566e26329dbaa9b2f0e6596ad52c1e657d9e09` |

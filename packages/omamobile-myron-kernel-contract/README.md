@@ -35,7 +35,7 @@ omamobile-myron-kernel-verify verify-runtime \
   --root ROOT --features gpu,wifi,touch
 ```
 
-## Stage contract (0.2.0)
+## Stage contract (0.2.0; verify-abi added in 0.3.0)
 
 `stage-contract.json` is a second metadata file. It binds the SHA-256 of
 `reference.json` and describes an immutable, activation-disabled, metadata-only
@@ -76,6 +76,56 @@ omamobile-myron-kernel-verify verify-stage \
   extra owned files, any other `.ko`, the forbidden paths above, and a bind
   mount inside the tree. Staged files are hashed, never executed.
 
+## ABI, import and load-order check (0.3.0)
+
+```text
+omamobile-myron-kernel-verify verify-abi \
+  --assets systemd-vt-device-assets.tar.gz \
+  --vmlinux-symvers vmlinux.symvers \
+  --module-symvers kernel_aarch64_Module.symvers
+```
+
+`verify-abi` is a staged-set-only, offline, pure-Python check. It loads the
+exact reference and stage contracts, validates the exact qualified archive
+bytes and both symvers files by SHA-256 (before parsing either), then parses
+the seven staged modules as AArch64 ELF64 `ET_REL` files with bounded reads
+(no mmap, no external command, nothing written). All three inputs must be
+canonical absolute paths with no symlink component and must be regular files.
+It checks:
+
+- `.modinfo` has exactly one `name` (equal to the file name, `-` and `_`
+  equivalent) and one `vermagic` that starts with the kernel release and is
+  identical across the set; GPL-only imports require a compatible `license`;
+  ELF class, byte order, type and machine;
+- undefined global/weak symbols are the imports; `__versions` (when present)
+  lists exactly those imports with 32-bit CRCs, and is required for imports
+  when vermagic enables `modversions`;
+- each import resolves to the kernel (`vmlinux.symvers`) or to exactly one
+  staged module (`Module.symvers` provider), with CRC and namespace
+  (`import_ns`) checks; unresolved imports, imports from modules outside the
+  staged set or from `rmnet_core`, and duplicate providers are refused;
+- each module's exports agree with its `Module.symvers` records in both
+  directions (symbol, export type, CRC);
+- the dependency graph has no cycle and the declared order in
+  `reference.json` is a valid topological load order.
+
+The output is deterministic JSON with `scope: staged-set-only`,
+`vendor_modules: not-verified`, `activation: disabled`, the three input
+hashes, the declared and resolved order and per-module imports, exports,
+providers and CRC status. It carries no deployment, boot or flash claim.
+
+**Unqualified on real modules.** The ELF reader supports one deterministic,
+synthetic representation shaped after Linux conventions (one `.symtab`, `.modinfo`,
+`___ksymtab[_gpl]+NAME` sections with `__ksymtab_NAME` symbols, absolute
+`__crc_NAME` symbols, a `__versions` table of 64-byte records). It has never
+been run on the real qualified archive: real layouts it does not model, such as
+a `module_layout` record in `__versions`, relocation sections or extended
+modversions sections, fail with a deterministic error and are not guessed at. A pass proves
+consistency of the staged set only. It does
+not clear the deployment blocker, which stays until the real qualified
+archive, the exact symvers files and the full vendor module inventory have
+been checked.
+
 **The verifier writes nothing.** It opens files read-only; it never creates,
 modifies, chmods, extracts, or removes anything, and it runs no `tar`,
 `depmod`, `modprobe`, `systemctl`, or network tool. (The kernel may still
@@ -83,8 +133,9 @@ update access times under the mount's own policy.) `verify-kernel` still
 ignores the manifest's `selector_destination`.
 
 Evidence limits: the checks prove byte identity with the recorded reference
-plus the exact kernel release marker in each module. That marker and hash proof
-is not full ABI, import, provider or load-order proof. No stage writer exists:
+plus the exact kernel release marker in each module. `verify-abi` adds an
+unqualified, synthetic-layout ABI/import/provider/load-order consistency check
+for the staged set only (see above); it has not been shown on real modules. No stage writer exists:
 nothing extracts the archive, runs `depmod`, installs a module, or touches
 boot. The contract authorizes no hardware access and no deployment.
 

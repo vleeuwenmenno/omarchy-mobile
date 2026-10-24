@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import heapq
 import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import struct
 import sys
 import tarfile
 from typing import NamedTuple
@@ -992,6 +994,648 @@ def load_reference() -> dict:
     return reference
 
 
+# --- staged-set-only module ABI, import and load-order verification ----------
+#
+# Offline and metadata-only. The ELF reader below supports one deterministic,
+# synthetic representation of a Linux AArch64 relocatable module. It has not
+# been qualified against any real vendor or GKI module: an unsupported real
+# layout fails with a deterministic error instead of being guessed at.
+
+MAX_SYMVERS_BYTES = 32 * 1024 * 1024
+MAX_SYMVERS_ROWS = 400_000
+MAX_SYMVERS_LINE = 1024
+MAX_MODULE_BYTES = 16 * 1024 * 1024
+MAX_ELF_SECTIONS = 128
+MAX_ELF_SYMBOLS = 100_000
+MAX_ELF_STRTAB_BYTES = 4 * 1024 * 1024
+MAX_MODINFO_BYTES = 64 * 1024
+MAX_MODINFO_ENTRIES = 512
+MAX_VERSIONS_ENTRIES = 16_384
+ELF_HEADER_SIZE = 64
+ELF_SECTION_SIZE = 64
+ELF_SYMBOL_SIZE = 24
+MODVERSION_ENTRY_SIZE = 64
+MODVERSION_NAME_SIZE = 56
+EM_AARCH64 = 183
+ET_REL = 1
+SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB = 0, 1, 2, 3
+SHT_RELA, SHT_NOBITS, SHT_REL = 4, 8, 9
+SHF_ALLOC, SHF_COMPRESSED = 0x2, 0x800
+KSYMTAB_ENTRY_SIZE = 8
+SHN_UNDEF, SHN_LORESERVE, SHN_ABS = 0, 0xFF00, 0xFFF1
+SYMBOL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,54}")
+LOCAL_SYMBOL_NAME = re.compile(r"[\x21-\x7e]{1,255}")
+SYMVERS_CRC = re.compile(r"0x[0-9a-f]{8}")
+SYMVERS_PROVIDER = re.compile(r"[A-Za-z0-9_./+-]{1,255}")
+SYMVERS_NAMESPACE = re.compile(r"[A-Za-z0-9_.-]{0,255}")
+SYMVERS_TYPES = {
+    "EXPORT_SYMBOL", "EXPORT_SYMBOL_GPL",
+    "EXPORT_UNUSED_SYMBOL", "EXPORT_UNUSED_SYMBOL_GPL",
+}
+GPL_COMPATIBLE_LICENSES = {
+    "GPL",
+    "GPL v2",
+    "GPL and additional rights",
+    "Dual BSD/GPL",
+    "Dual MIT/GPL",
+    "Dual MPL/GPL",
+}
+KSYMTAB_SECTIONS = {
+    "___ksymtab": "EXPORT_SYMBOL",
+    "___ksymtab_gpl": "EXPORT_SYMBOL_GPL",
+    "___ksymtab_unused": "EXPORT_UNUSED_SYMBOL",
+    "___ksymtab_unused_gpl": "EXPORT_UNUSED_SYMBOL_GPL",
+}
+MODINFO_KEY = re.compile(r"[a-z][a-z0-9_]{0,31}")
+MODINFO_NAME = re.compile(r"[A-Za-z0-9_]{1,55}")
+VERMAGIC_TOKEN = re.compile(r"[\x21-\x7e]+")
+
+
+class SymverRow(NamedTuple):
+    crc: int
+    provider: str
+    export_type: str
+    namespace: str
+
+
+class ModuleElf(NamedTuple):
+    name: str
+    vermagic: str
+    license: str | None
+    import_namespaces: tuple
+    imports: dict      # symbol -> "global" | "weak"
+    exports: dict      # symbol -> (export type, CRC or None)
+    versions: dict | None  # symbol -> CRC, None without a __versions section
+
+
+class ElfSection(NamedTuple):
+    name: str
+    kind: int
+    flags: int
+    offset: int
+    size: int
+    link: int
+    info: int
+    entsize: int
+
+
+def normalize_module_name(name: str) -> str:
+    """The kernel treats '-' and '_' in module names as the same character."""
+    return name.replace("-", "_")
+
+
+def read_canonical_regular(path: str, label: str, limit: int) -> bytes:
+    """Read one regular file: canonical absolute path, no symlink on any component."""
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise ContractError(f"{label} path is invalid")
+    if not os.path.isabs(path) or path == "/":
+        raise ContractError(f"{label} must be a canonical absolute path")
+    components = path.split("/")
+    if any(part in (".", "..") for part in components) or any(not part for part in components[1:]):
+        raise ContractError(f"{label} must be a canonical absolute path")
+    try:
+        current = os.open("/", stage_flags(directory=True))
+    except OSError as error:
+        raise ContractError(f"cannot open /: {error.strerror}") from error
+    try:
+        walked = ""
+        for part in components[1:-1]:
+            walked += "/" + part
+            following = open_directory_at(current, part, f"{label} component {walked}")
+            os.close(current)
+            current = following
+        descriptor = open_regular(components[-1], label, directory_fd=current)
+    finally:
+        os.close(current)
+    with os.fdopen(descriptor, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > limit:
+            raise ContractError(f"{label} exceeds the {limit}-byte safety limit")
+        data = stream.read(limit + 1)
+    if len(data) != size:
+        raise ContractError(f"{label} changed size while being read")
+    return data
+
+
+def parse_symvers(data: bytes, label: str, *, kernel: bool) -> dict[str, SymverRow]:
+    if len(data) > MAX_SYMVERS_BYTES:
+        raise ContractError(f"{label} exceeds the {MAX_SYMVERS_BYTES}-byte safety limit")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ContractError(f"{label} is not UTF-8") from error
+    if not text or not text.endswith("\n") or "\x00" in text or "\r" in text:
+        raise ContractError(f"{label} must be non-empty LF-terminated text without NUL or CR")
+    lines = text[:-1].split("\n")
+    if len(lines) > MAX_SYMVERS_ROWS:
+        raise ContractError(f"{label} has more than {MAX_SYMVERS_ROWS} rows")
+    rows: dict[str, SymverRow] = {}
+    for number, line in enumerate(lines, 1):
+        if len(line) > MAX_SYMVERS_LINE:
+            raise ContractError(f"{label} line {number} is too long")
+        fields = line.split("\t")
+        if len(fields) != 5:
+            raise ContractError(f"{label} line {number} does not have five tab-separated fields")
+        crc, symbol, provider, export_type, namespace = fields
+        if not SYMVERS_CRC.fullmatch(crc):
+            raise ContractError(f"{label} line {number} has an invalid CRC")
+        if not SYMBOL_NAME.fullmatch(symbol):
+            raise ContractError(f"{label} line {number} has an invalid symbol")
+        if not SYMVERS_PROVIDER.fullmatch(provider):
+            raise ContractError(f"{label} line {number} has an invalid provider")
+        if kernel and provider != "vmlinux":
+            raise ContractError(f"{label} line {number} has a provider other than vmlinux")
+        if export_type not in SYMVERS_TYPES:
+            raise ContractError(f"{label} line {number} has an invalid export type")
+        if not SYMVERS_NAMESPACE.fullmatch(namespace):
+            raise ContractError(f"{label} line {number} has an invalid namespace")
+        row = SymverRow(int(crc, 16), provider, export_type, namespace)
+        previous = rows.get(symbol)
+        if previous is not None:
+            kind = "duplicate" if previous == row else "conflicting"
+            raise ContractError(f"{label} line {number} has a {kind} record for {symbol}")
+        rows[symbol] = row
+    return rows
+
+
+def elf_cstring(table: bytes, index: int, what: str) -> str:
+    if index >= len(table):
+        raise ContractError(f"{what} string index is out of bounds")
+    end = table.find(b"\x00", index)
+    if end < 0:
+        raise ContractError(f"{what} string is not terminated")
+    try:
+        return table[index:end].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ContractError(f"{what} string is not ASCII") from error
+
+
+def parse_modinfo(data: bytes) -> tuple[str, str, str | None, tuple]:
+    if not data or len(data) > MAX_MODINFO_BYTES or data[-1] != 0:
+        raise ContractError(".modinfo is empty, oversized or not NUL-terminated")
+    entries = data[:-1].split(b"\x00")
+    if len(entries) > MAX_MODINFO_ENTRIES:
+        raise ContractError(".modinfo has too many entries")
+    single: dict[str, str] = {}
+    namespaces: list[str] = []
+    for raw in entries:
+        try:
+            entry = raw.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ContractError(".modinfo entry is not ASCII") from error
+        key, separator, value = entry.partition("=")
+        if (
+            not separator or not MODINFO_KEY.fullmatch(key) or len(value) > 1024
+            or any(not 0x20 <= ord(char) <= 0x7E for char in value)
+        ):
+            raise ContractError(".modinfo has a malformed entry")
+        if key == "import_ns":
+            if not SYMVERS_NAMESPACE.fullmatch(value) or not value or value in namespaces:
+                raise ContractError(".modinfo has an invalid or duplicate import_ns")
+            namespaces.append(value)
+        elif key in ("name", "vermagic", "license"):
+            if key in single:
+                raise ContractError(f".modinfo has duplicate {key}")
+            single[key] = value
+    for key in ("name", "vermagic"):
+        if key not in single:
+            raise ContractError(f".modinfo lacks {key}")
+    if not MODINFO_NAME.fullmatch(single["name"]):
+        raise ContractError(".modinfo name is invalid")
+    return single["name"], single["vermagic"], single.get("license"), tuple(sorted(namespaces))
+
+
+def parse_versions(data: bytes) -> dict[str, int]:
+    if not data or len(data) % MODVERSION_ENTRY_SIZE:
+        raise ContractError("__versions size is not a positive multiple of 64")
+    if len(data) // MODVERSION_ENTRY_SIZE > MAX_VERSIONS_ENTRIES:
+        raise ContractError("__versions has too many entries")
+    result: dict[str, int] = {}
+    for crc, raw in struct.iter_unpack(f"<Q{MODVERSION_NAME_SIZE}s", data):
+        end = raw.find(b"\x00")
+        if end < 1 or any(raw[end:]) or crc > 0xFFFFFFFF:
+            raise ContractError("__versions has a malformed entry")
+        try:
+            name = raw[:end].decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ContractError("__versions name is not ASCII") from error
+        if not SYMBOL_NAME.fullmatch(name) or name in result:
+            raise ContractError("__versions has an invalid or duplicate name")
+        result[name] = crc
+    return result
+
+
+def parse_module_elf(data: bytes) -> ModuleElf:
+    size = len(data)
+    if size > MAX_MODULE_BYTES:
+        raise ContractError(f"module exceeds the {MAX_MODULE_BYTES}-byte safety limit")
+    if size < ELF_HEADER_SIZE or data[:4] != b"\x7fELF":
+        raise ContractError("module is not an ELF file")
+    if data[4] != 2:
+        raise ContractError("module is not ELFCLASS64")
+    if data[5] != 1:
+        raise ContractError("module is not little-endian")
+    if data[6] != 1 or data[7] != 0 or data[8] != 0 or any(data[9:16]):
+        raise ContractError("module ELF identification is unsupported")
+    (e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize,
+     e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx) = struct.unpack_from(
+        "<HHIQQQIHHHHHH", data, 16)
+    if e_type != ET_REL:
+        raise ContractError("module is not ET_REL")
+    if e_machine != EM_AARCH64:
+        raise ContractError("module is not AArch64")
+    if (
+        e_version != 1 or e_entry or e_phoff or e_phnum or e_flags
+        or e_ehsize != ELF_HEADER_SIZE or e_phentsize not in (0, 56)
+    ):
+        raise ContractError("module ELF header fields are unsupported")
+    if e_shentsize != ELF_SECTION_SIZE or not 1 <= e_shnum <= MAX_ELF_SECTIONS:
+        raise ContractError("module section header table is unsupported")
+    if e_shstrndx == 0 or e_shstrndx >= e_shnum:
+        raise ContractError("module section name table index is invalid")
+    table_end = e_shoff + e_shnum * ELF_SECTION_SIZE
+    if e_shoff < ELF_HEADER_SIZE or table_end > size:
+        raise ContractError("module section header table is out of bounds")
+    raw_sections = [
+        struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + index * ELF_SECTION_SIZE)
+        for index in range(e_shnum)
+    ]
+    if any(raw_sections[0]):
+        raise ContractError("module section 0 is not the null section")
+    ranges = [(e_shoff, table_end, "section header table")]
+    for index, (_, kind, flags, _, offset, length, *_rest) in enumerate(raw_sections):
+        if kind in (SHT_REL, SHT_RELA):
+            raise ContractError("module relocation sections are unsupported")
+        if kind in (SHT_NULL, SHT_NOBITS) or length == 0:
+            continue
+        if flags & SHF_COMPRESSED:
+            raise ContractError(f"module section {index} is compressed")
+        if offset < ELF_HEADER_SIZE or offset + length > size:
+            raise ContractError(f"module section {index} is out of bounds")
+        ranges.append((offset, offset + length, f"section {index}"))
+    ranges.sort()
+    for (_, end, _), (start, _, what) in zip(ranges, ranges[1:]):
+        if start < end:
+            raise ContractError(f"module {what} overlaps another region")
+
+    def contents(section: ElfSection) -> bytes:
+        return data[section.offset:section.offset + section.size]
+
+    shstr = raw_sections[e_shstrndx]
+    if shstr[1] != SHT_STRTAB or shstr[5] == 0 or shstr[5] > MAX_ELF_STRTAB_BYTES:
+        raise ContractError("module section name table is invalid")
+    names = data[shstr[4]:shstr[4] + shstr[5]]
+    if names[0] != 0 or names[-1] != 0:
+        raise ContractError("module section name table is malformed")
+    sections = [
+        ElfSection(elf_cstring(names, raw[0], "section name"), raw[1], raw[2],
+                   raw[4], raw[5], raw[6], raw[7], raw[9])
+        for raw in raw_sections
+    ]
+    by_name: dict[str, list[int]] = {}
+    for index, section in enumerate(sections):
+        by_name.setdefault(section.name, []).append(index)
+    export_sections: dict[int, tuple[str, str]] = {}
+    for index, section in enumerate(sections):
+        if not section.name.startswith("___ksymtab"):
+            continue
+        prefix, plus, symbol = section.name.partition("+")
+        if (
+            not plus
+            or prefix not in KSYMTAB_SECTIONS
+            or not SYMBOL_NAME.fullmatch(symbol)
+            or section.kind != SHT_PROGBITS
+            or not section.flags & SHF_ALLOC
+            or section.size != KSYMTAB_ENTRY_SIZE
+        ):
+            raise ContractError(f"module has an unsupported export section: {section.name}")
+        export_sections[index] = (symbol, KSYMTAB_SECTIONS[prefix])
+    for special in (".modinfo", ".symtab", "__versions"):
+        if len(by_name.get(special, ())) > 1:
+            raise ContractError(f"module has duplicate {special}")
+    if ".modinfo" not in by_name:
+        raise ContractError("module lacks .modinfo")
+    if ".symtab" not in by_name:
+        raise ContractError("module lacks .symtab")
+    symtabs = [index for index, section in enumerate(sections) if section.kind == SHT_SYMTAB]
+    if symtabs != [by_name[".symtab"][0]]:
+        raise ContractError("module must contain exactly one SHT_SYMTAB named .symtab")
+    if "__version_ext_names" in by_name or "__version_ext_crcs" in by_name:
+        raise ContractError("module uses unsupported extended modversions sections")
+    modinfo = sections[by_name[".modinfo"][0]]
+    if modinfo.kind != SHT_PROGBITS:
+        raise ContractError(".modinfo is not PROGBITS")
+    name, vermagic, license_name, namespaces = parse_modinfo(contents(modinfo))
+
+    symtab = sections[by_name[".symtab"][0]]
+    if (
+        symtab.kind != SHT_SYMTAB or symtab.entsize != ELF_SYMBOL_SIZE
+        or symtab.size == 0 or symtab.size % ELF_SYMBOL_SIZE
+        or symtab.link in (0, e_shstrndx) or symtab.link >= e_shnum
+        or sections[symtab.link].kind != SHT_STRTAB
+        or not 0 < sections[symtab.link].size <= MAX_ELF_STRTAB_BYTES
+    ):
+        raise ContractError(".symtab is malformed")
+    count = symtab.size // ELF_SYMBOL_SIZE
+    if count > MAX_ELF_SYMBOLS or not 1 <= symtab.info <= count:
+        raise ContractError(".symtab symbol count or first-global index is invalid")
+    strtab = contents(sections[symtab.link])
+    if strtab[0] != 0 or strtab[-1] != 0:
+        raise ContractError("symbol string table is malformed")
+
+    imports: dict[str, str] = {}
+    export_symbols: dict[str, tuple[str, int]] = {}
+    export_crcs: dict[str, int] = {}
+    referenced_export_sections: set[int] = set()
+    for index, (st_name, st_info, st_other, st_shndx, st_value, st_size) in enumerate(
+        struct.iter_unpack("<IBBHQQ", contents(symtab))
+    ):
+        bind, kind = st_info >> 4, st_info & 15
+        if index == 0:
+            if (st_name, st_info, st_other, st_shndx, st_value, st_size) != (0,) * 6:
+                raise ContractError("symbol 0 is not the null symbol")
+            continue
+        if kind > 4 or bind > 2:
+            raise ContractError("module has an unsupported symbol type or binding")
+        if st_other != 0:
+            raise ContractError("module has unsupported symbol visibility")
+        if (bind == 0) != (index < symtab.info):
+            raise ContractError(".symtab local/global symbol ordering is invalid")
+        symbol = elf_cstring(strtab, st_name, "symbol name")
+        if symbol and not LOCAL_SYMBOL_NAME.fullmatch(symbol):
+            raise ContractError("module has an invalid symbol name")
+        if not symbol and kind not in (3, 4):
+            raise ContractError("module has an unnamed symbol")
+        if st_shndx == 0xFFFF or SHN_LORESERVE <= st_shndx < SHN_ABS or st_shndx > SHN_ABS:
+            raise ContractError("module has an unsupported symbol section index")
+        if st_shndx < SHN_LORESERVE and st_shndx >= e_shnum:
+            raise ContractError("module symbol section index is out of bounds")
+        if st_shndx == SHN_UNDEF:
+            if bind == 0:
+                raise ContractError("module has an undefined local symbol")
+            if kind in (3, 4):
+                raise ContractError("module has an undefined section or file symbol")
+            if not SYMBOL_NAME.fullmatch(symbol):
+                raise ContractError(f"module import has an invalid name: {symbol}")
+            if kind != 0 or st_value != 0 or st_size != 0:
+                raise ContractError(f"module import has an unsupported symbol record: {symbol}")
+            if symbol in imports:
+                raise ContractError(f"module has duplicate import: {symbol}")
+            imports[symbol] = "weak" if bind == 2 else "global"
+        elif symbol.startswith("__ksymtab_"):
+            exported = symbol[len("__ksymtab_"):]
+            if not SYMBOL_NAME.fullmatch(exported) or st_shndx == SHN_ABS:
+                raise ContractError(f"module has an invalid export record: {symbol}")
+            export_section = export_sections.get(st_shndx)
+            if export_section is None or export_section[0] != exported:
+                raise ContractError(f"module export {exported} is not in its ___ksymtab section")
+            if (
+                bind != 1
+                or kind != 1
+                or st_size != KSYMTAB_ENTRY_SIZE
+                or st_value > sections[st_shndx].size - st_size
+            ):
+                raise ContractError(f"module export {exported} has an invalid ___ksymtab record")
+            if exported in export_symbols:
+                raise ContractError(f"module has duplicate export: {exported}")
+            referenced_export_sections.add(st_shndx)
+            export_symbols[exported] = (export_section[1], 0)
+        elif symbol.startswith("__crc_"):
+            exported = symbol[len("__crc_"):]
+            if (
+                not SYMBOL_NAME.fullmatch(exported) or st_shndx != SHN_ABS
+                or bind != 1 or kind != 0 or st_size != 0
+                or st_value > 0xFFFFFFFF or exported in export_crcs
+            ):
+                raise ContractError(f"module has an invalid CRC record: {symbol}")
+            export_crcs[exported] = st_value
+    if referenced_export_sections != set(export_sections):
+        raise ContractError("module has an export section without exactly one export symbol")
+    if set(export_crcs) - set(export_symbols):
+        raise ContractError("module has a CRC record without an export")
+    exports = {
+        symbol: (record[0], export_crcs.get(symbol))
+        for symbol, record in export_symbols.items()
+    }
+    if set(exports) & set(imports):
+        raise ContractError("module imports a symbol it exports")
+
+    versions = None
+    if "__versions" in by_name:
+        section = sections[by_name["__versions"][0]]
+        if section.kind != SHT_PROGBITS:
+            raise ContractError("__versions is not PROGBITS")
+        versions = parse_versions(contents(section))
+        if set(versions) != set(imports):
+            raise ContractError("__versions entries differ from the undefined imports")
+    if imports and "modversions" in vermagic.split() and versions is None:
+        raise ContractError("module enables modversions but has imports without __versions")
+    return ModuleElf(name, vermagic, license_name, namespaces, imports, exports, versions)
+
+
+def verify_abi_bytes(
+    contracts: Contracts, archive_data: bytes, vmlinux_data: bytes, module_data: bytes
+) -> dict:
+    reference = contracts.reference
+    validate_stage_contract(contracts.stage, reference, contracts.reference_sha256)
+    kernel_ref = reference["kernel"]
+    assets = reference["module_assets"]
+    for label, data, key in (
+        ("vmlinux.symvers", vmlinux_data, "vmlinux_symvers_sha256"),
+        ("kernel_aarch64_Module.symvers", module_data, "module_symvers_sha256"),
+    ):
+        actual = sha256_bytes(data)
+        if actual != kernel_ref[key]:
+            raise ContractError(f"{label} SHA-256 differs: expected {kernel_ref[key]}, got {actual}")
+    payload = read_module_payload_bytes(
+        reference, archive_data, contracts.stage["layout"]["selector"]["destination"]
+    )
+    declared = list(assets["modules"])
+    forbidden = {normalize_module_name(name) for name in assets["forbidden_modules"]}
+    stems = [normalize_module_name(name) for name in declared]
+    if len(set(stems)) != len(stems):
+        raise ContractError("staged module names collide after normalization")
+    if forbidden & set(stems):
+        raise ContractError("a forbidden module is staged")
+    staged_files = {name[len("modules/"):-len(".ko")] for name in payload if name.startswith("modules/")}
+    if staged_files != set(declared):
+        raise ContractError("staged module set differs from the declared modules")
+
+    kernel_rows = parse_symvers(vmlinux_data, "vmlinux.symvers", kernel=True)
+    all_rows = parse_symvers(module_data, "Module.symvers", kernel=False)
+    staged_rows: dict[str, dict[str, SymverRow]] = {stem: {} for stem in stems}
+    outside: dict[str, str] = {}
+    for symbol, row in all_rows.items():
+        if row.provider == "vmlinux":
+            if kernel_rows.get(symbol) != row:
+                raise ContractError(f"Module.symvers conflicts with vmlinux.symvers for {symbol}")
+            continue
+        if symbol in kernel_rows:
+            raise ContractError(f"duplicate provider for {symbol}: vmlinux and {row.provider}")
+        stem = normalize_module_name(row.provider.rsplit("/", 1)[-1])
+        if stem in staged_rows:
+            staged_rows[stem][symbol] = row
+        else:
+            outside[symbol] = stem
+
+    parsed: dict[str, ModuleElf] = {}
+    for name, stem in zip(declared, stems):
+        member = f"modules/{name}.ko"
+        try:
+            module = parse_module_elf(payload[member])
+        except ContractError as error:
+            raise ContractError(f"{member}: {error}") from error
+        if normalize_module_name(module.name) != stem:
+            raise ContractError(f"{member}: .modinfo name {module.name} differs from the file name")
+        if module.name in forbidden:
+            raise ContractError(f"{member}: forbidden module {module.name}")
+        tokens = module.vermagic.split(" ")
+        if (
+            tokens[0] != kernel_ref["release"]
+            or any(not VERMAGIC_TOKEN.fullmatch(token) for token in tokens)
+        ):
+            raise ContractError(f"{member}: vermagic does not start with the kernel release")
+        parsed[name] = module
+    vermagics = {module.vermagic for module in parsed.values()}
+    if len(vermagics) != 1:
+        raise ContractError("staged modules disagree on vermagic")
+
+    providers: dict[str, str] = {}
+    for name, stem in zip(declared, stems):
+        module = parsed[name]
+        rows = staged_rows[stem]
+        for symbol in sorted(module.exports):
+            export_type, crc = module.exports[symbol]
+            if symbol in kernel_rows:
+                raise ContractError(f"duplicate provider for {symbol}: vmlinux and {name}")
+            if symbol in providers:
+                raise ContractError(f"duplicate provider for {symbol}: {providers[symbol]} and {name}")
+            providers[symbol] = name
+            row = rows.get(symbol)
+            if row is None:
+                raise ContractError(f"export {symbol} of {name} has no Module.symvers record")
+            if row.export_type != export_type:
+                raise ContractError(f"export {symbol} of {name} has a different export type")
+            if crc is not None and crc != row.crc:
+                raise ContractError(f"export {symbol} of {name} has a different CRC")
+        for symbol in sorted(set(rows) - set(module.exports)):
+            raise ContractError(f"Module.symvers lists {symbol} for {name} but the module does not export it")
+
+    report = []
+    edges: dict[str, set[str]] = {name: set() for name in declared}
+    for name in declared:
+        module = parsed[name]
+        imports = []
+        for symbol in sorted(module.imports):
+            if symbol in kernel_rows:
+                row, provider = kernel_rows[symbol], "kernel"
+            elif symbol in providers:
+                provider = providers[symbol]
+                row = staged_rows[normalize_module_name(provider)][symbol]
+                edges[name].add(provider)
+                provider = f"module:{provider}"
+            elif symbol in outside:
+                if outside[symbol] in forbidden:
+                    raise ContractError(f"{name} imports {symbol} from forbidden module {outside[symbol]}")
+                raise ContractError(
+                    f"{name} imports {symbol} from {outside[symbol]}, outside the staged set"
+                )
+            else:
+                raise ContractError(f"{name} has an unresolved import: {symbol}")
+            if row.namespace and row.namespace not in module.import_namespaces:
+                raise ContractError(f"{name} imports {symbol} without import_ns {row.namespace}")
+            if row.export_type.endswith("_GPL") and module.license not in GPL_COMPATIBLE_LICENSES:
+                shown = module.license if module.license is not None else "missing"
+                raise ContractError(
+                    f"{name} imports GPL-only symbol {symbol} with incompatible license {shown}"
+                )
+            if module.versions is None:
+                crc_status = "unversioned"
+            elif module.versions[symbol] != row.crc:
+                raise ContractError(f"{name} import {symbol} has a CRC mismatch")
+            else:
+                crc_status = "match"
+            imports.append({
+                "bind": module.imports[symbol],
+                "crc_status": crc_status,
+                "namespace": row.namespace,
+                "provider": provider,
+                "provider_crc": f"0x{row.crc:08x}",
+                "symbol": symbol,
+            })
+        exports = [
+            {
+                "crc": None if module.exports[symbol][1] is None else f"0x{module.exports[symbol][1]:08x}",
+                "crc_status": "module-matches-symvers" if module.exports[symbol][1] is not None else "module-has-no-crc",
+                "export_type": module.exports[symbol][0],
+                "symbol": symbol,
+            }
+            for symbol in sorted(module.exports)
+        ]
+        report.append({
+            "depends_on": sorted(edges[name]),
+            "exports": exports,
+            "imports": imports,
+            "member": f"modules/{name}.ko",
+            "license": module.license,
+            "modinfo_name": module.name,
+            "name": name,
+            "sha256": sha256_bytes(payload[f"modules/{name}.ko"]),
+            "versions": "present" if module.versions is not None else "absent",
+        })
+
+    position = {name: index for index, name in enumerate(declared)}
+    remaining = {name: set(edges[name]) for name in declared}
+    ready = [position[name] for name in declared if not remaining[name]]
+    heapq.heapify(ready)
+    resolved: list[str] = []
+    while ready:
+        current = declared[heapq.heappop(ready)]
+        resolved.append(current)
+        for name in declared:
+            if current in remaining[name]:
+                remaining[name].discard(current)
+                if not remaining[name]:
+                    heapq.heappush(ready, position[name])
+    if len(resolved) != len(declared):
+        raise ContractError(
+            "dependency cycle among: " + ", ".join(sorted(name for name in declared if name not in resolved))
+        )
+    for name in declared:
+        for provider in sorted(edges[name]):
+            if position[provider] > position[name]:
+                raise ContractError(f"declared order loads {name} before its provider {provider}")
+    return {
+        "schema": 1,
+        "status": "staged-set-consistent",
+        "scope": "staged-set-only",
+        "vendor_modules": "not-verified",
+        "activation": reference["activation"]["mode"],
+        "parser": "synthetic-offline-unqualified-on-real-modules",
+        "deployment_blocker": "unchanged",
+        "device": reference["device"]["codename"],
+        "kernel_release": kernel_ref["release"],
+        "vermagic": next(iter(vermagics)),
+        "reference_sha256": contracts.reference_sha256,
+        "stage_contract_sha256": contracts.stage_sha256,
+        "archive_sha256": assets["archive_sha256"],
+        "vmlinux_symvers_sha256": kernel_ref["vmlinux_symvers_sha256"],
+        "module_symvers_sha256": kernel_ref["module_symvers_sha256"],
+        "declared_order": declared,
+        "resolved_order": resolved,
+        "modules": report,
+    }
+
+
+def verify_abi_paths(contracts: Contracts, archive: str, vmlinux: str, module_symvers: str) -> dict:
+    archive_data = read_canonical_regular(archive, "module asset archive", MAX_ARCHIVE_BYTES)
+    vmlinux_data = read_canonical_regular(vmlinux, "vmlinux.symvers", MAX_SYMVERS_BYTES)
+    module_data = read_canonical_regular(
+        module_symvers, "kernel_aarch64_Module.symvers", MAX_SYMVERS_BYTES
+    )
+    return verify_abi_bytes(contracts, archive_data, vmlinux_data, module_data)
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description=__doc__)
     subcommands = command.add_subparsers(dest="command", required=True)
@@ -1009,6 +1653,12 @@ def parser() -> argparse.ArgumentParser:
     stage = subcommands.add_parser("verify-stage", help="verify an external stage tree read-only")
     stage.add_argument("--assets", type=Path, required=True)
     stage.add_argument("--root", required=True)
+    abi = subcommands.add_parser(
+        "verify-abi", help="verify the staged modules' ABI, imports and load order offline"
+    )
+    abi.add_argument("--assets", required=True)
+    abi.add_argument("--vmlinux-symvers", required=True)
+    abi.add_argument("--module-symvers", required=True)
     runtime = subcommands.add_parser("verify-runtime", help="verify private runtime assets read-only")
     runtime.add_argument("--manifest", type=Path, required=True)
     runtime.add_argument("--root", type=Path, required=True)
@@ -1026,6 +1676,14 @@ def main() -> int:
             plan = build_stage_plan(load_contracts(), args.assets)
             print(json.dumps(
                 plan if args.command == "plan-stage" else verify_stage_tree(plan, args.root),
+                indent=2, sort_keys=True,
+            ))
+            return 0
+        if args.command == "verify-abi":
+            print(json.dumps(
+                verify_abi_paths(
+                    load_contracts(), args.assets, args.vmlinux_symvers, args.module_symvers
+                ),
                 indent=2, sort_keys=True,
             ))
             return 0

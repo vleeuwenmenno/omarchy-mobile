@@ -105,6 +105,16 @@ Implemented in the metadata-only contract package:
   writer, extraction, `depmod`, module install, boot work, or hardware or
   deployment authorization.
 
+- (0.3.0, Phase 2.6) read-only `verify-abi`: a staged-set-only, offline,
+  pure-Python ABI/import/provider/CRC/load-order verifier that validates the
+  qualified archive and both symvers files by SHA-256 before parsing, with
+  `scope: staged-set-only`, `vendor_modules: not-verified` and
+  `activation: disabled` in its JSON. Its ELF reader supports a synthetic
+  layout only and is unqualified on real modules; it is not yet wired into
+  `tools/myron-deployment`, whose gate still records order status unverified
+  and the same blocker. The blocker remains until the real qualified archive,
+  exact symvers and the full vendor module inventory are checked.
+
 Phase 2.5 (laptop-only, done): `device/myron/deployment-contract.json` and
 `tools/myron-deployment` stage the module overlay writer-side and assemble a
 deterministic deployment-candidate kit bound to the rootfs stage, kernel
