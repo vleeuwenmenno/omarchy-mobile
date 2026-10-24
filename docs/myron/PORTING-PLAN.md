@@ -149,6 +149,11 @@ Legacy `tools/phone-provision`, `tools/phone-install-package`, and subsystem
 a verified live-compatible identity check before any Myron workflow may call
 them.
 
+The `bin/omamobile` refusal also depends on selecting `DEVICE=myron`; the
+project default remains `cheetah`. Do not run a device-transition command with
+the default target while Myron is connected. A live-compatible identity check
+must precede any future Myron write path.
+
 ## Test architecture
 
 Repository gates:
@@ -187,5 +192,7 @@ Future build gates:
 
 Build the Arch kernel-contract and graphics-source package drafts using only
 public source and metadata. Do not package vendor modules/firmware or boot
-images. Then build the Myron device package in the aarch64 package container
-and run an offline rootfs dependency resolution pass.
+images. Build the Myron device package in the aarch64 package container. Before
+an offline rootfs dependency pass, add a verified external-kernel/module input
+that can relax the current fail-closed rootfs refusal without admitting Pixel
+inputs.
