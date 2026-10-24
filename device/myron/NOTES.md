@@ -75,7 +75,8 @@ blockers, copies no payload bytes and performs no capture, restore or deploy.
 See [SNAPSHOT-GATE.md](../../docs/myron/SNAPSHOT-GATE.md).
 
 Phase 2.10 adds `device/myron/preflight-contract.json` and
-`tools/myron-preflight` 0.2.0. It re-verifies a kit and snapshot and produces a
+`tools/myron-preflight` 0.2.1 (0.2.0 plus a request depth bound checked before
+rendering). It re-verifies a kit and snapshot and produces a
 five-file, metadata-only hardware-read approval request. Seven declarative read
 IDs carry strict byte bounds, emitted-field allowlists, identifier/private-byte
 redaction and stop conditions. The execution and evidence lists remain empty,

@@ -30,7 +30,7 @@
   "components": {
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "e84bdef703403b17ab6d4222fb66479a10b6464ff4978b6fce72076b54f761c5"
+      "sha256": "9fe3d28d4f2843bf652efb3081f61c21791421e45e021a3842d1a6b84185fb1b"
     }
   },
   "evidence": {
@@ -71,12 +71,12 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-collect-impl.py",
-    "sha256": "1492cb030a7820a58e855488e158a3c53c12ea3b2c6501b0aa4030064c72d876"
+    "sha256": "a8de431db790968f399459d3d4d3bd951e51d7f3ad3df2037795ded5049fdeb9"
   },
   "kind": "myron-capture-collector-contract",
   "pinned_versions": {
     "deployment": "0.4.0",
-    "preflight": "0.2.0",
+    "preflight": "0.2.1",
     "snapshot": "0.2.0"
   },
   "policy": {

@@ -184,7 +184,7 @@ byte, including the data, from the request and the capture.
 
 ## Safety and publication
 
-The tool imports exact `myron-preflight` 0.2.0, `myron-snapshot` 0.2.0 and
+The tool imports exact `myron-preflight` 0.2.1, `myron-snapshot` 0.2.0 and
 `myron-deployment` 0.4.0 in-process and refuses any other version. The capture
 contract pins the preflight contract hash; the preflight contract does not
 reference the capture contract. The tool starts no process and has no network

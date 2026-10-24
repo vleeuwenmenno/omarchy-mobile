@@ -30,7 +30,7 @@ value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-capture-collector-contract"
 assert value["format_version"] == "0.1.0"
 assert value["pinned_versions"] == {
-    "deployment": "0.4.0", "preflight": "0.2.0", "snapshot": "0.2.0",
+    "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0",
 }
 assert value["transport"] == "external-precaptured-fixture"
 assert value["capture_schema"] == "myron-capture-evidence-v1"
@@ -830,8 +830,8 @@ ok("capture contract tampering and a changed preflight contract fail closed")
 patched_tools = fresh("version-pin") / "tools"
 shutil.copytree(repo / "tools", patched_tools, ignore=shutil.ignore_patterns("__pycache__"))
 source = (patched_tools / "myron-preflight").read_text()
-assert 'VERSION = "0.2.0"' in source
-(patched_tools / "myron-preflight").write_text(source.replace('VERSION = "0.2.0"', 'VERSION = "0.2.1"', 1))
+assert 'VERSION = "0.2.1"' in source
+(patched_tools / "myron-preflight").write_text(source.replace('VERSION = "0.2.1"', 'VERSION = "0.2.0"', 1))
 saved_tool, saved_module = C.PREFLIGHT_TOOL, C._preflight
 C.PREFLIGHT_TOOL, C._preflight = patched_tools / "myron-preflight", None
 try:
@@ -1664,6 +1664,35 @@ for levels in (C.MAX_DEPTH + 1, C.PLAN_MAX_DEPTH + 1, 800):
     finally:
         D.render_json = real_render
     ok(f"a {levels}-deep operation and manifest (and plan, past its bound) are refused before the canonical renderer runs")
+
+# A saved request is depth-checked inside the shared preflight reader, before it renders.
+def deep_request(levels, zeros=4096):
+    return b'{"data": ' + b"[" * levels + b",".join([b"0"] * zeros) + b"]" * levels + b"}"
+
+
+assert P.REQUEST_MAX_JSON_DEPTH == 8
+for levels in (P.REQUEST_MAX_JSON_DEPTH + 1, 33, 800):
+    raw = deep_request(levels)
+    assert len(raw) < 16 * 1024
+    clone = fresh("deep-request") / "request"
+    shutil.copytree(request, clone)
+    (clone / "request.json").write_bytes(raw)
+    for label, run in (
+        ("plan", lambda: invoke("plan", "--request", clone)),
+        ("collect", lambda: invoke("collect", "--request", clone, "--capture", capture,
+                                   "--out", work / f"deep-out-{levels}")),
+    ):
+        renders.clear()
+        D.render_json = counting_render
+        try:
+            code, _out, err = run()
+        finally:
+            D.render_json = real_render
+        assert code != 0 and "nests too deeply" in err, (label, err)
+        assert not renders, f"collector {label}: the renderer ran on a {levels}-deep request"
+    ok(f"a {levels}-deep request.json is refused by collector plan and collect before the renderer runs")
+expect_ok("plan", "--request", request)  # a legitimate request still nests to the bound
+ok("a legitimate request still plans")
 
 edge = {"a": [[[[[[[{}]]]]]]]}  # depth 8: allowed
 C.check_json_depth(edge, "edge")

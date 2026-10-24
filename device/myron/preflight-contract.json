@@ -30,7 +30,7 @@
       "sha256": "4dc53614992922b50cbfe7b59bfc10c473088c9d98058a9abec0933d345257ea"
     }
   },
-  "format_version": "0.2.0",
+  "format_version": "0.2.1",
   "kind": "myron-hardware-read-preflight-contract",
   "request": {
     "accepts_real_evidence": false,
@@ -38,7 +38,8 @@
     "contents": "evidence-gaps-and-bounded-read-plan-only",
     "decision": "refused-pending-live-evidence",
     "executes_operations": false,
-    "kind": "myron-hardware-read-approval-request"
+    "kind": "myron-hardware-read-approval-request",
+    "max_json_depth": 8
   },
   "schema": 1
 }

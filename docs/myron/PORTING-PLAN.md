@@ -162,7 +162,7 @@ capture or restore, clears no blocker and authorizes nothing
 ([SNAPSHOT-GATE.md](SNAPSHOT-GATE.md)).
 
 Phase 2.10 (laptop-only, mechanism done):
-`device/myron/preflight-contract.json` and `tools/myron-preflight` 0.2.0 bind a
+`device/myron/preflight-contract.json` and `tools/myron-preflight` 0.2.1 bind a
 re-verified kit and snapshot into a refusal-only hardware-read approval
 request. The request maps all seven open blockers to their real evidence
 producer and declares seven bounded, redacted future read operations, but its

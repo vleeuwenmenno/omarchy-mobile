@@ -21,7 +21,7 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-hardware-read-preflight-contract"
-assert value["format_version"] == "0.2.0"
+assert value["format_version"] == "0.2.1"
 assert value["capture_schema"] == "myron-capture-evidence-v1"
 assert len(value["blockers"]) == 7
 assert value["request"] == {
@@ -31,6 +31,7 @@ assert value["request"] == {
     "decision": "refused-pending-live-evidence",
     "executes_operations": False,
     "kind": "myron-hardware-read-approval-request",
+    "max_json_depth": 8,
 }
 assert all(flag is False for flag in value["authority"].values())
 PY
@@ -370,6 +371,71 @@ for name, mutate in (
     expect_fail(name, ["verify", *common_args(), "--request", clone])
 ok("unsafe request-tree entries fail closed")
 
+# Over-depth request.json is refused before the canonical renderer runs.
+renders = []
+real_render = D.render_json
+
+
+def counting_render(value):
+    if type(value) is dict and type(value.get("data")) is list:  # only the hostile document
+        renders.append(True)
+    return real_render(value)
+
+
+preflight_bytes = D.render_json(preflight_contract)
+
+
+def deep_request(levels, zeros=4096):
+    return (b'{"data": ' + b"[" * levels + b",".join([b"0"] * zeros) + b"]" * levels + b"}")
+
+
+def request_depth(value):
+    deepest, pending = 0, [(value, 0)]
+    while pending:
+        item, level = pending.pop()
+        deepest = max(deepest, level)
+        if type(item) is dict:
+            pending.extend((child, level + 1) for child in item.values())
+        elif type(item) is list:
+            pending.extend((child, level + 1) for child in item)
+    return deepest
+
+
+assert request_depth(request) == P.REQUEST_MAX_JSON_DEPTH == 8
+assert request_depth(preflight_contract) <= P.REQUEST_MAX_JSON_DEPTH
+assert preflight_contract["request"]["max_json_depth"] == P.REQUEST_MAX_JSON_DEPTH
+P.check_json_depth(request, "request.json")
+P.check_json_depth({"a": [[[[[[[{}]]]]]]]}, "edge")  # depth 8: allowed
+try:
+    P.check_json_depth({"a": [[[[[[[[{}]]]]]]]]}, "edge")
+except P.PreflightError:
+    pass
+else:
+    raise AssertionError("depth 9 accepted")
+ok("the request depth bound matches the real request and refuses one level more")
+
+for levels in (P.REQUEST_MAX_JSON_DEPTH + 1, 33, 800):
+    clone = fresh("deep-request") / "request"
+    shutil.copytree(request_a, clone)
+    raw = deep_request(levels)
+    assert len(raw) < 16 * 1024
+    (clone / "request.json").write_bytes(raw)
+    renders.clear()
+    D.render_json = counting_render
+    try:
+        code, out, err = invoke("verify", *common_args(), "--request", clone)
+        try:
+            P.read_request(str(clone), contracts, preflight_bytes, digest(preflight_bytes))
+        except P.PreflightError as error:
+            assert "nests too deeply" in str(error), error
+        else:
+            raise AssertionError(f"{levels}-deep request accepted")
+    finally:
+        D.render_json = real_render
+    assert code != 0 and "nests too deeply" in err, err
+    assert not renders, f"the renderer ran on a {levels}-deep request"
+    ok(f"a {levels}-deep request is refused before the canonical renderer runs")
+
 # Input and publication safety.
 bad_snapshot = fresh("bad-snapshot") / "snapshot"
 shutil.copytree(paths["snapshot"], bad_snapshot)
@@ -396,11 +462,11 @@ finally:
     unsafe_parent.chmod(0o700)
 ok("changed inputs and unsafe publication paths are rejected")
 
-# No 0.2.0 option can submit evidence or authorize a read.
+# No 0.2.1 option can submit evidence or authorize a read.
 code, out, err = invoke("assess", *common_args(), "--evidence", work / "evidence",
                         "--out", work / "never")
 assert code != 0 and not os.path.lexists(work / "never")
-ok("real evidence input is unavailable in 0.2.0")
+ok("real evidence input is unavailable in 0.2.1")
 
 # Process-spawn primitives remain unused even if present in the interpreter.
 def boom(*args, **kwargs):

@@ -2,7 +2,7 @@
 # Myron hardware-read preflight gate (Phase 2.10)
 
 Status (2026-10-24): offline, deterministic, refusal-only.
-`tools/myron-preflight` 0.2.0 consumes a fully re-verified deployment kit and
+`tools/myron-preflight` 0.2.1 consumes a fully re-verified deployment kit and
 snapshot candidate and produces a bounded hardware-read **approval request**.
 It executes no operation, collects no evidence, contacts no phone, and grants
 no approval. No real request exists yet because no real kit or snapshot has
@@ -116,6 +116,13 @@ implementations in-process. It reuses strict canonical JSON, stable bounded
 descriptor reads, no-follow tree walking, input collision/alias checks, and
 same-parent `renameat2(RENAME_NOREPLACE)` publication. It starts no process and
 has no network or broad-copy facility.
+
+A saved `request.json` is parsed with strict JSON and then checked, iteratively
+and before the canonical renderer runs, against a fixed nesting bound
+(`request.max_json_depth` in the contract, 8, which is exactly the depth of the
+real request). A deeper document is refused with `request.json nests too
+deeply`, so a small hostile request cannot be expanded into megabytes by the
+renderer. Version 0.2.1 adds this bound; 0.2.0 rendered first.
 
 Any changed byte, unknown or duplicate key, non-canonical JSON, extra/missing
 file, symlink, hardlink, special file, changed blocker/order, collected

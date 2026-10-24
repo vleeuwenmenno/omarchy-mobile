@@ -20,7 +20,7 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 REPO = Path(__file__).resolve().parent.parent
 SNAPSHOT_TOOL = REPO / "tools/myron-snapshot"
 PREFLIGHT_CONTRACT_PATH = "device/myron/preflight-contract.json"
@@ -28,6 +28,7 @@ CONTRACT_KIND = "myron-hardware-read-preflight-contract"
 REQUEST_KIND = "myron-hardware-read-approval-request"
 CAPTURE_SCHEMA = "myron-capture-evidence-v1"
 DECISION = "refused-pending-live-evidence"
+REQUEST_MAX_JSON_DEPTH = 8  # the deepest legitimate request (R7 field policy) nests exactly 8 levels
 HEX256 = re.compile(r"[0-9a-f]{64}")
 AUTHORITY_FLAGS = (
     "hardware_read_authorized",
@@ -200,6 +201,7 @@ def expected_preflight_contract(contracts, snapshot_contract_sha256: str) -> dic
             "accepts_real_evidence": False,
             "executes_operations": False,
             "collects_evidence": False,
+            "max_json_depth": REQUEST_MAX_JSON_DEPTH,
         },
         "blockers": list(d.BLOCKERS),
         "authority": authority(),
@@ -609,6 +611,22 @@ def request_spec(contract_bytes: bytes, document: dict) -> list:
     return spec
 
 
+def check_json_depth(value, label: str, limit: int = REQUEST_MAX_JSON_DEPTH) -> None:
+    """Refuse nesting past LIMIT, iteratively, before anything renders or recurses.
+
+    Runs straight after strict_json: a deep document is rejected here, never expanded
+    by the canonical renderer."""
+    pending = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > limit:
+            raise PreflightError(f"{label} nests too deeply")
+        if type(item) is dict:
+            pending.extend((child, depth + 1) for child in item.values())
+        elif type(item) is list:
+            pending.extend((child, depth + 1) for child in item)
+
+
 def read_request(path: str, contracts, contract_bytes: bytes, contract_sha256: str):
     d = deploy()
     descriptor, identity = d.open_trusted_artifact(path, "preflight request")
@@ -627,6 +645,7 @@ def read_request(path: str, contracts, contract_bytes: bytes, contract_sha256: s
     if raw is None:
         raise PreflightError("preflight request has no request.json")
     document = d.strict_json(raw, "request.json")
+    check_json_depth(document, "request.json")
     if raw != d.render_json(document):
         raise PreflightError("request.json is not canonical")
     validate_request_document(document, contracts, contract_sha256)
