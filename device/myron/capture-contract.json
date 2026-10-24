@@ -68,6 +68,11 @@
     "kernel.notes_sha256": "8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
     "kernel.release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
   },
+  "implementation": {
+    "algorithm": "sha256-of-tool-file-bytes",
+    "path": "tools/myron-collect",
+    "sha256": "c2ec4a2079bd7794a5cf30827de8f35203c8cb422db99d78d4c73b448bb64cb1"
+  },
   "kind": "myron-capture-collector-contract",
   "pinned_versions": {
     "deployment": "0.4.0",
@@ -83,6 +88,27 @@
       "total_bytes": 4194304
     },
     "exclusions": {
+      "document_hash_paths": {
+        "manifest": [
+          [
+            "contract_sha256"
+          ],
+          [
+            "request_sha256"
+          ],
+          [
+            "operations",
+            "*",
+            "sha256"
+          ]
+        ],
+        "operation": [
+          [
+            "request_sha256"
+          ]
+        ]
+      },
+      "hash_scope": "declared-hash-fields-only",
       "hash_values": "[0-9a-f]{64}",
       "identifier_patterns": [
         "(?i)(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}",
@@ -109,6 +135,7 @@
     },
     "operations": {
       "R1-identity-and-slot": {
+        "constraints": [],
         "container": null,
         "fields": {
           "codename": {
@@ -157,6 +184,7 @@
         ]
       },
       "R2-gpt-and-recovery-inventory": {
+        "constraints": [],
         "container": {
           "row_fields": [
             "partition_name",
@@ -207,6 +235,7 @@
         ]
       },
       "R3-boot-image-headers": {
+        "constraints": [],
         "container": {
           "row_fields": [
             "partition_name",
@@ -229,71 +258,150 @@
               "absent": {
                 "type": "bool"
               },
-              "component_offsets": {
-                "item": {
-                  "max": 4294967296,
-                  "min": 0,
-                  "type": "int"
-                },
-                "max": 8,
-                "min": 0,
-                "sorted_unique": false,
-                "type": "list"
-              },
-              "component_sizes": {
-                "item": {
-                  "max": 4294967296,
-                  "min": 0,
-                  "type": "int"
-                },
-                "max": 8,
-                "min": 0,
-                "sorted_unique": false,
-                "type": "list"
-              },
-              "header_sha256": {
-                "pattern": "[0-9a-f]{64}",
-                "type": "hash"
-              },
-              "header_version": {
-                "max": 4,
-                "min": 0,
-                "type": "int"
-              },
-              "os_version": {
-                "pattern": "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
-                "type": "text"
-              },
-              "page_size": {
-                "type": "int_enum",
-                "values": [
-                  2048,
-                  4096,
-                  8192,
-                  16384
-                ]
-              },
               "partition_name": {
                 "pattern": "(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?",
                 "type": "text"
-              },
-              "segment_count": {
-                "max": 8,
-                "min": 1,
-                "type": "int"
               }
             },
             "sorted_unique_by": "partition_name",
-            "type": "rows"
+            "type": "rows",
+            "variants": {
+              "cases": [
+                {
+                  "constraints": [
+                    {
+                      "count": "segment_count",
+                      "lists": [
+                        "component_sizes",
+                        "component_offsets"
+                      ],
+                      "type": "list_lengths"
+                    }
+                  ],
+                  "fields": {
+                    "component_offsets": {
+                      "item": {
+                        "max": 4294967296,
+                        "min": 0,
+                        "type": "int"
+                      },
+                      "max": 0,
+                      "min": 0,
+                      "sorted_unique": false,
+                      "type": "list"
+                    },
+                    "component_sizes": {
+                      "item": {
+                        "max": 4294967296,
+                        "min": 0,
+                        "type": "int"
+                      },
+                      "max": 0,
+                      "min": 0,
+                      "sorted_unique": false,
+                      "type": "list"
+                    },
+                    "header_sha256": {
+                      "type": "null"
+                    },
+                    "header_version": {
+                      "type": "null"
+                    },
+                    "os_version": {
+                      "type": "null"
+                    },
+                    "page_size": {
+                      "type": "null"
+                    },
+                    "segment_count": {
+                      "max": 0,
+                      "min": 0,
+                      "type": "int"
+                    }
+                  },
+                  "when": true
+                },
+                {
+                  "constraints": [
+                    {
+                      "count": "segment_count",
+                      "lists": [
+                        "component_sizes",
+                        "component_offsets"
+                      ],
+                      "type": "list_lengths"
+                    }
+                  ],
+                  "fields": {
+                    "component_offsets": {
+                      "item": {
+                        "max": 4294967296,
+                        "min": 0,
+                        "type": "int"
+                      },
+                      "max": 8,
+                      "min": 1,
+                      "sorted_unique": false,
+                      "type": "list"
+                    },
+                    "component_sizes": {
+                      "item": {
+                        "max": 4294967296,
+                        "min": 0,
+                        "type": "int"
+                      },
+                      "max": 8,
+                      "min": 1,
+                      "sorted_unique": false,
+                      "type": "list"
+                    },
+                    "header_sha256": {
+                      "pattern": "[0-9a-f]{64}",
+                      "type": "hash"
+                    },
+                    "header_version": {
+                      "max": 4,
+                      "min": 0,
+                      "type": "int"
+                    },
+                    "os_version": {
+                      "pattern": "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+                      "type": "text"
+                    },
+                    "page_size": {
+                      "type": "int_enum",
+                      "values": [
+                        2048,
+                        4096,
+                        8192,
+                        16384
+                      ]
+                    },
+                    "segment_count": {
+                      "max": 8,
+                      "min": 1,
+                      "type": "int"
+                    }
+                  },
+                  "when": false
+                }
+              ],
+              "discriminator": "absent"
+            }
           }
         },
-        "input_path": "operations/R3-boot-image-headers.json",
-        "rules": [
-          "absent-image-carries-no-header",
-          "segment-lists-match-count"
-        ]
+        "input_path": "operations/R3-boot-image-headers.json"
       },
       "R4-dtb-dtbo-selection": {
+        "constraints": [
+          {
+            "fields": [
+              "selected_board_id",
+              "selected_board_revision"
+            ],
+            "type": "null_together"
+          }
+        ],
         "container": null,
         "fields": {
           "compatible_prefix": {
@@ -311,14 +419,20 @@
             "type": "int"
           },
           "selected_board_id": {
-            "max": 4294967295,
-            "min": 0,
-            "type": "int"
+            "of": {
+              "max": 4294967295,
+              "min": 0,
+              "type": "int"
+            },
+            "type": "nullable"
           },
           "selected_board_revision": {
-            "max": 4294967295,
-            "min": 0,
-            "type": "int"
+            "of": {
+              "max": 4294967295,
+              "min": 0,
+              "type": "int"
+            },
+            "type": "nullable"
           },
           "selection_source": {
             "type": "enum",
@@ -329,12 +443,10 @@
             ]
           }
         },
-        "input_path": "operations/R4-dtb-dtbo-selection.json",
-        "rules": [
-          "board-id-and-revision-set-together"
-        ]
+        "input_path": "operations/R4-dtb-dtbo-selection.json"
       },
       "R5-module-load-order": {
+        "constraints": [],
         "container": null,
         "fields": {
           "load_order_index": {
@@ -373,6 +485,15 @@
           }
         },
         "input_path": "operations/R5-module-load-order.json",
+        "reference_module_order": [
+          "pwrseq-core",
+          "bluetooth",
+          "btbcm",
+          "btqca",
+          "hci_uart",
+          "rfkill",
+          "rmnet"
+        ],
         "rules": [
           "parallel-lists-match-names",
           "unique-names",
@@ -381,6 +502,7 @@
         ]
       },
       "R6-storage-and-mount-model": {
+        "constraints": [],
         "container": null,
         "fields": {
           "block_size": {
@@ -448,6 +570,7 @@
       },
       "R7-kernel-identity-revalidation": {
         "allowlist_unknown_keys": "reject",
+        "constraints": [],
         "container": null,
         "fields": {
           "allowlisted_bootconfig_keys": {

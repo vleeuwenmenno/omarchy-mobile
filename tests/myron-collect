@@ -968,15 +968,69 @@ bad_capture("suffixed partition_uuid", {R5: lambda d: d["data"]["module_names"].
     2, "partition_uuid_0")}, match="excluded identifier or payload field")
 bad_capture("excluded word as a key", {R1: lambda d: d["data"].update(android_id="x")},
             match="excluded identifier or payload field")
-C.reject_identifiers({"header_sha256": digest(b"x")}, "hash allowance")
-for hostile in ({"android_id": digest(b"x")}, {"note": "disk_guid_" + digest(b"x")}):
+ok("underscore, hyphen, suffixed and boundary excluded names reject; lookalikes pass")
+
+# 4b. A bare 64-hex value passes only at a declared hash or identity-hash field.
+REGISTRY = C.policy_registry()
+R3_HASHES = C.hash_scope(REGISTRY, "operation", R3)
+R7_HASHES = C.hash_scope(REGISTRY, "operation", R7)
+assert ("data", "images", "*", "header_sha256") in R3_HASHES
+assert ("data", "notes_sha256") in R7_HASHES
+assert ("request_sha256",) in R3_HASHES
+assert C.hash_scope(REGISTRY, "manifest") == frozenset({
+    ("contract_sha256",), ("request_sha256",), ("operations", "*", "sha256"),
+})
+assert REGISTRY["exclusions"]["hash_scope"] == "declared-hash-fields-only"
+assert {path[-1] for operation in OPERATION_IDS for path in C.hash_scope(REGISTRY, "operation", operation)
+        if path[0] == "data"} == {"header_sha256", "notes_sha256"}
+HEX = digest(b"x")
+# Real schema hash fields pass, in the real documents.
+C.reject_identifiers(operation_document(R3)["data"], "R3", frozenset({("images", "*", "header_sha256")}))
+C.reject_identifiers(operation_document(R3), R3, R3_HASHES)
+C.reject_identifiers(operation_document(R7), R7, R7_HASHES)
+C.reject_identifiers(json.loads(walk(capture)[1]["capture.json"]), "capture.json",
+                     C.hash_scope(REGISTRY, "manifest"))
+
+
+def hash_reject(name, value, paths):
     try:
-        C.reject_identifiers(hostile, "hash allowance")
+        C.reject_identifiers(value, "hash scope", paths)
     except C.CollectError:
-        pass
-    else:
-        raise AssertionError(f"identifier hidden beside a hash was accepted: {hostile}")
-ok("underscore, hyphen, suffixed and boundary excluded names reject; lookalikes and hashes pass")
+        return
+    raise AssertionError(f"{name} was accepted")
+
+
+hash_reject("hash under an undeclared key", {"header_sha256": HEX}, frozenset())
+hash_reject("hash at a different location than declared", {"data": {"note": HEX}}, R3_HASHES)
+hash_reject("hash in a list under a hash field name", {"data": {"images": [HEX]}}, R3_HASHES)
+hash_reject("hash as a dictionary key", {HEX: 1}, R3_HASHES)
+hash_reject("hash beside an excluded name", {"android_id": HEX}, R3_HASHES)
+hash_reject("hash behind an excluded token run", {"note": "disk_guid_" + HEX}, R3_HASHES)
+hash_reject("hash one level too deep", {"data": {"images": [{"header_sha256": [HEX]}]}}, R3_HASHES)
+hash_reject("hash at the wrong depth of the declared name",
+            {"data": {"header_sha256": HEX}}, R3_HASHES)
+hash_reject("hash in the manifest outside its declared fields",
+            {"operations": [{"sha256": HEX, "id": HEX}]}, C.hash_scope(REGISTRY, "manifest"))
+bad_capture("64-hex string in a non-hash R7 location",
+            {R7: lambda d: d["data"].update(kernel_release=digest(b"release"))},
+            match="identifier-shaped value")
+bad_capture("64-hex string as an R3 partition name",
+            {R3: lambda d: d["data"]["images"][0].update(partition_name=digest(b"boot"))},
+            match="identifier-shaped value")
+bad_capture("64-hex string as a module name",
+            {R5: lambda d: d["data"]["module_names"].__setitem__(2, digest(b"module"))},
+            match="identifier-shaped value")
+bad_capture("64-hex string as an R1 codename", {R1: lambda d: d["data"].update(codename=digest(b"x"))},
+            match="identifier-shaped value")
+bad_capture("64-hex string as an extra key",
+            {R1: lambda d: d["data"].update({digest(b"key"): "x"})},
+            match="identifier-shaped value")
+bad_capture("hash-shaped value under a hash-like but undeclared field",
+            {R2: lambda d: d["data"]["partitions"][0].update(header_sha256=digest(b"x"))})
+bad_capture("64-hex value in a non-hash manifest field",
+            manifest_edit=lambda m: m.update(format_version=digest(b"v")),
+            match="identifier-shaped value")
+ok("a 64-hex string passes only at declared hash fields; elsewhere it is rejected")
 
 # 5. R5 list bound is 256.
 def r5_list(count):
@@ -1104,7 +1158,328 @@ plan_tamper("plan input path", lambda v: v["capture_tree"]["operations"][0].upda
 plan_tamper("plan row container", lambda v: v["capture_tree"]["operations"][1].update(
     rows_field="rows"))
 plan_tamper("plan row fields", lambda v: v["capture_tree"]["operations"][2]["row_fields"].pop())
+plan_tamper("plan implementation hash", lambda v: v["implementation"].update(sha256="0" * 64))
+plan_tamper("plan implementation dropped", lambda v: v.pop("implementation"))
+plan_tamper("plan R3 variant policy", lambda v: v["capture_tree"]["operations"][2]["policy"][
+    "fields"]["images"]["variants"]["cases"][1]["fields"]["header_version"].update(type="nullable"))
+plan_tamper("plan R4 constraint dropped", lambda v: v["capture_tree"]["operations"][3]["policy"][
+    "constraints"].pop())
 ok("plan carries the request policy and typed registry; each tamper is named and refused")
+
+# --- Phase 2.12 R2 review fixes: nullable policy, implementation pin ----------------
+
+# 1. Null and branch semantics live in the serialized policy, read from the committed file.
+committed = json.loads((repo / C.CAPTURE_CONTRACT_PATH).read_text())
+images = committed["policy"]["operations"][R3]["fields"]["images"]
+cases = {case["when"]: case for case in images["variants"]["cases"]}
+absent_fields, present_fields = cases[True]["fields"], cases[False]["fields"]
+HEADER = ["header_version", "page_size", "os_version", "header_sha256"]
+assert images["variants"]["discriminator"] == "absent" and set(cases) == {True, False}
+assert set(images["row"]) == {"partition_name", "absent"}
+for name in HEADER:
+    assert absent_fields[name] == {"type": "null"}, name
+    assert present_fields[name]["type"] in ("int", "int_enum", "text", "hash"), name
+assert absent_fields["segment_count"] == {"type": "int", "min": 0, "max": 0}
+assert present_fields["segment_count"] == {"type": "int", "min": 1, "max": 8}
+for name in C.IMAGE_SEGMENT_LISTS:
+    assert absent_fields[name]["min"] == absent_fields[name]["max"] == 0
+    assert (present_fields[name]["min"], present_fields[name]["max"]) == (1, 8)
+for case in cases.values():
+    assert case["constraints"] == [{
+        "type": "list_lengths", "lists": ["component_sizes", "component_offsets"],
+        "count": "segment_count"}]
+assert set(absent_fields) == set(present_fields)
+assert committed["policy"]["operations"][R3]["container"]["row_fields"] == [
+    "partition_name", "absent", "header_version", "page_size", "os_version",
+    "component_sizes", "component_offsets", "segment_count", "header_sha256"]
+r4_policy = committed["policy"]["operations"][R4]
+for name in ("selected_board_id", "selected_board_revision"):
+    assert r4_policy["fields"][name] == {"type": "nullable", "of": {
+        "type": "int", "min": 0, "max": 2**32 - 1}}, name
+for name in ("dtb_count", "dtbo_entry_count"):
+    assert r4_policy["fields"][name]["type"] == "int"
+assert r4_policy["constraints"] == [{
+    "type": "null_together", "fields": ["selected_board_id", "selected_board_revision"]}]
+assert committed["policy"]["operations"][R5]["reference_module_order"] == D.REFERENCE_MODULE_ORDER
+assert all("constraints" in row for row in committed["policy"]["operations"].values())
+ok("serialized policy states the absent/null forms, the required present forms and the board pairing")
+
+
+def r3_images(*rows):
+    document = operation_document(R3)
+    document["data"]["images"] = list(rows)
+    return D.render_json(document)
+
+
+def r3_accepts(row, name="boot_a"):
+    try:
+        C.validate_operation(r3_images({**image_row(name, False), **row}), READS[2],
+                             request_sha256, envs.identity)
+    except C.CollectError as error:
+        return str(error)
+    return None
+
+
+def r3_absent(row=None):
+    try:
+        C.validate_operation(r3_images({**image_row("boot_a", True), **(row or {})}), READS[2],
+                             request_sha256, envs.identity)
+    except C.CollectError as error:
+        return str(error)
+    return None
+
+
+def spec_for(case, name):
+    return cases[case]["fields"][name]
+
+
+# The validator follows the policy: whatever the policy calls nullable accepts null and
+# whatever it calls required rejects null, for every header field in each branch.
+for name in present_fields:
+    nullable = spec_for(False, name)["type"] in ("null", "nullable")
+    assert not nullable, name
+    assert (r3_accepts({name: None}) is None) == nullable, name
+for name in absent_fields:
+    if absent_fields[name]["type"] == "null":
+        assert r3_absent() is None
+        assert r3_absent({name: image_row("boot_a", False)[name]}) is not None, name
+assert r3_absent() is None
+assert r3_absent({"segment_count": 1}) is not None
+assert r3_absent({"component_sizes": [1], "component_offsets": [1], "segment_count": 1}) is not None
+assert r3_absent({"segment_count": None}) is not None and r3_absent({"segment_count": False}) is not None
+assert r3_absent({"header_version": 0}) is not None
+assert r3_accepts({}) is None
+assert r3_accepts({"segment_count": 0, "component_sizes": [], "component_offsets": []}) is not None
+assert r3_accepts({"segment_count": 3}) is not None
+assert r3_accepts({"component_sizes": [4096], "segment_count": 2}) is not None
+assert r3_accepts({"header_sha256": None}) is not None
+assert r3_accepts({"absent": None}) is not None and r3_accepts({"absent": 0}) is not None
+assert r3_accepts({"absent": True}) is not None  # absent claim with a full header
+ok("R3 absent images carry exactly the null/empty form and present images keep every field required")
+
+
+def r4_result(**fields):
+    document = operation_document(R4)
+    document["data"].update(fields)
+    try:
+        C.validate_operation(D.render_json(document), READS[3], request_sha256, envs.identity)
+    except C.CollectError as error:
+        return str(error)
+    return None
+
+
+assert r4_result() is None
+assert r4_result(selected_board_id=None, selected_board_revision=None) is None
+assert r4_result(selected_board_id=None) == "R4 selected_board_id, selected_board_revision must all be set or all be null"
+assert r4_result(selected_board_revision=None) is not None
+assert r4_result(selected_board_id=2**32) is not None and r4_result(selected_board_id=-1) is not None
+assert r4_result(selected_board_id=True) is not None and r4_result(selected_board_id="7") is not None
+assert r4_result(selected_board_id=None, selected_board_revision=3) is not None
+assert r4_result(dtb_count=None) is not None and r4_result(selection_source=None) is not None
+assert r4_result(dtbo_entry_count=None) is not None and r4_result(compatible_prefix=None) is not None
+ok("R4 accepts both board fields null or both integers, never one, and nothing else null")
+
+# 2. Policy drift changes the validator and the derived contract together.
+
+
+saved_present = C.IMAGE_PRESENT["header_version"]
+assert r3_accepts({"header_version": None}) is not None
+C.IMAGE_PRESENT["header_version"] = C._nullable(saved_present)
+try:
+    assert r3_accepts({"header_version": None}) is None, "validator ignored the drifted policy"
+finally:
+    C.IMAGE_PRESENT["header_version"] = saved_present
+drift("R3 present header made nullable",
+      lambda: C.IMAGE_PRESENT.__setitem__("header_version", C._nullable(saved_present)),
+      lambda: C.IMAGE_PRESENT.__setitem__("header_version", saved_present))
+assert r3_accepts({"header_version": None}) is not None
+saved_absent = C.IMAGE_ABSENT["os_version"]
+drift("R3 absent os_version made required",
+      lambda: C.IMAGE_ABSENT.__setitem__("os_version", C._text(C.OS_VERSION)),
+      lambda: C.IMAGE_ABSENT.__setitem__("os_version", saved_absent))
+saved_count = C.IMAGE_ABSENT["segment_count"]
+drift("R3 absent segment count widened",
+      lambda: C.IMAGE_ABSENT.__setitem__("segment_count", C._int(0, 1)),
+      lambda: C.IMAGE_ABSENT.__setitem__("segment_count", saved_count))
+saved_segments = C.IMAGE_PRESENT["segment_count"]
+drift("R3 present segment count widened",
+      lambda: C.IMAGE_PRESENT.__setitem__("segment_count", C._int(0, 8)),
+      lambda: C.IMAGE_PRESENT.__setitem__("segment_count", saved_segments))
+saved_constraints = list(C.IMAGE_VARIANTS["cases"][1]["constraints"])
+drift("R3 segment-count constraint dropped",
+      lambda: C.IMAGE_VARIANTS["cases"][1]["constraints"].clear(),
+      lambda: C.IMAGE_VARIANTS["cases"][1]["constraints"].extend(saved_constraints))
+assert r3_accepts({"segment_count": 3}) is not None
+saved_dtb_constraints = list(C.DTB_CONSTRAINTS)
+drift("R4 board pairing dropped", lambda: C.DTB_CONSTRAINTS.clear(),
+      lambda: C.DTB_CONSTRAINTS.extend(saved_dtb_constraints))
+assert r4_result(selected_board_id=None) is not None
+saved_board = C.DTB_FIELDS["selected_board_revision"]
+drift("R4 board revision bound narrowed",
+      lambda: C.DTB_FIELDS.__setitem__("selected_board_revision", C._nullable(C._int(0, 255))),
+      lambda: C.DTB_FIELDS.__setitem__("selected_board_revision", saved_board))
+saved_order = list(D.REFERENCE_MODULE_ORDER)
+drift("R5 declared module order change", lambda: D.REFERENCE_MODULE_ORDER.append("extra-mod"),
+      lambda: D.REFERENCE_MODULE_ORDER.pop())
+assert D.REFERENCE_MODULE_ORDER == saved_order
+ok("a policy edit to a null form, branch bound or pairing changes the validator and the contract")
+
+# 3. A contradictory registry is refused outright (the contradiction the review found).
+
+
+def inconsistent(name, mutate, match="policy registry is inconsistent"):
+    registry = C.policy_registry()
+    mutate(registry)
+    try:
+        C.check_policy(registry)
+    except C.CollectError as error:
+        assert match in str(error), (name, str(error))
+    else:
+        raise AssertionError(f"{name}: contradictory registry accepted")
+    ok(f"{name} is refused by the policy consistency check")
+
+
+def variant_cases(registry):
+    return registry["operations"][R3]["fields"]["images"]["variants"]["cases"]
+
+
+C.check_policy(C.policy_registry())
+inconsistent("variant field removed", lambda r: variant_cases(r)[0]["fields"].pop("page_size"))
+inconsistent("variant field renamed", lambda r: variant_cases(r)[1]["fields"].update(
+    extra=variant_cases(r)[1]["fields"].pop("os_version")))
+inconsistent("variant field shadows a base field", lambda r: variant_cases(r)[0]["fields"].update(
+    absent={"type": "null"}), match="disjoint")
+inconsistent("both variants selected by true", lambda r: variant_cases(r)[1].update(when=True))
+inconsistent("variant selector not a boolean", lambda r: r["operations"][R3]["fields"]["images"][
+    "row"].update(absent={"type": "int", "min": 0, "max": 1}))
+inconsistent("variant selector pinned", lambda r: r["operations"][R3]["fields"]["images"][
+    "row"].update(absent={"type": "bool", "const": False}))
+inconsistent("variant constraint names an unknown list", lambda r: variant_cases(r)[0][
+    "constraints"][0]["lists"].append("missing"))
+inconsistent("variant count not an integer", lambda r: variant_cases(r)[0]["fields"].update(
+    segment_count={"type": "null"}))
+inconsistent("pairing over a non-nullable field", lambda r: r["operations"][R4]["fields"].update(
+    selected_board_id={"type": "int", "min": 0, "max": 1}))
+inconsistent("pairing over an unknown field", lambda r: r["operations"][R4]["constraints"][0][
+    "fields"].append("missing"))
+inconsistent("pairing over one field", lambda r: r["operations"][R4]["constraints"][0].update(
+    fields=["selected_board_id"]))
+inconsistent("unknown constraint type", lambda r: r["operations"][R4]["constraints"].append(
+    {"type": "other", "fields": []}))
+inconsistent("nullable of null", lambda r: r["operations"][R4]["fields"].update(
+    selected_board_id={"type": "nullable", "of": {"type": "null"}}))
+inconsistent("integer bounds reversed", lambda r: r["operations"][R4]["fields"].update(
+    dtb_count={"type": "int", "min": 5, "max": 1}))
+inconsistent("list bounds reversed", lambda r: r["operations"][R5]["fields"]["module_names"].update(
+    min=9, max=1))
+inconsistent("unknown spec type", lambda r: r["operations"][R4]["fields"].update(
+    dtb_count={"type": "wildcard"}))
+inconsistent("container row fields differ", lambda r: r["operations"][R3]["container"][
+    "row_fields"].pop())
+inconsistent("container points at a non-row field", lambda r: r["operations"][R3]["container"].update(
+    rows_field="missing"))
+
+# A drifted module constant that contradicts itself fails closed at load time too.
+saved_board = C.DTB_FIELDS["selected_board_id"]
+C.DTB_FIELDS["selected_board_id"] = C._int(0, 2**32 - 1)
+try:
+    code, _out, err = invoke("show")
+    assert code != 0 and "policy registry is inconsistent" in err, err
+    try:
+        C.policy_registry()
+    except C.CollectError:
+        pass
+    else:
+        raise AssertionError("contradictory registry served")
+finally:
+    C.DTB_FIELDS["selected_board_id"] = saved_board
+code, _out, _err = invoke("show")
+assert code == 0, _err
+ok("a registry that contradicts itself stops every command")
+
+# 4. The contract pins the collector's own source bytes.
+tool_bytes = (repo / "tools/myron-collect").read_bytes()
+implementation = {
+    "algorithm": "sha256-of-tool-file-bytes", "path": "tools/myron-collect",
+    "sha256": digest(tool_bytes),
+}
+assert C.implementation_binding() == implementation
+assert committed["implementation"] == implementation
+assert plan_a["implementation"] == implementation
+assert json.loads(capture_contract_bytes)["implementation"] == implementation
+shown, _ = expect_ok("show")
+assert shown["implementation"] == implementation
+assert implementation["sha256"].encode() not in tool_bytes, "tool must not hold its own pin"
+assert digest(capture_contract_bytes).encode() not in tool_bytes
+assert not any(value == implementation["sha256"] for value in vars(C).values())
+assert not any(
+    type(value) is str and C.HEX256.fullmatch(value) for value in vars(C).values()
+), "no stored digest in the tool"
+contract_tamper("contract implementation hash changed",
+                lambda v: v["implementation"].update(sha256="0" * 64))
+contract_tamper("contract implementation dropped", lambda v: v.pop("implementation"))
+contract_tamper("contract implementation path changed",
+                lambda v: v["implementation"].update(path="tools/other"))
+contract_tamper("contract implementation algorithm changed",
+                lambda v: v["implementation"].update(algorithm="none"))
+ok("capture contract and plan bind the SHA-256 of the collector's file bytes, held nowhere in the tool")
+
+
+def tool_copy(name, edit=None):
+    """A private copy of tools/ whose collector source is edited, loaded as its own module."""
+    base = fresh(name)
+    (base / "packages").mkdir()
+    for part in ["tools", *(f"packages/{p.name}" for p in (repo / "packages").glob("omamobile-myron-*"))]:
+        shutil.copytree(repo / part, base / part, ignore=shutil.ignore_patterns("__pycache__"))
+    source = base / "tools/myron-collect"
+    if edit is not None:
+        text = source.read_text()
+        edited = edit(text)
+        assert edited != text, f"{name}: edit changed nothing"
+        source.write_text(edited)
+    return base, load(f"collect_copy_{counter[0]}", source)
+
+
+def refuses(module, label):
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = module.main(["show"], contracts_root=contracts_root)
+    assert code != 0 and "differs from its derived form" in err.getvalue(), (label, err.getvalue())
+
+
+_, control = tool_copy("impl-control")
+control_err = io.StringIO()
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(control_err):
+    control_code = control.main(["show"], contracts_root=contracts_root)
+assert control_code == 0, control_err.getvalue()
+assert control.implementation_binding() == implementation, "a byte-identical copy keeps the pin"
+SOURCE_EDITS = {
+    "a comment-only edit": lambda t: t + "# unreviewed\n",
+    "an inverted free-versus-total rule": lambda t: t.replace("free > total", "free >= total", 1),
+    "a dropped slot cross-check": lambda t: t.replace(
+        'raise CollectError("R7 slot disagrees with R1")', "pass", 1),
+    "a loosened presence cross-check": lambda t: t.replace(
+        "(image[\"partition_name\"] in r2) == image[\"absent\"]", "False", 1),
+    "a weakened order recomputation": lambda t: t.replace("] == declared", "] != []", 1),
+    "a skipped R7 unknown-key policy check": lambda t: t.replace(
+        'raise CollectError("R7 policy no longer rejects unknown keys")', "pass", 1),
+}
+for label, edit in SOURCE_EDITS.items():
+    _, edited = tool_copy("impl-edit", edit)
+    assert edited.implementation_binding()["sha256"] != implementation["sha256"], label
+    refuses(edited, label)
+    ok(f"{label} in the collector source changes the pin and the repository contract is refused")
+other_base, _ = tool_copy("impl-moved")
+moved = other_base / "tools/myron-collect"
+renamed = other_base / "tools/myron-collect-renamed"
+moved.rename(renamed)
+try:
+    load("collect_renamed", renamed).implementation_binding()
+except Exception as error:
+    assert type(error).__name__ == "CollectError" and "pinned path" in str(error), error
+else:
+    raise AssertionError("a collector outside its pinned path produced a pin")
+ok("a collector that runs from another path cannot produce the pin")
 
 PY
 

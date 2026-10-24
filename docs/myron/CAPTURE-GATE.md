@@ -82,8 +82,11 @@ Bounds and rejections:
   `ramdisk_bytes`, `firmware_bytes`, `module_bytes`). A name matches as a run
   of whole tokens split on any non-alphanumeric character, so `android_id`,
   `android-id`, `android_id_2` and `x_raw_payload` all reject, while
-  `android_idx` or `serials` do not. A bare 64-hex SHA-256 value is exempt;
-  nothing else is;
+  `android_idx` or `serials` do not. A bare 64-hex SHA-256 value is exempt
+  only at a declared hash field: R3 `header_sha256`, R7 `notes_sha256`, the
+  request hash of each operation file and the contract, request and operation
+  hashes of `capture.json`. The same string in any other value, or as a key,
+  is rejected as an identifier-shaped value;
 - R5 lists at most 256 modules (names, load-order index and taint flags);
 - R7 accepts only the command-line and bootconfig keys and values the request
   lists; any other key or value fails;
@@ -99,23 +102,41 @@ Bounds and rejections:
 
 `policy_registry()` in the tool is the single typed source of every validation
 constant: patterns, enums, numeric and list bounds, row containers, the
-identifier patterns, capture limits and the exclusion list, plus the named
-cross-check rules. The validators, the collection plan and the capture contract
-all read it. The committed `device/myron/capture-contract.json` embeds, besides
-the preflight pin and the claims above:
+identifier patterns, the hash-field locations, capture limits, the exclusion
+list and the declared R5 module order, plus the named cross-check rules. The
+validators, the collection plan and the capture contract all read it. The
+committed `device/myron/capture-contract.json` embeds, besides the preflight
+pin and the claims above:
 
 - `requested_operations`: the exact R1..R7 definitions (purpose, bounds,
   targets, emits, field policy, never-emits, stop conditions);
 - `forbidden_operations` and `redaction` from the request;
 - `identity`: the device and kernel values the checks compare against;
-- `policy`: the typed registry.
+- `policy`: the typed registry;
+- `implementation`: the SHA-256 of the bytes of `tools/myron-collect`.
 
-Changing any validator constant, pattern, enum or bound changes the derived
-contract, and the tool refuses a committed contract that differs from it
-(`capture contract differs from its derived form`), so a policy change is
-always a reviewed contract change. The named cross-check rules are recorded in
-the registry, but the logic behind them is code: a new rule's logic is not
-bound by the contract hash alone.
+Nullable fields and branch rules are policy data, not code. A `nullable` or
+`null` type says where `null` is allowed; a `rows` spec may carry `variants`
+selected by a boolean field. R3 uses that for `absent`: an absent image has
+null `header_version`, `page_size`, `os_version` and `header_sha256`, empty
+component lists and `segment_count` 0, a present image has every field set
+with `segment_count` 1..8, and both lists match the count. R4's board id and
+revision are `nullable` integers with a `null_together` constraint. The
+validators evaluate exactly these specs, so the serialized policy and the
+accepted forms cannot disagree, and `check_policy` refuses a registry whose
+variants, constraints or bounds contradict each other.
+
+Changing any validator constant, pattern, enum, bound, null form or
+constraint changes the derived contract, and the tool refuses a committed
+contract that differs from it (`capture contract differs from its derived
+form`), so a policy change is always a reviewed contract change. The remaining
+rule logic is code (R1 slot, R2 suffix and recovery, R5 order and indexes, R6
+rounding, the R7 allowlist and the cross-checks), so the contract also pins the
+tool itself: `implementation.sha256` is recomputed from the tool file's bytes on
+every run (never stored in the tool), and any source edit, even a comment,
+fails every command until the contract is regenerated from the final source.
+The pin covers `tools/myron-collect` only; the preflight, snapshot and
+deployment tools it calls stay pinned by version.
 
 A capture that reports a stop condition (identity mismatch, source
 disagreement, `sources_agree: false`) is rejected, not recorded.

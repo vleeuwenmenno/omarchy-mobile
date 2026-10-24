@@ -15,6 +15,7 @@ if __name__ == "__main__":
     sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _here]
 
 import argparse
+import copy
 import importlib.machinery
 import importlib.util
 import json
@@ -172,21 +173,61 @@ def _identity(source: str, pattern=None) -> dict:
     return spec
 
 
+def _null() -> dict:
+    return {"type": "null"}
+
+
+def _nullable(spec: dict) -> dict:
+    return {"type": "nullable", "of": spec}
+
+
 def _list(item: dict, low: int, high: int, sorted_unique: bool = False) -> dict:
     return {
         "type": "list", "item": item, "min": low, "max": high, "sorted_unique": sorted_unique,
     }
 
 
-def _rows(row: dict, low: int, high: int, key: str) -> dict:
-    return {"type": "rows", "row": row, "min": low, "max": high, "sorted_unique_by": key}
+def _case(when: bool, fields: dict, constraints=()) -> dict:
+    return {"when": when, "fields": fields, "constraints": list(constraints)}
 
 
-def _operation_policy(operation_id: str, fields: dict, container=None, **extra) -> dict:
+def _variants(discriminator: str, cases: list) -> dict:
+    return {"discriminator": discriminator, "cases": cases}
+
+
+def _rows(row: dict, low: int, high: int, key: str, variants=None) -> dict:
+    spec = {"type": "rows", "row": row, "min": low, "max": high, "sorted_unique_by": key}
+    if variants is not None:
+        spec["variants"] = variants
+    return spec
+
+
+def _null_together(*fields: str) -> dict:
+    return {"type": "null_together", "fields": list(fields)}
+
+
+def _list_lengths(lists, count: str) -> dict:
+    return {"type": "list_lengths", "lists": list(lists), "count": count}
+
+
+def row_fields(spec: dict) -> list:
+    """Every field a row may carry: the base fields, then each variant's fields."""
+    names = list(spec["row"])
+    for case in spec.get("variants", {}).get("cases", []):
+        names += [name for name in case["fields"] if name not in names]
+    return names
+
+
+def _container(rows_field: str, spec: dict) -> dict:
+    return {"rows_field": rows_field, "row_fields": row_fields(spec)}
+
+
+def _operation_policy(operation_id: str, fields: dict, container=None, constraints=(), **extra) -> dict:
     return {
         "input_path": operation_path(operation_id),
         "fields": fields,
         "container": container,
+        "constraints": list(constraints),
         **extra,
     }
 
@@ -206,20 +247,56 @@ PARTITION_ROW = {
     "bootable_flag": _bool(),
     "slot_suffix": _enum(["", "_a", "_b"]),
 }
+PARTITION_ROWS = _rows(PARTITION_ROW, 1, 128, "partition_name")
 IMAGE_ROW = {
     "partition_name": _text(IMAGE_NAME),
     "absent": _bool(),
+}
+# The header fields depend on `absent`: an absent image has null headers, empty
+# lists and no segments; a present image has every header field set.
+IMAGE_ABSENT = {
+    "header_version": _null(),
+    "page_size": _null(),
+    "os_version": _null(),
+    "component_sizes": _list(_int(0, 2**32), 0, 0),
+    "component_offsets": _list(_int(0, 2**32), 0, 0),
+    "segment_count": _int(0, 0),
+    "header_sha256": _null(),
+}
+IMAGE_PRESENT = {
     "header_version": _int(0, 4),
     "page_size": _int_enum([2048, 4096, 8192, 16384]),
     "os_version": _text(OS_VERSION),
-    "component_sizes": _list(_int(0, 2**32), 0, 8),
-    "component_offsets": _list(_int(0, 2**32), 0, 8),
+    "component_sizes": _list(_int(0, 2**32), 1, 8),
+    "component_offsets": _list(_int(0, 2**32), 1, 8),
     "segment_count": _int(1, 8),
     "header_sha256": _hash(),
 }
+IMAGE_SEGMENT_LISTS = ["component_sizes", "component_offsets"]
+IMAGE_VARIANTS = _variants("absent", [
+    _case(True, IMAGE_ABSENT, [_list_lengths(IMAGE_SEGMENT_LISTS, "segment_count")]),
+    _case(False, IMAGE_PRESENT, [_list_lengths(IMAGE_SEGMENT_LISTS, "segment_count")]),
+])
+IMAGE_ROWS = _rows(IMAGE_ROW, 1, 12, "partition_name", IMAGE_VARIANTS)
+# The board id and revision are null together (no board selected) or set together.
+DTB_FIELDS = {
+    "dtb_count": _int(0, 64),
+    "selected_board_id": _nullable(_int(0, 2**32 - 1)),
+    "selected_board_revision": _nullable(_int(0, 2**32 - 1)),
+    "dtbo_entry_count": _int(0, 256),
+    "compatible_prefix": _identity("device.compatible"),
+    "selection_source": _enum(["bootconfig", "device-tree", "dtbo-header"]),
+}
+DTB_CONSTRAINTS = [_null_together("selected_board_id", "selected_board_revision")]
 
 
 def policy_registry() -> dict:
+    registry = copy.deepcopy(_policy_registry())  # callers get a copy, never the constants
+    check_policy(registry)
+    return registry
+
+
+def _policy_registry() -> dict:
     p = preflight()
     return {
         "capture_limits": {
@@ -233,6 +310,13 @@ def policy_registry() -> dict:
             "never_emits": list(p.NEVER_EMITS),
             "match": "token-run-boundary",
             "hash_values": HEX256.pattern,
+            "hash_scope": "declared-hash-fields-only",
+            "document_hash_paths": {
+                "manifest": [
+                    ["contract_sha256"], ["request_sha256"], ["operations", "*", "sha256"],
+                ],
+                "operation": [["request_sha256"]],
+            },
             "identifier_patterns": [pattern.pattern for pattern in IDENTIFIER_PATTERNS],
         },
         "operations": {
@@ -246,30 +330,23 @@ def policy_registry() -> dict:
                 "sources_agree": _bool(True),
             }, rules=["slot-suffix-matches-slot"]),
             R2_ID: _operation_policy(R2_ID, {
-                "partitions": _rows(PARTITION_ROW, 1, 128, "partition_name"),
+                "partitions": PARTITION_ROWS,
                 "recovery_present": _bool(),
-            }, {"rows_field": "partitions", "row_fields": list(PARTITION_ROW)},
+            }, _container("partitions", PARTITION_ROWS),
                 recovery_pattern=r"recovery(_a|_b)?",
                 rules=["slot-suffix-matches-name", "recovery-flag-matches-inventory"]),
             R3_ID: _operation_policy(R3_ID, {
-                "images": _rows(IMAGE_ROW, 1, 12, "partition_name"),
-            }, {"rows_field": "images", "row_fields": list(IMAGE_ROW)},
-                rules=["absent-image-carries-no-header", "segment-lists-match-count"]),
-            R4_ID: _operation_policy(R4_ID, {
-                "dtb_count": _int(0, 64),
-                "selected_board_id": _int(0, 2**32 - 1),
-                "selected_board_revision": _int(0, 2**32 - 1),
-                "dtbo_entry_count": _int(0, 256),
-                "compatible_prefix": _identity("device.compatible"),
-                "selection_source": _enum(["bootconfig", "device-tree", "dtbo-header"]),
-            }, rules=["board-id-and-revision-set-together"]),
+                "images": IMAGE_ROWS,
+            }, _container("images", IMAGE_ROWS)),
+            R4_ID: _operation_policy(R4_ID, DTB_FIELDS, constraints=DTB_CONSTRAINTS),
             R5_ID: _operation_policy(R5_ID, {
                 "module_names": _list(_text(MODULE_NAME), 0, MAX_MODULES),
                 "load_order_index": _list(_int(0, MAX_MODULES), 0, MAX_MODULES),
                 "taint_flags": _list(_text(TAINT_FLAGS), 0, MAX_MODULES),
                 "order_matches_declared": _bool(),
-            }, rules=["parallel-lists-match-names", "unique-names", "sequential-index",
-                      "order-claim-recomputed"]),
+            }, reference_module_order=list(deploy().REFERENCE_MODULE_ORDER),
+                rules=["parallel-lists-match-names", "unique-names", "sequential-index",
+                       "order-claim-recomputed"]),
             R6_ID: _operation_policy(R6_ID, {
                 "root_source_gpt_name": _text(PARTITION_NAME),
                 "filesystem_type": _enum(FILESYSTEMS),
@@ -299,6 +376,127 @@ def identity_values(contracts) -> dict:
     }
 
 
+# --- policy consistency ---------------------------------------------------------
+
+
+def policy_error(message: str):
+    raise CollectError(f"policy registry is inconsistent: {message}")
+
+
+def check_spec_shape(spec, where: str) -> None:
+    """A typed spec is well formed: known type, ordered bounds, nested specs sound."""
+    if type(spec) is not dict or "type" not in spec:
+        policy_error(f"{where} is not a typed spec")
+    kind = spec["type"]
+    if kind in ("int", "list") and spec["min"] > spec["max"]:
+        policy_error(f"{where} has min above max")
+    if kind == "list":
+        check_spec_shape(spec["item"], f"{where} item")
+    elif kind == "nullable":
+        check_spec_shape(spec["of"], f"{where} value")
+        if spec["of"]["type"] in ("null", "nullable"):
+            policy_error(f"{where} nests a null type in a nullable")
+    elif kind == "rows":
+        for name, field in spec["row"].items():
+            check_spec_shape(field, f"{where} {name}")
+    elif kind not in (
+        "enum", "int", "int_enum", "bool", "text", "hash", "identity", "null", "request-allowlist"
+    ):
+        policy_error(f"{where} has unknown type {kind}")
+
+
+def check_constraint_shape(constraint: dict, fields: dict, where: str) -> None:
+    """Constraints name known fields of the right type, so none can dangle."""
+    kind = constraint["type"]
+    if kind == "null_together":
+        names = constraint["fields"]
+        if len(names) < 2 or set(names) - set(fields):
+            policy_error(f"{where} null_together names unknown fields")
+        for name in names:
+            if fields[name]["type"] not in ("nullable", "null"):
+                policy_error(f"{where} null_together field {name} cannot be null")
+    elif kind == "list_lengths":
+        names = constraint["lists"]
+        if not names or set(names) - set(fields) or constraint["count"] not in fields:
+            policy_error(f"{where} list_lengths names unknown fields")
+        if any(fields[name]["type"] != "list" for name in names):
+            policy_error(f"{where} list_lengths names a non-list field")
+        if fields[constraint["count"]]["type"] != "int":
+            policy_error(f"{where} list_lengths count is not an integer")
+    else:
+        policy_error(f"{where} has unknown constraint {kind}")
+
+
+def check_rows_shape(name: str, spec: dict, where: str) -> None:
+    variants = spec.get("variants")
+    if variants is None:
+        return
+    discriminator = variants["discriminator"]
+    selector = spec["row"].get(discriminator)
+    if selector is None or selector["type"] != "bool" or "const" in selector:
+        policy_error(f"{where} discriminator {discriminator} is not a free boolean field")
+    cases = variants["cases"]
+    whens = [case["when"] for case in cases]
+    if any(type(when) is not bool for when in whens) or sorted(whens) != [False, True]:
+        policy_error(f"{where} variants must cover true and false exactly once")
+    names = [set(case["fields"]) for case in cases]
+    if names[0] != names[1] or names[0] & set(spec["row"]):
+        policy_error(f"{where} variants do not share one disjoint field set")
+    for case in cases:
+        for field, field_spec in case["fields"].items():
+            check_spec_shape(field_spec, f"{where} {field} when {case['when']}")
+        for constraint in case["constraints"]:
+            check_constraint_shape(
+                constraint, {**spec["row"], **case["fields"]}, f"{where} when {case['when']}"
+            )
+
+
+def check_policy(registry: dict) -> None:
+    """Refuse a registry whose parts contradict each other (nulls, variants, containers)."""
+    for operation_id, policy in registry["operations"].items():
+        where = operation_id.split("-")[0]
+        fields = policy["fields"]
+        for name, spec in fields.items():
+            check_spec_shape(spec, f"{where} {name}")
+            if spec["type"] == "rows":
+                check_rows_shape(name, spec, f"{where} {name}")
+        for constraint in policy["constraints"]:
+            check_constraint_shape(constraint, fields, where)
+        container = policy["container"]
+        if container is not None:
+            rows = fields.get(container["rows_field"])
+            if rows is None or rows["type"] != "rows" or container["row_fields"] != row_fields(rows):
+                policy_error(f"{where} container differs from its row spec")
+
+
+# --- implementation pin ---------------------------------------------------------
+# The typed registry carries every constant and the field/null/variant rules, but the
+# cross-check logic is code. The contract therefore pins the SHA-256 of this tool
+# file's bytes. There is no stored digest to edit: it is recomputed from the file on
+# every call, and the file never holds the contract's own hash.
+
+
+IMPLEMENTATION_PATH = "tools/myron-collect"
+
+
+def implementation_binding() -> dict:
+    source = Path(__file__).resolve()
+    if source != (REPO / IMPLEMENTATION_PATH).resolve():
+        raise CollectError("collector is not running from its pinned path")
+    try:
+        with source.open("rb") as stream:
+            data = stream.read(MAX_FILE_BYTES + 1)
+    except OSError as error:
+        raise CollectError(f"cannot read the collector source: {error}") from error
+    if len(data) > MAX_FILE_BYTES:
+        raise CollectError("collector source exceeds its byte bound")
+    return {
+        "algorithm": "sha256-of-tool-file-bytes",
+        "path": IMPLEMENTATION_PATH,
+        "sha256": deploy().sha256_bytes(data),
+    }
+
+
 # --- contract -------------------------------------------------------------------
 
 
@@ -315,6 +513,7 @@ def expected_capture_contract(preflight_contract_sha256: str, contracts) -> dict
             }
         },
         "pinned_versions": dict(PINNED_VERSIONS),
+        "implementation": implementation_binding(),
         "capture_schema": p.CAPTURE_SCHEMA,
         "transport": TRANSPORT,
         "capture": {
@@ -441,31 +640,65 @@ def need_sorted_unique(names: list, label: str) -> None:
         raise CollectError(f"{label} is not unique and sorted")
 
 
-def reject_identifiers(value, label: str, depth: int = 0) -> None:
-    """Refuse identifier-shaped strings anywhere in a document, keys included."""
+def reject_string(value: str, label: str) -> None:
+    forbidden = set(preflight().NEVER_EMITS)
+    # An excluded name is one or more whole tokens, so underscore, hyphen and
+    # other separators all match (android_id, android-id, x_raw_payload_2).
+    window = max(len(name.split("_")) for name in forbidden)
+    tokens = [token for token in re.split(r"[^a-z0-9]+", value.lower()) if token]
+    for start in range(len(tokens)):
+        for end in range(start + 1, min(len(tokens), start + window) + 1):
+            if "_".join(tokens[start:end]) in forbidden:
+                raise CollectError(f"{label} names an excluded identifier or payload field")
+    if any(pattern.search(value) for pattern in IDENTIFIER_PATTERNS):
+        raise CollectError(f"{label} contains an identifier-shaped value")
+
+
+def hash_paths_of(spec: dict, path: tuple) -> set:
+    """Locations of the declared hash fields under one typed spec (`*` is a list index)."""
+    kind = spec["type"]
+    if kind == "hash" or (kind == "identity" and spec.get("pattern") == HEX256.pattern):
+        return {path}
+    if kind == "nullable":
+        return hash_paths_of(spec["of"], path)
+    if kind == "list":
+        return hash_paths_of(spec["item"], path + ("*",))
+    found = set()
+    if kind == "rows":
+        fields = dict(spec["row"])
+        for case in spec.get("variants", {}).get("cases", []):
+            fields.update(case["fields"])
+        for name, field in fields.items():
+            found |= hash_paths_of(field, path + ("*", name))
+    return found
+
+
+def hash_scope(registry: dict, document: str, operation_id: str | None = None) -> frozenset:
+    """The only places a bare 64-hex value is allowed: declared hash and identity-hash fields."""
+    paths = {tuple(path) for path in registry["exclusions"]["document_hash_paths"][document]}
+    if operation_id is not None:
+        for name, spec in registry["operations"][operation_id]["fields"].items():
+            paths |= hash_paths_of(spec, ("data", name))
+    return frozenset(paths)
+
+
+def reject_identifiers(value, label: str, hash_paths, path: tuple = (), depth: int = 0) -> None:
+    """Refuse identifier-shaped strings anywhere in a document, keys included.
+
+    A bare 64-hex string passes only at a path in HASH_PATHS."""
     if depth > MAX_DEPTH:
         raise CollectError(f"{label} nests too deeply")
     if type(value) is dict:
         for key, item in value.items():
-            reject_identifiers(key, label, depth + 1)
-            reject_identifiers(item, label, depth + 1)
+            if type(key) is str:
+                reject_string(key, label)
+            reject_identifiers(item, label, hash_paths, path + (key,), depth + 1)
     elif type(value) is list:
         for item in value:
-            reject_identifiers(item, label, depth + 1)
+            reject_identifiers(item, label, hash_paths, path + ("*",), depth + 1)
     elif type(value) is str:
-        if HEX256.fullmatch(value):
-            return
-        forbidden = set(preflight().NEVER_EMITS)
-        # An excluded name is one or more whole tokens, so underscore, hyphen and
-        # other separators all match (android_id, android-id, x_raw_payload_2).
-        window = max(len(name.split("_")) for name in forbidden)
-        tokens = [token for token in re.split(r"[^a-z0-9]+", value.lower()) if token]
-        for start in range(len(tokens)):
-            for end in range(start + 1, min(len(tokens), start + window) + 1):
-                if "_".join(tokens[start:end]) in forbidden:
-                    raise CollectError(f"{label} names an excluded identifier or payload field")
-        if any(pattern.search(value) for pattern in IDENTIFIER_PATTERNS):
-            raise CollectError(f"{label} contains an identifier-shaped value")
+        if not (HEX256.fullmatch(value) and path in hash_paths):
+            reject_string(value, label)
 
 
 def field_key(emit: str) -> str:
@@ -502,6 +735,12 @@ def check_spec(spec: dict, value, label: str, identity: dict):
         if value != identity[spec["source"]]:
             raise CollectError(f"{label} differs from the contract identity")
         return value
+    if kind == "null":
+        if value is not None:
+            raise CollectError(f"{label} must be null")
+        return None
+    if kind == "nullable":
+        return None if value is None else check_spec(spec["of"], value, label, identity)
     if kind == "list":
         items = need_list(value, label, spec["min"], spec["max"])
         for item in items:
@@ -512,15 +751,44 @@ def check_spec(spec: dict, value, label: str, identity: dict):
     raise CollectError(f"{label} has an unknown policy type")
 
 
-def check_rows(spec: dict, value, label: str) -> list:
+def check_constraints(constraints: list, values: dict, label: str) -> None:
+    """Cross-field rules named by the policy, evaluated on already type-checked values."""
+    for constraint in constraints:
+        kind = constraint["type"]
+        if kind == "null_together":
+            if len({values[name] is None for name in constraint["fields"]}) != 1:
+                raise CollectError(
+                    f"{label} {', '.join(constraint['fields'])} must all be set or all be null"
+                )
+        elif kind == "list_lengths":
+            count = values[constraint["count"]]
+            if any(len(values[name]) != count for name in constraint["lists"]):
+                raise CollectError(f"{label} lists differ from {constraint['count']}")
+        else:
+            raise CollectError(f"{label} has an unknown constraint type")
+
+
+def check_rows(spec: dict, value, label: str, row_label: str, identity: dict) -> list[dict]:
+    """Check each row against the base fields and the variant its discriminator selects."""
     rows = need_list(value, label, spec["min"], spec["max"])
+    variants = spec.get("variants")
+    checked = []
     for row in rows:
-        need_dict(row, list(spec["row"]), f"{label} row")
-    return rows
-
-
-def check_row_field(spec: dict, row: dict, name: str, label: str, identity: dict):
-    return check_spec(spec["row"][name], row[name], f"{label} {name}", identity)
+        need_dict(row, row_fields(spec), f"{label} row")
+        values = {
+            name: check_spec(field, row[name], f"{row_label} {name}", identity)
+            for name, field in spec["row"].items()
+        }
+        if variants is not None:
+            selector = values[variants["discriminator"]]
+            case = next((item for item in variants["cases"] if item["when"] is selector), None)
+            if case is None:
+                raise CollectError(f"{row_label} has no policy variant for {selector}")
+            for name, field in case["fields"].items():
+                values[name] = check_spec(field, row[name], f"{row_label} {name}", identity)
+            check_constraints(case["constraints"], values, row_label)
+        checked.append(values)
+    return checked
 
 
 # --- per-operation schemas ------------------------------------------------------
@@ -536,10 +804,7 @@ def check_r1(data: dict, policy: dict, identity: dict) -> None:
 def check_r2(data: dict, policy: dict, identity: dict) -> None:
     spec = policy["fields"]["partitions"]
     names = []
-    for row in check_rows(spec, data["partitions"], "R2 partitions"):
-        values = {
-            name: check_row_field(spec, row, name, "R2 partition", identity) for name in spec["row"]
-        }
+    for values in check_rows(spec, data["partitions"], "R2 partitions", "R2 partition", identity):
         name, suffix = values["partition_name"], values["slot_suffix"]
         if suffix != (name[-2:] if name.endswith(("_a", "_b")) else ""):
             raise CollectError("R2 slot suffix differs from the partition name")
@@ -552,44 +817,18 @@ def check_r2(data: dict, policy: dict, identity: dict) -> None:
 
 
 def check_r3(data: dict, policy: dict, identity: dict) -> None:
-    spec = policy["fields"]["images"]
-    names = []
-    for row in check_rows(spec, data["images"], "R3 images"):
-        field = lambda name: check_row_field(spec, row, name, "R3 image", identity)
-        names.append(field("partition_name"))
-        sizes = field("component_sizes")
-        offsets = field("component_offsets")
-        if field("absent"):
-            if (
-                row["header_version"] is not None or row["page_size"] is not None
-                or row["os_version"] is not None or row["header_sha256"] is not None
-                or sizes or offsets or row["segment_count"] != 0
-                or type(row["segment_count"]) is not int
-            ):
-                raise CollectError("R3 absent image carries header fields")
-            continue
-        for name in ("header_version", "page_size", "os_version", "header_sha256"):
-            field(name)
-        count = field("segment_count")
-        if not len(sizes) == len(offsets) == count:
-            raise CollectError("R3 segment lists differ in length")
-    need_sorted_unique(names, "R3 images")
+    rows = check_rows(
+        policy["fields"]["images"], data["images"], "R3 images", "R3 image", identity
+    )
+    need_sorted_unique([values["partition_name"] for values in rows], "R3 images")
 
 
 def check_r4(data: dict, policy: dict, identity: dict) -> None:
-    fields = policy["fields"]
-    check = lambda name: check_spec(fields[name], data[name], f"R4 {name}", identity)
-    check("dtb_count")
-    board = data["selected_board_id"]
-    revision = data["selected_board_revision"]
-    if (board is None) != (revision is None):
-        raise CollectError("R4 board id and revision must both be set or both be null")
-    if board is not None:
-        check("selected_board_id")
-        check("selected_board_revision")
-    check("dtbo_entry_count")
-    check("compatible_prefix")
-    check("selection_source")
+    values = {
+        name: check_spec(spec, data[name], f"R4 {name}", identity)
+        for name, spec in policy["fields"].items()
+    }
+    check_constraints(policy["constraints"], values, "R4")
 
 
 def check_r5(data: dict, policy: dict, identity: dict) -> None:
@@ -603,7 +842,7 @@ def check_r5(data: dict, policy: dict, identity: dict) -> None:
     for position, value in enumerate(index):
         if value != position:
             raise CollectError("R5 load order index is not sequential")
-    declared = [name.replace("-", "_") for name in deploy().REFERENCE_MODULE_ORDER]
+    declared = [name.replace("-", "_") for name in policy["reference_module_order"]]
     seen = [name.replace("-", "_") for name in names]
     matches = [name for name in seen if name in declared] == declared
     flag = check_spec(fields["order_matches_declared"], data["order_matches_declared"], "R5 order flag", identity)
@@ -673,7 +912,8 @@ def validate_operation(
 ) -> tuple[dict, dict | None]:
     d = deploy()
     operation_id = spec["id"]
-    policy = policy_registry()["operations"].get(operation_id)
+    registry = policy_registry()
+    policy = registry["operations"].get(operation_id)
     if policy is None:
         raise CollectError(f"unknown operation {operation_id}")
     if len(raw) > spec["max_bytes"]:
@@ -681,7 +921,7 @@ def validate_operation(
     document = d.strict_json(raw, operation_id)
     if raw != d.render_json(document):
         raise CollectError(f"{operation_id} is not canonical JSON")
-    reject_identifiers(document, operation_id)
+    reject_identifiers(document, operation_id, hash_scope(registry, "operation", operation_id))
     need_dict(
         document,
         ["schema", "kind", "id", "request_sha256", "transport", "read_only", "bytes_read", "data"],
@@ -810,7 +1050,7 @@ def read_capture(path: str, env: Environment, request: dict, request_sha256: str
     manifest = d.strict_json(tree.data["capture.json"], "capture.json")
     if tree.data["capture.json"] != d.render_json(manifest):
         raise CollectError("capture.json is not canonical")
-    reject_identifiers(manifest, "capture.json")
+    reject_identifiers(manifest, "capture.json", hash_scope(policy_registry(), "manifest"))
     expected_manifest = manifest_document(env, request_sha256, request, tree.data)
     if not kernel().strict_equal(manifest, expected_manifest):
         raise CollectError("capture.json differs from its operations or bindings")
@@ -877,6 +1117,7 @@ def plan_document(env: Environment, request: dict, request_sha256: str) -> dict:
         "request_sha256": request_sha256,
         "transport": TRANSPORT,
         "evidence_level": EVIDENCE_LEVEL,
+        "implementation": implementation_binding(),
         "live": False,
         "executes": False,
         "remote_commands": [],
