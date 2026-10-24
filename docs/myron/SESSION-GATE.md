@@ -85,8 +85,9 @@ not seen, and a write through a writable shared mapping that was dirtied before
 admission changes bytes without changing mtime, ctime or size. Consequences:
 
 - a defect detected before payload traversal costs zero payload bytes;
-- a race first observable during or after traversal may consume bounded bytes
-  (at most 4 MiB) and then rejects with no output;
+- a detected race first observable during or after traversal may consume bounded
+  bytes (at most 4 MiB) and then normally rejects with no output; a failed
+  identity-bound cleanup can leave one as described under Safety and publication;
 - a race that lands after the captured bytes' final observation can yield the
   already-bound snapshot of those bytes, so the artifact is valid evidence of
   what was read, not of the source's current state;

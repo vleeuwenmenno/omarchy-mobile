@@ -1929,7 +1929,7 @@ assert (existing_session_out / "precious").read_text() == "keep"
 assert sorted(os.listdir(existing_session_out)) == ["precious"]
 no_leftovers("existing output")
 assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
-ok("a parent-directory fsync failure is a fixed publish-rejected refusal with no output and no leftovers")
+ok("a parent-directory fsync failure with successful cleanup is publish-rejected with no leftovers")
 
 # Every dependency exception class is sanitized at the rehearsal boundary, not only two of them.
 for label, error in (
@@ -2144,7 +2144,7 @@ finally:
     D.publish = real_publish
 no_leftovers("publication race")
 expect_ok("rehearse", *args(), "--out", work / "after-races")
-ok("request, reads and collector rejection races leave no output and no temp tree")
+ok("request, reads and collector rejection races with successful cleanup leave no output or temp tree")
 
 # Publication failures never name the caller's output path: one fixed single-line diagnostic,
 # empty stdout, and the existing output is neither modified nor removed.
