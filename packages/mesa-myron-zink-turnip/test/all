@@ -1,0 +1,146 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the activation-disabled Myron Mesa source package.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+
+bash -n PKGBUILD || fail "PKGBUILD parses"
+[[ -x omamobile-myron-gpu-verify ]] || fail "verifier is not executable"
+python3 -m py_compile omamobile-myron-gpu-verify || fail "verifier parses"
+python3 -m json.tool reference.json >/dev/null || fail "reference parses"
+python3 -m json.tool freedreno-kgsl.json >/dev/null || fail "ICD parses"
+pass "metadata and scripts parse"
+
+makepkg --printsrcinfo > "$tmp/SRCINFO" || fail "cannot generate .SRCINFO"
+cmp -s .SRCINFO "$tmp/SRCINFO" || fail ".SRCINFO is stale"
+pass "package metadata is current"
+
+python3 - "$PWD" <<'PY' || exit 1
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+reference = json.loads((root / "reference.json").read_text())
+for name, expected in reference["source"]["package_patch_sha512"].items():
+    actual = hashlib.sha512((root / name).read_bytes()).hexdigest()
+    assert actual == expected, (name, actual, expected)
+assert reference["activation"] == {
+    "mode": "disabled",
+    "system_loader_registration": False,
+}
+assert reference["build"]["libc"] == "glibc"
+assert reference["build"]["freedreno_kmds"] == ["msm", "kgsl"]
+PY
+pass "source and activation contract is exact"
+
+for option in \
+  'freedreno-kmds=msm,kgsl' \
+  'gallium-drivers=zink' \
+  'gallium-va=disabled' \
+  'vulkan-drivers=freedreno' \
+  'glvnd=disabled' \
+  'llvm=disabled'; do
+  grep -Fq -- "$option" PKGBUILD || fail "missing Meson option: $option"
+done
+if grep -Eq '^(provides|conflicts|replaces)=' PKGBUILD; then
+  fail "package claims or replaces a system Mesa package"
+fi
+grep -Fq 'options=(!lto !strip)' PKGBUILD \
+  || fail "makepkg may mutate libraries after payload hashing"
+grep -Fq 'strip --strip-unneeded' PKGBUILD \
+  || fail "package does not strip libraries before payload hashing"
+grep -Eq '^  spirv-tools$' PKGBUILD \
+  || fail "package omits Turnip/Zink SPIR-V runtime"
+grep -Eq '^  python$' PKGBUILD \
+  || fail "package omits verifier's Python runtime"
+if grep -Eq 'usr/share/vulkan/(icd|implicit_layer)\.d|systemd/(system|user)|pacman\.d/hooks|udev/rules' PKGBUILD; then
+  fail "package stages a global activation path"
+fi
+if grep -Ei '\.(ko|mbn|fw|bin)(["[:space:]]|$)' PKGBUILD; then
+  fail "package references a kernel module or firmware payload"
+fi
+pass "package remains isolated and activation-disabled"
+
+python3 - "$tmp/root" "$PWD/freedreno-kgsl.json" <<'PY'
+from pathlib import Path
+import hashlib
+import os
+import sys
+
+root = Path(sys.argv[1])
+prefix = root / "usr/lib/omamobile/myron-gpu"
+(prefix / "dri").mkdir(parents=True)
+names = [
+    "dri/libdril_dri.so",
+    "libEGL.so.1.0.0",
+    "libGLESv2.so.2.0.0",
+    "libgallium-26.2.2.so",
+    "libgbm.so.1.0.0",
+    "libvulkan_freedreno.so",
+]
+header = bytearray(64)
+header[:6] = b"\x7fELF\x02\x01"
+header[18:20] = (183).to_bytes(2, "little")
+for name in names:
+    path = prefix / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(header + name.encode())
+(prefix / "freedreno-kgsl.json").write_bytes(Path(sys.argv[2]).read_bytes())
+links = {
+    "dri/zink_dri.so": "libdril_dri.so",
+    "libEGL.so": "libEGL.so.1",
+    "libEGL.so.1": "libEGL.so.1.0.0",
+    "libGLESv2.so": "libGLESv2.so.2",
+    "libGLESv2.so.2": "libGLESv2.so.2.0.0",
+    "libgbm.so": "libgbm.so.1",
+    "libgbm.so.1": "libgbm.so.1.0.0",
+}
+for name, target in links.items():
+    (prefix / name).symlink_to(target)
+regular = ["freedreno-kgsl.json", *names]
+(prefix / "SHA256SUMS").write_text("".join(
+    f"{hashlib.sha256((prefix / name).read_bytes()).hexdigest()}  {name}\n"
+    for name in regular
+))
+PY
+./omamobile-myron-gpu-verify --reference reference.json \
+  verify-layout --root "$tmp/root" > "$tmp/result.json" \
+  || fail "valid isolated layout rejected"
+grep -q '"status": "verified"' "$tmp/result.json" \
+  || fail "verifier omitted success status"
+cp "$tmp/root/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so" \
+  "$tmp/libvulkan_freedreno.so"
+printf 'changed' >> "$tmp/root/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so"
+if ./omamobile-myron-gpu-verify --reference reference.json \
+    verify-layout --root "$tmp/root" >/dev/null 2>&1; then
+  fail "changed Turnip library accepted"
+fi
+mv "$tmp/libvulkan_freedreno.so" \
+  "$tmp/root/usr/lib/omamobile/myron-gpu/libvulkan_freedreno.so"
+
+reference_parent="$tmp/root/usr/share/omamobile/myron-gpu"
+mkdir -p "$reference_parent"
+cp reference.json "$reference_parent/reference.json"
+./omamobile-myron-gpu-verify verify-layout --root "$tmp/root" >/dev/null \
+  || fail "root-relative reference lookup failed"
+
+ln -s / "$tmp/root/usr/lib/omamobile/myron-gpu/extra"
+if ./omamobile-myron-gpu-verify verify-layout --root "$tmp/root" >/dev/null 2>&1; then
+  fail "unexpected directory symlink accepted"
+fi
+rm "$tmp/root/usr/lib/omamobile/myron-gpu/extra"
+
+mv "$tmp/root/usr/lib/omamobile" "$tmp/root/usr/lib/omamobile.real"
+ln -s omamobile.real "$tmp/root/usr/lib/omamobile"
+if ./omamobile-myron-gpu-verify verify-layout --root "$tmp/root" >/dev/null 2>&1; then
+  fail "symlinked payload ancestor accepted"
+fi
+pass "verifier accepts exact layout and rejects bytes and path escapes"

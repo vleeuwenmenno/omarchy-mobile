@@ -1,0 +1,206 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: MIT
+"""Verify the inert, isolated Myron Mesa payload without activating it."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+
+PREFIX = Path("usr/lib/omamobile/myron-gpu")
+DEFAULT_REFERENCE = Path("usr/share/omamobile/myron-gpu/reference.json")
+MAX_FILE_BYTES = 256 * 1024 * 1024
+REGULAR_FILES = {
+    "dri/libdril_dri.so",
+    "freedreno-kgsl.json",
+    "libEGL.so.1.0.0",
+    "libGLESv2.so.2.0.0",
+    "libgallium-26.2.2.so",
+    "libgbm.so.1.0.0",
+    "libvulkan_freedreno.so",
+}
+SYMLINKS = {
+    "dri/zink_dri.so": "libdril_dri.so",
+    "libEGL.so": "libEGL.so.1",
+    "libEGL.so.1": "libEGL.so.1.0.0",
+    "libGLESv2.so": "libGLESv2.so.2",
+    "libGLESv2.so.2": "libGLESv2.so.2.0.0",
+    "libgbm.so": "libgbm.so.1",
+    "libgbm.so.1": "libgbm.so.1.0.0",
+}
+ELF_FILES = REGULAR_FILES - {"freedreno-kgsl.json"}
+
+
+class VerificationError(Exception):
+    pass
+
+
+def regular_file(path: Path) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise VerificationError(f"missing file: {path}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise VerificationError(f"not a regular file: {path}")
+    if metadata.st_size > MAX_FILE_BYTES:
+        raise VerificationError(f"file exceeds safety limit: {path}")
+    return metadata
+
+
+def digest(path: Path) -> str:
+    regular_file(path)
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def load_reference(path: Path) -> dict:
+    regular_file(path)
+    try:
+        reference = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise VerificationError(f"invalid reference: {error}") from error
+    if reference.get("schema") != 1:
+        raise VerificationError("unsupported reference schema")
+    package = reference.get("package", {})
+    if package != {
+        "name": "mesa-myron-zink-turnip",
+        "prefix": "/usr/lib/omamobile/myron-gpu",
+        "version": "26.2.2",
+    }:
+        raise VerificationError("unexpected package identity")
+    if reference.get("activation") != {
+        "mode": "disabled",
+        "system_loader_registration": False,
+    }:
+        raise VerificationError("reference does not disable activation")
+    return reference
+
+
+def require_directory(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise VerificationError(f"missing directory: {path}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise VerificationError(f"not a real directory: {path}")
+
+
+def require_directory_tree(root: Path, relative: Path) -> None:
+    require_directory(root)
+    current = root
+    for part in relative.parts:
+        current /= part
+        require_directory(current)
+
+
+def parse_manifest(path: Path) -> dict[str, str]:
+    regular_file(path)
+    result = {}
+    for number, raw in enumerate(path.read_text().splitlines(), 1):
+        parts = raw.split("  ", 1)
+        if len(parts) != 2 or len(parts[0]) != 64:
+            raise VerificationError(f"invalid manifest line {number}")
+        checksum, name = parts
+        if any(character not in "0123456789abcdef" for character in checksum):
+            raise VerificationError(f"invalid digest on manifest line {number}")
+        parts = Path(name).parts
+        if name.startswith("/") or not parts or ".." in parts or str(Path(name)) != name:
+            raise VerificationError(f"unsafe manifest path on line {number}")
+        if name in result:
+            raise VerificationError(f"duplicate manifest path: {name}")
+        result[name] = checksum
+    if set(result) != REGULAR_FILES:
+        raise VerificationError("manifest file set differs from contract")
+    return result
+
+
+def verify_aarch64_elf(path: Path) -> None:
+    with path.open("rb") as stream:
+        header = stream.read(20)
+    if len(header) != 20 or header[:4] != b"\x7fELF":
+        raise VerificationError(f"not ELF: {path}")
+    if header[4] != 2 or header[5] != 1:
+        raise VerificationError(f"not little-endian ELF64: {path}")
+    if int.from_bytes(header[18:20], "little") != 183:
+        raise VerificationError(f"not AArch64 ELF: {path}")
+
+
+def verify_layout(root: Path, reference: dict) -> dict:
+    if not root.is_absolute():
+        raise VerificationError("root must be absolute")
+    require_directory_tree(root, PREFIX)
+    prefix = root / PREFIX
+    manifest = parse_manifest(prefix / "SHA256SUMS")
+    for name, expected in manifest.items():
+        path = prefix / name
+        if digest(path) != expected:
+            raise VerificationError(f"checksum mismatch: {path}")
+        if name in ELF_FILES:
+            verify_aarch64_elf(path)
+    for name, target in SYMLINKS.items():
+        path = prefix / name
+        if not path.is_symlink() or os.readlink(path) != target:
+            raise VerificationError(f"unexpected symlink: {path}")
+    allowed_files = REGULAR_FILES | set(SYMLINKS) | {"SHA256SUMS"}
+    actual_files = set()
+    actual_directories = set()
+    for path in prefix.rglob("*"):
+        relative = str(path.relative_to(prefix))
+        metadata = path.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            actual_directories.add(relative)
+        else:
+            actual_files.add(relative)
+    if actual_directories != {"dri"} or actual_files != allowed_files:
+        raise VerificationError("payload contains unexpected or missing paths")
+    try:
+        icd = json.loads((prefix / "freedreno-kgsl.json").read_text())
+    except json.JSONDecodeError as error:
+        raise VerificationError(f"invalid ICD manifest: {error}") from error
+    if icd.get("ICD", {}).get("library_path") != reference["package"]["prefix"] + "/libvulkan_freedreno.so":
+        raise VerificationError("ICD does not point to isolated Turnip library")
+    return {
+        "activation": "disabled",
+        "files": len(REGULAR_FILES),
+        "prefix": reference["package"]["prefix"],
+        "status": "verified",
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reference", type=Path)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("show")
+    verify = subparsers.add_parser("verify-layout")
+    verify.add_argument("--root", type=Path, default=Path("/"))
+    arguments = parser.parse_args()
+    try:
+        if arguments.reference is not None:
+            reference_path = arguments.reference
+        elif arguments.command == "verify-layout":
+            if not arguments.root.is_absolute():
+                raise VerificationError("root must be absolute")
+            require_directory_tree(arguments.root, DEFAULT_REFERENCE.parent)
+            reference_path = arguments.root / DEFAULT_REFERENCE
+        else:
+            reference_path = Path("/") / DEFAULT_REFERENCE
+        reference = load_reference(reference_path)
+        result = reference if arguments.command == "show" else verify_layout(arguments.root, reference)
+    except VerificationError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    json.dump(result, sys.stdout, indent=2, sort_keys=True)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

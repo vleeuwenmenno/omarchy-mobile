@@ -83,7 +83,7 @@ Early Arch builds should use two isolated source packages rather than replace
 system Mesa:
 
 1. `mesa-myron-zink-turnip`: Mesa libraries under
-   `/opt/omamobile/myron-gpu`, ICD and DRI paths included, no global loader
+   `/usr/lib/omamobile/myron-gpu`, ICD and DRI paths included, no global loader
    configuration;
 2. `omamobile-myron-gpu-profile`: systemd environment/drop-ins and a probe
    wrapper that opt the compositor/session into that exact prefix.
@@ -96,20 +96,41 @@ Mesa hashes differ.
 Only after equivalence tests pass should the project consider replacing the
 repository's generic Mesa package or loader configuration.
 
-## Reproducibility gates
+## Reproducibility result
 
-Before creating the Arch Mesa package, resolve these reference inconsistencies:
+The source-level r0/r1 inconsistency is resolved:
 
-- Attempt104 documentation records an older combined APK hash;
-- the promoted installer expects the r1 APK with a different hash;
-- the r1 APK and calibrated-timestamp patch are untracked in the reference
-  checkout;
-- accepted compiler and dependency versions are not recorded as a complete
-  build manifest.
+- r0 is SHA-256 `0cd3b2fb24af4b07f2863561e39c78afb41a487c5ae80d97deb0ab6aa56fc9a7`;
+- r1 is SHA-256 `f03111c858112c3b3d71717fd5482eb7982e23d018defda8c3335c9ecdfad538`;
+- the reference checkout diff shows r1 adds only the KGSL calibrated-timestamp
+  patch to the same source and Meson options;
+- Gallium, EGL, GLES2, and GBM payload hashes are unchanged; Turnip differs.
 
-The Arch PKGBUILD must pin Mesa source, both patches, toolchain inputs, Meson
-options, and source hashes. It must build aarch64 output from source; importing
-the APK is forbidden.
+The r1 APK and patch remain untracked in the read-only reference checkout.
+Its Alpine image digest is pinned, but rolling `apk add` inputs mean the full
+compiler/dependency versions cannot be reconstructed from repository evidence.
+The Arch package is therefore source-equivalent rather than byte-equivalent.
+
+`packages/mesa-myron-zink-turnip` pins Mesa, its release signature, both patch
+semantics, Meson options, reference hashes, and its isolated path. Arch package
+versions are captured by the built package metadata and build log. Importing
+the musl APK remains forbidden.
+
+### Offline package result (2026-10-24)
+
+The unsigned AArch64 development build completed all 1421 Mesa targets in the
+verified Arch Linux ARM container. Source signature/checksums, zero-fuzz patch
+application, package tests, assembly, AArch64 ELF checks, runtime dependency
+audit, final-byte manifest, and isolated path audit passed. Exact artifact:
+
+```text
+mesa-myron-zink-turnip-26.2.2-1-aarch64.pkg.tar.zst
+SHA-256 2d384eb7032d21aa0de347023c5407b8a056f8354fe82d84380e2c16fb45fbb7
+```
+
+The artifact remains outside the signed repository under a disposable `/tmp`
+build directory. It has not been installed or run on the phone. This proves
+the glibc package builds; it does not qualify GPU hardware behavior.
 
 ## Equivalence test ladder
 

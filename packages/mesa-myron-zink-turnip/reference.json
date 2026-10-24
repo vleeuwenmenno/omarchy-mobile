@@ -1,0 +1,44 @@
+{
+  "activation": {
+    "mode": "disabled",
+    "system_loader_registration": false
+  },
+  "build": {
+    "freedreno_kmds": [
+      "msm",
+      "kgsl"
+    ],
+    "gallium_drivers": [
+      "zink"
+    ],
+    "libc": "glibc",
+    "vulkan_drivers": [
+      "freedreno"
+    ]
+  },
+  "package": {
+    "name": "mesa-myron-zink-turnip",
+    "prefix": "/usr/lib/omamobile/myron-gpu",
+    "version": "26.2.2"
+  },
+  "reference": {
+    "attempt105_apk_r0_sha256": "0cd3b2fb24af4b07f2863561e39c78afb41a487c5ae80d97deb0ab6aa56fc9a7",
+    "attempt105_apk_r1_sha256": "f03111c858112c3b3d71717fd5482eb7982e23d018defda8c3335c9ecdfad538",
+    "r1_delta": "r0 plus KGSL calibrated-timestamps patch",
+    "status": "source-equivalent draft; no Arch hardware qualification"
+  },
+  "schema": 1,
+  "source": {
+    "mesa_sha256": "eeb29ca7e56cfaa8e8a79538dcf834e3b18e501c31bef5145e959ea437cc4216",
+    "mesa_sha512": "55b1234c8653dad9b85ba3de7b777a0d957909baf4628f0c00e21d4ba89c004cb687a1dcf8da46ed0a092231dd4f859027509f83ad8c558750845ba470902615",
+    "mesa_url": "https://archive.mesa3d.org/mesa-26.2.2.tar.xz",
+    "package_patch_sha512": {
+      "turnip-kgsl-disable-calibrated-timestamps.patch": "4fc6b4a801c5c94a6cccbcd0234e2e1f9d0ca0d431e4d2a1544a7399f6e6f4a905d92f60a6da082ce8e38c7c54d2b0c078cda586bb264249b17c1f17776dd407",
+      "zink-sole-pdev.patch": "5a758f6aa13dbfb127c1871fd5a6b658414a454cb21706e1993b5f62b60e746e7d3af84df662ac10b1b3788a5dc0944ec62676d9fa71f7f58765c041d3c4f280"
+    },
+    "reference_patch_sha512": {
+      "turnip-kgsl-disable-calibrated-timestamps.patch": "f86dc41b5f6cfe4024b27df129878dc08b8e513a771b1025ba321a1585fd27c893482c79fc4e6f899f670f9dec5020b65e8c32344a1ff0831ee7071e00d0c244",
+      "zink-sole-pdev.patch": "8991f1c126a08f8f8ff3a78441c5c2d21d3d49877bc00ace334fedbbeff05dbd19c84fbcfccea967293fbf51f2e5317736daea2981a42fe8fab09057e3f0ec65"
+    }
+  }
+}

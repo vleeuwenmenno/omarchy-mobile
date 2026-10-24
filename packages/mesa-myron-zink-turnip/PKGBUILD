@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=mesa-myron-zink-turnip
+pkgver=$(cat "${startdir:-.}/version")
+pkgrel=1
+pkgdesc="Isolated experimental Mesa Zink and Turnip/KGSL stack for Xiaomi myron"
+arch=(aarch64)
+url="https://www.mesa3d.org/"
+license=("MIT AND BSD-3-Clause AND SGI-B-2.0")
+depends=(
+  expat
+  gcc-libs
+  glibc
+  libdrm
+  libx11
+  libxcb
+  libxext
+  libxshmfence
+  libxxf86vm
+  python
+  spirv-tools
+  systemd-libs
+  vulkan-icd-loader
+  wayland
+  zlib
+  zstd
+)
+makedepends=(
+  bison
+  flex
+  glslang
+  libxdamage
+  libxfixes
+  libxrandr
+  libxml2
+  meson
+  python-mako
+  python-packaging
+  python-ply
+  python-pycparser
+  python-yaml
+  vulkan-headers
+  wayland-protocols
+  xorgproto
+)
+options=(!lto !strip)
+source=(
+  "https://archive.mesa3d.org/mesa-$pkgver.tar.xz"{,.sig}
+  zink-sole-pdev.patch
+  turnip-kgsl-disable-calibrated-timestamps.patch
+  freedreno-kgsl.json
+  reference.json
+  omamobile-myron-gpu-verify
+  README.md
+  BUILD-PROVENANCE.md
+)
+validpgpkeys=(
+  57551DE15B968F6341C248F68D8E31AFC32428A6 # Eric Engestrom
+)
+sha512sums=(
+  '55b1234c8653dad9b85ba3de7b777a0d957909baf4628f0c00e21d4ba89c004cb687a1dcf8da46ed0a092231dd4f859027509f83ad8c558750845ba470902615'
+  'SKIP'
+  '5a758f6aa13dbfb127c1871fd5a6b658414a454cb21706e1993b5f62b60e746e7d3af84df662ac10b1b3788a5dc0944ec62676d9fa71f7f58765c041d3c4f280'
+  '4fc6b4a801c5c94a6cccbcd0234e2e1f9d0ca0d431e4d2a1544a7399f6e6f4a905d92f60a6da082ce8e38c7c54d2b0c078cda586bb264249b17c1f17776dd407'
+  '6dc288f0fbd4c743eb5d2a225eec4dfce69f9992b89712230bbe71355eed4866b0bd59285705cc3bf96e12ecdd8b72d619be7505ebf3f3696e88d08c476e4363'
+  '85b59da8a45001d6d4cf120cf70536fc5e268c9dce5f2ad6b5b6e445e135b1307250fc547b025752fee4852208f2f25d8317496053e20acd7385b436ef86ec05'
+  '07d5927bade13bbd0ee41ed26fe32c3b3e65347fed6ac3d9051c8a07ca2eea0f1d0e1e9d416be9fd1155166c20721406c4f9f5f4d73ad40076aca99dea5954ab'
+  'b035cc4c97d9657a11c441d658f36e4aecc0869b9a2e04e187d93d8c4e23cc2b5886234f5c3ed7fb9f58b1f8420146db9bd4cda44a823398599596ed03f98535'
+  '99bd15936960e5af5b9b8bdc0f34455cd67e47841a7840d1b397c0a31bf7870a9c98baaf626d83018f4ff2b6a14d7fd87857135fc7d32cb24ed19074a30c4180'
+)
+
+prepare() {
+  cd "mesa-$pkgver"
+  patch --fuzz=0 -Np1 < ../zink-sole-pdev.patch
+  patch --fuzz=0 -Np1 < ../turnip-kgsl-disable-calibrated-timestamps.patch
+}
+
+build() {
+  local meson_options=(
+    --optimization 2
+    --auto-features auto
+    -D allow-kcmp=enabled
+    -D b_ndebug=true
+    -D build-tests=false
+    -D egl=enabled
+    -D expat=enabled
+    -D freedreno-kmds=msm,kgsl
+    -D gallium-drivers=zink
+    -D gallium-va=disabled
+    -D gbm=enabled
+    -D gles1=enabled
+    -D gles2=enabled
+    -D glvnd=disabled
+    -D glx=dri
+    -D libunwind=disabled
+    -D llvm=disabled
+    -D lmsensors=disabled
+    -D microsoft-clc=disabled
+    -D opengl=true
+    -D platforms=x11,wayland
+    -D selinux=false
+    -D shader-cache=enabled
+    -D shared-llvm=disabled
+    -D valgrind=disabled
+    -D video-codecs=
+    -D vulkan-drivers=freedreno
+    -D vulkan-layers=
+    -D xmlconfig=enabled
+    -D xlib-lease=enabled
+    -D zstd=enabled
+  )
+
+  arch-meson "mesa-$pkgver" build "${meson_options[@]}"
+  meson compile -C build
+}
+
+check() {
+  local dril
+  dril=$(find build -type f -name libdril_dri.so -print -quit)
+  [[ -n "$dril" ]]
+  readelf --dyn-syms --wide "$dril" | grep -Fq __driDriverGetExtensions_zink
+  "$startdir/test/all"
+}
+
+package() {
+  local stage="$srcdir/package-stage"
+  local prefix="$pkgdir/usr/lib/omamobile/myron-gpu"
+  rm -rf "$stage"
+  DESTDIR="$stage" meson install -C build --no-rebuild
+
+  install -Dm755 "$stage/usr/lib/libgallium-$pkgver.so" "$prefix/libgallium-$pkgver.so"
+  install -Dm755 "$stage/usr/lib/libEGL.so.1.0.0" "$prefix/libEGL.so.1.0.0"
+  install -Dm755 "$stage/usr/lib/libGLESv2.so.2.0.0" "$prefix/libGLESv2.so.2.0.0"
+  install -Dm755 "$stage/usr/lib/libgbm.so.1.0.0" "$prefix/libgbm.so.1.0.0"
+  install -Dm755 "$stage/usr/lib/libvulkan_freedreno.so" "$prefix/libvulkan_freedreno.so"
+  install -Dm755 "$stage/usr/lib/dri/libdril_dri.so" "$prefix/dri/libdril_dri.so"
+  install -Dm644 "$startdir/freedreno-kgsl.json" "$prefix/freedreno-kgsl.json"
+
+  ln -s libdril_dri.so "$prefix/dri/zink_dri.so"
+  ln -s libEGL.so.1.0.0 "$prefix/libEGL.so.1"
+  ln -s libEGL.so.1 "$prefix/libEGL.so"
+  ln -s libGLESv2.so.2.0.0 "$prefix/libGLESv2.so.2"
+  ln -s libGLESv2.so.2 "$prefix/libGLESv2.so"
+  ln -s libgbm.so.1.0.0 "$prefix/libgbm.so.1"
+  ln -s libgbm.so.1 "$prefix/libgbm.so"
+
+  strip --strip-unneeded \
+    "$prefix/libEGL.so.1.0.0" \
+    "$prefix/libGLESv2.so.2.0.0" \
+    "$prefix/libgallium-$pkgver.so" \
+    "$prefix/libgbm.so.1.0.0" \
+    "$prefix/dri/libdril_dri.so" \
+    "$prefix/libvulkan_freedreno.so"
+
+  (
+    cd "$prefix"
+    sha256sum \
+      freedreno-kgsl.json \
+      dri/libdril_dri.so \
+      libEGL.so.1.0.0 \
+      libGLESv2.so.2.0.0 \
+      "libgallium-$pkgver.so" \
+      libgbm.so.1.0.0 \
+      libvulkan_freedreno.so > SHA256SUMS
+  )
+
+  install -Dm755 "$startdir/omamobile-myron-gpu-verify" \
+    "$pkgdir/usr/bin/omamobile-myron-gpu-verify"
+  install -Dm644 "$startdir/reference.json" \
+    "$pkgdir/usr/share/omamobile/myron-gpu/reference.json"
+  install -Dm644 "$startdir/README.md" \
+    "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "$startdir/BUILD-PROVENANCE.md" \
+    "$pkgdir/usr/share/doc/$pkgname/BUILD-PROVENANCE.md"
+  install -Dm644 "mesa-$pkgver/docs/license.rst" \
+    "$pkgdir/usr/share/licenses/$pkgname/license.rst"
+}
+
+# vim:set sw=2 sts=-1 et:

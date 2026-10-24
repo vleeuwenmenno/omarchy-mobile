@@ -1,0 +1,15 @@
+Backport of Mesa commit 67754571ca932823ede9c392c9e538218a434943.
+
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 4b5778c..9c83af6 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1802,0 +1803,8 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, u
++      /* Not all Vulkan implementations expose DRM device information through
++       * VK_EXT_physical_device_drm. When DRM matching is requested with a
++       * valid render node and only a single Vulkan physical device is
++       * available, select that device rather than failing due to the lack
++       * of DRM metadata.
++       */
++      if (idx == -1 && !adapter_luid && !cpu && pdev_count == 1)
++         idx = 0;
