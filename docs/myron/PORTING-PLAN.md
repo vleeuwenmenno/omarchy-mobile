@@ -177,6 +177,14 @@ fixture evidence, not live evidence and not approval; it has no live transport,
 clears no blocker and sets no authority flag
 ([CAPTURE-GATE.md](CAPTURE-GATE.md)).
 
+Phase 2.13 (laptop-only, rehearsal done): `device/myron/session-contract.json`
+and `tools/myron-session` 0.1.0 adapt a fixed set of **synthetic** input
+projections into the exact R1-R7 capture fixture and prove the unchanged
+collector accepts it. This is not acquisition, a live transport, hardware
+evidence, authorization, blocker closure or device-format qualification; no GPT,
+Android boot-image or device-tree parser exists
+([SESSION-GATE.md](SESSION-GATE.md)).
+
 Phase 2.11 (laptop-only, mechanism done): kernel-contract and deployment tool
 0.4.0 add synthetic coverage for standard AArch64/GKI module layouts so real
 owner bytes are no longer guaranteed to fail on RELA, PREL32 exports,
@@ -320,7 +328,9 @@ Future build gates:
 ## Next implementation task
 
 Offline refusal tooling is now complete through the preflight request, and the
-fixture collector (Phase 2.12) can check the shape of pre-captured evidence. Next,
+fixture collector (Phase 2.12) can check the shape of pre-captured evidence; the
+synthetic adapter rehearsal (Phase 2.13) shows synthetic projections adapt into that
+fixture. Next,
 assemble a **real** kit and snapshot candidate from the owner-supplied qualified
 archive, runtime tree and symvers pair, then generate and independently review
 its preflight request SHA-256. That work stays offline. The following boundary

@@ -129,6 +129,14 @@ file, symlink, hardlink, special file, changed blocker/order, collected
 evidence, execution entry, authorization claim, unbounded read, identifier
 emission, or changed component binding fails closed.
 
+## Downstream gates
+
+The preflight 0.2.1 contract is unchanged by the later gates and does not
+reference them. The fixture collector ([CAPTURE-GATE.md](CAPTURE-GATE.md)) and
+the synthetic adapter rehearsal ([SESSION-GATE.md](SESSION-GATE.md)) read a
+request with this tool's `read_request` and import this tool as a trusted,
+version-pinned dependency; neither executes the reads it lists.
+
 ## Boundary after Phase 2.10
 
 Offline mechanism is ready to describe the next step, but evidence is not.

@@ -197,6 +197,15 @@ refused, and both are re-read and recomputed inside `verify_built`, so a byte
 that changes between the first read and publication aborts the run and leaves
 no output.
 
+## Synthetic adapter rehearsal (Phase 2.13)
+
+`tools/myron-session` ([SESSION-GATE.md](SESSION-GATE.md)) builds a capture
+fixture of exactly this shape from a flat tree of synthetic projections and
+checks it with this collector's `validate_operation`, `cross_check` and
+`read_capture`. `capture/` in its rehearsal artifact is consumed by `collect`
+unchanged. The collector (0.1.0) is not modified, and its fixture evidence stays
+`artifact-structure-only`: the rehearsal adds no provenance to it.
+
 ## Boundary after Phase 2.12
 
 A passing fixture says only that its structure is acceptable. Before any real

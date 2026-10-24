@@ -95,6 +95,16 @@ evidence, not approval, and clears no blocker; it has no live transport and
 contacts no phone. All seven blockers stay missing and every authority flag
 stays false. See [CAPTURE-GATE.md](../../docs/myron/CAPTURE-GATE.md).
 
+Phase 2.13 adds `device/myron/session-contract.json` and `tools/myron-session`
+0.1.0 (a minimal trusted loader for `tools/lib/myron-session-impl.py`, whose
+captured bytes the contract pins). It adapts a flat tree of **synthetic**
+projections into the exact R1-R7 capture fixture, checks it with the unchanged
+collector and writes a rehearsal artifact that the collector's own `collect`
+accepts. It is synthetic rehearsal only: no acquisition, no live transport, no
+hardware evidence, no authorization, no blocker closure and no GPT, boot-image
+or device-tree parser. The collector and preflight are trusted version-pinned
+imports, not byte-pinned. See [SESSION-GATE.md](../../docs/myron/SESSION-GATE.md).
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,
