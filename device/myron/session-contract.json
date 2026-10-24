@@ -1,0 +1,1238 @@
+{
+  "authority": {
+    "atomic_snapshot_proof": false,
+    "atomicity_proven": false,
+    "bootable": false,
+    "deployment_authorized": false,
+    "flashable": false,
+    "hardware_qualified": false,
+    "hardware_read_authorized": false,
+    "image_ready": false,
+    "rollback_proven": false
+  },
+  "blockers": [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization"
+  ],
+  "bound_contracts": {
+    "deployment_contract": {
+      "path": "device/myron/deployment-contract.json",
+      "sha256": "77aeb784326943ce9bcfa76de599d04502370a333d234561b477f269d9ebaee9"
+    },
+    "kernel_reference": {
+      "path": "device/myron/kernel-contract.json",
+      "sha256": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193"
+    },
+    "snapshot_contract": {
+      "path": "device/myron/snapshot-contract.json",
+      "sha256": "4dc53614992922b50cbfe7b59bfc10c473088c9d98058a9abec0933d345257ea"
+    }
+  },
+  "capture": {
+    "collector_transport_label_is_not_provenance": true,
+    "kind": "myron-precaptured-fixture",
+    "operation_kind": "myron-precaptured-operation",
+    "transport": "external-precaptured-fixture",
+    "unchanged_for_collector": true,
+    "validated_by": [
+      "validate_operation",
+      "cross_check",
+      "read_capture"
+    ]
+  },
+  "components": {
+    "capture_contract": {
+      "path": "device/myron/capture-contract.json",
+      "sha256": "b5ccb100cf28c7d58ce40fc634719bb9ceede6a3e94476c546914af7a443edce"
+    },
+    "preflight_contract": {
+      "path": "device/myron/preflight-contract.json",
+      "sha256": "9fe3d28d4f2843bf652efb3081f61c21791421e45e021a3842d1a6b84185fb1b"
+    }
+  },
+  "coverage": {
+    "classes": [
+      "parsed-bytes",
+      "synthetic-projection",
+      "unverified-source-claim"
+    ],
+    "fields": [
+      {
+        "classification": "synthetic-projection",
+        "field": "codename",
+        "operation": "R1-identity-and-slot"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "soc",
+        "operation": "R1-identity-and-slot"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "compatible_prefix",
+        "operation": "R1-identity-and-slot"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "current_slot",
+        "operation": "R1-identity-and-slot"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "slot_suffix",
+        "operation": "R1-identity-and-slot"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "verified_boot_state",
+        "operation": "R1-identity-and-slot"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "sources_agree",
+        "operation": "R1-identity-and-slot"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "partitions.partition_name",
+        "operation": "R2-gpt-and-recovery-inventory"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "partitions.size_bytes",
+        "operation": "R2-gpt-and-recovery-inventory"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "partitions.bootable_flag",
+        "operation": "R2-gpt-and-recovery-inventory"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "partitions.slot_suffix",
+        "operation": "R2-gpt-and-recovery-inventory"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "recovery_present",
+        "operation": "R2-gpt-and-recovery-inventory"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "images.partition_name",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "images.absent",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.header_version",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.page_size",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.os_version",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.component_sizes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.component_offsets",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.segment_count",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.header_sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "dtb_count",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "selected_board_id",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "selected_board_revision",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "dtbo_entry_count",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "compatible_prefix",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "selection_source",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "module_names",
+        "operation": "R5-module-load-order"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "load_order_index",
+        "operation": "R5-module-load-order"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "taint_flags",
+        "operation": "R5-module-load-order"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "order_matches_declared",
+        "operation": "R5-module-load-order"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "root_source_gpt_name",
+        "operation": "R6-storage-and-mount-model"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "filesystem_type",
+        "operation": "R6-storage-and-mount-model"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "mount_options",
+        "operation": "R6-storage-and-mount-model"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "block_size",
+        "operation": "R6-storage-and-mount-model"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "rounded_total_bytes",
+        "operation": "R6-storage-and-mount-model"
+      },
+      {
+        "classification": "synthetic-projection",
+        "field": "rounded_free_bytes",
+        "operation": "R6-storage-and-mount-model"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "kernel_release",
+        "operation": "R7-kernel-identity-revalidation"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "notes_sha256",
+        "operation": "R7-kernel-identity-revalidation"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "allowlisted_cmdline",
+        "operation": "R7-kernel-identity-revalidation"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "allowlisted_bootconfig_keys",
+        "operation": "R7-kernel-identity-revalidation"
+      }
+    ],
+    "unresolved_claims": [
+      {
+        "claim": "simulated-flag-supplied-not-inferred",
+        "field": "partitions.bootable_flag",
+        "operation": "R2-gpt-and-recovery-inventory"
+      },
+      {
+        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.header_version",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.page_size",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.os_version",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.component_sizes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.component_offsets",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.segment_count",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "header-hash-supplied-not-verified-against-image-bytes",
+        "field": "images.header_sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "selection-supplied-not-derived-from-boot-image-bytes",
+        "field": "dtb_count",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "claim": "selection-supplied-not-derived-from-boot-image-bytes",
+        "field": "selected_board_id",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "claim": "selection-supplied-not-derived-from-boot-image-bytes",
+        "field": "selected_board_revision",
+        "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "claim": "selection-supplied-not-derived-from-boot-image-bytes",
+        "field": "dtbo_entry_count",
+        "operation": "R4-dtb-dtbo-selection"
+      }
+    ]
+  },
+  "dependencies": {
+    "byte_pinned": false,
+    "imports": [
+      "tools/myron-collect",
+      "tools/myron-preflight",
+      "tools/myron-snapshot",
+      "tools/myron-deployment"
+    ],
+    "note": "imported in-process and pinned by version only; their bytes are not pinned here, and the collector implementation digest is bound through the capture contract",
+    "trust": "trusted-version-pinned-imports"
+  },
+  "evidence_level": "synthetic-adapter-rehearsal-only",
+  "executes": false,
+  "format_version": "0.1.0",
+  "human_approval_required": true,
+  "identity": {
+    "device.codename": "myron",
+    "device.compatible": "qcom,canoe-mtp",
+    "device.soc": "sm8850",
+    "kernel.notes_sha256": "8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
+    "kernel.release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
+  },
+  "implementation": {
+    "algorithm": "sha256-of-captured-implementation-bytes",
+    "path": "tools/lib/myron-session-impl.py",
+    "sha256": "027db95c7177bf7f9d20a931422cbc8b9d5f9d52316fbf85c86e5f1ea73e0591"
+  },
+  "input": {
+    "closure": [
+      "r1-source-a.json",
+      "r1-source-b.json",
+      "r2-partitions.json",
+      "r3-header-summaries.json",
+      "r4-selection.json",
+      "r5-modules.tsv",
+      "r6-filesystem.json",
+      "r7-bootconfig.txt",
+      "r7-cmdline.txt",
+      "r7-notes.bin",
+      "r7-release.txt",
+      "reads.json"
+    ],
+    "closure_checked_before_payload_read": true,
+    "entries_max": 13,
+    "extra_entries": "reject",
+    "files": [
+      {
+        "format": "json",
+        "max_bytes": 16384,
+        "min_bytes": 1,
+        "operation": "R1-identity-and-slot",
+        "parser": "synthetic-r1-source-record-v1",
+        "path": "r1-source-a.json"
+      },
+      {
+        "format": "json",
+        "max_bytes": 16384,
+        "min_bytes": 1,
+        "operation": "R1-identity-and-slot",
+        "parser": "synthetic-r1-source-record-v1",
+        "path": "r1-source-b.json"
+      },
+      {
+        "format": "json",
+        "max_bytes": 65536,
+        "min_bytes": 1,
+        "operation": "R2-gpt-and-recovery-inventory",
+        "parser": "synthetic-gpt-projection-v1",
+        "path": "r2-partitions.json"
+      },
+      {
+        "format": "json",
+        "max_bytes": 32768,
+        "min_bytes": 1,
+        "operation": "R3-boot-image-headers",
+        "parser": "synthetic-header-summaries-v1",
+        "path": "r3-header-summaries.json"
+      },
+      {
+        "format": "json",
+        "max_bytes": 16384,
+        "min_bytes": 1,
+        "operation": "R4-dtb-dtbo-selection",
+        "parser": "synthetic-selection-record-v1",
+        "path": "r4-selection.json"
+      },
+      {
+        "format": "tsv",
+        "max_bytes": 32768,
+        "min_bytes": 1,
+        "operation": "R5-module-load-order",
+        "parser": "module-name-taint-tsv-v1",
+        "path": "r5-modules.tsv"
+      },
+      {
+        "format": "json",
+        "max_bytes": 16384,
+        "min_bytes": 1,
+        "operation": "R6-storage-and-mount-model",
+        "parser": "synthetic-filesystem-statistics-v1",
+        "path": "r6-filesystem.json"
+      },
+      {
+        "format": "text-line",
+        "max_bytes": 256,
+        "min_bytes": 2,
+        "operation": "R7-kernel-identity-revalidation",
+        "parser": "kernel-release-line-v1",
+        "path": "r7-release.txt"
+      },
+      {
+        "format": "bounded-bytes",
+        "max_bytes": 524288,
+        "min_bytes": 1,
+        "operation": "R7-kernel-identity-revalidation",
+        "parser": "bounded-bytes-sha256-v1",
+        "path": "r7-notes.bin"
+      },
+      {
+        "format": "text-line",
+        "max_bytes": 4096,
+        "min_bytes": 0,
+        "operation": "R7-kernel-identity-revalidation",
+        "parser": "narrow-cmdline-projection-v1",
+        "path": "r7-cmdline.txt"
+      },
+      {
+        "format": "key-value-lines",
+        "max_bytes": 4096,
+        "min_bytes": 0,
+        "operation": "R7-kernel-identity-revalidation",
+        "parser": "narrow-bootconfig-projection-v1",
+        "path": "r7-bootconfig.txt"
+      }
+    ],
+    "format_version": "0.1.0",
+    "json": "strict canonical ASCII; duplicate keys, floats, booleans for integers rejected",
+    "json_depth_max": 8,
+    "kind": "myron-synthetic-reads",
+    "layout": "flat",
+    "manifest": {
+      "binds": [
+        "session_contract_sha256",
+        "request_sha256"
+      ],
+      "max_bytes": 65536,
+      "path": "reads.json",
+      "rows_sorted_by": "path"
+    },
+    "parser_selection": "fixed-registry-only",
+    "safety": [
+      "flat-tree-only",
+      "exact-closure-before-payload-read",
+      "no-symlinks",
+      "no-hardlinks",
+      "no-executable-files",
+      "no-special-files",
+      "no-mount-crossing",
+      "no-writable-ancestry",
+      "no-aliases-of-inputs",
+      "stable-while-read"
+    ],
+    "schemas": {
+      "r1-source-a.json": {
+        "fields": {
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-r1-source"
+            ]
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "source": {
+            "type": "enum",
+            "values": [
+              "a"
+            ]
+          }
+        },
+        "observed": {
+          "codename": {
+            "pattern": "[a-z0-9]{1,32}",
+            "type": "text"
+          },
+          "compatible_prefix": {
+            "pattern": "[a-z0-9,._-]{1,64}",
+            "type": "text"
+          },
+          "current_slot": {
+            "type": "enum",
+            "values": [
+              "a",
+              "b"
+            ]
+          },
+          "slot_suffix": {
+            "type": "enum",
+            "values": [
+              "_a",
+              "_b"
+            ]
+          },
+          "soc": {
+            "pattern": "[a-z0-9]{1,32}",
+            "type": "text"
+          },
+          "verified_boot_state": {
+            "type": "enum",
+            "values": [
+              "green",
+              "yellow",
+              "orange",
+              "red"
+            ]
+          }
+        }
+      },
+      "r1-source-b.json": {
+        "fields": {
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-r1-source"
+            ]
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "source": {
+            "type": "enum",
+            "values": [
+              "b"
+            ]
+          }
+        },
+        "observed": {
+          "codename": {
+            "pattern": "[a-z0-9]{1,32}",
+            "type": "text"
+          },
+          "compatible_prefix": {
+            "pattern": "[a-z0-9,._-]{1,64}",
+            "type": "text"
+          },
+          "current_slot": {
+            "type": "enum",
+            "values": [
+              "a",
+              "b"
+            ]
+          },
+          "slot_suffix": {
+            "type": "enum",
+            "values": [
+              "_a",
+              "_b"
+            ]
+          },
+          "soc": {
+            "pattern": "[a-z0-9]{1,32}",
+            "type": "text"
+          },
+          "verified_boot_state": {
+            "type": "enum",
+            "values": [
+              "green",
+              "yellow",
+              "orange",
+              "red"
+            ]
+          }
+        }
+      },
+      "r2-partitions.json": {
+        "fields": {
+          "disk_lbas": {
+            "max": 281474976710656,
+            "min": 2,
+            "type": "int"
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-gpt-projection"
+            ]
+          },
+          "projection": {
+            "type": "enum",
+            "values": [
+              "synthetic-gpt-projection-v1"
+            ]
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "sector_bytes": {
+            "type": "int_enum",
+            "values": [
+              512,
+              4096
+            ]
+          }
+        },
+        "rows": {
+          "max": 128,
+          "min": 1,
+          "row": {
+            "first_lba": {
+              "max": 281474976710656,
+              "min": 1,
+              "type": "int"
+            },
+            "last_lba": {
+              "max": 281474976710656,
+              "min": 1,
+              "type": "int"
+            },
+            "name": {
+              "pattern": "[a-z0-9_]{1,36}",
+              "type": "text"
+            },
+            "simulated_bootable": {
+              "type": "bool"
+            }
+          },
+          "sorted_unique_by": "name",
+          "type": "rows"
+        },
+        "rows_field": "rows"
+      },
+      "r3-header-summaries.json": {
+        "fields": {
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-header-summaries"
+            ]
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          }
+        },
+        "rows": {
+          "max": 12,
+          "min": 1,
+          "row": {
+            "absent": {
+              "type": "bool"
+            },
+            "partition_name": {
+              "pattern": "(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?",
+              "type": "text"
+            }
+          },
+          "sorted_unique_by": "partition_name",
+          "type": "rows",
+          "variants": {
+            "cases": [
+              {
+                "constraints": [
+                  {
+                    "count": "segment_count",
+                    "lists": [
+                      "component_sizes",
+                      "component_offsets"
+                    ],
+                    "type": "list_lengths"
+                  }
+                ],
+                "fields": {
+                  "component_offsets": {
+                    "item": {
+                      "max": 4294967296,
+                      "min": 0,
+                      "type": "int"
+                    },
+                    "max": 0,
+                    "min": 0,
+                    "sorted_unique": false,
+                    "type": "list"
+                  },
+                  "component_sizes": {
+                    "item": {
+                      "max": 4294967296,
+                      "min": 0,
+                      "type": "int"
+                    },
+                    "max": 0,
+                    "min": 0,
+                    "sorted_unique": false,
+                    "type": "list"
+                  },
+                  "header_sha256": {
+                    "type": "null"
+                  },
+                  "header_version": {
+                    "type": "null"
+                  },
+                  "os_version": {
+                    "type": "null"
+                  },
+                  "page_size": {
+                    "type": "null"
+                  },
+                  "segment_count": {
+                    "max": 0,
+                    "min": 0,
+                    "type": "int"
+                  }
+                },
+                "when": true
+              },
+              {
+                "constraints": [
+                  {
+                    "count": "segment_count",
+                    "lists": [
+                      "component_sizes",
+                      "component_offsets"
+                    ],
+                    "type": "list_lengths"
+                  }
+                ],
+                "fields": {
+                  "component_offsets": {
+                    "item": {
+                      "max": 4294967296,
+                      "min": 0,
+                      "type": "int"
+                    },
+                    "max": 8,
+                    "min": 1,
+                    "sorted_unique": false,
+                    "type": "list"
+                  },
+                  "component_sizes": {
+                    "item": {
+                      "max": 4294967296,
+                      "min": 0,
+                      "type": "int"
+                    },
+                    "max": 8,
+                    "min": 1,
+                    "sorted_unique": false,
+                    "type": "list"
+                  },
+                  "header_sha256": {
+                    "pattern": "[0-9a-f]{64}",
+                    "type": "hash"
+                  },
+                  "header_version": {
+                    "max": 4,
+                    "min": 0,
+                    "type": "int"
+                  },
+                  "os_version": {
+                    "pattern": "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+                    "type": "text"
+                  },
+                  "page_size": {
+                    "type": "int_enum",
+                    "values": [
+                      2048,
+                      4096,
+                      8192,
+                      16384
+                    ]
+                  },
+                  "segment_count": {
+                    "max": 8,
+                    "min": 1,
+                    "type": "int"
+                  }
+                },
+                "when": false
+              }
+            ],
+            "discriminator": "absent"
+          }
+        },
+        "rows_field": "images"
+      },
+      "r4-selection.json": {
+        "fields": {
+          "compatible_prefix": {
+            "pattern": "[a-z0-9,._-]{1,64}",
+            "type": "text"
+          },
+          "dtb_count": {
+            "max": 64,
+            "min": 0,
+            "type": "int"
+          },
+          "dtbo_entry_count": {
+            "max": 256,
+            "min": 0,
+            "type": "int"
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-selection"
+            ]
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "selected_board_id": {
+            "of": {
+              "max": 4294967295,
+              "min": 0,
+              "type": "int"
+            },
+            "type": "nullable"
+          },
+          "selected_board_revision": {
+            "of": {
+              "max": 4294967295,
+              "min": 0,
+              "type": "int"
+            },
+            "type": "nullable"
+          },
+          "selection_source": {
+            "type": "enum",
+            "values": [
+              "bootconfig",
+              "device-tree",
+              "dtbo-header"
+            ]
+          }
+        }
+      },
+      "r6-filesystem.json": {
+        "fields": {
+          "allocation_unit_bytes": {
+            "type": "int_enum",
+            "values": [
+              512,
+              1024,
+              2048,
+              4096,
+              8192,
+              16384,
+              65536
+            ]
+          },
+          "block_count": {
+            "max": 1125899906842624,
+            "min": 1,
+            "type": "int"
+          },
+          "block_size": {
+            "type": "int_enum",
+            "values": [
+              1024,
+              2048,
+              4096,
+              8192,
+              16384,
+              65536
+            ]
+          },
+          "filesystem": {
+            "type": "enum",
+            "values": [
+              "ext4",
+              "f2fs",
+              "erofs",
+              "btrfs",
+              "xfs"
+            ]
+          },
+          "free_block_count": {
+            "max": 1125899906842624,
+            "min": 0,
+            "type": "int"
+          },
+          "gpt_name": {
+            "pattern": "[a-z0-9_]{1,36}",
+            "type": "text"
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-filesystem-statistics"
+            ]
+          },
+          "mount_options": {
+            "item": {
+              "type": "enum",
+              "values": [
+                "discard",
+                "errors=remount-ro",
+                "noatime",
+                "nodev",
+                "noexec",
+                "nosuid",
+                "relatime",
+                "ro",
+                "rw"
+              ]
+            },
+            "max": 16,
+            "min": 0,
+            "sorted_unique": false,
+            "type": "list"
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          }
+        }
+      },
+      "reads.json": {
+        "fields": {
+          "format_version": {
+            "type": "enum",
+            "values": [
+              "0.1.0"
+            ]
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-reads"
+            ]
+          },
+          "request_sha256": {
+            "pattern": "[0-9a-f]{64}",
+            "type": "hash"
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "session_contract_sha256": {
+            "pattern": "[0-9a-f]{64}",
+            "type": "hash"
+          },
+          "synthetic": {
+            "const": true,
+            "type": "bool"
+          }
+        },
+        "rows": {
+          "max": 11,
+          "min": 11,
+          "row": {
+            "bytes": {
+              "max": 524288,
+              "min": 0,
+              "type": "int"
+            },
+            "path": {
+              "type": "enum",
+              "values": [
+                "r1-source-a.json",
+                "r1-source-b.json",
+                "r2-partitions.json",
+                "r3-header-summaries.json",
+                "r4-selection.json",
+                "r5-modules.tsv",
+                "r6-filesystem.json",
+                "r7-bootconfig.txt",
+                "r7-cmdline.txt",
+                "r7-notes.bin",
+                "r7-release.txt"
+              ]
+            },
+            "sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            }
+          },
+          "sorted_unique_by": "path",
+          "type": "rows"
+        },
+        "rows_field": "files"
+      }
+    },
+    "text_limits": {
+      "max_modules": 256,
+      "max_partitions": 128,
+      "module_name": "[A-Za-z0-9_-]{1,56}",
+      "release": "[A-Za-z0-9._+-]{1,128}",
+      "taint_flags": "[A-Z]{0,8}"
+    },
+    "total_max_bytes": 4194304
+  },
+  "kind": "myron-synthetic-session-contract",
+  "kit_snapshot_reverified": false,
+  "limitations": [
+    "synthetic input adaptation only: the fixture bytes were never read from a phone",
+    "collector validation proves structure and cross-checks only, not that any value is true",
+    "R2 is a synthetic projection, not a GPT binary parse",
+    "R3 header values and the R4 selection are explicit claims, not parsed from image or device-tree bytes",
+    "R5 order is the fixture file order, not historical load chronology",
+    "R7 command line and bootconfig are deliberately narrow projections, not full parsers",
+    "bytes_read is fixture accounting only: it counts consumed fixture payload bytes",
+    "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
+    "the session contract pins the session implementation bytes; the collector implementation is bound only through the capture contract"
+  ],
+  "live": false,
+  "non_goals": [
+    "real acquisition from a device",
+    "live transport of any kind",
+    "hardware evidence",
+    "authorization of any read, deployment or boot",
+    "closing any blocker",
+    "device-format qualification: no GPT, Android boot image or device-tree parser is implemented"
+  ],
+  "output": {
+    "accounting": {
+      "bytes_read": "exact-consumed-fixture-payload-bytes",
+      "excludes": [
+        "reads.json",
+        "verification-rereads"
+      ],
+      "meaning": "fixture-accounting-only",
+      "operation_inputs": {
+        "R1-identity-and-slot": [
+          "r1-source-a.json",
+          "r1-source-b.json"
+        ],
+        "R2-gpt-and-recovery-inventory": [
+          "r2-partitions.json"
+        ],
+        "R3-boot-image-headers": [
+          "r3-header-summaries.json"
+        ],
+        "R4-dtb-dtbo-selection": [
+          "r4-selection.json"
+        ],
+        "R5-module-load-order": [
+          "r5-modules.tsv"
+        ],
+        "R6-storage-and-mount-model": [
+          "r6-filesystem.json"
+        ],
+        "R7-kernel-identity-revalidation": [
+          "r7-release.txt",
+          "r7-notes.bin",
+          "r7-cmdline.txt",
+          "r7-bootconfig.txt"
+        ]
+      }
+    },
+    "closure": {
+      "checksums": {
+        "covers": "every file except SHA256SUMS itself",
+        "path": "SHA256SUMS",
+        "sufficient_for_verification": false
+      },
+      "directories": [
+        "capture",
+        "capture/operations"
+      ],
+      "extra_entries": "reject",
+      "files": [
+        "SHA256SUMS",
+        "capture/capture.json",
+        "capture/operations/R1-identity-and-slot.json",
+        "capture/operations/R2-gpt-and-recovery-inventory.json",
+        "capture/operations/R3-boot-image-headers.json",
+        "capture/operations/R4-dtb-dtbo-selection.json",
+        "capture/operations/R5-module-load-order.json",
+        "capture/operations/R6-storage-and-mount-model.json",
+        "capture/operations/R7-kernel-identity-revalidation.json",
+        "manifest.json",
+        "rehearsal.json"
+      ]
+    },
+    "deterministic": true,
+    "kind": "myron-synthetic-rehearsal",
+    "manifest_kind": "myron-synthetic-rehearsal-manifest",
+    "published": "atomic-no-replace",
+    "verification": "recompute-from-request-and-reads-byte-for-byte"
+  },
+  "pinned_versions": {
+    "collector": "0.1.0",
+    "deployment": "0.4.0",
+    "preflight": "0.2.1",
+    "snapshot": "0.2.0"
+  },
+  "registry": {
+    "operations": [
+      {
+        "derivations": [
+          "each source record holds a non-empty subset of the six observed facts",
+          "the facts both records hold are compared; any difference rejects the rehearsal",
+          "sources_agree is derived from that comparison and is never read from input",
+          "the two records must together cover every fact; nothing is filled from the contract"
+        ],
+        "id": "R1-identity-and-slot",
+        "inputs": [
+          "r1-source-a.json",
+          "r1-source-b.json"
+        ],
+        "parser": "synthetic-two-source-compare-v1"
+      },
+      {
+        "derivations": [
+          "size_bytes = (last_lba - first_lba + 1) * sector_bytes",
+          "slot_suffix is the name's _a or _b ending, else empty",
+          "recovery_present is true when a name matches recovery, recovery_a or recovery_b",
+          "rows are kept in first_lba order for the overlap check, then emitted sorted by name",
+          "simulated_bootable is copied to bootable_flag; no flag is inferred"
+        ],
+        "id": "R2-gpt-and-recovery-inventory",
+        "inputs": [
+          "r2-partitions.json"
+        ],
+        "parser": "synthetic-gpt-projection-v1"
+      },
+      {
+        "derivations": [
+          "rows are explicit synthetic header summaries copied as supplied",
+          "header_sha256 is an unverified fixture claim, never recomputed",
+          "every R2 partition that names a boot image needs a present row; no row is inferred",
+          "an absent row is only accepted where R2 lacks the partition"
+        ],
+        "id": "R3-boot-image-headers",
+        "inputs": [
+          "r3-header-summaries.json"
+        ],
+        "parser": "synthetic-header-summaries-v1"
+      },
+      {
+        "derivations": [
+          "the record is copied field by field; no selection is inferred",
+          "the board id and revision are both set or both null"
+        ],
+        "id": "R4-dtb-dtbo-selection",
+        "inputs": [
+          "r4-selection.json"
+        ],
+        "parser": "synthetic-selection-record-v1"
+      },
+      {
+        "derivations": [
+          "each line is module name, a tab, then the taint flags; file order is kept",
+          "load_order_index is the line position and is not historical load chronology",
+          "names repeat if equal after hyphen and underscore are treated as one",
+          "order_matches_declared compares the declared module order with the file order"
+        ],
+        "id": "R5-module-load-order",
+        "inputs": [
+          "r5-modules.tsv"
+        ],
+        "parser": "module-name-taint-tsv-v1"
+      },
+      {
+        "derivations": [
+          "rounded_total_bytes = floor(block_count * allocation_unit_bytes / 1 MiB) * 1 MiB",
+          "rounded_free_bytes = floor(free_block_count * allocation_unit_bytes / 1 MiB) * 1 MiB",
+          "free_block_count is the free-block count (f_bfree), not the unprivileged count",
+          "allocation_unit_bytes divides block_size and is at most block_size",
+          "ro and rw together reject; mount options are emitted sorted"
+        ],
+        "id": "R6-storage-and-mount-model",
+        "inputs": [
+          "r6-filesystem.json"
+        ],
+        "parser": "synthetic-filesystem-statistics-v1"
+      },
+      {
+        "derivations": [
+          "kernel_release is the single bounded release line",
+          "notes_sha256 is the SHA-256 of the bounded notes bytes; the bytes are not kept",
+          "the command line is space-separated key=value or flag tokens, no quoting",
+          "the bootconfig is one key=value per line, no quoting, comments or nesting",
+          "only keys and values the request lists are accepted; nothing else is filtered out"
+        ],
+        "id": "R7-kernel-identity-revalidation",
+        "inputs": [
+          "r7-release.txt",
+          "r7-notes.bin",
+          "r7-cmdline.txt",
+          "r7-bootconfig.txt"
+        ],
+        "parser": "release-notes-cmdline-bootconfig-v1"
+      }
+    ]
+  },
+  "remote_commands": [],
+  "schema": 1,
+  "status": "synthetic-rehearsal-recorded",
+  "synthetic": true,
+  "transport": "synthetic-adapter-rehearsal"
+}

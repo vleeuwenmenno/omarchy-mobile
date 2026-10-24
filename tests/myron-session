@@ -1,0 +1,1748 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the Myron synthetic adapter rehearsal (Phase 2.13). Everything
+# here is synthetic: no phone, no network, no process, no real acquisition.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+impl=tools/lib/myron-session-impl.py
+python3 -m py_compile tools/myron-session "$impl" || fail "tool parses"
+for f in tools/myron-session "$impl"; do
+  grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http|ctypes|ssl|requests|zipfile|tarfile|gzip|zlib|lzma|bz2|pty|signal)|os\.(system|popen|exec|spawn|fork)|posix_spawn' "$f" \
+    && fail "$f references process, network, archive, or broad-copy facilities"
+  grep -Eqi '\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b' "$f" \
+    && fail "$f names a live transport command"
+done
+grep -q 'synthetic-adapter-rehearsal' "$impl" || fail "tool lacks the synthetic transport"
+[[ $(wc -l < tools/myron-session) -le 90 ]] || fail "the trusted loader grew past 90 lines"
+pass "loader and implementation parse and have no process, network, archive, or live-transport facility"
+
+tools/myron-session show > "$tmp/show.json" || fail "repository session contract failed"
+python3 - "$tmp/show.json" <<'PY' || exit 1
+import hashlib, json, sys
+value = json.load(open(sys.argv[1]))
+assert value["kind"] == "myron-synthetic-session-contract"
+assert value["format_version"] == "0.1.0"
+assert value["pinned_versions"] == {
+    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0",
+}
+assert value["dependencies"]["trust"] == "trusted-version-pinned-imports"
+assert value["dependencies"]["byte_pinned"] is False
+assert value["synthetic"] is True and value["live"] is False and value["executes"] is False
+assert value["kit_snapshot_reverified"] is False and value["remote_commands"] == []
+assert len(value["blockers"]) == 7
+assert len(value["authority"]) == 9 and all(v is False for v in value["authority"].values())
+for name, path in (("preflight_contract", "device/myron/preflight-contract.json"),
+                   ("capture_contract", "device/myron/capture-contract.json")):
+    pinned = value["components"][name]
+    assert pinned["path"] == path
+    assert pinned["sha256"] == hashlib.sha256(open(path, "rb").read()).hexdigest(), name
+for name in ("preflight-contract", "capture-contract", "deployment-contract", "snapshot-contract"):
+    assert "session-contract" not in open(f"device/myron/{name}.json").read(), "pins are one-way"
+impl = value["implementation"]
+assert impl["path"] == "tools/lib/myron-session-impl.py"
+assert impl["sha256"] == hashlib.sha256(open(impl["path"], "rb").read()).hexdigest()
+PY
+pass "repository contract is canonical, one-way pinned, synthetic, and authorizes nothing"
+
+mkdir "$tmp/fixture"
+MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
+  || { cat "$tmp/snapshot-suite.log" >&2; fail "snapshot fixture export"; }
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+S = load("session_tool_test", repo / "tools/myron-session")
+C = S.collect()
+CT = load("collect_tool_for_session_test", repo / "tools/myron-collect")
+P = C.preflight()
+D = P.deploy()
+K = D.kernel()
+paths = {key: Path(value) for key, value in json.loads(
+    (work / "fixture/paths.json").read_text()
+).items()}
+contracts_root = paths["contracts_root"]
+contracts = D.load_contracts(contracts_root)
+_, _, snapshot_sha = P.snapshot().load_snapshot_contract(contracts_root, contracts)
+preflight_bytes = D.render_json(P.expected_preflight_contract(contracts, snapshot_sha))
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).parent.mkdir(parents=True, exist_ok=True)
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes)
+capture_contract_bytes = D.render_json(
+    C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts)
+)
+(contracts_root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes)
+collector_env = C.load_environment(contracts_root)
+session_contract = S.expected_session_contract(collector_env)
+session_contract_bytes = D.render_json(session_contract)
+(contracts_root / S.SESSION_CONTRACT_PATH).write_bytes(session_contract_bytes)
+env = S.load_environment(contracts_root)
+SC = env.contract_sha256
+assert SC == hashlib.sha256(session_contract_bytes).hexdigest()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+counter = [0]
+
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{name}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+def invoke(*arguments, root=None):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = S.main([str(value) for value in arguments], contracts_root=root or contracts_root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def expect_ok(*arguments, **kwargs):
+    code, out, err = invoke(*arguments, **kwargs)
+    assert code == 0, (arguments, err)
+    return json.loads(out), out
+
+
+def expect_fail(name, arguments, *outputs, match=None, absent=(), **kwargs):
+    code, out, err = invoke(*arguments, **kwargs)
+    assert code != 0, f"{name}: accepted\n{out}"
+    if match is not None:
+        assert match in err, f"{name}: expected {match!r}, got {err!r}"
+    for text in absent:
+        assert text not in err and text not in out, f"{name}: diagnostics echo {text!r}: {err}"
+    for output in outputs:
+        assert not os.path.lexists(output), f"{name}: left output {output}"
+    ok(f"{name} is rejected")
+    return err
+
+
+def walk(path):
+    descriptor = D.open_canonical_dir(str(path), "test tree")
+    try:
+        tree = D.walk_tree(descriptor, D.STAGE_LIMITS, allow_symlinks=False, keep_data=True)
+    finally:
+        os.close(descriptor)
+    return tree.entries, tree.data
+
+
+def with_patch(owner, attribute, replacement, run):
+    original = getattr(owner, attribute)
+    setattr(owner, attribute, replacement(original))
+    try:
+        return run()
+    finally:
+        setattr(owner, attribute, original)
+
+
+def no_leftovers(label):
+    leftovers = [p.name for p in work.iterdir() if ".tmp-" in p.name]
+    assert not leftovers, (label, leftovers)
+
+
+# A real preflight request, built by the pinned preflight tool, is the only request input.
+request = work / "request"
+with contextlib.redirect_stdout(io.StringIO()):
+    code = P.main(
+        ["assess", "--kit", str(paths["kit"]), "--snapshot", str(paths["snapshot"]),
+         "--rootfs-stage", str(paths["rootfs"]), "--rootfs-manifest", str(paths["manifest"]),
+         "--assets", str(paths["archive"]), "--runtime-assets", "none",
+         "--vmlinux-symvers", "none", "--module-symvers", "none", "--out", str(request)],
+        contracts_root=contracts_root,
+    )
+assert code == 0
+request_sha256 = digest((request / "SHA256SUMS").read_bytes())
+request_document = json.loads((request / "request.json").read_text())
+READS = request_document["requested_reads"]
+OPERATION_IDS = [row["id"] for row in READS]
+assert OPERATION_IDS == S.OPERATION_IDS
+R1, R2, R3, R4, R5, R6, R7 = OPERATION_IDS
+
+# --- a coherent, test-only synthetic kernel and device -----------------------------
+
+RELEASE = contracts.reference["kernel"]["release"]
+NOTES = b"snapshot-test-notes\n"  # the synthetic kernel contract's notes are these bytes
+assert digest(NOTES) == contracts.reference["kernel"]["notes_sha256"]
+assert RELEASE == "snapshot-test-release"
+SECTOR = 4096
+LAYOUT = [  # (name, sectors, simulated bootable), in LBA order
+    ("boot_a", 24576, True), ("vendor_boot_a", 24576, False), ("pmos_root", 10485760, False),
+    ("dtbo_a", 6144, False), ("recovery_a", 25600, False), ("boot_b", 24576, False),
+    ("init_boot_a", 2048, False),
+]
+
+
+def gpt_rows(layout=LAYOUT, start=6, gap=2):
+    rows, lba = [], start
+    for name, sectors, bootable in layout:
+        rows.append({"name": name, "first_lba": lba, "last_lba": lba + sectors - 1,
+                     "simulated_bootable": bootable})
+        lba += sectors + gap
+    return rows, lba
+
+
+ROWS, END_LBA = gpt_rows()
+DISK_LBAS = END_LBA + 1000
+
+
+def header_row(name, absent):
+    if absent:
+        return {"partition_name": name, "absent": True, "header_version": None, "page_size": None,
+                "os_version": None, "component_sizes": [], "component_offsets": [],
+                "segment_count": 0, "header_sha256": None}
+    return {"partition_name": name, "absent": False, "header_version": 4, "page_size": 4096,
+            "os_version": "16.0.0", "component_sizes": [4096, 8192],
+            "component_offsets": [4096, 8192], "segment_count": 2,
+            "header_sha256": digest(name.encode())}
+
+
+MODULES = [("pwrseq_core", ""), ("bluetooth", ""), ("extra_mod", "O"), ("btbcm", ""),
+           ("btqca", ""), ("hci_uart", ""), ("rfkill", ""), ("rmnet", "")]
+CMDLINE = b"bootconfig androidboot.slot_suffix=_a\n"
+BOOTCONFIG = b"androidboot.hardware=myron\nandroidboot.verifiedbootstate=orange\n"
+
+
+def jbytes(value):
+    return D.render_json(value)
+
+
+def good_files():
+    return {
+        "r1-source-a.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-r1-source", "source": "a",
+            "observed": {"codename": "myron", "soc": "sm8850", "compatible_prefix": "qcom,canoe-mtp",
+                         "current_slot": "a", "slot_suffix": "_a"}}),
+        "r1-source-b.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-r1-source", "source": "b",
+            "observed": {"compatible_prefix": "qcom,canoe-mtp", "current_slot": "a",
+                         "slot_suffix": "_a", "verified_boot_state": "orange"}}),
+        "r2-partitions.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-gpt-projection",
+            "projection": "synthetic-gpt-projection-v1", "sector_bytes": SECTOR,
+            "disk_lbas": DISK_LBAS, "rows": copy.deepcopy(ROWS)}),
+        "r3-header-summaries.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-header-summaries",
+            "images": [header_row(n, a) for n, a in (
+                ("boot_a", False), ("boot_b", False), ("dtbo_a", False), ("init_boot_a", False),
+                ("recovery_a", False), ("vendor_boot_a", False), ("vendor_kernel_boot_a", True))]}),
+        "r4-selection.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-selection", "compatible_prefix": "qcom,canoe-mtp",
+            "dtb_count": 2, "dtbo_entry_count": 3, "selected_board_id": 7,
+            "selected_board_revision": 1, "selection_source": "bootconfig"}),
+        "r5-modules.tsv": "".join(f"{name}\t{taint}\n" for name, taint in MODULES).encode(),
+        "r6-filesystem.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-filesystem-statistics", "gpt_name": "pmos_root",
+            "filesystem": "ext4", "mount_options": ["rw", "noatime"], "block_size": 4096,
+            "allocation_unit_bytes": 4096, "block_count": 10485760, "free_block_count": 5242880}),
+        "r7-release.txt": (RELEASE + "\n").encode(),
+        "r7-notes.bin": NOTES,
+        "r7-cmdline.txt": CMDLINE,
+        "r7-bootconfig.txt": BOOTCONFIG,
+    }
+
+
+def manifest_document(files, req_sha=None, **overrides):
+    value = {
+        "schema": 1, "kind": S.READS_KIND, "format_version": "0.1.0",
+        "session_contract_sha256": SC, "request_sha256": req_sha or request_sha256,
+        "synthetic": True,
+        "files": [{"path": name, "bytes": len(files[name]), "sha256": digest(files[name])}
+                  for name in sorted(files)],
+    }
+    value.update(overrides)
+    return value
+
+
+def write_reads(path, edits=None, drop=(), manifest_edit=None, manifest_raw=None, req_sha=None,
+                keep_manifest_rows=False):
+    """Write the flat closure; EDITS replace file bytes and the manifest is regenerated."""
+    files = good_files()
+    original = copy.deepcopy(files)
+    for name, data in (edits or {}).items():
+        files[name] = data
+    path.mkdir(parents=True)
+    manifest_files = original if keep_manifest_rows else files
+    manifest = manifest_document(manifest_files, req_sha)
+    if manifest_edit:
+        manifest_edit(manifest)
+    raw = manifest_raw if manifest_raw is not None else jbytes(manifest)
+    for name, data in {**files, "reads.json": raw}.items():
+        if name in drop:
+            continue
+        (path / name).write_bytes(data)
+        (path / name).chmod(0o644)
+    path.chmod(0o755)
+    return files
+
+
+reads = fresh("reads") / "reads"
+FILES = write_reads(reads)
+args = lambda **extra: ["--request", request, "--reads", reads,
+                        *sum(([f"--{k}", v] for k, v in extra.items()), [])]
+
+# The expected capture, derived here independently of the implementation.
+EXPECTED = {
+    R1: {"codename": "myron", "soc": "sm8850", "compatible_prefix": "qcom,canoe-mtp",
+         "current_slot": "a", "slot_suffix": "_a", "verified_boot_state": "orange",
+         "sources_agree": True},
+    R2: {"partitions": sorted((
+        {"partition_name": n, "size_bytes": s * SECTOR, "bootable_flag": b,
+         "slot_suffix": n[-2:] if n.endswith(("_a", "_b")) else ""} for n, s, b in LAYOUT),
+        key=lambda row: row["partition_name"]), "recovery_present": True},
+    R3: {"images": [header_row(n, a) for n, a in (
+        ("boot_a", False), ("boot_b", False), ("dtbo_a", False), ("init_boot_a", False),
+        ("recovery_a", False), ("vendor_boot_a", False), ("vendor_kernel_boot_a", True))]},
+    R4: {"dtb_count": 2, "selected_board_id": 7, "selected_board_revision": 1,
+         "dtbo_entry_count": 3, "compatible_prefix": "qcom,canoe-mtp",
+         "selection_source": "bootconfig"},
+    R5: {"module_names": [n for n, _ in MODULES], "load_order_index": list(range(8)),
+         "taint_flags": [t for _, t in MODULES], "order_matches_declared": True},
+    R6: {"root_source_gpt_name": "pmos_root", "filesystem_type": "ext4",
+         "mount_options": ["noatime", "rw"], "block_size": 4096,
+         "rounded_total_bytes": 42949672960, "rounded_free_bytes": 21474836480},
+    R7: {"kernel_release": RELEASE, "notes_sha256": digest(NOTES),
+         "allowlisted_cmdline": [{"key": "androidboot.slot_suffix", "value": "_a"},
+                                 {"key": "bootconfig", "value": "present"}],
+         "allowlisted_bootconfig_keys": [{"key": "androidboot.hardware", "value": "myron"},
+                                         {"key": "androidboot.verifiedbootstate", "value": "orange"}]},
+}
+BYTES_READ = {
+    R1: len(FILES["r1-source-a.json"]) + len(FILES["r1-source-b.json"]),
+    R2: len(FILES["r2-partitions.json"]), R3: len(FILES["r3-header-summaries.json"]),
+    R4: len(FILES["r4-selection.json"]), R5: len(FILES["r5-modules.tsv"]),
+    R6: len(FILES["r6-filesystem.json"]),
+    R7: len(RELEASE) + 1 + len(NOTES) + len(CMDLINE) + len(BOOTCONFIG),
+}
+
+# --- contract -----------------------------------------------------------------
+
+contract = json.loads(session_contract_bytes)
+assert contract["components"]["capture_contract"] == {
+    "path": C.CAPTURE_CONTRACT_PATH, "sha256": digest(capture_contract_bytes)}
+assert contract["components"]["preflight_contract"] == {
+    "path": C.PREFLIGHT_CONTRACT_PATH, "sha256": digest(preflight_bytes)}
+assert contract["bound_contracts"]["deployment_contract"]["sha256"] == contracts.deployment_sha256
+assert contract["bound_contracts"]["kernel_reference"]["sha256"] == contracts.reference_sha256
+assert contract["bound_contracts"]["snapshot_contract"]["sha256"] == snapshot_sha
+assert contract["pinned_versions"] == {
+    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0"}
+assert contract["dependencies"]["trust"] == "trusted-version-pinned-imports"
+assert contract["dependencies"]["byte_pinned"] is False
+assert "not pinned" in contract["dependencies"]["note"]
+assert contract["implementation"] == S.implementation_binding()
+assert contract["implementation"]["sha256"] == digest((repo / "tools/lib/myron-session-impl.py").read_bytes())
+assert contract["transport"] == "synthetic-adapter-rehearsal"
+assert contract["synthetic"] is True and contract["live"] is False and contract["executes"] is False
+assert contract["kit_snapshot_reverified"] is False and contract["remote_commands"] == []
+assert contract["human_approval_required"] is True
+assert contract["blockers"] == D.BLOCKERS
+assert contract["authority"] == {flag: False for flag in P.AUTHORITY_FLAGS}
+assert len(contract["authority"]) == 9
+assert contract["coverage"]["classes"] == ["parsed-bytes", "synthetic-projection",
+                                            "unverified-source-claim"]
+assert contract["input"]["closure"] == sorted([
+    "reads.json", "r1-source-a.json", "r1-source-b.json", "r2-partitions.json",
+    "r3-header-summaries.json", "r4-selection.json", "r5-modules.tsv", "r6-filesystem.json",
+    "r7-release.txt", "r7-notes.bin", "r7-cmdline.txt", "r7-bootconfig.txt"])
+assert contract["input"]["total_max_bytes"] == 4 * 1024 * 1024
+assert contract["input"]["manifest"]["max_bytes"] == 64 * 1024
+assert contract["input"]["json_depth_max"] == 8 and contract["input"]["layout"] == "flat"
+assert contract["input"]["closure_checked_before_payload_read"] is True
+assert contract["input"]["parser_selection"] == "fixed-registry-only"
+assert contract["output"]["closure"]["files"] == sorted([
+    "SHA256SUMS", "manifest.json", "rehearsal.json", "capture/capture.json",
+    *(f"capture/operations/{i}.json" for i in OPERATION_IDS)])
+assert contract["output"]["closure"]["checksums"]["sufficient_for_verification"] is False
+assert contract["output"]["accounting"]["meaning"] == "fixture-accounting-only"
+assert contract["output"]["accounting"]["bytes_read"] == "exact-consumed-fixture-payload-bytes"
+assert contract["capture"]["unchanged_for_collector"] is True
+assert contract["identity"] == C.identity_values(contracts)
+assert any("byte-pinned" in text for text in contract["limitations"])
+assert any("GPT" in text for text in contract["non_goals"])
+assert not re.search(r"\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b", session_contract_bytes.decode())
+shown, shown_text = expect_ok("show")
+assert shown == contract and shown_text.encode() == json.dumps(contract, indent=2, sort_keys=True).encode() + b"\n"
+ok("session contract binds the pins, registry, closure, coverage, limits and every false authority")
+
+
+def clone_root(name):
+    target = fresh(name) / "root"
+    shutil.copytree(contracts_root, target)
+    return target
+
+
+def contract_tamper(name, mutate, match="differs from its derived form"):
+    root = clone_root("contract-tamper")
+    value = json.loads(session_contract_bytes)
+    mutate(value)
+    (root / S.SESSION_CONTRACT_PATH).write_bytes(D.render_json(value))
+    expect_fail(name, ["show"], root=root, match=match)
+
+
+contract_tamper("contract without a pin", lambda v: v["components"].pop("capture_contract"))
+contract_tamper("contract capture hash", lambda v: v["components"]["capture_contract"].update(sha256="0" * 64))
+contract_tamper("contract preflight hash", lambda v: v["components"]["preflight_contract"].update(sha256="0" * 64))
+contract_tamper("contract bound deployment hash", lambda v: v["bound_contracts"]["deployment_contract"].update(sha256="0" * 64))
+contract_tamper("contract version pin", lambda v: v["pinned_versions"].update(collector="0.2.0"))
+contract_tamper("contract dependencies claim byte pin", lambda v: v["dependencies"].update(byte_pinned=True))
+contract_tamper("contract dependency trust label", lambda v: v["dependencies"].update(trust="byte-pinned"))
+contract_tamper("contract implementation hash", lambda v: v["implementation"].update(sha256="0" * 64))
+contract_tamper("contract live claim", lambda v: v.update(live=True))
+contract_tamper("contract execution claim", lambda v: v.update(executes=True))
+contract_tamper("contract synthetic dropped", lambda v: v.update(synthetic=False))
+contract_tamper("contract remote command", lambda v: v["remote_commands"].append("x"))
+contract_tamper("contract kit reverification", lambda v: v.update(kit_snapshot_reverified=True))
+contract_tamper("contract authority", lambda v: v["authority"].update(bootable=True))
+contract_tamper("contract blocker dropped", lambda v: v["blockers"].pop())
+contract_tamper("contract closure widened", lambda v: v["input"]["closure"].append("extra.json"))
+contract_tamper("contract file bound widened", lambda v: v["input"]["files"][2].update(max_bytes=2**30))
+contract_tamper("contract schema widened", lambda v: v["input"]["schemas"]["r6-filesystem.json"][
+    "fields"]["filesystem"]["values"].append("ntfs"))
+contract_tamper("contract coverage class changed", lambda v: v["coverage"]["fields"][0].update(
+    classification="parsed-bytes"))
+contract_tamper("contract unresolved claim dropped", lambda v: v["coverage"]["unresolved_claims"].pop())
+contract_tamper("contract output closure", lambda v: v["output"]["closure"]["files"].pop())
+contract_tamper("contract accounting meaning", lambda v: v["output"]["accounting"].update(meaning="hardware-read"))
+contract_tamper("contract limitations dropped", lambda v: v["limitations"].pop())
+contract_tamper("contract non-goal dropped", lambda v: v["non_goals"].pop())
+contract_tamper("contract parser registry", lambda v: v["registry"]["operations"][0].update(parser="other"))
+root = clone_root("contract-noncanonical")
+(root / S.SESSION_CONTRACT_PATH).write_bytes(json.dumps(session_contract).encode())
+expect_fail("non-canonical contract", ["show"], root=root)
+root = clone_root("contract-missing")
+(root / S.SESSION_CONTRACT_PATH).unlink()
+expect_fail("missing contract", ["show"], root=root)
+root = clone_root("capture-contract-changed")
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes + b" ")
+expect_fail("capture contract changed under the pin", ["show"], root=root)
+root = clone_root("preflight-contract-changed")
+(root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes + b" ")
+expect_fail("preflight contract changed under the pin", ["show"], root=root)
+ok("contract tampering and changed pinned contracts fail closed")
+
+# --- plan ---------------------------------------------------------------------
+
+plan_a, plan_text = expect_ok("plan", "--request", request)
+_, plan_text_b = expect_ok("plan", "--request", request)
+assert plan_text == plan_text_b and plan_text.encode("ascii") == D.render_json(plan_a)
+assert plan_a["request_sha256"] == request_sha256 and plan_a["session_contract_sha256"] == SC
+assert plan_a["synthetic"] is True and plan_a["live"] is False and plan_a["executes"] is False
+assert plan_a["remote_commands"] == [] and plan_a["blockers"] == D.BLOCKERS
+assert plan_a["implementation"] == S.implementation_binding()
+assert [row["id"] for row in plan_a["operations"]] == OPERATION_IDS
+assert plan_a["input_closure"]["total_max_bytes"] == 4 * 1024 * 1024
+assert plan_a["output_closure"] == contract["output"]["closure"]
+assert not re.search(r"\b(adb|fastboot|ssh|scp|rsync|curl|wget|sudo|bash|chmod)\b", plan_text)
+assert "$(" not in plan_text and "export " not in plan_text and "<<" not in plan_text
+for needle in ("/proc", "/sys", "/dev", "targets", "pmos_root", "sm8850", "qcom,canoe"):
+    assert needle not in plan_text, needle
+
+
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in list(value) + list(value.values()):
+            yield from strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
+
+
+assert not any(text.startswith("/") for text in strings(plan_a)), "no absolute path in the plan"
+plan_file = work / "plan.json"
+plan_file.write_text(plan_text)
+verified_plan, _ = expect_ok("verify-plan", "--request", request, "--plan", plan_file)
+assert verified_plan["status"] == "verified" and verified_plan["synthetic"] is True
+
+
+def plan_tamper(name, mutate):
+    value = json.loads(plan_text)
+    mutate(value)
+    path = fresh("plan-tamper") / "plan.json"
+    path.write_bytes(D.render_json(value))
+    expect_fail(name, ["verify-plan", "--request", request, "--plan", path],
+                match="session plan differs from the request")
+
+
+plan_tamper("plan live claim", lambda v: v.update(live=True))
+plan_tamper("plan synthetic claim", lambda v: v.update(synthetic=False))
+plan_tamper("plan remote command", lambda v: v["remote_commands"].append("x"))
+plan_tamper("plan closure widened", lambda v: v["input_closure"]["files"].pop())
+plan_tamper("plan bound widened", lambda v: v["input_closure"]["files"][0].update(max_bytes=1 << 30))
+plan_tamper("plan parser changed", lambda v: v["operations"][1].update(parser="other"))
+plan_tamper("plan coverage", lambda v: v["coverage"].pop())
+plan_tamper("plan authority", lambda v: v["authority"].update(flashable=True))
+plan_tamper("plan implementation hash", lambda v: v["implementation"].update(sha256="0" * 64))
+plan_tamper("plan request binding", lambda v: v.update(request_sha256="0" * 64))
+plan_tamper("plan contract binding", lambda v: v.update(session_contract_sha256="0" * 64))
+noncanonical = work / "noncanonical-plan.json"
+noncanonical.write_text(json.dumps(plan_a))
+expect_fail("non-canonical plan", ["verify-plan", "--request", request, "--plan", noncanonical])
+for levels in (S.PLAN_DEPTH + 1, 300):
+    deep = fresh("deep-plan") / "plan.json"
+    deep.write_bytes(b'{"data": ' + b"[" * levels + b"]" * levels + b"}")
+    expect_fail(f"plan nested {levels} deep", ["verify-plan", "--request", request, "--plan", deep],
+                match="nests too deeply")
+ok("plan is deterministic, canonical, value-free, command-free and recomputed by verify-plan")
+
+# --- rehearse: end to end -------------------------------------------------------
+
+rehearsal_a = work / "rehearsal-a"
+rehearsal_b = work / "rehearsal-b"
+result, result_text = expect_ok("rehearse", *args(), "--out", rehearsal_a)
+expect_ok("rehearse", *args(), "--out", rehearsal_b)
+assert walk(rehearsal_a) == walk(rehearsal_b), "repeat rehearsals are byte-identical"
+entries, data = walk(rehearsal_a)
+assert sorted(e.path for e in entries if e.kind == "file") == sorted(
+    ["SHA256SUMS", "manifest.json", "rehearsal.json", "capture/capture.json",
+     *(f"capture/operations/{i}.json" for i in OPERATION_IDS)])
+assert {e.path for e in entries if e.kind == "dir"} == {".", "capture", "capture/operations"}
+assert all(e.mode == 0o644 for e in entries if e.kind == "file")
+assert data["SHA256SUMS"] == "".join(
+    f"{digest(data[p])}  {p}\n" for p in sorted(data) if p != "SHA256SUMS").encode()
+assert result["status"] == "rehearsed" and result["synthetic"] is True
+assert result["live"] is False and result["executes"] is False and result["kit_snapshot_reverified"] is False
+assert all(result[flag] is False for flag in P.AUTHORITY_FLAGS)
+assert result["rehearsal_sha256"] == digest(data["SHA256SUMS"]) and result["blocker_count"] == 7
+assert result["reads_sha256"] == digest((reads / "reads.json").read_bytes())
+assert "$(" not in result_text and "export " not in result_text
+
+for operation in OPERATION_IDS:
+    document = json.loads(data[f"capture/operations/{operation}.json"])
+    assert document == {
+        "schema": 1, "kind": C.OPERATION_KIND, "id": operation, "request_sha256": request_sha256,
+        "transport": C.TRANSPORT, "read_only": True, "bytes_read": BYTES_READ[operation],
+        "data": EXPECTED[operation]}, operation
+    assert data[f"capture/operations/{operation}.json"] == D.render_json(document)
+rehearsal = json.loads(data["rehearsal.json"])
+manifest = json.loads(data["manifest.json"])
+assert rehearsal["synthetic"] is True and rehearsal["live"] is False and rehearsal["executes"] is False
+assert rehearsal["kit_snapshot_reverified"] is False and rehearsal["remote_commands"] == []
+assert rehearsal["evidence_level"] == "synthetic-adapter-rehearsal-only"
+assert rehearsal["transport"] == "synthetic-adapter-rehearsal"
+assert rehearsal["authority"] == {flag: False for flag in P.AUTHORITY_FLAGS}
+assert [row["blocker"] for row in rehearsal["blockers"]] == D.BLOCKERS
+assert all(row["state"] == "missing" for row in rehearsal["blockers"])
+assert rehearsal["session_contract_sha256"] == SC and rehearsal["request_sha256"] == request_sha256
+assert rehearsal["capture_contract_sha256"] == digest(capture_contract_bytes)
+assert rehearsal["preflight_contract_sha256"] == digest(preflight_bytes)
+assert rehearsal["reads_sha256"] == digest((reads / "reads.json").read_bytes())
+assert manifest["session_contract_sha256"] == SC and manifest["reads_sha256"] == rehearsal["reads_sha256"]
+assert manifest["synthetic"] is True and manifest["live"] is False
+assert [row["path"] for row in manifest["files"]] == sorted(
+    p for p in data if p not in ("SHA256SUMS", "manifest.json"))
+assert [row["bytes_read"] for row in rehearsal["operations"]] == [BYTES_READ[i] for i in OPERATION_IDS]
+assert rehearsal["accounting"]["meaning"] == "fixture-accounting-only"
+assert rehearsal["accounting"]["total_fixture_payload_bytes"] == sum(len(v) for v in FILES.values())
+assert "reads.json" in rehearsal["accounting"]["excludes"]
+classes = {(row["operation"], row["field"]): row["classification"] for row in rehearsal["coverage"]}
+assert classes[(R3, "images.header_sha256")] == "unverified-source-claim"
+assert classes[(R7, "notes_sha256")] == "parsed-bytes" and classes[(R5, "module_names")] == "parsed-bytes"
+assert classes[(R2, "partitions.size_bytes")] == "synthetic-projection"
+assert {(row["operation"], row["field"]) for row in rehearsal["unresolved_claims"]} == {
+    key for key, value in classes.items() if value == "unverified-source-claim"}
+assert {(R3, "images.header_sha256"), (R2, "partitions.bootable_flag")} <= {
+    (row["operation"], row["field"]) for row in rehearsal["unresolved_claims"]}
+assert rehearsal["limitations"] == contract["limitations"] and rehearsal["non_goals"] == contract["non_goals"]
+assert rehearsal["dependencies"] == {"trust": "trusted-version-pinned-imports", "byte_pinned": False}
+verified, _ = expect_ok("verify-rehearsal", *args(), "--rehearsal", rehearsal_a)
+assert verified["status"] == "verified" and verified["blocker_count"] == 7
+assert verified["rehearsal_sha256"] == result["rehearsal_sha256"]
+ok("rehearse is deterministic, exact outer closure, coherent, synthetic and every blocker missing")
+
+# Unchanged myron-collect consumes the preserved capture fixture.
+collect_out = work / "collector-evidence"
+out_buf, err_buf = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+    code = CT.main(["collect", "--request", str(request), "--capture", str(rehearsal_a / "capture"),
+                    "--out", str(collect_out)], contracts_root=contracts_root)
+assert code == 0, err_buf.getvalue()
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_buf):
+    code = CT.main(["verify-evidence", "--request", str(request),
+                    "--capture", str(rehearsal_a / "capture"),
+                    "--evidence", str(collect_out)], contracts_root=contracts_root)
+assert code == 0, err_buf.getvalue()
+evidence = json.loads(walk(collect_out)[1]["evidence.json"])
+for row in evidence["operations"]:
+    assert row["data"] == EXPECTED[row["id"]], row["id"]
+    assert row["bytes_read"] == BYTES_READ[row["id"]]
+assert evidence["evidence_level"] == "artifact-structure-only" and evidence["live"] is False
+capture_files = {p[len("capture/"):]: d for p, d in data.items() if p.startswith("capture/")}
+assert capture_files["capture.json"] == (rehearsal_a / "capture/capture.json").read_bytes()
+assert json.loads(capture_files["capture.json"]) == C.manifest_document(
+    collector_env, request_sha256, request_document, capture_files)
+ok("the unchanged collector collects and verify-evidence accepts the rehearsal's capture fixture")
+
+# Independent derivation of boundary values (reference arithmetic lives here, not in the tool).
+MIB = 1024 * 1024
+
+
+def rehearse_ok(label, edits, **kwargs):
+    base = fresh("derive") / "reads"
+    write_reads(base, edits, **kwargs)
+    out = work / f"derive-out-{counter[0]}"
+    expect_ok("rehearse", "--request", request, "--reads", base, "--out", out)
+    capture_data = walk(out)[1]
+    return {i: json.loads(capture_data[f"capture/operations/{i}.json"])["data"] for i in OPERATION_IDS}
+
+
+def r6_edit(**changes):
+    value = json.loads(good_files()["r6-filesystem.json"])
+    value.update(changes)
+    return {"r6-filesystem.json": jbytes(value)}
+
+
+for count, free, unit, block in (
+    (MIB // 4096, 0, 4096, 4096),                # exactly 1 MiB, nothing free
+    (MIB // 4096 + 255, 255, 4096, 4096),        # just under 2 MiB total, floors to 1 MiB
+    (2 * MIB // 512 - 1, 2047, 512, 4096),       # one allocation unit under 2 MiB, 1 MiB - 512 free
+    (3 * MIB // 1024 + 1023, 1023, 1024, 4096),  # 3 MiB + 1023 units
+    (2**50 // 65536, 2**50 // 65536 // 2 + 1, 65536, 65536),  # the size ceiling
+):
+    derived = rehearse_ok("r6", r6_edit(block_count=count, free_block_count=free,
+                                        allocation_unit_bytes=unit, block_size=block))["R6-storage-and-mount-model"]
+    assert derived["rounded_total_bytes"] == count * unit // MIB * MIB
+    assert derived["rounded_free_bytes"] == free * unit // MIB * MIB
+    assert derived["rounded_total_bytes"] % MIB == 0 and derived["rounded_free_bytes"] % MIB == 0
+    assert derived["rounded_free_bytes"] <= derived["rounded_total_bytes"]
+    assert derived["block_size"] == block and derived["mount_options"] == ["noatime", "rw"]
+ok("R6 totals use block counts times the allocation unit and floor to MiB at every boundary")
+
+for sector, last_offset in ((512, 0), (4096, 0), (4096, 7)):
+    rows = [{"name": "boot_a", "first_lba": 6, "last_lba": 6 + last_offset, "simulated_bootable": False},
+            {"name": "pmos_root", "first_lba": 7 + last_offset, "last_lba": 7 + last_offset + 99,
+             "simulated_bootable": True}]
+    base = write_reads(fresh("r2-derive") / "reads", {
+        "r2-partitions.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-gpt-projection",
+            "projection": "synthetic-gpt-projection-v1", "sector_bytes": sector,
+            "disk_lbas": 7 + last_offset + 100, "rows": rows}),
+        "r3-header-summaries.json": jbytes({
+            "schema": 1, "kind": "myron-synthetic-header-summaries",
+            "images": [header_row("boot_a", False)]}),
+    })
+    out = work / f"r2-derive-out-{counter[0]}"
+    expect_ok("rehearse", "--request", request, "--reads", work / f"r2-derive-{counter[0]}/reads", "--out", out)
+    partitions = json.loads(walk(out)[1][f"capture/operations/{R2}.json"])["data"]["partitions"]
+    assert partitions == [
+        {"partition_name": "boot_a", "size_bytes": (last_offset + 1) * sector,
+         "bootable_flag": False, "slot_suffix": "_a"},
+        {"partition_name": "pmos_root", "size_bytes": 100 * sector, "bootable_flag": True,
+         "slot_suffix": ""}]
+ok("R2 derives sizes from LBA geometry, suffixes from names, and keeps simulated flags as supplied")
+
+modules = rehearse_ok("r5", {"r5-modules.tsv": b"rmnet\t\nbluetooth\tO\n"})["R5-module-load-order"]
+assert modules == {"module_names": ["rmnet", "bluetooth"], "load_order_index": [0, 1],
+                   "taint_flags": ["", "O"], "order_matches_declared": False}
+modules = rehearse_ok("r5", {"r5-modules.tsv": b"pwrseq-core\t\nbluetooth\t\nbtbcm\t\nbtqca\t\n"
+                             b"hci_uart\t\nrfkill\t\nrmnet\t\n"})["R5-module-load-order"]
+assert modules["order_matches_declared"] is True and modules["module_names"][0] == "pwrseq-core"
+modules = rehearse_ok("r5", {"r5-modules.tsv": b"pwrseq-core\t\nbluetooth\t\nbtbcm\t\nbtqca\t\n"
+                             b"hci_uart\t\nrmnet\t\nrfkill\t\n"})["R5-module-load-order"]
+assert modules["order_matches_declared"] is False
+modules = rehearse_ok("r5", {"r5-modules.tsv": b"".join(
+    f"m{i}\t\n".encode() for i in range(256))})["R5-module-load-order"]
+assert len(modules["module_names"]) == 256 and modules["load_order_index"] == list(range(256))
+ok("R5 preserves file order, derives indexes and the declared-order comparison")
+
+derived = rehearse_ok("r7", {
+    "r7-cmdline.txt": b"", "r7-bootconfig.txt": b"androidboot.slot=a\nandroidboot.slot_suffix=_a\n"})
+assert derived[R7]["allowlisted_cmdline"] == []
+assert derived[R7]["allowlisted_bootconfig_keys"] == [
+    {"key": "androidboot.slot", "value": "a"}, {"key": "androidboot.slot_suffix", "value": "_a"}]
+derived = rehearse_ok("r7", {"r7-cmdline.txt": b"androidboot.slot=a bootconfig\n", "r7-bootconfig.txt": b""})
+assert derived[R7]["allowlisted_cmdline"] == [
+    {"key": "androidboot.slot", "value": "a"}, {"key": "bootconfig", "value": "present"}]
+ok("R7 projections are sorted, narrow and accept empty files as empty lists")
+
+# --- exact input closure and tree hazards ----------------------------------------
+
+
+def bad_reads(name, edits=None, *, match=None, absent=(), **kwargs):
+    base = fresh("reads-bad") / "reads"
+    write_reads(base, edits, **kwargs)
+    out = work / f"bad-out-{counter[0]}"
+    expect_fail(name, ["rehearse", "--request", request, "--reads", base, "--out", out], out,
+                match=match, absent=absent)
+    return base
+
+
+def mutated_reads(name, mutate, match=None):
+    base = fresh("reads-shape") / "reads"
+    write_reads(base)
+    mutate(base)
+    out = work / f"shape-out-{counter[0]}"
+    expect_fail(name, ["rehearse", "--request", request, "--reads", base, "--out", out], out, match=match)
+
+
+mutated_reads("extra file", lambda c: (c / "notes.txt").write_text("x"), match="exact closure")
+mutated_reads("extra file with a long name", lambda c: (c / ("x" * 200)).write_text("x"), match="exact closure")
+mutated_reads("nested directory", lambda c: (c / "sub").mkdir(), match="exact closure")
+mutated_reads("nested file", lambda c: ((c / "sub").mkdir(), (c / "sub/r1.json").write_text("x")))
+mutated_reads("missing payload", lambda c: (c / "r5-modules.tsv").unlink(), match="exact closure")
+mutated_reads("missing manifest", lambda c: (c / "reads.json").unlink(), match="exact closure")
+mutated_reads("renamed payload", lambda c: (c / "r5-modules.tsv").rename(c / "r5-modules.txt"),
+              match="exact closure")
+mutated_reads("payload symlink", lambda c: (
+    (c / "r4-selection.json").unlink(), (c / "r4-selection.json").symlink_to("r3-header-summaries.json")))
+mutated_reads("manifest symlink", lambda c: (
+    (c / "reads.json").rename(c / "real.json"), (c / "reads.json").symlink_to("real.json")))
+mutated_reads("payload hardlink", lambda c: (
+    (c / "r4-selection.json").unlink(), os.link(c / "r3-header-summaries.json", c / "r4-selection.json")))
+mutated_reads("hardlink to an outside file", lambda c: (
+    (c / "r4-selection.json").unlink(), os.link(paths["archive"], c / "r4-selection.json")))
+mutated_reads("payload fifo", lambda c: ((c / "r4-selection.json").unlink(), os.mkfifo(c / "r4-selection.json")))
+mutated_reads("payload directory", lambda c: ((c / "r4-selection.json").unlink(), (c / "r4-selection.json").mkdir()))
+mutated_reads("executable payload", lambda c: (c / "r4-selection.json").chmod(0o755), match="executable")
+mutated_reads("executable manifest", lambda c: (c / "reads.json").chmod(0o744), match="executable")
+mutated_reads("world-writable payload", lambda c: (c / "r4-selection.json").chmod(0o666))
+mutated_reads("group-writable payload", lambda c: (c / "r4-selection.json").chmod(0o664))
+mutated_reads("group-writable reads root", lambda c: c.chmod(0o775))
+
+real = fresh("root-symlink")
+write_reads(real / "reads")
+(real / "link").symlink_to(real / "reads")
+expect_fail("reads root symlink", ["rehearse", "--request", request, "--reads", real / "link",
+                                   "--out", work / "o1"], work / "o1")
+(real / "parent-link").symlink_to(real)
+expect_fail("reads ancestor symlink", ["rehearse", "--request", request,
+                                       "--reads", real / "parent-link/reads", "--out", work / "o2"], work / "o2")
+unsafe = fresh("writable-parent")
+write_reads(unsafe / "reads")
+unsafe.chmod(0o777)
+try:
+    expect_fail("writable reads ancestry", ["rehearse", "--request", request, "--reads", unsafe / "reads",
+                                            "--out", work / "o3"], work / "o3")
+finally:
+    unsafe.chmod(0o700)
+expect_fail("relative reads path", ["rehearse", "--request", request, "--reads", "reads", "--out", work / "o4"])
+expect_fail("noncanonical reads path", ["rehearse", "--request", request, "--reads", f"{reads}/../reads",
+                                        "--out", work / "o5"], work / "o5")
+expect_fail("missing reads directory", ["rehearse", "--request", request, "--reads", work / "nothing",
+                                        "--out", work / "o6"], work / "o6")
+
+# Mount crossing: inside the reads read, report a different mount for every descriptor after the first.
+real_mount = K.mount_id_for_fd
+
+
+def crossing_reader(original):
+    def patched(*a, **kw):
+        mounts = [0]
+
+        def crossing_mount(descriptor, label):
+            mounts[0] += 1
+            return real_mount(descriptor, label) + (mounts[0] > 1)
+
+        K.mount_id_for_fd = crossing_mount
+        try:
+            return original(*a, **kw)
+        finally:
+            K.mount_id_for_fd = real_mount
+    return patched
+
+
+with_patch(S, "read_reads", crossing_reader, lambda: expect_fail(
+    "mount crossing inside the reads tree", ["rehearse", *args(), "--out", work / "o7"], work / "o7",
+    match="mount"))
+
+# Bounds: per-file, manifest, entry count, and the closure is checked before any payload read.
+for name, size in (("r1-source-a.json", 16 * 1024 + 1), ("r2-partitions.json", 64 * 1024 + 1),
+                   ("r5-modules.tsv", 32 * 1024 + 1), ("r7-notes.bin", 512 * 1024 + 1),
+                   ("r7-release.txt", 257), ("r7-cmdline.txt", 4097), ("r7-bootconfig.txt", 4097),
+                   ("r4-selection.json", 16 * 1024 + 1), ("r6-filesystem.json", 16 * 1024 + 1)):
+    bad_reads(f"{name} over its bound", {name: b" " * size}, match="bound")
+bad_reads("empty required file", {"r5-modules.tsv": b""}, match="bound")
+bad_reads("empty R1 record", {"r1-source-a.json": b""}, match="bound")
+bad_reads("manifest over 64 KiB", manifest_raw=b" " * (64 * 1024 + 1), match="bound")
+over = fresh("entries") / "reads"
+write_reads(over)
+for number in range(2):
+    (over / f"extra{number}.bin").write_bytes(b"x")
+expect_fail("more entries than the bound", ["rehearse", "--request", request, "--reads", over,
+                                            "--out", work / "o8"], work / "o8")
+big = fresh("closure-first") / "reads"
+write_reads(big)
+(big / "z-extra.bin").write_bytes(b"x" * (3 * MIB))
+real_read = os.read
+read_sizes = []
+
+
+def counting_read(descriptor, count):
+    read_sizes.append(count)
+    return real_read(descriptor, count)
+
+
+os.read = counting_read
+try:
+    expect_fail("oversized extra file", ["rehearse", "--request", request, "--reads", big,
+                                         "--out", work / "o9"], work / "o9", match="exact closure")
+finally:
+    os.read = real_read
+assert max(read_sizes or [0]) < MIB, "no payload was ingested before the closure was rejected"
+ok("exact closure, links, special files, writable ancestry, mount crossing and bounds fail closed")
+
+# Reads bound to another request or contract, and manifest rows.
+bad_reads("manifest wrong request", req_sha="1" * 64, match="request binding")
+bad_reads("manifest wrong contract", manifest_edit=lambda m: m.update(session_contract_sha256="0" * 64),
+          match="session contract binding")
+bad_reads("manifest synthetic false", manifest_edit=lambda m: m.update(synthetic=False))
+bad_reads("manifest kind", manifest_edit=lambda m: m.update(kind="myron-precaptured-fixture"))
+bad_reads("manifest version", manifest_edit=lambda m: m.update(format_version="0.2.0"))
+bad_reads("manifest extra field", manifest_edit=lambda m: m.update(parser="module-name-taint-tsv-v1"),
+          match="fields differ")
+bad_reads("manifest missing field", manifest_edit=lambda m: m.pop("synthetic"))
+bad_reads("manifest unknown path row", manifest_edit=lambda m: m["files"][0].update(path="other.json"))
+bad_reads("manifest row extra field", manifest_edit=lambda m: m["files"][0].update(parser="x"))
+bad_reads("manifest row byte count", manifest_edit=lambda m: m["files"][0].update(bytes=1),
+          match="differs from the file")
+bad_reads("manifest row hash", manifest_edit=lambda m: m["files"][0].update(sha256="0" * 64),
+          match="differs from the file")
+bad_reads("manifest unsorted rows", manifest_edit=lambda m: m["files"].reverse())
+bad_reads("manifest dropped row", manifest_edit=lambda m: m["files"].pop())
+bad_reads("manifest duplicate row", manifest_edit=lambda m: m["files"].append(dict(m["files"][0])))
+bad_reads("manifest includes itself", manifest_edit=lambda m: m["files"].append(
+    {"path": "reads.json", "bytes": 1, "sha256": "0" * 64}))
+bad_reads("manifest not canonical", manifest_raw=json.dumps(manifest_document(good_files())).encode())
+bad_reads("manifest duplicate key", manifest_raw=b'{"schema": 1, "schema": 1}\n')
+bad_reads("manifest NaN", manifest_raw=b'{"schema": NaN}\n')
+bad_reads("manifest not JSON", manifest_raw=b"not json\n")
+bad_reads("manifest not an object", manifest_raw=b"[]\n")
+bad_reads("manifest stale rows", {"r4-selection.json": jbytes({"x": 1})}, keep_manifest_rows=True,
+          match="differs from the file")
+for levels in (S.JSON_DEPTH + 1, 200):
+    bad_reads(f"manifest nested {levels} deep",
+              manifest_raw=b'{"data": ' + b"[" * levels + b"]" * levels + b"}", match="nests too deeply")
+ok("reads.json binds the contract and request, lists exact rows, and cannot select parsers or paths")
+
+# --- per-operation malformed input, rejected before any output -----------------------
+
+
+def edit_json(name, mutate):
+    value = json.loads(good_files()[name])
+    mutate(value)
+    return {name: jbytes(value)}
+
+
+def json_case(label, name, mutate, **kwargs):
+    bad_reads(label, edit_json(name, mutate), **kwargs)
+
+
+for name in ("r1-source-a.json", "r2-partitions.json", "r3-header-summaries.json",
+             "r4-selection.json", "r6-filesystem.json"):
+    json_case(f"{name} unknown field", name, lambda v: v.update(extra=1), match="fields differ")
+    json_case(f"{name} missing field", name, lambda v: v.pop("kind"), match="fields differ")
+    json_case(f"{name} wrong kind", name, lambda v: v.update(kind="other"))
+    json_case(f"{name} schema as bool", name, lambda v: v.update(schema=True))
+    json_case(f"{name} schema 2", name, lambda v: v.update(schema=2))
+    bad_reads(f"{name} not canonical", {name: json.dumps(json.loads(good_files()[name])).encode()},
+              match="not canonical JSON")
+    bad_reads(f"{name} duplicate key", {name: b'{"schema": 1, "schema": 1}\n'}, match="repeats a JSON key")
+    bad_reads(f"{name} NaN", {name: b'{"schema": NaN}\n'})
+    bad_reads(f"{name} not JSON", {name: b"not json\n"}, match="invalid JSON")
+    bad_reads(f"{name} non-UTF-8", {name: b"\xff\xfe{}\n"}, match="invalid JSON")
+    bad_reads(f"{name} array", {name: b"[]\n"}, match="not a JSON object")
+    bad_reads(f"{name} deeply nested", {name: b'{"data": ' + b"[" * 50 + b"]" * 50 + b"}"},
+              match="nests too deeply")
+json_case("R1 file of the wrong source", "r1-source-a.json", lambda v: v.update(source="b"))
+json_case("R1 sources_agree supplied", "r1-source-a.json", lambda v: v.update(sources_agree=True),
+          match="fields differ")
+json_case("R1 sources_agree inside observed", "r1-source-a.json",
+          lambda v: v["observed"].update(sources_agree=True), match="observed facts differ")
+json_case("R1 empty observed", "r1-source-a.json", lambda v: v.update(observed={}),
+          match="observed facts differ")
+json_case("R1 observed not a dict", "r1-source-a.json", lambda v: v.update(observed=[]))
+json_case("R1 disagreeing slot", "r1-source-b.json",
+          lambda v: v["observed"].update(current_slot="b", slot_suffix="_b"), match="disagree")
+json_case("R1 disagreeing compatible", "r1-source-b.json",
+          lambda v: v["observed"].update(compatible_prefix="qcom,other"), match="disagree")
+json_case("R1 no overlap", "r1-source-b.json", lambda v: v.update(
+    observed={"verified_boot_state": "orange"}), match="share no fact")
+json_case("R1 coverage gap", "r1-source-a.json", lambda v: v["observed"].pop("soc"),
+          match="do not cover every observed fact")
+json_case("R1 bad enum", "r1-source-b.json", lambda v: v["observed"].update(verified_boot_state="purple"))
+json_case("R1 bad slot", "r1-source-a.json", lambda v: v["observed"].update(current_slot="c"))
+json_case("R1 slot suffix disagrees with slot", "r1-source-a.json",
+          lambda v: v["observed"].update(slot_suffix="_b"), match="disagree")
+bad_reads("R1 consistent sources whose slot and suffix differ",
+          {**edit_json("r1-source-a.json", lambda v: v["observed"].update(slot_suffix="_b")),
+           **edit_json("r1-source-b.json", lambda v: v["observed"].update(slot_suffix="_b"))},
+          match="R1 slot and slot suffix disagree")
+json_case("R1 wrong identity is refused by the collector", "r1-source-a.json",
+          lambda v: v["observed"].update(codename="cheetah"), match="differs from the contract identity")
+json_case("R1 wrong SoC is refused by the collector", "r1-source-a.json",
+          lambda v: v["observed"].update(soc="sm8750"), match="differs from the contract identity")
+json_case("R1 float in text", "r1-source-a.json", lambda v: v["observed"].update(soc=1.5))
+# R1 observed facts are never filled from the expected identity.
+json_case("R1 observed without the codename", "r1-source-a.json",
+          lambda v: v["observed"].pop("codename"), match="do not cover")
+
+json_case("R2 unknown projection", "r2-partitions.json", lambda v: v.update(projection="gpt-binary-v1"))
+json_case("R2 sector size", "r2-partitions.json", lambda v: v.update(sector_bytes=1024))
+json_case("R2 duplicate name", "r2-partitions.json", lambda v: v["rows"].__setitem__(
+    1, {**v["rows"][1], "name": v["rows"][0]["name"]}), match="repeat a partition name")
+json_case("R2 overlapping rows", "r2-partitions.json", lambda v: v["rows"][1].update(
+    first_lba=v["rows"][0]["last_lba"]), match="overlap")
+json_case("R2 contained row", "r2-partitions.json", lambda v: v["rows"][1].update(
+    first_lba=v["rows"][0]["first_lba"] + 1, last_lba=v["rows"][0]["first_lba"] + 2), match="overlap")
+json_case("R2 rows sharing one LBA", "r2-partitions.json",
+          lambda v: v["rows"][1].update(first_lba=v["rows"][0]["last_lba"]), match="overlap")
+json_case("R2 same first LBA", "r2-partitions.json", lambda v: v["rows"][1].update(
+    first_lba=v["rows"][0]["first_lba"]), match="ascending")
+json_case("R2 rows out of LBA order", "r2-partitions.json", lambda v: v["rows"].reverse(), match="ascending")
+json_case("R2 backwards geometry", "r2-partitions.json", lambda v: v["rows"][0].update(
+    first_lba=v["rows"][0]["last_lba"] + 1), match="geometry")
+json_case("R2 row past the disk", "r2-partitions.json", lambda v: v.update(disk_lbas=v["rows"][-1]["last_lba"]),
+          match="geometry")
+json_case("R2 zero first LBA", "r2-partitions.json", lambda v: v["rows"][0].update(first_lba=0))
+json_case("R2 negative LBA", "r2-partitions.json", lambda v: v["rows"][0].update(last_lba=-1))
+json_case("R2 LBA past the range", "r2-partitions.json", lambda v: v["rows"][0].update(last_lba=2**48 + 1))
+json_case("R2 size past 1 PiB", "r2-partitions.json", lambda v: v.update(
+    disk_lbas=2**48, rows=[{"name": "boot_a", "first_lba": 1, "last_lba": 2**48 - 1,
+                            "simulated_bootable": False}]), match="size is outside")
+json_case("R2 empty rows", "r2-partitions.json", lambda v: v.update(rows=[]))
+json_case("R2 too many rows", "r2-partitions.json", lambda v: v.update(rows=[
+    {"name": f"p{i:03d}", "first_lba": i * 10 + 1, "last_lba": i * 10 + 5, "simulated_bootable": False}
+    for i in range(129)], disk_lbas=2000))
+json_case("R2 bad name", "r2-partitions.json", lambda v: v["rows"][0].update(name="Boot A"))
+json_case("R2 flag as string", "r2-partitions.json", lambda v: v["rows"][0].update(simulated_bootable="yes"))
+json_case("R2 inferred flag field", "r2-partitions.json", lambda v: v["rows"][0].update(bootable_flag=True))
+json_case("R2 extra row field", "r2-partitions.json", lambda v: v["rows"][0].update(guid="x"))
+json_case("R2 recovery supplied", "r2-partitions.json", lambda v: v.update(recovery_present=False),
+          match="fields differ")
+
+json_case("R3 unknown image", "r3-header-summaries.json",
+          lambda v: v["images"][0].update(partition_name="vbmeta_a"))
+json_case("R3 unsorted", "r3-header-summaries.json", lambda v: v["images"].reverse(), match="unique and sorted")
+json_case("R3 duplicate", "r3-header-summaries.json", lambda v: v["images"].append(dict(v["images"][-1])),
+          match="unique and sorted")
+json_case("R3 missing summary for an inventoried image", "r3-header-summaries.json",
+          lambda v: v["images"].pop(1), match="no header summary")
+json_case("R3 missing recovery summary", "r3-header-summaries.json",
+          lambda v: v["images"].pop(4), match="no header summary")
+json_case("R3 empty means nothing", "r3-header-summaries.json", lambda v: v.update(images=[]))
+json_case("R3 absent claimed for an inventoried partition", "r3-header-summaries.json",
+          lambda v: v["images"].__setitem__(0, header_row("boot_a", True)), match="presence differs")
+json_case("R3 present claimed for a missing partition", "r3-header-summaries.json",
+          lambda v: v["images"].__setitem__(-1, header_row("vendor_kernel_boot_a", False)),
+          match="presence differs")
+json_case("R3 absent with a header", "r3-header-summaries.json",
+          lambda v: v["images"][-1].update(header_version=4))
+json_case("R3 present without a hash", "r3-header-summaries.json",
+          lambda v: v["images"][0].update(header_sha256=None))
+json_case("R3 header hash shape", "r3-header-summaries.json",
+          lambda v: v["images"][0].update(header_sha256="abc"))
+json_case("R3 page size", "r3-header-summaries.json", lambda v: v["images"][0].update(page_size=1234))
+json_case("R3 segment mismatch", "r3-header-summaries.json", lambda v: v["images"][0].update(segment_count=1))
+json_case("R3 os version", "r3-header-summaries.json", lambda v: v["images"][0].update(os_version="16"))
+json_case("R3 absent as integer", "r3-header-summaries.json", lambda v: v["images"][0].update(absent=0))
+json_case("R3 absent missing", "r3-header-summaries.json", lambda v: v["images"][0].pop("absent"))
+
+json_case("R4 half selection id", "r4-selection.json", lambda v: v.update(selected_board_revision=None),
+          match="both be set or both be null")
+json_case("R4 half selection revision", "r4-selection.json", lambda v: v.update(selected_board_id=None),
+          match="both be set or both be null")
+json_case("R4 id as string", "r4-selection.json", lambda v: v.update(selected_board_id="7"))
+json_case("R4 id as bool", "r4-selection.json", lambda v: v.update(selected_board_id=True))
+json_case("R4 id out of range", "r4-selection.json", lambda v: v.update(selected_board_id=2**32))
+json_case("R4 dtb count", "r4-selection.json", lambda v: v.update(dtb_count=65))
+json_case("R4 dtbo count", "r4-selection.json", lambda v: v.update(dtbo_entry_count=257))
+json_case("R4 selection source", "r4-selection.json", lambda v: v.update(selection_source="qualcomm"))
+json_case("R4 missing source", "r4-selection.json", lambda v: v.pop("selection_source"), match="fields differ")
+json_case("R4 inferred nested board", "r4-selection.json", lambda v: v.update(board={"id": 7}))
+json_case("R4 wrong compatible is refused by the collector", "r4-selection.json",
+          lambda v: v.update(compatible_prefix="qcom,other"), match="differs from the contract identity")
+derived = rehearse_ok("r4 null pair", edit_json("r4-selection.json", lambda v: v.update(
+    selected_board_id=None, selected_board_revision=None)))
+assert derived[R4]["selected_board_id"] is None and derived[R4]["selected_board_revision"] is None
+
+json_case("R6 filesystem", "r6-filesystem.json", lambda v: v.update(filesystem="ntfs"))
+json_case("R6 mount option", "r6-filesystem.json", lambda v: v.update(mount_options=["rw", "uid=1000"]))
+json_case("R6 ro and rw", "r6-filesystem.json", lambda v: v.update(mount_options=["ro", "rw"]),
+          match="both ro and rw")
+json_case("R6 duplicate option", "r6-filesystem.json", lambda v: v.update(mount_options=["rw", "rw"]),
+          match="mount options repeat")
+json_case("R6 free above count", "r6-filesystem.json", lambda v: v.update(
+    free_block_count=v["block_count"] + 1), match="free blocks exceed")
+json_case("R6 block count zero", "r6-filesystem.json", lambda v: v.update(block_count=0, free_block_count=0))
+json_case("R6 block count overflow", "r6-filesystem.json", lambda v: v.update(block_count=2**50 + 1))
+json_case("R6 size overflow", "r6-filesystem.json", lambda v: v.update(
+    block_count=2**50 // 4096 + 1, free_block_count=0), match="size is outside")
+json_case("R6 under one MiB", "r6-filesystem.json", lambda v: v.update(
+    block_count=255, free_block_count=0), match="under 1 MiB")
+json_case("R6 unit above block", "r6-filesystem.json", lambda v: v.update(
+    allocation_unit_bytes=8192), match="allocation unit")
+json_case("R6 unit not a size", "r6-filesystem.json", lambda v: v.update(allocation_unit_bytes=3000))
+json_case("R6 block size", "r6-filesystem.json", lambda v: v.update(block_size=3000))
+json_case("R6 count as float", "r6-filesystem.json", lambda v: v.update(block_count=1.5))
+json_case("R6 count as bool", "r6-filesystem.json", lambda v: v.update(free_block_count=False))
+json_case("R6 GPT name not in R2", "r6-filesystem.json", lambda v: v.update(gpt_name="other"),
+          match="R6 root partition is not in the R2 inventory")
+json_case("R6 GPT name pattern", "r6-filesystem.json", lambda v: v.update(gpt_name="Root Part"))
+json_case("R6 supplied totals", "r6-filesystem.json", lambda v: v.update(rounded_total_bytes=1),
+          match="fields differ")
+
+for label, raw, match in (
+    ("R5 no trailing newline", b"bluetooth\t", "newline"),
+    ("R5 empty line", b"bluetooth\t\n\nbtbcm\t\n", "taint column"),
+    ("R5 one column", b"bluetooth\n", "taint column"),
+    ("R5 three columns", b"bluetooth\t\tO\n", "taint column"),
+    ("R5 CRLF", b"bluetooth\t\r\n", "control character"),
+    ("R5 spaces", b"blue tooth\t\n", "pattern"),
+    ("R5 leading space", b" bluetooth\t\n", "pattern"),
+    ("R5 lowercase taint", b"bluetooth\to\n", "pattern"),
+    ("R5 long taint", b"bluetooth\tABCDEFGHI\n", "pattern"),
+    ("R5 long name", b"m" * 57 + b"\t\n", "pattern"),
+    ("R5 non-ASCII", "bluet\u00f6\u00f6th\t\n".encode(), "not ASCII"),
+    ("R5 NUL", b"blue\x00\t\n", "control character"),
+    ("R5 header row", b"name\ttaint\nbluetooth\t\n", None),
+    ("R5 duplicate", b"bluetooth\t\nbluetooth\tO\n", "repeat"),
+    ("R5 hyphen and underscore collide", b"pwrseq-core\t\npwrseq_core\t\n", "hyphen and underscore"),
+    ("R5 underscore then hyphen collide", b"hci_uart\t\nhci-uart\t\n", "hyphen and underscore"),
+    ("R5 too many", b"".join(f"m{i}\t\n".encode() for i in range(257)), "exceed 256"),
+):
+    bad_reads(label, {"r5-modules.tsv": raw}, match=match)
+bad_reads("R5 module named like an excluded field", {"r5-modules.tsv": b"android_id\t\n"},
+          match="excluded identifier")
+
+for label, raw, match in (
+    ("R7 release without newline", RELEASE.encode(), "one newline-terminated line"),
+    ("R7 release two lines", (RELEASE + "\nextra\n").encode(), "one newline-terminated line"),
+    ("R7 release blank", b"\n\n", "one newline-terminated line"),
+    ("R7 release with a space", (RELEASE + " x\n").encode(), "pattern"),
+    ("R7 release non-ASCII", "6.12\u00e9\n".encode(), "not ASCII"),
+    ("R7 release quoted", b'"snapshot-test-release"\n', "pattern"),
+    ("R7 release of another kernel", b"6.12.23-other\n", "differs from the contract identity"),
+):
+    bad_reads(label, {"r7-release.txt": raw}, match=match)
+bad_reads("R7 notes of another kernel", {"r7-notes.bin": b"other notes\n"},
+          match="R7 notes hash differs from the contract identity")
+for label, raw, match in (
+    ("R7 cmdline unknown key", b"androidboot.unknown=a\n", "the request does not list"),
+    ("R7 cmdline unknown flag", b"quiet\n", "the request does not list"),
+    ("R7 cmdline duplicate", b"androidboot.slot=a androidboot.slot=a\n", "repeats a key"),
+    ("R7 cmdline duplicate flag", b"bootconfig bootconfig\n", "repeats a key"),
+    ("R7 cmdline double quote", b'androidboot.slot="a"\n', "quoted"),
+    ("R7 cmdline single quote", b"androidboot.slot='a'\n", "quoted"),
+    ("R7 cmdline escape", b"androidboot.slot=a\\ b\n", "quoted"),
+    ("R7 cmdline value outside allowlist", b"androidboot.slot=c\n", "value the request does not list"),
+    ("R7 cmdline missing value", b"androidboot.slot\n", "no value"),
+    ("R7 cmdline flag with value", b"bootconfig=present\n", "flag carries a value"),
+    ("R7 cmdline double space", b"bootconfig  androidboot.slot=a\n", "empty token"),
+    ("R7 cmdline leading space", b" bootconfig\n", "empty token"),
+    ("R7 cmdline trailing space", b"bootconfig \n", "empty token"),
+    ("R7 cmdline no newline", b"bootconfig", "newline-terminated"),
+    ("R7 cmdline lone newline", b"\n", "newline-terminated"),
+    ("R7 cmdline two lines", b"bootconfig\nandroidboot.slot=a\n", "newline-terminated"),
+    ("R7 cmdline tab", b"bootconfig\tandroidboot.slot=a\n", "newline-terminated"),
+    ("R7 cmdline second equals", b"androidboot.slot=a=b\n", "value the request does not list"),
+    ("R7 cmdline NUL", b"bootconfig\x00\n", "control character"),
+):
+    bad_reads(label, {"r7-cmdline.txt": raw}, match=match)
+for label, raw, match in (
+    ("R7 bootconfig unknown key", b"androidboot.unknown=a\n", "the request does not list"),
+    ("R7 bootconfig duplicate", b"androidboot.slot=a\nandroidboot.slot=a\n", "repeats a key"),
+    ("R7 bootconfig quoted", b'androidboot.slot="a"\n', "quoted"),
+    ("R7 bootconfig single quoted", b"androidboot.slot='a'\n", "quoted"),
+    ("R7 bootconfig spaces", b"androidboot.slot = a\n", "unsupported form"),
+    ("R7 bootconfig comment", b"# note\nandroidboot.slot=a\n", "unsupported form"),
+    ("R7 bootconfig semicolon", b"androidboot.slot=a;\n", "unsupported form"),
+    ("R7 bootconfig nested", b"androidboot { slot = a }\n", "unsupported form"),
+    ("R7 bootconfig no equals", b"androidboot.slot\n", "unsupported form"),
+    ("R7 bootconfig empty line", b"androidboot.slot=a\n\n", "unsupported form"),
+    ("R7 bootconfig no newline", b"androidboot.slot=a", "newline"),
+    ("R7 bootconfig flag form", b"bootconfig=present\n", "the request does not list"),
+    ("R7 bootconfig value outside allowlist", b"androidboot.hardware=cheetah\n", "value the request does not list"),
+    ("R7 bootconfig verified boot disagrees with R1", b"androidboot.verifiedbootstate=green\n",
+     "R7 verified boot state disagrees with R1"),
+    ("R7 bootconfig slot disagrees with R1", b"androidboot.slot=b\n", "R7 slot disagrees with R1"),
+):
+    bad_reads(label, {"r7-bootconfig.txt": raw}, match=match)
+bad_reads("R7 cmdline slot suffix disagrees with R1", {"r7-cmdline.txt": b"androidboot.slot_suffix=_b\n"},
+          match="R7 slot suffix disagrees with R1")
+ok("malformed schemas, JSON, TSV and R1-R7 inputs are rejected with value-free diagnostics")
+
+# --- privacy canaries --------------------------------------------------------------
+
+MAC_CANARY = ":".join(["02"] * 6)
+UUID_CANARY = "-".join(["123e4567", "e89b", "12d3", "a456", "426614174000"])
+DIGITS_CANARY = "4" + "9" * 14
+HEX_CANARY = "c" * 32
+TOKEN_CANARY = "canary" + "q7k2"
+SERIAL_NAME = "serial" + "_" + "no"
+for canary in (MAC_CANARY, UUID_CANARY, DIGITS_CANARY, HEX_CANARY):
+    bad_reads(f"identifier-shaped release {canary[:6]}", {"r7-release.txt": (canary + "\n").encode()},
+              absent=(canary,))
+    bad_reads(f"identifier-shaped module {canary[:6]}",
+              {"r5-modules.tsv": f"{canary.replace(':', '-')}\t\n".encode()},
+              absent=(canary, canary.replace(":", "-")))
+bad_reads("identifier-shaped GPT name", edit_json("r2-partitions.json", lambda v: v["rows"].append(
+    {"name": DIGITS_CANARY, "first_lba": END_LBA, "last_lba": END_LBA + 9, "simulated_bootable": False})),
+    absent=(DIGITS_CANARY,), match="identifier-shaped value")
+bad_reads("canary as a JSON key", edit_json("r4-selection.json", lambda v: v.update({TOKEN_CANARY: 1})),
+          absent=(TOKEN_CANARY,))
+bad_reads("canary as a duplicate JSON key",
+          {"r4-selection.json": b'{"' + TOKEN_CANARY.encode() + b'": 1, "' + TOKEN_CANARY.encode() + b'": 2}\n'},
+          absent=(TOKEN_CANARY,))
+bad_reads("canary as a command-line key", {"r7-cmdline.txt": f"{TOKEN_CANARY}=a\n".encode()},
+          absent=(TOKEN_CANARY,))
+bad_reads("canary as a bootconfig value", {"r7-bootconfig.txt": f"androidboot.hardware={TOKEN_CANARY}\n".encode()},
+          absent=(TOKEN_CANARY,))
+bad_reads("canary as an excluded-name module", {"r5-modules.tsv": f"{SERIAL_NAME}_{TOKEN_CANARY}\t\n".encode()},
+          absent=(TOKEN_CANARY,))
+bad_reads("canary in the manifest", manifest_edit=lambda m: m.update({TOKEN_CANARY: 1}), absent=(TOKEN_CANARY,))
+bad_reads("canary header hash field", edit_json("r3-header-summaries.json", lambda v: v["images"][0].update(
+    os_version=TOKEN_CANARY)), absent=(TOKEN_CANARY,))
+canary_dir = fresh("canary-name") / "reads"
+write_reads(canary_dir)
+(canary_dir / (TOKEN_CANARY + ".json")).write_text("x")
+expect_fail("canary file name", ["rehearse", "--request", request, "--reads", canary_dir,
+                                 "--out", work / "canary-out"], work / "canary-out", absent=(TOKEN_CANARY,))
+# Notes bytes are hashed, never copied: a canary inside them stays out of every output file.
+canary_notes = TOKEN_CANARY.encode() + MAC_CANARY.encode() + DIGITS_CANARY.encode()
+edited_contracts = None
+out_canary = work / "canary-notes-out"
+notes_files = write_reads(fresh("canary-notes") / "reads", {"r7-notes.bin": canary_notes})
+# the synthetic kernel contract wants the fixed notes, so the collector refuses these bytes,
+# and the refusal names no value
+expect_fail("canary inside the notes bytes", ["rehearse", "--request", request,
+            "--reads", work / f"canary-notes-{counter[0]}/reads", "--out", out_canary], out_canary,
+            absent=(TOKEN_CANARY, MAC_CANARY, DIGITS_CANARY))
+good_output = b"".join(walk(rehearsal_a)[1].values()) + plan_text.encode() + result_text.encode()
+for canary in (MAC_CANARY, UUID_CANARY, DIGITS_CANARY, HEX_CANARY, TOKEN_CANARY):
+    assert canary.encode() not in good_output, canary
+for banned in ("android_id", "partition_uuid", "disk_guid", "raw_payload", "module_bytes"):
+    assert banned.encode() not in walk(rehearsal_a)[1]["capture/operations/R7-kernel-identity-revalidation.json"]
+ok("identifier and privacy canaries are rejected, never echoed, and absent from every output")
+
+# --- verify-rehearsal: every outer binding, manifest, operation, claim and checksum ----
+
+SUM_FILES = lambda root: sorted(
+    str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+
+
+def reseal(clone):
+    (clone / "SHA256SUMS").write_text("".join(
+        f"{digest((clone / name).read_bytes())}  {name}\n" for name in SUM_FILES(clone)))
+
+
+def tampered(name, mutate_files=None, *, resum=True, match=None):
+    clone = fresh("rehearsal-tamper") / "rehearsal"
+    shutil.copytree(rehearsal_a, clone)
+    if mutate_files:
+        mutate_files(clone)
+    if resum:
+        reseal(clone)
+    expect_fail(name, ["verify-rehearsal", *args(), "--rehearsal", clone], match=match)
+
+
+def edit_document(relative, mutate):
+    def apply(clone):
+        value = json.loads((clone / relative).read_text())
+        mutate(value)
+        (clone / relative).write_bytes(D.render_json(value))
+    return apply
+
+
+for field, value in (
+    ("schema", 2), ("kind", "x"), ("format_version", "9"), ("session_contract_sha256", "0" * 64),
+    ("capture_contract_sha256", "0" * 64), ("preflight_contract_sha256", "0" * 64),
+    ("request_sha256", "0" * 64), ("reads_sha256", "0" * 64), ("capture_sha256", "0" * 64),
+    ("transport", "external-precaptured-fixture"), ("evidence_level", "live"),
+    ("status", "collected"), ("synthetic", False), ("live", True), ("executes", True),
+    ("kit_snapshot_reverified", True), ("human_approval_required", False),
+    ("remote_commands", ["x"]), ("collector_checks", []), ("limitations", []), ("non_goals", []),
+    ("unresolved_claims", []), ("coverage", []), ("inputs", []), ("operations", []),
+    ("dependencies", {"trust": "byte-pinned", "byte_pinned": True}), ("blockers", []),
+    ("authority", {}), ("extra", 1),
+):
+    tampered(f"rehearsal.json {field}", edit_document("rehearsal.json", lambda v, f=field, x=value: v.update({f: x})),
+             match="rehearsal differs at")
+tampered("rehearsal.json field removed", edit_document("rehearsal.json", lambda v: v.pop("synthetic")))
+tampered("rehearsal blocker cleared", edit_document("rehearsal.json", lambda v: v["blockers"][0].update(state="present")))
+tampered("rehearsal blocker removed", edit_document("rehearsal.json", lambda v: v["blockers"].pop()))
+tampered("rehearsal blocker cleared flag", edit_document("rehearsal.json", lambda v: v["blockers"][0].update(blocker_cleared=True)))
+for flag in P.AUTHORITY_FLAGS:
+    tampered(f"rehearsal authority {flag}", edit_document("rehearsal.json", lambda v, f=flag: v["authority"].update({f: True})))
+tampered("rehearsal operation bytes_read", edit_document("rehearsal.json", lambda v: v["operations"][0].update(bytes_read=1)))
+tampered("rehearsal operation hash", edit_document("rehearsal.json", lambda v: v["operations"][3].update(output_sha256="0" * 64)))
+tampered("rehearsal operation parser", edit_document("rehearsal.json", lambda v: v["operations"][3].update(parser="x")))
+tampered("rehearsal input hash", edit_document("rehearsal.json", lambda v: v["inputs"][0].update(sha256="0" * 64)))
+tampered("rehearsal coverage class", edit_document("rehearsal.json", lambda v: v["coverage"][0].update(classification="parsed-bytes")))
+tampered("rehearsal header claim reclassified", edit_document("rehearsal.json", lambda v: [
+    row.update(classification="parsed-bytes") for row in v["coverage"] if row["field"] == "images.header_sha256"]))
+tampered("rehearsal accounting", edit_document("rehearsal.json", lambda v: v["accounting"].update(meaning="hardware-read")))
+for field, value in (
+    ("schema", 2), ("kind", "x"), ("format_version", "9"), ("session_contract_sha256", "0" * 64),
+    ("capture_contract_sha256", "0" * 64), ("preflight_contract_sha256", "0" * 64),
+    ("request_sha256", "0" * 64), ("reads_sha256", "0" * 64), ("transport", "x"),
+    ("synthetic", False), ("live", True), ("files", []), ("extra", 1),
+):
+    tampered(f"manifest.json {field}", edit_document("manifest.json", lambda v, f=field, x=value: v.update({f: x})),
+             match="rehearsal differs at")
+tampered("manifest file hash", edit_document("manifest.json", lambda v: v["files"][0].update(sha256="0" * 64)))
+tampered("manifest file size", edit_document("manifest.json", lambda v: v["files"][0].update(bytes=1)))
+tampered("manifest file order", edit_document("manifest.json", lambda v: v["files"].reverse()))
+tampered("capture.json changed", edit_document("capture/capture.json", lambda v: v.update(live=True)))
+tampered("capture manifest operation hash", edit_document("capture/capture.json",
+         lambda v: v["operations"][0].update(sha256="0" * 64)))
+for operation in OPERATION_IDS:
+    tampered(f"operation {operation} data", edit_document(f"capture/operations/{operation}.json",
+             lambda v: v["data"].update(extra=1)))
+    tampered(f"operation {operation} bytes_read", edit_document(f"capture/operations/{operation}.json",
+             lambda v: v.update(bytes_read=v["bytes_read"] + 1)))
+    tampered(f"operation {operation} request binding", edit_document(f"capture/operations/{operation}.json",
+             lambda v: v.update(request_sha256="0" * 64)))
+    tampered(f"operation {operation} read-only claim", edit_document(f"capture/operations/{operation}.json",
+             lambda v: v.update(read_only=False)))
+tampered("operation value changed to another valid one", edit_document(
+    f"capture/operations/{R5}.json", lambda v: v["data"]["module_names"].__setitem__(2, "other_mod")))
+tampered("operation transport", edit_document(f"capture/operations/{R1}.json", lambda v: v.update(transport="live")))
+tampered("stale checksums", lambda c: (c / "rehearsal.json").write_bytes(
+    (c / "rehearsal.json").read_bytes() + b" "), resum=False)
+tampered("checksum of the wrong file", lambda c: (c / "SHA256SUMS").write_text("0" * 64 + "  rehearsal.json\n"), resum=False)
+tampered("checksum file missing entries", lambda c: (c / "SHA256SUMS").write_text(
+    "".join(f"{digest((c / n).read_bytes())}  {n}\n" for n in SUM_FILES(c)[1:])), resum=False)
+tampered("checksum file extra entry", lambda c: (c / "SHA256SUMS").write_text(
+    (c / "SHA256SUMS").read_text() + "0" * 64 + "  extra\n"), resum=False)
+tampered("checksum order", lambda c: (c / "SHA256SUMS").write_text(
+    "".join(reversed((c / "SHA256SUMS").read_text().splitlines(True)))), resum=False)
+tampered("extra output file", lambda c: (c / "extra.txt").write_text("x"))
+tampered("extra capture file", lambda c: (c / "capture/extra.txt").write_text("x"))
+tampered("extra nested directory", lambda c: (c / "capture/operations/sub").mkdir())
+tampered("missing output file", lambda c: (c / "manifest.json").unlink(), resum=False)
+tampered("missing operation", lambda c: (c / f"capture/operations/{R2}.json").unlink(), resum=False)
+tampered("output symlink", lambda c: ((c / "manifest.json").unlink(),
+                                      (c / "manifest.json").symlink_to("rehearsal.json")), resum=False)
+tampered("output hardlink", lambda c: ((c / "manifest.json").unlink(),
+                                       os.link(c / "rehearsal.json", c / "manifest.json")), resum=False)
+tampered("output fifo", lambda c: ((c / "manifest.json").unlink(), os.mkfifo(c / "manifest.json")), resum=False)
+tampered("executable output", lambda c: (c / "manifest.json").chmod(0o755), resum=False)
+tampered("writable output", lambda c: (c / "manifest.json").chmod(0o666), resum=False)
+tampered("writable capture directory", lambda c: (c / "capture").chmod(0o777), resum=False)
+tampered("non-canonical rehearsal", lambda c: (c / "rehearsal.json").write_text(
+    json.dumps(json.loads((c / "rehearsal.json").read_text()))))
+other_reads = fresh("other-reads") / "reads"
+write_reads(other_reads, {"r6-filesystem.json": jbytes({
+    **json.loads(good_files()["r6-filesystem.json"]), "mount_options": ["nodev", "rw"]})})
+expect_fail("rehearsal from other reads", ["verify-rehearsal", "--request", request, "--reads", other_reads,
+                                          "--rehearsal", rehearsal_a], match="rehearsal differs at")
+other_request = fresh("other-request") / "request"
+shutil.copytree(request, other_request)
+value = json.loads((other_request / "request.json").read_text())
+value["artifacts"]["deployment_kit"]["sha256"] = "7" * 64
+(other_request / "request.json").write_bytes(D.render_json(value))
+(other_request / "SHA256SUMS").write_text("".join(
+    f"{digest((other_request / p).read_bytes())}  {p}\n"
+    for p in ["STATUS.txt", "contracts/preflight-contract.json", "request.json", "status.json"]))
+expect_fail("rehearsal bound to another request", ["verify-rehearsal", "--request", other_request,
+            "--reads", reads, "--rehearsal", rehearsal_a])
+expect_fail("verify given the reads tree", ["verify-rehearsal", *args(), "--rehearsal", reads])
+expect_fail("verify given the request tree", ["verify-rehearsal", *args(), "--rehearsal", request])
+expect_fail("verify with the capture only", ["verify-rehearsal", *args(), "--rehearsal", rehearsal_a / "capture"])
+ok("verify-rehearsal recomputes from request and reads: every binding, document, claim and checksum matters")
+
+# --- publication hazards --------------------------------------------------------
+
+existing = work / "existing"
+existing.mkdir()
+expect_fail("existing output", ["rehearse", *args(), "--out", existing])
+expect_fail("output inside reads", ["rehearse", *args(), "--out", reads / "out"], reads / "out")
+expect_fail("output inside request", ["rehearse", *args(), "--out", request / "out"], request / "out")
+expect_fail("output equals reads", ["rehearse", *args(), "--out", reads])
+expect_fail("output contains reads", ["rehearse", *args(), "--out", reads.parent])
+expect_fail("reads equal request", ["rehearse", "--request", request, "--reads", request,
+                                    "--out", work / "o10"], work / "o10")
+nest = fresh("nest")
+shutil.copytree(request, nest / "request")
+write_reads(nest / "request/reads")
+expect_fail("reads inside request", ["rehearse", "--request", nest / "request",
+                                     "--reads", nest / "request/reads", "--out", work / "o11"], work / "o11")
+unsafe_out = work / "unsafe-out"
+unsafe_out.mkdir()
+unsafe_out.chmod(0o777)
+try:
+    expect_fail("writable output parent", ["rehearse", *args(), "--out", unsafe_out / "out"], unsafe_out / "out")
+finally:
+    unsafe_out.chmod(0o700)
+alias_parent = fresh("alias-parent")
+os.symlink(reads, alias_parent / "alias")
+expect_fail("output through a symlink into the reads", ["rehearse", *args(), "--out", alias_parent / "alias/out"])
+assert not (reads / "out").exists()
+code, out, err = invoke("rehearse", *args(), "--out", work / "never", "--live")
+assert code != 0 and not os.path.lexists(work / "never")
+code, out, err = invoke("rehearse", "--request", request, "--out", work / "never")
+assert code != 0
+expect_fail("relative output path", ["rehearse", *args(), "--out", "out"])
+no_leftovers("hazards")
+ok("overlap, alias, existing and writable-parent publication hazards fail closed")
+
+# --- races, unstable reads and collector rejection leave no output -----------------
+
+
+def mutate_after(count_at, change):
+    def wrap(original):
+        calls = [0]
+
+        def patched(*a, **kw):
+            result = original(*a, **kw)
+            calls[0] += 1
+            if calls[0] == count_at:
+                change()
+            return result
+        return patched
+    return wrap
+
+
+for label, target, at in (
+    ("payload changed after the first read", "r4-selection.json", 1),
+    ("payload changed between the temp and published checks", "r4-selection.json", 2),
+    ("manifest changed after the first read", "reads.json", 1),
+    ("manifest changed between the temp and published checks", "reads.json", 2),
+):
+    racy = fresh("race") / "reads"
+    write_reads(racy)
+    victim = racy / target
+    out = work / f"race-out-{counter[0]}"
+    with_patch(S, "read_reads", mutate_after(at, lambda v=victim: v.write_bytes(v.read_bytes() + b" ")),
+               lambda: expect_fail(label, ["rehearse", "--request", request, "--reads", racy, "--out", out], out))
+no_leftovers("reads races")
+
+racy_request = fresh("race-request") / "request"
+shutil.copytree(request, racy_request)
+for at in (1, 2):
+    out = work / f"race-request-{at}"
+    clone = fresh("race-request-copy") / "request"
+    shutil.copytree(request, clone)
+
+    def poke(path=clone / "STATUS.txt"):
+        with path.open("ab") as stream:
+            stream.write(b"x")
+
+    with_patch(S, "read_request", mutate_after(at, poke),
+               lambda: expect_fail(f"request changed after read {at}",
+                                   ["rehearse", "--request", clone, "--reads", reads, "--out", out], out))
+no_leftovers("request races")
+
+# unstable reads: a file that grows while it is read, and one whose size changes between stat and read
+growing = fresh("growing") / "reads"
+write_reads(growing)
+victim = growing / "r5-modules.tsv"
+real_os_read = os.read
+state = {"done": False}
+
+
+def growing_read(descriptor, count):
+    if not state["done"]:
+        state["done"] = True
+        with victim.open("ab") as stream:
+            stream.write(b"extra\t\n")
+    return real_os_read(descriptor, count)
+
+
+os.read = growing_read
+try:
+    expect_fail("file grows while it is read", ["rehearse", "--request", request, "--reads", growing,
+                                                "--out", work / "grow-out"], work / "grow-out")
+finally:
+    os.read = real_os_read
+shrinking = fresh("shrinking") / "reads"
+write_reads(shrinking)
+victim = shrinking / "r5-modules.tsv"
+state = {"done": False}
+
+
+def shrinking_read(descriptor, count):
+    if not state["done"]:
+        state["done"] = True
+        victim.write_bytes(victim.read_bytes()[:-3])
+    return real_os_read(descriptor, count)
+
+
+os.read = shrinking_read
+try:
+    expect_fail("file shrinks while it is read", ["rehearse", "--request", request, "--reads", shrinking,
+                                                  "--out", work / "shrink-out"], work / "shrink-out")
+finally:
+    os.read = real_os_read
+no_leftovers("unstable reads")
+
+# collector rejection after the build leaves no output at any stage
+calls = {"count": 0}
+
+
+def reject_collector(original):
+    def patched(*a, **kw):
+        calls["count"] += 1
+        raise C.CollectError("injected collector rejection")
+    return patched
+
+
+for target in ("validate_operation", "cross_check"):
+    out = work / f"collector-{target}"
+    with_patch(C, target, reject_collector,
+               lambda: expect_fail(f"collector {target} rejection", ["rehearse", *args(), "--out", out],
+                                   out, match="injected collector rejection"))
+for stage in (1, 2):
+    out = work / f"collector-capture-{stage}"
+    seen = [0]
+
+    def late_reject(original, stage=stage, seen=seen):
+        def patched(*a, **kw):
+            seen[0] += 1
+            if seen[0] == stage:
+                raise C.CollectError("injected capture rejection")
+            return original(*a, **kw)
+        return patched
+
+    with_patch(C, "read_capture", late_reject,
+               lambda: expect_fail(f"collector capture read rejection at stage {stage}",
+                                   ["rehearse", *args(), "--out", out], out, match="injected capture rejection"))
+no_leftovers("collector rejection")
+# the published-path verification removes a published output when it fails
+real_publish = D.publish
+out = work / "publish-race"
+
+
+def racing_publish(out_path, protected, ids, spec, verify_built):
+    seen = [0]
+
+    def wrapped(path, descriptor):
+        seen[0] += 1
+        if seen[0] == 2:
+            raise D.DeploymentError("injected failure after publication")
+        return verify_built(path, descriptor)
+    return real_publish(out_path, protected, ids, spec, wrapped)
+
+
+D.publish = racing_publish
+try:
+    expect_fail("failure after the atomic rename removes the output", ["rehearse", *args(), "--out", out],
+                out, match="injected failure after publication")
+finally:
+    D.publish = real_publish
+no_leftovers("publication race")
+expect_ok("rehearse", *args(), "--out", work / "after-races")
+ok("request, reads and collector rejection races leave no output and no temp tree")
+
+# --- no process, no network ---------------------------------------------------------
+
+
+def boom(*a, **kw):
+    raise AssertionError("process or network use attempted")
+
+
+saved = (os.system, os.fork, os.posix_spawn, os.execv, os.execvp, subprocess.Popen, socket.socket,
+         socket.create_connection, socket.getaddrinfo)
+os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 5
+subprocess.Popen = socket.socket = socket.create_connection = socket.getaddrinfo = boom
+try:
+    expect_ok("show")
+    expect_ok("plan", "--request", request)
+    expect_ok("verify-plan", "--request", request, "--plan", plan_file)
+    expect_ok("rehearse", *args(), "--out", work / "spawn-free")
+    expect_ok("verify-rehearsal", *args(), "--rehearsal", work / "spawn-free")
+finally:
+    (os.system, os.fork, os.posix_spawn, os.execv, os.execvp, subprocess.Popen, socket.socket,
+     socket.create_connection, socket.getaddrinfo) = saved
+ok("planning, rehearsal and verification spawn no process and open no network")
+
+# --- registry drift and consistency --------------------------------------------------
+
+baseline = D.render_json(S.expected_session_contract(collector_env))
+assert baseline == session_contract_bytes
+
+
+def drift(name, apply, restore):
+    apply()
+    try:
+        drifted = D.render_json(S.expected_session_contract(collector_env))
+        assert drifted != baseline, f"{name}: contract did not change"
+        code, _out, err = invoke("show")
+        assert code != 0 and "differs from its derived form" in err, err
+    finally:
+        restore()
+    assert D.render_json(S.expected_session_contract(collector_env)) == baseline
+    ok(f"{name} changes the derived contract and the committed contract is refused")
+
+
+saved_files = copy.deepcopy(S.INPUT_FILES)
+drift("input file bound change", lambda: S.INPUT_FILES[2].update(max_bytes=32 * 1024),
+      lambda: S.INPUT_FILES[2].update(max_bytes=64 * 1024))
+drift("parser registry change", lambda: S.OPERATION_PARSERS.update({R5: "x"}),
+      lambda: S.OPERATION_PARSERS.update({R5: "module-name-taint-tsv-v1"}))
+saved_coverage = list(S.COVERAGE)
+drift("coverage class change", lambda: S.COVERAGE.__setitem__(
+    9, (R2, "partitions.bootable_flag", "synthetic-projection", None)),
+      lambda: S.COVERAGE.__setitem__(9, saved_coverage[9]))
+drift("limitation text change", lambda: S.LIMITATIONS.append("x"), lambda: S.LIMITATIONS.pop())
+drift("collector mount option change", lambda: C.MOUNT_OPTIONS.append("noauto"), lambda: C.MOUNT_OPTIONS.pop())
+drift("collector filesystem change", lambda: C.FILESYSTEMS.append("ntfs"), lambda: C.FILESYSTEMS.pop())
+drift("derivation text change", lambda: S.DERIVATIONS[R6].append("x"), lambda: S.DERIVATIONS[R6].pop())
+
+
+def inconsistent(name, mutate, restore):
+    mutate()
+    try:
+        S.check_registry_consistency(C)
+    except S.SessionError as error:
+        assert any(word in str(error) for word in ("inconsistent", "differ", "exceed")), error
+    else:
+        raise AssertionError(f"{name}: inconsistent registry accepted")
+    finally:
+        restore()
+    S.check_registry_consistency(C)
+    ok(f"{name} is refused by the registry consistency check")
+
+
+inconsistent("module bound differing from the collector", lambda: setattr(S, "MAX_MODULES", 300),
+             lambda: setattr(S, "MAX_MODULES", 256))
+saved_pattern = S.MODULE_NAME
+inconsistent("module pattern differing from the collector",
+             lambda: setattr(S, "MODULE_NAME", re.compile(r"[a-z]{1,8}")),
+             lambda: setattr(S, "MODULE_NAME", saved_pattern))
+saved_recovery = S.RECOVERY_NAME
+inconsistent("recovery pattern differing from the collector",
+             lambda: setattr(S, "RECOVERY_NAME", re.compile(r"recovery")),
+             lambda: setattr(S, "RECOVERY_NAME", saved_recovery))
+inconsistent("coverage row removed", lambda: S.COVERAGE.pop(), lambda: S.COVERAGE.append(saved_coverage[-1]))
+inconsistent("coverage class without a claim", lambda: S.COVERAGE.__setitem__(
+    9, (R2, "partitions.bootable_flag", "unverified-source-claim", None)),
+    lambda: S.COVERAGE.__setitem__(9, saved_coverage[9]))
+inconsistent("coverage unknown class", lambda: S.COVERAGE.__setitem__(
+    0, (R1, "codename", "verified", None)), lambda: S.COVERAGE.__setitem__(0, saved_coverage[0]))
+inconsistent("coverage duplicate field", lambda: S.COVERAGE.append(saved_coverage[0]),
+             lambda: S.COVERAGE.pop())
+inconsistent("input bound past the operation bound", lambda: S.INPUT_FILES[0].update(max_bytes=40 * 1024)
+             or S.INPUT_FILES[1].update(max_bytes=40 * 1024) or None,
+             lambda: [S.INPUT_FILES[0].update(max_bytes=16 * 1024), S.INPUT_FILES[1].update(max_bytes=16 * 1024)])
+ok("registry drift changes the derived contract and a contradictory registry stops every command")
+
+# --- trusted loader: source pin and races ----------------------------------------------
+
+impl_path = repo / "tools/lib/myron-session-impl.py"
+tool_bytes = impl_path.read_bytes()
+implementation = {
+    "algorithm": "sha256-of-captured-implementation-bytes",
+    "path": "tools/lib/myron-session-impl.py",
+    "sha256": digest(tool_bytes),
+}
+assert S.implementation_binding() == implementation
+assert S.CAPTURED_IMPLEMENTATION_SHA256 == implementation["sha256"]
+assert contract["implementation"] == implementation and plan_a["implementation"] == implementation
+loader_bytes = (repo / "tools/myron-session").read_bytes()
+for held in (tool_bytes, loader_bytes):
+    assert implementation["sha256"].encode() not in held, "no source file holds the pin"
+    assert digest(session_contract_bytes).encode() not in held
+assert [name for name, value in vars(S).items()
+        if type(value) is str and S.HEX256.fullmatch(value)] == ["CAPTURED_IMPLEMENTATION_SHA256"], \
+    "the only digest in the namespace is the loader's capture"
+contract_tamper("contract implementation dropped", lambda v: v.pop("implementation"))
+contract_tamper("contract implementation path", lambda v: v["implementation"].update(path="tools/other"))
+contract_tamper("contract implementation algorithm", lambda v: v["implementation"].update(algorithm="none"))
+ok("session contract and plan bind the SHA-256 of the captured implementation bytes, held in no source file")
+
+
+def tool_copy(name, edit=None):
+    """A private copy of tools/ with its own session source, loaded as its own module."""
+    base = fresh(name)
+    (base / "packages").mkdir()
+    for part in ["tools", *(f"packages/{p.name}" for p in (repo / "packages").glob("omamobile-myron-*"))]:
+        shutil.copytree(repo / part, base / part, ignore=shutil.ignore_patterns("__pycache__"))
+    source = base / "tools/lib/myron-session-impl.py"
+    if edit is not None:
+        text = source.read_text()
+        edited = edit(text)
+        assert edited != text, f"{name}: edit changed nothing"
+        source.write_text(edited)
+    return base, load(f"session_copy_{counter[0]}", base / "tools/myron-session")
+
+
+def refuses(module, label):
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = module.main(["show"], contracts_root=contracts_root)
+    assert code != 0 and "differs from its derived form" in err.getvalue(), (label, err.getvalue())
+
+
+_, control = tool_copy("impl-control")
+control_err = io.StringIO()
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(control_err):
+    control_code = control.main(["show"], contracts_root=contracts_root)
+assert control_code == 0, control_err.getvalue()
+assert control.implementation_binding() == implementation, "a byte-identical copy keeps the pin"
+SOURCE_EDITS = {
+    "a comment-only edit": lambda t: t + "# unreviewed\n",
+    "an inverted free-versus-count rule": lambda t: t.replace("if free > count:", "if free >= count:", 1),
+    "a dropped overlap rule": lambda t: t.replace('raise SessionError("R2 rows overlap")', "pass", 1),
+    "a skipped normalized-duplicate rule": lambda t: t.replace(
+        "if key in seen:", "if False:", 1),
+    "a weakened R1 agreement rule": lambda t: t.replace("agree = all(", "agree = True or all(", 1),
+    "a loosened quote rule": lambda t: t.replace('"\\"\'`\\\\"', '""', 1),
+}
+for label, edit in SOURCE_EDITS.items():
+    _, edited = tool_copy("impl-edit", edit)
+    assert edited.implementation_binding()["sha256"] != implementation["sha256"], label
+    refuses(edited, label)
+    ok(f"{label} in the session source changes the pin and the committed contract is refused")
+other_base, _ = tool_copy("impl-moved")
+(other_base / "tools/myron-session").rename(other_base / "tools/myron-session-renamed")
+try:
+    load("session_renamed", other_base / "tools/myron-session-renamed").implementation_binding()
+except Exception as error:
+    assert type(error).__name__ == "SessionError" and "pinned path" in str(error), error
+else:
+    raise AssertionError("a session tool outside its pinned path produced a pin")
+ok("a session tool that runs from another path cannot produce the pin")
+
+# A modified validator loaded, its path restored, cannot claim the original pin.
+rule_edit = lambda text: text.replace("if free > count:", "if False:", 1)
+base, modified = tool_copy("impl-restore", rule_edit)
+impl_copy = base / "tools/lib/myron-session-impl.py"
+modified_sha = digest(impl_copy.read_bytes())
+assert modified_sha != implementation["sha256"]
+impl_copy.write_bytes(tool_bytes)
+assert modified.implementation_binding()["sha256"] == modified_sha != implementation["sha256"]
+refuses(modified, "a modified validator with its path restored")
+restored = load("session_restored", base / "tools/myron-session")
+assert restored.implementation_binding() == implementation
+ok("a loaded modified validator with its path restored cannot claim the original pin")
+
+# The path is swapped to a different inode while the capture is reading.
+base, _ = tool_copy("impl-swap", rule_edit)
+impl_copy = base / "tools/lib/myron-session-impl.py"
+modified_sha = digest(impl_copy.read_bytes())
+real_read, real_open, opened, swapped = os.read, os.open, [], []
+
+
+def swapping_read(descriptor, count):
+    if not swapped:
+        swapped.append(True)
+        replacement = impl_copy.with_name("swap.tmp")
+        replacement.write_bytes(tool_bytes)
+        replacement.chmod(0o644)
+        os.replace(replacement, impl_copy)
+    return real_read(descriptor, count)
+
+
+def counting_open(path, *a, **kw):
+    opened.append(os.fspath(path))
+    return real_open(path, *a, **kw)
+
+
+os.read, os.open = swapping_read, counting_open
+try:
+    swapped_module = load("session_swapped", base / "tools/myron-session")
+finally:
+    os.read, os.open = real_read, real_open
+assert swapped and digest(impl_copy.read_bytes()) == implementation["sha256"]
+assert swapped_module.implementation_binding()["sha256"] == modified_sha
+assert opened.count("myron-session-impl.py") == 1, opened
+ok("path replacement during the capture changes neither the hashed nor the executed bytes")
+
+
+def loader_refuses(label, damage, match):
+    base, _ = tool_copy("impl-loader")
+    damage(base / "tools/lib/myron-session-impl.py")
+    try:
+        load(f"session_bad_{counter[0]}", base / "tools/myron-session")
+    except ImportError as error:
+        assert match in str(error), (label, error)
+    else:
+        raise AssertionError(f"{label}: the loader accepted it")
+    result = subprocess.run([sys.executable, "-I", str(base / "tools/myron-session"), "show"],
+                            capture_output=True, text=True)
+    assert result.returncode == 1 and result.stderr.startswith("ERROR: ") and not result.stdout, label
+    ok(f"the loader refuses {label}")
+
+
+def to_symlink(path):
+    target = path.with_name("target.py")
+    path.rename(target)
+    path.symlink_to(target)
+
+
+def to_fifo(path):
+    path.unlink()
+    os.mkfifo(path)
+
+
+loader_refuses("an implementation that is a symlink", to_symlink, "cannot read")
+loader_refuses("an implementation that is not a regular file", to_fifo, "not a regular file")
+loader_refuses("a group-writable implementation", lambda path: path.chmod(0o664), "writable by others")
+loader_refuses("an oversize implementation", lambda path: path.write_bytes(b"#" * (1024 * 1024 + 1)), "byte bound")
+loader_refuses("a missing implementation", lambda path: path.unlink(), "cannot read")
+
+# Dependency version pins: a collector, preflight, snapshot or deployment outside the pins is refused.
+
+
+def version_pin(label, tool, old, new, expect):
+    base = fresh("version-pin")
+    (base / "packages").mkdir()
+    for part in ["tools", *(f"packages/{p.name}" for p in (repo / "packages").glob("omamobile-myron-*"))]:
+        shutil.copytree(repo / part, base / part, ignore=shutil.ignore_patterns("__pycache__"))
+    target = base / tool
+    text = target.read_text()
+    assert old in text, label
+    target.write_text(text.replace(old, new, 1))
+    module = load(f"session_pin_{counter[0]}", base / "tools/myron-session")
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = module.main(["show"], contracts_root=contracts_root)
+    assert code != 0 and expect in err.getvalue(), (label, err.getvalue())
+    ok(f"{label} is refused before any use")
+
+
+version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
+            'VERSION = "0.1.0"', 'VERSION = "0.1.1"', "unsupported verifier versions")
+version_pin("a preflight at another version", "tools/myron-preflight",
+            'VERSION = "0.2.1"', 'VERSION = "0.2.0"', "unsupported verifier versions")
+ok("dependency version pins are enforced")
+
+print("ok - myron session rehearsal tests passed")
+PY
+
+pass "myron session tests passed"
