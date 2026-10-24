@@ -43,13 +43,834 @@
     "remote_commands": [],
     "status": "fixture-evidence-recorded"
   },
+  "forbidden_operations": [
+    "phone-contact",
+    "ssh",
+    "adb",
+    "fastboot",
+    "reboot",
+    "slot-change",
+    "partition-write",
+    "flash",
+    "erase",
+    "format",
+    "mount",
+    "module-load",
+    "service-restart",
+    "package-install",
+    "network-access"
+  ],
   "format_version": "0.1.0",
+  "identity": {
+    "device.codename": "myron",
+    "device.compatible": "qcom,canoe-mtp",
+    "device.soc": "sm8850",
+    "kernel.notes_sha256": "8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
+    "kernel.release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
+  },
   "kind": "myron-capture-collector-contract",
   "pinned_versions": {
     "deployment": "0.4.0",
     "preflight": "0.2.0",
     "snapshot": "0.2.0"
   },
+  "policy": {
+    "capture_limits": {
+      "depth": 2,
+      "entries": 16,
+      "file_bytes": 1048576,
+      "json_depth": 8,
+      "total_bytes": 4194304
+    },
+    "exclusions": {
+      "hash_values": "[0-9a-f]{64}",
+      "identifier_patterns": [
+        "(?i)(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}",
+        "(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        "[0-9]{14,}",
+        "(?i)[0-9a-f]{24,}"
+      ],
+      "match": "token-run-boundary",
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ]
+    },
+    "operations": {
+      "R1-identity-and-slot": {
+        "container": null,
+        "fields": {
+          "codename": {
+            "source": "device.codename",
+            "type": "identity"
+          },
+          "compatible_prefix": {
+            "source": "device.compatible",
+            "type": "identity"
+          },
+          "current_slot": {
+            "type": "enum",
+            "values": [
+              "a",
+              "b"
+            ]
+          },
+          "slot_suffix": {
+            "type": "enum",
+            "values": [
+              "_a",
+              "_b"
+            ]
+          },
+          "soc": {
+            "source": "device.soc",
+            "type": "identity"
+          },
+          "sources_agree": {
+            "const": true,
+            "type": "bool"
+          },
+          "verified_boot_state": {
+            "type": "enum",
+            "values": [
+              "green",
+              "yellow",
+              "orange",
+              "red"
+            ]
+          }
+        },
+        "input_path": "operations/R1-identity-and-slot.json",
+        "rules": [
+          "slot-suffix-matches-slot"
+        ]
+      },
+      "R2-gpt-and-recovery-inventory": {
+        "container": {
+          "row_fields": [
+            "partition_name",
+            "size_bytes",
+            "bootable_flag",
+            "slot_suffix"
+          ],
+          "rows_field": "partitions"
+        },
+        "fields": {
+          "partitions": {
+            "max": 128,
+            "min": 1,
+            "row": {
+              "bootable_flag": {
+                "type": "bool"
+              },
+              "partition_name": {
+                "pattern": "[a-z0-9_]{1,36}",
+                "type": "text"
+              },
+              "size_bytes": {
+                "max": 1125899906842624,
+                "min": 0,
+                "type": "int"
+              },
+              "slot_suffix": {
+                "type": "enum",
+                "values": [
+                  "",
+                  "_a",
+                  "_b"
+                ]
+              }
+            },
+            "sorted_unique_by": "partition_name",
+            "type": "rows"
+          },
+          "recovery_present": {
+            "type": "bool"
+          }
+        },
+        "input_path": "operations/R2-gpt-and-recovery-inventory.json",
+        "recovery_pattern": "recovery(_a|_b)?",
+        "rules": [
+          "slot-suffix-matches-name",
+          "recovery-flag-matches-inventory"
+        ]
+      },
+      "R3-boot-image-headers": {
+        "container": {
+          "row_fields": [
+            "partition_name",
+            "absent",
+            "header_version",
+            "page_size",
+            "os_version",
+            "component_sizes",
+            "component_offsets",
+            "segment_count",
+            "header_sha256"
+          ],
+          "rows_field": "images"
+        },
+        "fields": {
+          "images": {
+            "max": 12,
+            "min": 1,
+            "row": {
+              "absent": {
+                "type": "bool"
+              },
+              "component_offsets": {
+                "item": {
+                  "max": 4294967296,
+                  "min": 0,
+                  "type": "int"
+                },
+                "max": 8,
+                "min": 0,
+                "sorted_unique": false,
+                "type": "list"
+              },
+              "component_sizes": {
+                "item": {
+                  "max": 4294967296,
+                  "min": 0,
+                  "type": "int"
+                },
+                "max": 8,
+                "min": 0,
+                "sorted_unique": false,
+                "type": "list"
+              },
+              "header_sha256": {
+                "pattern": "[0-9a-f]{64}",
+                "type": "hash"
+              },
+              "header_version": {
+                "max": 4,
+                "min": 0,
+                "type": "int"
+              },
+              "os_version": {
+                "pattern": "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+                "type": "text"
+              },
+              "page_size": {
+                "type": "int_enum",
+                "values": [
+                  2048,
+                  4096,
+                  8192,
+                  16384
+                ]
+              },
+              "partition_name": {
+                "pattern": "(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?",
+                "type": "text"
+              },
+              "segment_count": {
+                "max": 8,
+                "min": 1,
+                "type": "int"
+              }
+            },
+            "sorted_unique_by": "partition_name",
+            "type": "rows"
+          }
+        },
+        "input_path": "operations/R3-boot-image-headers.json",
+        "rules": [
+          "absent-image-carries-no-header",
+          "segment-lists-match-count"
+        ]
+      },
+      "R4-dtb-dtbo-selection": {
+        "container": null,
+        "fields": {
+          "compatible_prefix": {
+            "source": "device.compatible",
+            "type": "identity"
+          },
+          "dtb_count": {
+            "max": 64,
+            "min": 0,
+            "type": "int"
+          },
+          "dtbo_entry_count": {
+            "max": 256,
+            "min": 0,
+            "type": "int"
+          },
+          "selected_board_id": {
+            "max": 4294967295,
+            "min": 0,
+            "type": "int"
+          },
+          "selected_board_revision": {
+            "max": 4294967295,
+            "min": 0,
+            "type": "int"
+          },
+          "selection_source": {
+            "type": "enum",
+            "values": [
+              "bootconfig",
+              "device-tree",
+              "dtbo-header"
+            ]
+          }
+        },
+        "input_path": "operations/R4-dtb-dtbo-selection.json",
+        "rules": [
+          "board-id-and-revision-set-together"
+        ]
+      },
+      "R5-module-load-order": {
+        "container": null,
+        "fields": {
+          "load_order_index": {
+            "item": {
+              "max": 256,
+              "min": 0,
+              "type": "int"
+            },
+            "max": 256,
+            "min": 0,
+            "sorted_unique": false,
+            "type": "list"
+          },
+          "module_names": {
+            "item": {
+              "pattern": "[A-Za-z0-9_-]{1,56}",
+              "type": "text"
+            },
+            "max": 256,
+            "min": 0,
+            "sorted_unique": false,
+            "type": "list"
+          },
+          "order_matches_declared": {
+            "type": "bool"
+          },
+          "taint_flags": {
+            "item": {
+              "pattern": "[A-Z]{0,8}",
+              "type": "text"
+            },
+            "max": 256,
+            "min": 0,
+            "sorted_unique": false,
+            "type": "list"
+          }
+        },
+        "input_path": "operations/R5-module-load-order.json",
+        "rules": [
+          "parallel-lists-match-names",
+          "unique-names",
+          "sequential-index",
+          "order-claim-recomputed"
+        ]
+      },
+      "R6-storage-and-mount-model": {
+        "container": null,
+        "fields": {
+          "block_size": {
+            "type": "int_enum",
+            "values": [
+              1024,
+              2048,
+              4096,
+              8192,
+              16384,
+              65536
+            ]
+          },
+          "filesystem_type": {
+            "type": "enum",
+            "values": [
+              "ext4",
+              "f2fs",
+              "erofs",
+              "btrfs",
+              "xfs"
+            ]
+          },
+          "mount_options": {
+            "item": {
+              "type": "enum",
+              "values": [
+                "discard",
+                "errors=remount-ro",
+                "noatime",
+                "nodev",
+                "noexec",
+                "nosuid",
+                "relatime",
+                "ro",
+                "rw"
+              ]
+            },
+            "max": 16,
+            "min": 0,
+            "sorted_unique": true,
+            "type": "list"
+          },
+          "root_source_gpt_name": {
+            "pattern": "[a-z0-9_]{1,36}",
+            "type": "text"
+          },
+          "rounded_free_bytes": {
+            "max": 1125899906842624,
+            "min": 0,
+            "type": "int"
+          },
+          "rounded_total_bytes": {
+            "max": 1125899906842624,
+            "min": 1,
+            "type": "int"
+          }
+        },
+        "input_path": "operations/R6-storage-and-mount-model.json",
+        "rounding_bytes": 1048576,
+        "rules": [
+          "sizes-rounded",
+          "free-not-above-total"
+        ]
+      },
+      "R7-kernel-identity-revalidation": {
+        "allowlist_unknown_keys": "reject",
+        "container": null,
+        "fields": {
+          "allowlisted_bootconfig_keys": {
+            "type": "request-allowlist"
+          },
+          "allowlisted_cmdline": {
+            "type": "request-allowlist"
+          },
+          "kernel_release": {
+            "source": "kernel.release",
+            "type": "identity"
+          },
+          "notes_sha256": {
+            "pattern": "[0-9a-f]{64}",
+            "source": "kernel.notes_sha256",
+            "type": "identity"
+          }
+        },
+        "input_path": "operations/R7-kernel-identity-revalidation.json",
+        "rules": [
+          "cross-checked-against-r1"
+        ]
+      }
+    }
+  },
+  "redaction": {
+    "emitted": "allowlisted header fields, enums, booleans, counts, sizes, and sha256 of declared bounded reads",
+    "identifiers": "excluded",
+    "private_bytes": "excluded",
+    "raw_payload": "excluded"
+  },
+  "requested_operations": [
+    {
+      "emits": [
+        "codename",
+        "soc",
+        "compatible-prefix",
+        "current-slot",
+        "slot-suffix",
+        "verified-boot-state",
+        "sources-agree"
+      ],
+      "field_policy": {},
+      "id": "R1-identity-and-slot",
+      "max_bytes": 65536,
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ],
+      "purpose": [
+        "no-bootable-image-or-captured-boot-chain"
+      ],
+      "read_only": true,
+      "stop_conditions": [
+        "identity-mismatch",
+        "two-source-disagreement",
+        "bound-exceeded",
+        "unstable-read",
+        "write-attempt"
+      ],
+      "targets": [
+        "bootloader-current-slot",
+        "ro.boot.slot_suffix",
+        "ro.boot.slot",
+        "verified-boot-state",
+        "device-tree-compatible"
+      ],
+      "transport": "approved-read-only-recovery-session"
+    },
+    {
+      "emits": [
+        "partition-name",
+        "size-bytes",
+        "bootable-flag",
+        "slot-suffix",
+        "recovery-present"
+      ],
+      "field_policy": {},
+      "id": "R2-gpt-and-recovery-inventory",
+      "max_bytes": 1048576,
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ],
+      "purpose": [
+        "no-bootable-image-or-captured-boot-chain"
+      ],
+      "read_only": true,
+      "stop_conditions": [
+        "identity-mismatch",
+        "two-source-disagreement",
+        "bound-exceeded",
+        "unstable-read",
+        "write-attempt"
+      ],
+      "targets": [
+        "read-only-gpt-header-and-entry-array",
+        "recovery-partition-presence"
+      ],
+      "transport": "approved-read-only-recovery-session"
+    },
+    {
+      "emits": [
+        "partition-name",
+        "header-version",
+        "page-size",
+        "os-version",
+        "component-sizes",
+        "component-offsets",
+        "segment-count",
+        "header-sha256",
+        "absent"
+      ],
+      "field_policy": {},
+      "id": "R3-boot-image-headers",
+      "max_bytes": 65536,
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ],
+      "purpose": [
+        "no-bootable-image-or-captured-boot-chain"
+      ],
+      "read_only": true,
+      "stop_conditions": [
+        "identity-mismatch",
+        "two-source-disagreement",
+        "bound-exceeded",
+        "unstable-read",
+        "write-attempt"
+      ],
+      "targets": [
+        "boot_* header",
+        "init_boot_* header",
+        "vendor_boot_* header",
+        "vendor_kernel_boot_* header",
+        "dtbo_* header",
+        "recovery_* header"
+      ],
+      "transport": "approved-read-only-recovery-session"
+    },
+    {
+      "emits": [
+        "dtb-count",
+        "selected-board-id",
+        "selected-board-revision",
+        "dtbo-entry-count",
+        "compatible-prefix",
+        "selection-source"
+      ],
+      "field_policy": {},
+      "id": "R4-dtb-dtbo-selection",
+      "max_bytes": 65536,
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ],
+      "purpose": [
+        "no-bootable-image-or-captured-boot-chain"
+      ],
+      "read_only": true,
+      "stop_conditions": [
+        "identity-mismatch",
+        "two-source-disagreement",
+        "bound-exceeded",
+        "unstable-read",
+        "write-attempt"
+      ],
+      "targets": [
+        "live-bootconfig-dt-selection-fields",
+        "live-device-tree-compatible-prefix",
+        "dtbo-header-selection-fields"
+      ],
+      "transport": "approved-read-only-recovery-session"
+    },
+    {
+      "emits": [
+        "module-names",
+        "load-order-index",
+        "taint-flags",
+        "order-matches-declared"
+      ],
+      "field_policy": {},
+      "id": "R5-module-load-order",
+      "max_bytes": 1048576,
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ],
+      "purpose": [
+        "module-abi-import-and-load-order-not-verified"
+      ],
+      "read_only": true,
+      "stop_conditions": [
+        "identity-mismatch",
+        "two-source-disagreement",
+        "bound-exceeded",
+        "unstable-read",
+        "write-attempt"
+      ],
+      "targets": [
+        "/proc/modules names-order-taint-only"
+      ],
+      "transport": "approved-read-only-recovery-session"
+    },
+    {
+      "emits": [
+        "root-source-gpt-name",
+        "filesystem-type",
+        "mount-options",
+        "block-size",
+        "rounded-total-bytes",
+        "rounded-free-bytes"
+      ],
+      "field_policy": {},
+      "id": "R6-storage-and-mount-model",
+      "max_bytes": 65536,
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ],
+      "purpose": [
+        "no-bootable-image-or-captured-boot-chain"
+      ],
+      "read_only": true,
+      "stop_conditions": [
+        "identity-mismatch",
+        "two-source-disagreement",
+        "bound-exceeded",
+        "unstable-read",
+        "write-attempt"
+      ],
+      "targets": [
+        "root-mount-by-gpt-name",
+        "root-filesystem-statistics"
+      ],
+      "transport": "approved-read-only-recovery-session"
+    },
+    {
+      "emits": [
+        "kernel-release",
+        "notes-sha256",
+        "allowlisted-cmdline",
+        "allowlisted-bootconfig-keys"
+      ],
+      "field_policy": {
+        "bootconfig": {
+          "entries": [
+            {
+              "allowed_values": [
+                "_a",
+                "_b"
+              ],
+              "key": "androidboot.slot_suffix",
+              "value_type": "enum"
+            },
+            {
+              "allowed_values": [
+                "a",
+                "b"
+              ],
+              "key": "androidboot.slot",
+              "value_type": "enum"
+            },
+            {
+              "allowed_values": [
+                "green",
+                "yellow",
+                "orange",
+                "red"
+              ],
+              "key": "androidboot.verifiedbootstate",
+              "value_type": "enum"
+            },
+            {
+              "allowed_values": [
+                "myron"
+              ],
+              "key": "androidboot.hardware",
+              "value_type": "enum"
+            },
+            {
+              "allowed_values": [
+                "myron"
+              ],
+              "key": "androidboot.product.vendor.device",
+              "value_type": "enum"
+            }
+          ],
+          "unknown_keys": "reject"
+        },
+        "kernel_command_line": {
+          "entries": [
+            {
+              "allowed_values": [
+                "_a",
+                "_b"
+              ],
+              "key": "androidboot.slot_suffix",
+              "value_type": "enum"
+            },
+            {
+              "allowed_values": [
+                "a",
+                "b"
+              ],
+              "key": "androidboot.slot",
+              "value_type": "enum"
+            },
+            {
+              "allowed_values": [
+                "present"
+              ],
+              "key": "bootconfig",
+              "value_type": "flag"
+            }
+          ],
+          "unknown_keys": "reject"
+        }
+      },
+      "id": "R7-kernel-identity-revalidation",
+      "max_bytes": 1048576,
+      "never_emits": [
+        "serial",
+        "imei",
+        "meid",
+        "mac",
+        "ssid",
+        "android_id",
+        "partition_uuid",
+        "disk_guid",
+        "raw_payload",
+        "kernel_bytes",
+        "ramdisk_bytes",
+        "firmware_bytes",
+        "module_bytes"
+      ],
+      "purpose": [
+        "no-bootable-image-or-captured-boot-chain"
+      ],
+      "read_only": true,
+      "stop_conditions": [
+        "identity-mismatch",
+        "two-source-disagreement",
+        "bound-exceeded",
+        "unstable-read",
+        "write-attempt"
+      ],
+      "targets": [
+        "/sys/kernel/notes hash-only",
+        "/proc/version release-only",
+        "allowlisted-kernel-command-line",
+        "allowlisted-bootconfig"
+      ],
+      "transport": "approved-read-only-recovery-session"
+    }
+  ],
   "schema": 1,
   "transport": "external-precaptured-fixture"
 }

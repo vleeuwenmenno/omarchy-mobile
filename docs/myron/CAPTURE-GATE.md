@@ -34,7 +34,7 @@ a read session or deployment may follow, stays a separate human decision.
 | Command | Effect |
 | --- | --- |
 | `show` | Print the canonical capture contract. |
-| `plan --request R` | Print the deterministic, value-free collection plan. |
+| `plan --request R` | Print the deterministic, value-free collection plan: the request's forbidden operations and redaction, and per operation its purpose, bounds, emits, field policy, never-emits, stop conditions, input path, row container and typed policy. |
 | `verify-plan --request R --plan P` | Recompute the plan; `P` must match byte for byte. |
 | `collect --request R --capture C --out O` | Validate the fixture and publish a new evidence artifact. |
 | `verify-evidence --request R --capture C --evidence E` | Recompute the evidence from `R` and `C`; `E` must match exactly. |
@@ -76,13 +76,46 @@ Bounds and rejections:
 - strict schemas: exact keys, no booleans for integers, no floats, ranges,
   enums, ASCII patterns, sorted unique lists, list-length bounds;
 - identifier rejection everywhere (keys and values): MAC, UUID, 14+ digit
-  runs (IMEI-shaped), long hex, and the words the request lists under
-  `never_emits` (serial, IMEI, MEID, MAC, SSID, partition UUID, disk GUID,
-  raw payload, kernel/ramdisk/firmware/module bytes);
+  runs (IMEI-shaped), long hex, and every name the request lists under
+  `never_emits` (`serial`, `imei`, `meid`, `mac`, `ssid`, `android_id`,
+  `partition_uuid`, `disk_guid`, `raw_payload`, `kernel_bytes`,
+  `ramdisk_bytes`, `firmware_bytes`, `module_bytes`). A name matches as a run
+  of whole tokens split on any non-alphanumeric character, so `android_id`,
+  `android-id`, `android_id_2` and `x_raw_payload` all reject, while
+  `android_idx` or `serials` do not. A bare 64-hex SHA-256 value is exempt;
+  nothing else is;
+- R5 lists at most 256 modules (names, load-order index and taint flags);
 - R7 accepts only the command-line and bootconfig keys and values the request
   lists; any other key or value fails;
+- identity is compared exactly to the pinned contract, not merely shaped: R1
+  codename, SoC and compatible prefix and R4 compatible prefix equal the
+  kernel contract's device values, and R7 `kernel_release` and `notes_sha256`
+  equal its kernel release and notes hash (a well-formed but different value
+  is a stop condition and is rejected);
 - cross-checks: R1 slot agreement, R2/R3/R6 partition consistency, R7 against
   R1, and the R5 order claim against the module list.
+
+## Policy registry and capture contract
+
+`policy_registry()` in the tool is the single typed source of every validation
+constant: patterns, enums, numeric and list bounds, row containers, the
+identifier patterns, capture limits and the exclusion list, plus the named
+cross-check rules. The validators, the collection plan and the capture contract
+all read it. The committed `device/myron/capture-contract.json` embeds, besides
+the preflight pin and the claims above:
+
+- `requested_operations`: the exact R1..R7 definitions (purpose, bounds,
+  targets, emits, field policy, never-emits, stop conditions);
+- `forbidden_operations` and `redaction` from the request;
+- `identity`: the device and kernel values the checks compare against;
+- `policy`: the typed registry.
+
+Changing any validator constant, pattern, enum or bound changes the derived
+contract, and the tool refuses a committed contract that differs from it
+(`capture contract differs from its derived form`), so a policy change is
+always a reviewed contract change. The named cross-check rules are recorded in
+the registry, but the logic behind them is code: a new rule's logic is not
+bound by the contract hash alone.
 
 A capture that reports a stop condition (identity mismatch, source
 disagreement, `sources_agree: false`) is rejected, not recorded.
@@ -97,9 +130,12 @@ Exactly five files:
 - `STATUS.txt`
 - `SHA256SUMS`
 
-`evidence.json` holds hashes, sizes and bounds per operation, not the captured
-values. The artifact is deterministic: the same request and capture give the
-same bytes.
+`evidence.json` records, per operation, its file hash, size, `bytes_read`,
+`max_bytes` and the exact validated `data`: only the allowlisted, typed fields,
+with identifiers and raw payloads already rejected, so it holds no raw payload.
+Evidence therefore carries the (fixture) values: treat it with the same care as
+the capture. The artifact is deterministic: `verify-evidence` recomputes every
+byte, including the data, from the request and the capture.
 
 ## Safety and publication
 

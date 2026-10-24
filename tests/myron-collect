@@ -92,7 +92,7 @@ preflight_contract = P.expected_preflight_contract(contracts, snapshot_contract_
 preflight_bytes = D.render_json(preflight_contract)
 (contracts_root / P.PREFLIGHT_CONTRACT_PATH).parent.mkdir(parents=True, exist_ok=True)
 (contracts_root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes)
-capture_contract = C.expected_capture_contract(D.sha256_bytes(preflight_bytes))
+capture_contract = C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts)
 capture_contract_bytes = D.render_json(capture_contract)
 (contracts_root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes)
 
@@ -131,9 +131,11 @@ def expect_ok(*arguments, **kwargs):
     return json.loads(out), out
 
 
-def expect_fail(name, arguments, *outputs, **kwargs):
+def expect_fail(name, arguments, *outputs, match=None, **kwargs):
     code, out, err = invoke(*arguments, **kwargs)
     assert code != 0, f"{name}: accepted\n{out}"
+    if match is not None:
+        assert match in err, f"{name}: expected {match!r}, got {err!r}"
     for output in outputs:
         assert not os.path.lexists(output), f"{name}: left output {output}"
     ok(f"{name} is rejected")
@@ -228,8 +230,8 @@ DATA = {
         "rounded_total_bytes": 42949672960, "rounded_free_bytes": 21474836480,
     },
     "R7-kernel-identity-revalidation": {
-        "kernel_release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k",
-        "notes_sha256": digest(b"notes"),
+        "kernel_release": contracts.reference["kernel"]["release"],
+        "notes_sha256": contracts.reference["kernel"]["notes_sha256"],
         "allowlisted_cmdline": [{"key": "bootconfig", "value": "present"}],
         "allowlisted_bootconfig_keys": [
             {"key": "androidboot.hardware", "value": "myron"},
@@ -336,7 +338,9 @@ assert json.loads(data["status.json"]) == {
     "artifact": C.EVIDENCE_KIND, "blockers": D.BLOCKERS, **{f: False for f in P.AUTHORITY_FLAGS},
 }
 assert b"artifact-structure-only" in data["STATUS.txt"] and b"not live evidence" in data["STATUS.txt"]
-assert b"pmos_root" not in b"".join(data.values())
+assert b"pmos_root" not in b"".join(
+    data[path] for path in data if path != "evidence.json"
+), "values appear only in evidence.json"
 assert data["SHA256SUMS"] == "".join(
     f"{digest(data[p])}  {p}\n"
     for p in sorted(("contracts/capture-contract.json", "evidence.json", "status.json", "STATUS.txt"))
@@ -349,7 +353,7 @@ assert verified["status"] == "verified" and verified["blocker_count"] == 7
 ok("collect is deterministic, exact five files, and says structure-only with every blocker missing")
 
 
-def tampered_evidence(name, mutate_document=None, mutate_files=None):
+def tampered_evidence(name, mutate_document=None, mutate_files=None, match=None):
     clone = fresh("evidence-tamper") / "evidence"
     shutil.copytree(evidence_a, clone)
     if mutate_document:
@@ -362,7 +366,7 @@ def tampered_evidence(name, mutate_document=None, mutate_files=None):
     (clone / "SHA256SUMS").write_text("".join(
         f"{digest((clone / path).read_bytes())}  {path}\n" for path in files
     ))
-    expect_fail(name, ["verify-evidence", *args(), "--evidence", clone])
+    expect_fail(name, ["verify-evidence", *args(), "--evidence", clone], match=match)
 
 
 tampered_evidence("live claim", lambda v: v.update(live=True))
@@ -411,7 +415,8 @@ ok("verify-evidence recomputes and rejects semantic and structural tampering")
 # --- capture tamper: schemas, bounds, lists, strings, identifiers -------------
 
 
-def bad_capture(name, edit=None, *, raw=None, manifest_edit=None, req_sha=None, documents=None):
+def bad_capture(name, edit=None, *, raw=None, manifest_edit=None, req_sha=None, documents=None,
+                match=None):
     """Build a capture whose manifest is regenerated, so only validators can object."""
     base = fresh("capture-tamper") / "capture"
     docs = documents or {}
@@ -422,7 +427,8 @@ def bad_capture(name, edit=None, *, raw=None, manifest_edit=None, req_sha=None, 
             docs[operation_id] = document
     write_capture(base, docs, raw, manifest_edit, req_sha)
     out = work / f"tamper-out-{counter[0]}"
-    expect_fail(name, ["collect", "--request", request, "--capture", base, "--out", out], out)
+    expect_fail(name, ["collect", "--request", request, "--capture", base, "--out", out], out,
+                match=match)
     return base
 
 
@@ -440,7 +446,8 @@ bad_capture("bytes_read over operation bound",
             {R1: lambda d: d.update(bytes_read=READS[0]["max_bytes"] + 1)})
 bad_capture("bytes_read float", {R1: lambda d: d.update(bytes_read=1.5)})
 bad_capture("bytes_read bool", {R1: lambda d: d.update(bytes_read=True)})
-bad_capture("R1 wrong codename", {R1: lambda d: d["data"].update(codename="cheetah")})
+bad_capture("R1 wrong codename", {R1: lambda d: d["data"].update(codename="cheetah")},
+            match="differs from the contract identity")
 bad_capture("R1 sources disagree", {R1: lambda d: d["data"].update(sources_agree=False)})
 bad_capture("R1 slot mismatch", {R1: lambda d: d["data"].update(slot_suffix="_b")})
 bad_capture("R1 bad enum", {R1: lambda d: d["data"].update(verified_boot_state="purple")})
@@ -479,7 +486,8 @@ bad_capture("R5 order claim false lie", {R5: lambda d: d["data"].update(
     module_names=list(reversed(d["data"]["module_names"])))})
 bad_capture("R5 too many modules", {R5: lambda d: d["data"].update(
     module_names=[f"m{i}" for i in range(1025)], load_order_index=list(range(1025)),
-    taint_flags=[""] * 1025, order_matches_declared=False)})
+    taint_flags=[""] * 1025, order_matches_declared=False)},
+    match="R5 module names must hold 0..256 entries")
 bad_capture("R5 module name", {R5: lambda d: d["data"]["module_names"].__setitem__(2, "bad name")})
 bad_capture("R5 taint flag", {R5: lambda d: d["data"]["taint_flags"].__setitem__(2, "lower")})
 bad_capture("R6 root not in inventory", {R6: lambda d: d["data"].update(root_source_gpt_name="other")})
@@ -532,12 +540,16 @@ bad_capture("operation NaN", raw={R1: b'{"schema": NaN}\n'})
 bad_capture("operation not JSON", raw={R1: b"not json\n"})
 good_raw = D.render_json(operation_document(R1, bytes_read=100))
 try:
-    C.validate_operation(good_raw, {**READS[0], "max_bytes": len(good_raw) - 1}, request_sha256)
+    C.validate_operation(
+        good_raw, {**READS[0], "max_bytes": len(good_raw) - 1}, request_sha256, envs.identity
+    )
 except C.CollectError as error:
     assert "byte bound" in str(error)
 else:
     raise AssertionError("operation larger than its max_bytes was accepted")
-C.validate_operation(good_raw, {**READS[0], "max_bytes": len(good_raw)}, request_sha256)
+C.validate_operation(
+    good_raw, {**READS[0], "max_bytes": len(good_raw)}, request_sha256, envs.identity
+)
 ok("operation larger than its own max_bytes is rejected")
 bad_capture("manifest wrong request", req_sha="1" * 64)
 bad_capture("manifest extra field", manifest_edit=lambda m: m.update(extra=1))
@@ -824,6 +836,276 @@ try:
 finally:
     C.PREFLIGHT_TOOL, C._preflight = saved_tool, saved_module
 ok("a preflight tool outside the pinned versions is refused")
+# --- Phase 2.12 R1 review fixes: policy binding, evidence data, plan policy ----------
+
+# 1. The capture contract binds the operations, the redaction and the typed registry.
+contract = json.loads(capture_contract_bytes)
+assert contract["requested_operations"] == READS
+assert contract["forbidden_operations"] == request_document["forbidden_operations"]
+assert contract["redaction"] == request_document["redaction"]
+assert contract["policy"] == C.policy_registry()
+assert contract["identity"] == C.identity_values(contracts)
+assert [row["id"] for row in contract["requested_operations"]] == OPERATION_IDS
+assert set(contract["policy"]["operations"]) == set(OPERATION_IDS)
+r5_policy = contract["policy"]["operations"][R5]["fields"]
+assert r5_policy["module_names"]["max"] == 256 and r5_policy["load_order_index"]["max"] == 256
+assert contract["policy"]["exclusions"]["never_emits"] == P.NEVER_EMITS
+ok("capture contract binds R1..R7, forbidden operations, redaction, identity and the typed registry")
+
+
+def contract_tamper(name, mutate, match="differs from its derived form"):
+    root = clone_root("policy-tamper")
+    value = json.loads(capture_contract_bytes)
+    mutate(value)
+    (root / C.CAPTURE_CONTRACT_PATH).write_bytes(D.render_json(value))
+    expect_fail(name, ["show"], root=root, match=match)
+
+
+contract_tamper("contract without the policy registry", lambda v: v.pop("policy"))
+contract_tamper("contract without requested operations", lambda v: v.pop("requested_operations"))
+contract_tamper("contract operation removed", lambda v: v["requested_operations"].pop())
+contract_tamper("contract operation bound widened",
+                lambda v: v["requested_operations"][4].update(max_bytes=2 * 1024 * 1024))
+contract_tamper("contract operation emits widened",
+                lambda v: v["requested_operations"][0]["emits"].append("extra"))
+contract_tamper("contract forbidden operation dropped", lambda v: v["forbidden_operations"].pop())
+contract_tamper("contract redaction relaxed", lambda v: v["redaction"].update(identifiers="allowed"))
+contract_tamper("contract identity release", lambda v: v["identity"].update(
+    **{"kernel.release": "6.12.23-other"}))
+contract_tamper("contract R5 list bound back at 1024", lambda v: v["policy"]["operations"][R5][
+    "fields"]["module_names"].update(max=1024))
+contract_tamper("contract mount option widened", lambda v: v["policy"]["operations"][R6]["fields"][
+    "mount_options"]["item"]["values"].append("uid=1000"))
+contract_tamper("contract exclusion dropped", lambda v: v["policy"]["exclusions"][
+    "never_emits"].remove("android_id"))
+contract_tamper("contract identifier pattern dropped", lambda v: v["policy"]["exclusions"][
+    "identifier_patterns"].pop())
+contract_tamper("contract field type changed", lambda v: v["policy"]["operations"][R1]["fields"][
+    "sources_agree"].pop("const"))
+contract_tamper("contract R7 policy dropped", lambda v: v["policy"]["operations"].pop(R7))
+contract_tamper("contract capture limits widened", lambda v: v["policy"]["capture_limits"].update(
+    total_bytes=8 * 1024 * 1024))
+ok("capture contract tampering of operations, redaction, identity and typed policy is refused")
+
+# 1b. Policy drift: a changed validator constant changes the derived contract, so the
+# committed contract no longer matches and the tool refuses it.
+baseline = D.render_json(C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts))
+assert baseline == capture_contract_bytes
+
+
+def drift(name, apply, restore):
+    apply()
+    try:
+        drifted = D.render_json(
+            C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts)
+        )
+        assert drifted != baseline, f"{name}: contract did not change"
+        assert digest(drifted) != digest(baseline)
+        try:
+            C.load_capture_contract(contracts_root, D.sha256_bytes(preflight_bytes), contracts)
+        except C.CollectError as error:
+            assert "differs from its derived form" in str(error), error
+        else:
+            raise AssertionError(f"{name}: repository contract accepted after drift")
+        code, _out, err = invoke("show")
+        assert code != 0 and "differs from its derived form" in err, err
+    finally:
+        restore()
+    assert D.render_json(
+        C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts)
+    ) == baseline
+    ok(f"{name} changes the derived contract and the repository contract is refused")
+
+
+drift("MOUNT_OPTIONS change", lambda: C.MOUNT_OPTIONS.append("noauto"), lambda: C.MOUNT_OPTIONS.pop())
+drift("FILESYSTEMS change", lambda: C.FILESYSTEMS.append("ntfs"), lambda: C.FILESYSTEMS.pop())
+saved_modules = C.MAX_MODULES
+drift("R5 list bound change", lambda: setattr(C, "MAX_MODULES", 1024),
+      lambda: setattr(C, "MAX_MODULES", saved_modules))
+saved_pattern = C.MODULE_NAME
+drift("module name pattern change",
+      lambda: setattr(C, "MODULE_NAME", C.re.compile(r"[A-Za-z0-9_.-]{1,56}")),
+      lambda: setattr(C, "MODULE_NAME", saved_pattern))
+drift("exclusion list change", lambda: P.NEVER_EMITS.append("msisdn"), lambda: P.NEVER_EMITS.pop())
+saved_ids = C.IDENTIFIER_PATTERNS
+drift("identifier pattern change", lambda: setattr(C, "IDENTIFIER_PATTERNS", saved_ids[:-1]),
+      lambda: setattr(C, "IDENTIFIER_PATTERNS", saved_ids))
+saved_total = C.TOTAL_CAPTURE_BYTES
+drift("total byte bound change", lambda: setattr(C, "TOTAL_CAPTURE_BYTES", 8 * 1024 * 1024),
+      lambda: setattr(C, "TOTAL_CAPTURE_BYTES", saved_total))
+
+# 4. Underscore and boundary forms of the excluded names reject; lookalike words stay valid.
+R5_SPEC = READS[4]
+
+
+def r5_with(name):
+    document = operation_document(R5)
+    document["data"]["module_names"][2] = name
+    return D.render_json(document)
+
+
+def r5_error(name):
+    try:
+        C.validate_operation(r5_with(name), R5_SPEC, request_sha256, envs.identity)
+    except C.CollectError as error:
+        return str(error)
+    return None
+
+
+for word in P.NEVER_EMITS:
+    for form in (word, f"{word}_2", f"x_{word}", f"{word}-v2", f"{word}_x_{word}"):
+        assert "excluded identifier or payload field" in (r5_error(form) or ""), form
+    assert "excluded identifier or payload field" in (r5_error(word.replace("_", "-")) or "")
+    if "_" in word:
+        assert r5_error(word.replace("_", "")) is None, word
+    for form in (f"{word}x", f"x{word}", f"{word}s9", f"{word}_x".replace("_x", "x")):
+        assert r5_error(form) is None, (form, r5_error(form))
+bad_capture("android_id module name", {R5: lambda d: d["data"]["module_names"].__setitem__(
+    2, "android_id")}, match="excluded identifier or payload field")
+bad_capture("raw_payload module name", {R5: lambda d: d["data"]["module_names"].__setitem__(
+    2, "raw_payload")}, match="excluded identifier or payload field")
+bad_capture("suffixed partition_uuid", {R5: lambda d: d["data"]["module_names"].__setitem__(
+    2, "partition_uuid_0")}, match="excluded identifier or payload field")
+bad_capture("excluded word as a key", {R1: lambda d: d["data"].update(android_id="x")},
+            match="excluded identifier or payload field")
+C.reject_identifiers({"header_sha256": digest(b"x")}, "hash allowance")
+for hostile in ({"android_id": digest(b"x")}, {"note": "disk_guid_" + digest(b"x")}):
+    try:
+        C.reject_identifiers(hostile, "hash allowance")
+    except C.CollectError:
+        pass
+    else:
+        raise AssertionError(f"identifier hidden beside a hash was accepted: {hostile}")
+ok("underscore, hyphen, suffixed and boundary excluded names reject; lookalikes and hashes pass")
+
+# 5. R5 list bound is 256.
+def r5_list(count):
+    document = operation_document(R5)
+    document["data"] = {
+        "module_names": [f"m{i}" for i in range(count)], "load_order_index": list(range(count)),
+        "taint_flags": [""] * count, "order_matches_declared": False,
+    }
+    return D.render_json(document)
+
+
+C.validate_operation(r5_list(256), R5_SPEC, request_sha256, envs.identity)
+for count in (257, 1024):
+    try:
+        C.validate_operation(r5_list(count), R5_SPEC, request_sha256, envs.identity)
+    except C.CollectError as error:
+        assert "R5 module names must hold 0..256 entries" in str(error), error
+    else:
+        raise AssertionError(f"{count} modules accepted")
+ok("R5 accepts 256 modules and rejects 257 with the list-bound error")
+
+# Identity: wrong-but-shaped R7 and R1/R4 values reject against the contract.
+wrong_release = "6.12.23-android16-5-gdeadbeefcafe-dirty-4k"
+assert wrong_release != contracts.reference["kernel"]["release"]
+bad_capture("R7 wrong-but-shaped kernel release",
+            {R7: lambda d: d["data"].update(kernel_release=wrong_release)},
+            match="R7 kernel release differs from the contract identity")
+bad_capture("R7 wrong-but-shaped notes hash",
+            {R7: lambda d: d["data"].update(notes_sha256=digest(b"other notes"))},
+            match="R7 notes hash differs from the contract identity")
+bad_capture("R1 wrong soc", {R1: lambda d: d["data"].update(soc="sm8750")},
+            match="R1 soc differs from the contract identity")
+bad_capture("R1 wrong compatible", {R1: lambda d: d["data"].update(compatible_prefix="qcom,other")},
+            match="R1 compatible_prefix differs from the contract identity")
+bad_capture("R4 wrong compatible", {R4: lambda d: d["data"].update(compatible_prefix="qcom,other")},
+            match="R4 compatible_prefix differs from the contract identity")
+other_identity = dict(envs.identity, **{"device.compatible": "qcom,other"})
+try:
+    C.validate_operation(
+        D.render_json(operation_document(R4)), READS[3], request_sha256, other_identity
+    )
+except C.CollectError as error:
+    assert "contract identity" in str(error)
+else:
+    raise AssertionError("R4 identity is not derived from the contract")
+ok("R1, R4 and R7 identity values are compared exactly to the contract identity")
+
+# 2. Evidence carries the exact validated data per operation, recomputed.
+evidence = json.loads(walk(evidence_a)[1]["evidence.json"])
+for row in evidence["operations"]:
+    assert row["data"] == DATA[row["id"]], row["id"]
+assert evidence["operations"][6]["data"]["notes_sha256"] == contracts.reference["kernel"]["notes_sha256"]
+assert evidence["operations"][4]["data"]["module_names"][2] == "extra_mod"
+assert b"raw_payload" not in walk(evidence_a)[1]["evidence.json"]
+tampered_evidence("evidence data value changed", lambda v: v["operations"][4]["data"][
+    "module_names"].__setitem__(2, "other_mod"), match="capture evidence differs at")
+tampered_evidence("evidence data removed", lambda v: v["operations"][0].pop("data"),
+                  match="capture evidence differs at")
+tampered_evidence("evidence data field added", lambda v: v["operations"][0]["data"].update(extra=1),
+                  match="capture evidence differs at")
+tampered_evidence("evidence R7 release changed", lambda v: v["operations"][6]["data"].update(
+    kernel_release="6.12.23-other"), match="capture evidence differs at")
+other_capture = fresh("evidence-other") / "capture"
+other_data = copy.deepcopy(DATA[R6])
+other_data["mount_options"] = ["noatime", "nodev", "rw"]
+write_capture(other_capture, {R6: operation_document(R6, data=other_data)})
+other_out = work / "evidence-other-out"
+expect_ok("collect", "--request", request, "--capture", other_capture, "--out", other_out)
+other_evidence = json.loads(walk(other_out)[1]["evidence.json"])
+assert other_evidence["operations"][5]["data"]["mount_options"] == ["noatime", "nodev", "rw"]
+assert other_evidence != evidence
+expect_fail("evidence from another capture", ["verify-evidence", *args(), "--evidence", other_out],
+            match="differs at")
+ok("evidence holds exact validated data per operation, deterministic and recomputed")
+
+# 3. The plan carries the request policy and the typed registry.
+plan_text_now = D.render_json(plan_a)
+assert plan_a["forbidden_operations"] == request_document["forbidden_operations"]
+assert plan_a["redaction"] == request_document["redaction"]
+assert plan_a["policy"]["exclusions"] == C.policy_registry()["exclusions"]
+for row, planned in zip(READS, plan_a["capture_tree"]["operations"]):
+    for key in ("purpose", "read_only", "max_bytes", "emits", "field_policy", "never_emits",
+                "stop_conditions"):
+        assert planned[key] == row[key], (row["id"], key)
+    registry = C.policy_registry()["operations"][row["id"]]
+    assert planned["policy"] == registry and planned["path"] == registry["input_path"]
+assert plan_a["capture_tree"]["operations"][1]["rows_field"] == "partitions"
+assert plan_a["capture_tree"]["operations"][1]["row_fields"] == [
+    "partition_name", "size_bytes", "bootable_flag", "slot_suffix"]
+assert plan_a["capture_tree"]["operations"][0]["rows_field"] is None
+assert plan_a["capture_tree"]["operations"][6]["field_policy"]["kernel_command_line"]["unknown_keys"] == "reject"
+assert not any(key in plan_text for key in ("sm8850", "qcom,canoe", "pmos_root"))
+
+
+def plan_tamper(name, mutate):
+    value = copy.deepcopy(plan_a)
+    mutate(value)
+    path = fresh("plan-tamper") / "plan.json"
+    path.write_bytes(D.render_json(value))
+    expect_fail(name, ["verify-plan", "--request", request, "--plan", path],
+                match="capture plan differs from the request")
+
+
+plan_tamper("plan forbidden operation dropped", lambda v: v["forbidden_operations"].pop())
+plan_tamper("plan forbidden operation added", lambda v: v["forbidden_operations"].append("x"))
+plan_tamper("plan redaction relaxed", lambda v: v["redaction"].update(identifiers="allowed"))
+plan_tamper("plan global exclusion dropped", lambda v: v["policy"]["exclusions"][
+    "never_emits"].pop())
+plan_tamper("plan operation purpose", lambda v: v["capture_tree"]["operations"][0]["purpose"].append("x"))
+plan_tamper("plan operation read_only", lambda v: v["capture_tree"]["operations"][0].update(read_only=False))
+plan_tamper("plan operation bound", lambda v: v["capture_tree"]["operations"][4].update(max_bytes=1))
+plan_tamper("plan operation emits", lambda v: v["capture_tree"]["operations"][4]["emits"].pop())
+plan_tamper("plan operation field policy", lambda v: v["capture_tree"]["operations"][6][
+    "field_policy"]["bootconfig"].update(unknown_keys="accept"))
+plan_tamper("plan operation never_emits", lambda v: v["capture_tree"]["operations"][2][
+    "never_emits"].pop())
+plan_tamper("plan operation stop conditions", lambda v: v["capture_tree"]["operations"][3][
+    "stop_conditions"].pop())
+plan_tamper("plan typed policy bound", lambda v: v["capture_tree"]["operations"][4]["policy"][
+    "fields"]["module_names"].update(max=1024))
+plan_tamper("plan typed policy enum", lambda v: v["capture_tree"]["operations"][5]["policy"][
+    "fields"]["mount_options"]["item"]["values"].append("uid=1000"))
+plan_tamper("plan input path", lambda v: v["capture_tree"]["operations"][0].update(
+    path="operations/other.json"))
+plan_tamper("plan row container", lambda v: v["capture_tree"]["operations"][1].update(
+    rows_field="rows"))
+plan_tamper("plan row fields", lambda v: v["capture_tree"]["operations"][2]["row_fields"].pop())
+ok("plan carries the request policy and typed registry; each tamper is named and refused")
+
 PY
 
 pass "myron collect fixture tests passed"
