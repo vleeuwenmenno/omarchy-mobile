@@ -1630,6 +1630,127 @@ assert D.walk_tree is real_walk
 no_leftovers("rehearsal tree sanitization")
 ok("untrusted rehearsal-tree failures name no input: fixed codes at the session boundary")
 
+# Directory mutations during the settle pass's own name checks, in admission and in the final settle.
+def settle_mutation(label, nth, command, match, untouched=True):
+    base = fresh("settle-mutation") / "reads"
+    write_reads(base)
+    state = {"calls": 0, "inside": False, "fired": []}
+    real_stat = os.stat
+
+    def wrap_settle(original):
+        def patched(*a, **kw):
+            state["calls"] += 1
+            state["inside"] = True
+            try:
+                return original(*a, **kw)
+            finally:
+                state["inside"] = False
+        return patched
+
+    def stat_hook(path, *a, **kw):
+        if state["inside"] and state["calls"] == nth and path == "reads.json" and not state["fired"]:
+            state["fired"].append(True)
+            (base / "late-extra.bin").write_bytes(b"x" * 6949)
+        return real_stat(path, *a, **kw)
+
+    if command == "rehearse":
+        out = work / f"settle-mutation-out-{counter[0]}"
+        arguments, outputs = ["rehearse", "--request", request, "--reads", base, "--out", out], (out,)
+    else:
+        arguments = ["verify-rehearsal", "--request", request, "--reads", base, "--rehearsal", rehearsal_a]
+        outputs = ()
+    os.stat = stat_hook
+    try:
+        err = with_patch(S, "settle_reads", wrap_settle, lambda: expect_fail(
+            label, arguments, *outputs, match=match, untouched=base if untouched else None))
+    finally:
+        os.stat = real_stat
+    assert state["fired"], f"{label}: the injection never ran"
+    return err
+
+
+settle_mutation("file added during the admission settle's name checks", 1, "rehearse",
+                "changed during admission and differ from the exact closure (1 extra, 0 missing)")
+settle_mutation("file added during the final settle's name checks (rehearse)", 2, "rehearse",
+                "changed while being read and differ from the exact closure (1 extra, 0 missing)",
+                untouched=False)
+settle_mutation("file added during the final settle's name checks (verify-rehearsal)", 2, "verify-rehearsal",
+                "changed while being read and differ from the exact closure (1 extra, 0 missing)",
+                untouched=False)
+no_leftovers("settle mutation")
+ok("directory mutations during the settle name checks refuse; admission reads zero payload bytes")
+
+# Every dependency exception class is sanitized at the rehearsal boundary, not only two of them.
+for label, error in (
+    ("contract error", K.ContractError(f"unexpected file /{CN}")),
+    ("value error", ValueError(f"unexpected file /{CN}")),
+    ("os error", OSError(24, "Too many open files", f"/{CN}")),
+):
+    def raising_walker(original, error=error):
+        def patched(descriptor, limits, **kw):
+            if kw.get("label") == "rehearsal":
+                raise error
+            return original(descriptor, limits, **kw)
+        return patched
+
+    out = work / f"canary-tree-{counter[0]}"
+    counter[0] += 1
+    with_patch(D, "walk_tree", raising_walker, lambda: expect_fail(
+        f"{label} from the tree reader in the built tree", ["rehearse", *args(), "--out", out], out,
+        match="tree failed safe inspection", absent=(CN,)))
+    with_patch(D, "walk_tree", raising_walker, lambda: expect_fail(
+        f"{label} from the tree reader in verify-rehearsal", ["verify-rehearsal", *args(), "--rehearsal", rehearsal_a],
+        match="tree failed safe inspection", absent=(CN,)))
+    out = work / f"canary-capture-{counter[0]}"
+    counter[0] += 1
+    with_patch(C, "read_capture", lambda original, error=error: lambda *a, **kw: (_ for _ in ()).throw(error),
+               lambda: expect_fail(f"{label} from the collector's capture read in the built tree",
+                                   ["rehearse", *args(), "--out", out], out,
+                                   match="code capture-rejected", absent=(CN,)))
+    with_patch(C, "read_capture", lambda original, error=error: lambda *a, **kw: (_ for _ in ()).throw(error),
+               lambda: expect_fail(f"{label} from the collector's capture read in verify-rehearsal",
+                                   ["verify-rehearsal", *args(), "--rehearsal", rehearsal_a],
+                                   match="code capture-rejected", absent=(CN,)))
+no_leftovers("dependency exception sanitization")
+ok("contract, value and os errors from the tree and capture readers never echo an input name")
+
+# Request-tree and saved-plan diagnostics hold no untrusted names or content, and stdout stays empty.
+canary_request = fresh("canary-request") / "request"
+shutil.copytree(request, canary_request, symlinks=True)
+(canary_request / CN).symlink_to("request.json")
+plan_out = work / "canary-plan-out"
+for label, arguments, outputs in (
+    ("plan from a request tree holding a canary symlink", ["plan", "--request", canary_request], ()),
+    ("verify-plan against a request tree holding a canary symlink",
+     ["verify-plan", "--request", canary_request, "--plan", plan_file], ()),
+    ("rehearse against a request tree holding a canary symlink",
+     ["rehearse", "--request", canary_request, "--reads", reads, "--out", plan_out], (plan_out,)),
+    ("verify-rehearsal against a request tree holding a canary symlink",
+     ["verify-rehearsal", "--request", canary_request, "--reads", reads, "--rehearsal", rehearsal_a], ()),
+):
+    code, out, err = invoke(*arguments)
+    assert code != 0 and out == "", (label, out)
+    assert CN not in err and err.count("\n") == 1 and "code request-rejected" in err, (label, err)
+    for output in outputs:
+        assert not os.path.lexists(output), label
+    ok(f"{label} is rejected without naming it")
+forged = fresh("forged-plan") / "plan.json"
+forged.write_bytes(b'{"k\\nERROR: forged%s":1,"k\\nERROR: forged%s":2}' % (CN.encode(), CN.encode()))
+code, out, err = invoke("verify-plan", "--request", request, "--plan", forged)
+assert code != 0 and out == "" and err == "ERROR: session plan repeats a JSON key\n", err
+for payload, expect in (
+    (b'{"a\\u0000%s": [1,}' % CN.encode(), "session plan is invalid JSON"),
+    (b'{"x%s": NaN}' % CN.encode(), "session plan holds a non-finite number"),
+    (b'[1, "%s"]' % CN.encode(), "session plan is not a JSON object"),
+):
+    bad = fresh("bad-plan") / "plan.json"
+    bad.write_bytes(payload)
+    code, out, err = invoke("verify-plan", "--request", request, "--plan", bad)
+    assert code != 0 and out == "" and CN not in err and err.count("\n") == 1 and expect in err, (payload, err)
+code, out, err = invoke("verify-plan", "--request", request, "--plan", work / "no-such-plan.json")
+assert code != 0 and out == "" and err == "ERROR: session plan cannot be read safely\n", err
+ok("saved-plan parse and read failures are fixed single-line diagnostics that never echo content")
+
 # --- publication hazards --------------------------------------------------------
 
 existing = work / "existing"

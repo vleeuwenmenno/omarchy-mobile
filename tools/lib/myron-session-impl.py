@@ -1044,9 +1044,13 @@ def pin_reads(directory: int, root, root_mount: int) -> list:
 def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> None:
     """The listing, the directory and every name still match the pinned descriptors."""
     d = deploy()
-    check_closure(list_names(directory), f"changed {when} and ")
-    if d.fingerprint(os.fstat(directory)) != root_before:
-        raise SessionError(f"synthetic reads directory changed {when}")
+
+    def directory_unchanged() -> None:
+        check_closure(list_names(directory), f"changed {when} and ")
+        if d.fingerprint(os.fstat(directory)) != root_before:
+            raise SessionError(f"synthetic reads directory changed {when}")
+
+    directory_unchanged()
     for item in held:
         pinned = d.fingerprint(item.opened)
         if d.fingerprint(os.fstat(item.descriptor)) != pinned:
@@ -1057,6 +1061,7 @@ def settle_reads(directory: int, held: list, root_before: tuple, when: str) -> N
             raise SessionError(f"synthetic reads file {item.name} was removed {when}") from error
         if d.fingerprint(current) != pinned:
             raise SessionError(f"synthetic reads file {item.name} was replaced {when}")
+    directory_unchanged()  # a mutation during the name checks above is caught here
 
 
 def read_pinned(item: Held) -> bytes:
@@ -1137,7 +1142,12 @@ class Inputs:
 
 
 def read_request(path: str, env: Environment):
-    request, request_sha256, ids = collect().read_request(path, env.collector)
+    c, d = collect(), deploy()
+    p = c.preflight()
+    try:
+        request, request_sha256, ids = c.read_request(path, env.collector)
+    except (c.CollectError, p.PreflightError, p.snapshot().SnapshotError, *d.handled_errors()):
+        raise SessionError("request tree failed safe inspection (code request-rejected)") from None
     if [row["id"] for row in request["requested_reads"]] != OPERATION_IDS:
         raise SessionError("request operations differ from the session registry")
     return request, request_sha256, ids
@@ -1439,7 +1449,7 @@ def walk_rehearsal(descriptor: int, label: str, **options):
     d = deploy()
     try:
         return d.walk_tree(descriptor, d.STAGE_LIMITS, allow_symlinks=False, label=label, **options)
-    except (d.DeploymentError, OSError) as error:
+    except d.handled_errors() as error:
         raise SessionError(
             f"{label} tree failed safe inspection (code {tree_failure_code(str(error))})"
         ) from None
@@ -1465,7 +1475,7 @@ def reread_capture(path: str, env: Environment, request: dict, request_sha256: s
     c, d = collect(), deploy()
     try:
         return c.read_capture(path, env.collector, request, request_sha256)
-    except (c.CollectError, d.DeploymentError, OSError, ValueError):
+    except (c.CollectError, *d.handled_errors()):
         raise SessionError(f"{label} capture was refused by the collector's read (code capture-rejected)") from None
 
 
@@ -1481,11 +1491,11 @@ def command_verify_plan(env: Environment, args) -> dict:
     d = deploy()
     request, request_sha256, _ids = read_request(args.request, env)
     expected = plan_document(env, request, request_sha256)
-    raw = d.read_file(args.plan, "session plan", d.MAX_SMALL_BYTES)
-    document = d.strict_json(raw, "session plan")
-    collect().check_json_depth(document, "session plan", PLAN_DEPTH)
-    if raw != d.render_json(document):
-        raise SessionError("session plan is not canonical")
+    try:
+        raw = d.read_file(args.plan, "session plan", d.MAX_SMALL_BYTES)
+    except d.handled_errors():
+        raise SessionError("session plan cannot be read safely") from None
+    document = parse_json(raw, "session plan")  # value-free messages, canonical, depth-bounded
     if not collect().kernel().strict_equal(document, expected):
         raise SessionError("session plan differs from the request")
     return {
