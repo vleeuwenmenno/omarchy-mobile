@@ -12,6 +12,9 @@ trap 'rm -rf "$tmp"' EXIT
 cmp -s device/myron/kernel-contract.json \
   packages/omamobile-myron-kernel-contract/reference.json \
   || fail "canonical and packaged contracts differ"
+cmp -s device/myron/stage-contract.json \
+  packages/omamobile-myron-kernel-contract/stage-contract.json \
+  || fail "canonical and packaged stage contracts differ"
 grep -qx 'BOOT_METHOD=external-android' device/myron/device.conf \
   || fail "Myron boot method is no longer external-android"
 grep -qx 'ROOTFS_PACKAGES="omamobile-myron-kernel-contract"' device/myron/device.conf \
@@ -20,7 +23,7 @@ pass "descriptor selects the exact metadata contract and remains fail closed"
 
 mkdir -p "$tmp/fakes"
 : > "$tmp/calls"
-for command in ssh scp adb fastboot docker mount pacman systemctl; do
+for command in ssh scp adb fastboot docker mount tar pacman depmod modprobe systemctl; do
   printf '#!/bin/sh\nprintf "%%s\\n" "%s $*" >> "$CALLS"\nexit 97\n' "$command" \
     > "$tmp/fakes/$command"
   chmod +x "$tmp/fakes/$command"
@@ -40,6 +43,32 @@ assert data["device"]["boot_method"] == "external-android"
 PY
 pass "contract is read-only, metadata-only, and activation-disabled"
 
+CALLS="$tmp/calls" PATH="$tmp/fakes:$PATH" \
+  tools/verify-myron-kernel-contract show-stage > "$tmp/stage-contract.json" \
+  || fail "read-only stage contract display failed"
+python3 - "$tmp/stage-contract.json" device/myron/kernel-contract.json <<'PY' || exit 1
+import hashlib, json, sys
+stage = json.load(open(sys.argv[1]))
+assert stage["reference_sha256"] == hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+assert stage["stage"]["kind"] == "external-kernel-module-stage"
+assert stage["stage"]["activation"] == "disabled"
+assert stage["stage"]["boot_payload"] is False and stage["stage"]["image"] is False
+assert stage["stage"]["payload"] == "metadata-only"
+PY
+: > "$tmp/not-the-archive"
+mkdir "$tmp/stage-root"
+for args in "plan-stage --assets $tmp/not-the-archive" \
+            "verify-stage --assets $tmp/not-the-archive --root $tmp/stage-root"; do
+  # shellcheck disable=SC2086
+  if CALLS="$tmp/calls" PATH="$tmp/fakes:$PATH" \
+      tools/verify-myron-kernel-contract $args >/dev/null 2>&1; then
+    fail "stage command accepted an archive that is not the qualified one"
+  fi
+done
+[[ ! -s $tmp/calls ]] || fail "stage commands invoked an external system tool"
+[[ -z $(ls -A "$tmp/stage-root") ]] || fail "stage verification wrote into the root"
+pass "stage contract is bound to the reference; stage commands run no external tool and write nothing"
+
 packages/omamobile-myron-kernel-contract/install "$tmp/stage"
 while IFS= read -r -d '' file; do
   magic=$(od -An -tx1 -N8 "$file" | tr -d ' \n')
@@ -49,4 +78,18 @@ while IFS= read -r -d '' file; do
       ;;
   esac
 done < <(find "$tmp/stage" -type f -print0)
+for path in usr/bin/omamobile-myron-kernel-verify \
+            usr/share/omamobile/myron-kernel-contract/stage-contract.json; do
+  [[ -f $tmp/stage/$path ]] || fail "contract package lacks $path"
+done
+cmp -s device/myron/stage-contract.json \
+  "$tmp/stage/usr/share/omamobile/myron-kernel-contract/stage-contract.json" \
+  || fail "installed stage contract differs from the canonical copy"
+"$tmp/stage/usr/bin/omamobile-myron-kernel-verify" show-stage >/dev/null \
+  || fail "installed verifier rejects its installed stage contract"
+if find "$tmp/stage" \( -path '*/systemd/*' -o -path '*/pacman.d/*' -o -path '*/modprobe.d/*' \
+     -o -path '*/udev/*' -o -path '*/vulkan/*' -o -path '*/usr/lib/modules*' \
+     -o -path '*/boot/*' -o -path '*/myron-gki-module-sets*' -o -name '*.ko' \) | grep -q .; then
+  fail "contract package stages a payload or activation path"
+fi
 pass "contract package contains no kernel, module, firmware, image, or archive payload"

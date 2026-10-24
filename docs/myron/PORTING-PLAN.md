@@ -95,6 +95,16 @@ Implemented in the metadata-only contract package:
   unverified;
 - no Image, module, firmware, vendor binary, service, hook, or writer payload.
 
+- (0.2.0) a separate, metadata-only stage contract plus read-only `show-stage`,
+  `plan-stage` and `verify-stage`: exact destinations, modes and hashes for the
+  eight target files of an external module stage (selector at
+  `/usr/local/sbin/myron-attempt79-module-dir`, seven modules directly in the
+  notes-keyed directory; archive metadata is validated, not staged), forbidden boot, firmware, vendor, `/usr/lib/modules`
+  and activation paths, and no writes or external commands. This is not full
+  ABI, import, provider or load-order proof, and there is still no stage
+  writer, extraction, `depmod`, module install, boot work, or hardware or
+  deployment authorization.
+
 Remaining Phase 2 gates are a clean reproducible source build, a trusted SSH
 host-key revalidation before another live read, and translation of the vendor
 module boot order. The generic rootfs builder remains blocked because its

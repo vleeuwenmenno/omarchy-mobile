@@ -14,6 +14,8 @@ install -Dm755 bin/omamobile-myron-kernel-verify \
   "$destination/usr/bin/omamobile-myron-kernel-verify"
 install -Dm644 reference.json \
   "$destination/usr/share/omamobile/myron-kernel-contract/reference.json"
+install -Dm644 stage-contract.json \
+  "$destination/usr/share/omamobile/myron-kernel-contract/stage-contract.json"
 install -Dm644 README.md \
   "$destination/usr/share/doc/omamobile-myron-kernel-contract/README.md"
 install -Dm644 LICENSE \

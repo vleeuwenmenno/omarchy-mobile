@@ -1,0 +1,616 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the read-only Myron stage plan and verifier. Synthetic
+# bytes only: nothing here is a kernel, module, firmware, or boot payload.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+
+cmp -s reference.json ../../device/myron/kernel-contract.json \
+  || fail "package reference drifted from canonical device contract"
+cmp -s stage-contract.json ../../device/myron/stage-contract.json \
+  || fail "package stage contract drifted from canonical device contract"
+pass "stage contract copies are byte-identical"
+
+bin/omamobile-myron-kernel-verify show-stage > "$tmp/show-stage.out" \
+  || fail "production stage contract validates"
+python3 - "$tmp/show-stage.out" reference.json <<'PY' || exit 1
+import hashlib, json, sys
+stage = json.load(open(sys.argv[1]))
+assert stage["schema"] == 1
+assert stage["reference_sha256"] == hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+assert stage["stage"] == {
+    "kind": "external-kernel-module-stage", "mutability": "immutable",
+    "activation": "disabled", "boot_payload": False, "image": False,
+    "payload": "metadata-only",
+}
+assert stage["device"]["codename"] == "myron"
+PY
+pass "production stage contract is bound to reference.json and inert"
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import gzip, hashlib, importlib.machinery, importlib.util, io, json, os
+import shutil, stat, subprocess, sys, tarfile
+from pathlib import Path
+
+package = Path(sys.argv[1])
+work = Path(sys.argv[2]) / "stage-tests"
+work.mkdir()
+bin_path = package / "bin/omamobile-myron-kernel-verify"
+loader = importlib.machinery.SourceFileLoader("myron_stage", str(bin_path))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+sha = lambda data: hashlib.sha256(data).hexdigest()
+counter = [0]
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{counter[0]:03d}-{name}"
+    path.mkdir()
+    return path
+
+SELECTOR = "/usr/local/sbin/myron-attempt79-module-dir"
+
+def make_fixture(name, manifest_extra=None, drop_selector_destination=False):
+    base = fresh(name)
+    notes = b"synthetic-notes\n"
+    modules = ["alpha", "beta"]
+    directory = f"/usr/local/lib/myron-gki-module-sets/{sha(notes)}"
+    payload = {
+        "candidate-module-dir.sh": b"#!/bin/sh\nexit 0\n",
+        "previous-module-dir.sh": b"#!/bin/sh\nexit 1\n",
+        "kernel-notes.bin": notes,
+        **{
+            f"modules/{n}.ko": f"module-{n}\0vermagic=test-release SMP\0".encode()
+            for n in modules
+        },
+    }
+    manifest = {
+        "phase": "inactive-staging-payload-only",
+        "candidate_image_sha256": sha(b"image"),
+        "candidate_config_sha256": sha(b"config"),
+        "candidate_notes_sha256": sha(notes),
+        "module_directory": directory,
+        "files": {n: sha(d) for n, d in sorted(payload.items())},
+        "selector_destination": SELECTOR,
+        **(manifest_extra or {}),
+    }
+    if drop_selector_destination:
+        del manifest["selector_destination"]
+    payload["manifest.json"] = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    payload["SHA256SUMS"] = "".join(
+        f"{sha(d)}  {n}\n" for n, d in sorted(payload.items())
+    ).encode()
+    archive = base / "assets.tar.gz"
+    with archive.open("wb") as out:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=out, mtime=0) as zipped:
+            with tarfile.open(fileobj=zipped, mode="w") as tar:
+                for n, d in sorted(payload.items()):
+                    info = tarfile.TarInfo("fixture/" + n)
+                    info.size = len(d)
+                    info.mode = 0o644
+                    tar.addfile(info, io.BytesIO(d))
+    reference = {
+        "schema": 1,
+        "device": {
+            "codename": "myron", "compatible": "qcom,canoe-mtp", "soc": "sm8850",
+            "model_contains": "Myron", "boot_method": "external-android",
+        },
+        "kernel": {
+            "release": "test-release", "gki_source_revision": "0" * 40,
+            "image_sha256": sha(b"image"), "notes_sha256": sha(notes),
+            "config_sha256": sha(b"config"),
+            "vmlinux_symvers_sha256": "5" * 64, "module_symvers_sha256": "6" * 64,
+        },
+        "source": {
+            "lock_sha256": "2" * 64, "manifest_sha256": "3" * 64,
+            "patches": {"0001-test.patch": "4" * 64},
+        },
+        "module_assets": {
+            "archive_sha256": sha(archive.read_bytes()), "root": "fixture",
+            "module_directory": directory,
+            "candidate_selector_sha256": sha(payload["candidate-module-dir.sh"]),
+            "previous_selector_sha256": sha(payload["previous-module-dir.sh"]),
+            "forbidden_modules": ["rmnet_core"], "modules": modules,
+        },
+        "runtime_assets": {"manifest_sha256": "7" * 64},
+        "activation": {
+            "mode": "disabled", "source_lock_reproduction": "not_verified",
+            "device_qualification": "reference_evidence_only",
+        },
+        "payload": {"kind": "metadata-only"},
+        "provenance": {
+            "reference_repository_base_commit": "1" * 40,
+            "reference_worktree_state": "synthetic fixture",
+            "qualification": "test", "status": "metadata-only",
+        },
+    }
+    reference_bytes = (json.dumps(reference, indent=2) + "\n").encode()
+    stage = module.expected_stage_contract(reference, sha(reference_bytes))
+    stage_bytes = (json.dumps(stage, indent=2) + "\n").encode()
+    contracts = module.Contracts(reference, sha(reference_bytes), stage, sha(stage_bytes))
+    return base, directory, payload, archive, reference_bytes, stage_bytes, contracts
+
+def build_tree(plan, payload, directory, destination):
+    for path in plan["ancestor_directories"]:
+        (destination / path.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    for entry in plan["directories"]:
+        (destination / entry["destination"].lstrip("/")).mkdir(parents=True, exist_ok=True)
+    for entry in plan["directories"]:
+        (destination / entry["destination"].lstrip("/")).chmod(0o755)
+    for entry in plan["files"]:
+        path = destination / entry["destination"].lstrip("/")
+        member = "candidate-module-dir.sh" if entry["destination"] == SELECTOR else "modules/" + path.name
+        path.write_bytes(payload[member])
+        path.chmod(int(entry["mode"], 8))
+
+base, directory, payload, archive, reference_bytes, stage_bytes, contracts = make_fixture("main")
+plan = module.build_stage_plan(contracts, archive)
+assert plan["status"] == "planned" and plan["activation_mode"] == "disabled"
+assert [e["destination"] for e in plan["files"]] == sorted(e["destination"] for e in plan["files"])
+assert len(plan["files"]) == 1 + 2
+assert {e["destination"]: e["mode"] for e in plan["files"]} == {
+    SELECTOR: "0755",
+    f"{directory}/alpha.ko": "0644",
+    f"{directory}/beta.ko": "0644",
+}
+assert [d["destination"] for d in plan["directories"]] == [
+    "/usr/local/lib/myron-gki-module-sets", directory,
+]
+assert "/usr/local/sbin" in plan["ancestor_directories"]
+# archive metadata is validated but never planned into the stage tree
+for name in ("SHA256SUMS", "manifest.json", "kernel-notes.bin", "previous-module-dir.sh"):
+    assert not any(e["destination"].endswith(name) for e in plan["files"])
+assert json.dumps(plan, sort_keys=True) == json.dumps(module.build_stage_plan(contracts, archive), sort_keys=True)
+module_files = {e["destination"] for e in plan["files"] if e["destination"].endswith(".ko")}
+assert module_files == {f"{directory}/alpha.ko", f"{directory}/beta.ko"}
+
+def good_tree(name="tree"):
+    root = fresh(name) / "root"
+    root.mkdir()
+    build_tree(plan, payload, directory, root)
+    return root
+
+def rel(root, path):
+    return root / path.lstrip("/")
+
+root = good_tree()
+before = sorted((p.relative_to(root).as_posix(), p.lstat().st_mtime_ns, p.lstat().st_mode) for p in root.rglob("*"))
+result = module.verify_stage_tree(plan, str(root))
+assert result["status"] == "verified" and result["file_count"] == 3
+assert before == sorted((p.relative_to(root).as_posix(), p.lstat().st_mtime_ns, p.lstat().st_mode) for p in root.rglob("*"))
+# an empty real /usr/lib/modules is allowed
+(root / "usr/lib/modules").mkdir(parents=True)
+module.verify_stage_tree(plan, str(root))
+
+def rejects(label, mutate, needle=None, plan_to_use=None):
+    tree = good_tree("reject")
+    mutate(tree)
+    try:
+        module.verify_stage_tree(plan_to_use or plan, str(tree))
+    except module.ContractError as error:
+        if needle and needle not in str(error):
+            raise AssertionError(f"{label}: wrong error: {error}")
+    else:
+        raise AssertionError(f"{label}: accepted")
+
+def edit(path_in_tree, data):
+    def run(tree):
+        target = rel(tree, path_in_tree)
+        mode = stat.S_IMODE(target.stat().st_mode)
+        target.write_bytes(data)
+        target.chmod(mode)
+    return run
+
+alpha = f"{directory}/alpha.ko"
+rejects("changed module", edit(alpha, payload["modules/alpha.ko"][:-1] + b"X"), "SHA-256")
+rejects("changed module size", edit(alpha, b"short"), "size")
+rejects("changed selector", edit(SELECTOR, b"#!/bin/sh\nexit 9\n"), "SHA-256")
+rejects("selector lost exec bit", lambda t: rel(t, SELECTOR).chmod(0o644), "mode")
+rejects("missing module", lambda t: rel(t, alpha).unlink(), "missing")
+rejects("missing selector", lambda t: rel(t, SELECTOR).unlink(), "missing")
+rejects("missing sbin", lambda t: shutil.rmtree(rel(t, "/usr/local/sbin")), None)
+rejects("extra module", lambda t: rel(t, f"{directory}/gamma.ko").write_bytes(b"x"), "extra")
+rejects("modules subdirectory", lambda t: rel(t, f"{directory}/modules").mkdir(), "unexpected")
+rejects("archive metadata staged", lambda t: rel(t, f"{directory}/manifest.json").write_bytes(b"{}"), "unexpected")
+rejects("notes staged", lambda t: rel(t, f"{directory}/kernel-notes.bin").write_bytes(b"x"), "unexpected")
+rejects("previous selector staged", lambda t: rel(t, f"{directory}/previous-module-dir.sh").write_bytes(b"x"), "unexpected")
+rejects("extra file", lambda t: rel(t, f"{directory}/README").write_bytes(b"x"), "unexpected")
+rejects("extra module-set", lambda t: rel(t, "/usr/local/lib/myron-gki-module-sets/other").mkdir(), "unexpected")
+rejects("extra activation file", lambda t: rel(t, "/etc/profile.d/activate.sh").parent.mkdir(parents=True) or rel(t, "/etc/profile.d/activate.sh").write_bytes(b"true\n"), "unexpected stage path")
+rejects("extra unrelated file", lambda t: rel(t, "/opt/readme").parent.mkdir(parents=True) or rel(t, "/opt/readme").write_bytes(b"x"), "unexpected stage path")
+rejects("extra ko elsewhere", lambda t: rel(t, "/usr/share/rogue.ko").parent.mkdir(parents=True) or rel(t, "/usr/share/rogue.ko").write_bytes(b"x"), "unexpected stage path")
+rejects("extra compressed ko", lambda t: rel(t, "/opt/rogue.ko.zst").parent.mkdir(parents=True) or rel(t, "/opt/rogue.ko.zst").write_bytes(b"x"), "unexpected stage path")
+rejects("ko directory", lambda t: rel(t, "/opt/dir.ko").mkdir(parents=True), "unexpected stage path")
+rejects("file mode", lambda t: rel(t, alpha).chmod(0o755), "mode")
+rejects("module executable", lambda t: rel(t, alpha).chmod(0o755), "mode")
+rejects("directory mode", lambda t: rel(t, directory).chmod(0o700), "mode")
+rejects("world writable directory", lambda t: rel(t, directory).chmod(0o777), "mode")
+
+def hardlink(tree):
+    os.link(rel(tree, alpha), tree / "alias")
+rejects("hard link", hardlink, "unexpected")
+
+def leaf_symlink(tree):
+    target = rel(tree, alpha)
+    copy = tree / "copy.bin"
+    shutil.copy(target, copy)
+    target.unlink()
+    target.symlink_to(copy)
+rejects("symlink leaf", leaf_symlink, "unexpected")
+
+def dir_symlink(path):
+    def run(tree):
+        target = rel(tree, path)
+        moved = tree.parent / ("moved-" + target.name)
+        shutil.move(str(target), str(moved))
+        target.symlink_to(moved, target_is_directory=True)
+    return run
+rejects("symlink sbin", dir_symlink("/usr/local/sbin"), "real directory")
+rejects("symlink selector", lambda t: (shutil.copy(rel(t, SELECTOR), t / "sel"), rel(t, SELECTOR).unlink(), rel(t, SELECTOR).symlink_to(t / "sel")), "unexpected")
+rejects("symlink module dir", dir_symlink(directory), "real directory")
+rejects("symlink ancestor", dir_symlink("/usr/local"), "symlink")
+rejects("symlink usr", dir_symlink("/usr"), "symlink")
+
+def fifo_leaf(tree):
+    target = rel(tree, alpha)
+    target.unlink()
+    os.mkfifo(target)
+rejects("fifo leaf", fifo_leaf, "not a regular file")
+rejects("fifo extra", lambda t: os.mkfifo(rel(t, f"{directory}/extra")), "unexpected")
+def socket_extra(tree):
+    import socket
+    descriptor = os.open(rel(tree, directory), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(f"/proc/self/fd/{descriptor}/sock")
+        sock.close()
+    finally:
+        os.close(descriptor)
+rejects("socket extra", socket_extra, "unexpected")
+
+
+try:
+    tree = good_tree("symlink-root")
+    link = tree.parent / "root-link"
+    link.symlink_to(tree, target_is_directory=True)
+    module.verify_stage_tree(plan, str(link))
+except module.ContractError as error:
+    assert "symlink" in str(error)
+else:
+    raise AssertionError("symlink root accepted")
+try:
+    tree = good_tree("symlink-root-ancestor")
+    outer = tree.parent / "outer"
+    outer.symlink_to(tree.parent, target_is_directory=True)
+    module.verify_stage_tree(plan, str(outer / "root"))
+except module.ContractError as error:
+    assert "symlink" in str(error)
+else:
+    raise AssertionError("symlink root ancestor accepted")
+for bad_root in ("/", "//", "/../", ""):
+    try:
+        module.verify_stage_tree(plan, bad_root)
+    except module.ContractError:
+        pass
+    else:
+        raise AssertionError(f"root {bad_root!r} accepted")
+try:
+    module.verify_stage_tree(plan, str(work / "does-not-exist"))
+except module.ContractError:
+    pass
+else:
+    raise AssertionError("missing root accepted")
+tree = good_tree("relative-root")
+old_cwd = os.getcwd()
+try:
+    os.chdir(tree.parent)
+    try:
+        module.verify_stage_tree(plan, tree.name)
+    except module.ContractError as error:
+        assert "absolute path" in str(error)
+    else:
+        raise AssertionError("relative root accepted")
+finally:
+    os.chdir(old_cwd)
+for bad_root in (
+    str(tree.parent / "missing" / ".." / tree.name),
+    str(tree.parent) + "/./" + tree.name,
+    str(tree) + "/",
+):
+    try:
+        module.verify_stage_tree(plan, bad_root)
+    except module.ContractError as error:
+        assert "canonical" in str(error) or "components" in str(error)
+    else:
+        raise AssertionError(f"non-canonical root {bad_root!r} accepted")
+
+# A required file removed or replaced immediately before the definitive scan
+# must not survive based on an earlier hash pass.
+for label, replacement in (
+    ("removed-before-scan", None),
+    ("symlink-before-scan", "dangling"),
+):
+    race_tree = good_tree(label)
+    original_scan = module.scan_stage_tree
+    def changed_scan(*args, replacement=replacement, **kwargs):
+        target = rel(race_tree, SELECTOR)
+        target.unlink()
+        if replacement is not None:
+            target.symlink_to(replacement)
+        return original_scan(*args, **kwargs)
+    module.scan_stage_tree = changed_scan
+    try:
+        module.verify_stage_tree(plan, str(race_tree))
+    except module.ContractError:
+        pass
+    else:
+        raise AssertionError(f"{label} accepted")
+    finally:
+        module.scan_stage_tree = original_scan
+
+# Mount identity is checked on opened regular files, not only directories or
+# filesystem device numbers. This synthetic hook avoids requiring mount(2).
+mount_tree = good_tree("file-mount-id")
+original_mount_id = module.mount_id_for_fd
+mount_tree_fd = os.open(mount_tree, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    root_mount_id = original_mount_id(mount_tree_fd, "test")
+finally:
+    os.close(mount_tree_fd)
+def changed_mount_id(descriptor, label):
+    target = os.readlink(f"/proc/self/fd/{descriptor}")
+    if target.endswith("/alpha.ko"):
+        return root_mount_id + 1
+    return original_mount_id(descriptor, label)
+module.mount_id_for_fd = changed_mount_id
+try:
+    module.verify_stage_tree(plan, str(mount_tree))
+except module.ContractError as error:
+    assert "mount point" in str(error)
+else:
+    raise AssertionError("regular-file mount identity change accepted")
+finally:
+    module.mount_id_for_fd = original_mount_id
+
+# Growth after hash_regular_at validates size but before sha256_descriptor's
+# fstat is rejected before content reads begin.
+early_growth_dir = fresh("early-growth-bound")
+early_growth_file = early_growth_dir / "file"
+early_growth_file.write_bytes(b"x")
+early_growth_file.chmod(0o644)
+early_growth_directory_fd = os.open(early_growth_dir, os.O_RDONLY | os.O_DIRECTORY)
+early_growth_writer = os.open(early_growth_file, os.O_WRONLY)
+early_growth_mount_id = module.mount_id_for_fd(early_growth_directory_fd, "test")
+original_sha256_descriptor = module.sha256_descriptor
+def early_growing_sha256_descriptor(descriptor, label, *, expected_size=None):
+    os.ftruncate(early_growth_writer, 1 << 40)
+    return original_sha256_descriptor(
+        descriptor, label, expected_size=expected_size
+    )
+module.sha256_descriptor = early_growing_sha256_descriptor
+try:
+    module.hash_regular_at(
+        early_growth_directory_fd,
+        "file",
+        "early growing file",
+        {"mode": "0644", "size": 1, "sha256": sha(b"x")},
+        early_growth_mount_id,
+    )
+except module.ContractError as error:
+    assert "changed size before being read" in str(error)
+else:
+    raise AssertionError("growth before hashing accepted")
+finally:
+    module.sha256_descriptor = original_sha256_descriptor
+    os.close(early_growth_writer)
+    os.close(early_growth_directory_fd)
+
+# Hashing also uses the contract size as its fixed read budget. Growth after
+# sha256_descriptor's fstat is detected by one overflow-byte read, not hashed.
+growth_file = fresh("growth-bound") / "file"
+growth_file.write_bytes(b"x")
+growth_reader = os.open(growth_file, os.O_RDONLY)
+growth_writer = os.open(growth_file, os.O_WRONLY)
+original_fdopen = module.os.fdopen
+def growing_fdopen(descriptor, mode):
+    os.ftruncate(growth_writer, 1 << 40)
+    return original_fdopen(descriptor, mode)
+module.os.fdopen = growing_fdopen
+try:
+    module.sha256_descriptor(growth_reader, "growing file", expected_size=1)
+except module.ContractError as error:
+    assert "changed size" in str(error)
+else:
+    raise AssertionError("concurrent one-terabyte sparse growth accepted")
+finally:
+    module.os.fdopen = original_fdopen
+    os.close(growth_writer)
+
+def mk(path_in_tree, content=None, directory_=True):
+    def run(tree):
+        target = rel(tree, path_in_tree)
+        if content is None:
+            target.mkdir(parents=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+    return run
+for label, path in (
+    ("boot", "/boot"), ("efi", "/efi"), ("vendor", "/vendor"), ("odm", "/odm"),
+    ("firmware", "/usr/lib/firmware"), ("gpu assets", "/usr/local/lib/myron-gpu"),
+    ("systemd", "/etc/systemd/system"), ("systemd lib", "/usr/lib/systemd/system"),
+    ("modprobe", "/etc/modprobe.d"), ("modprobe lib", "/usr/lib/modprobe.d"),
+    ("modules-load", "/etc/modules-load.d"), ("udev", "/etc/udev/rules.d"),
+    ("udev lib", "/usr/lib/udev/rules.d"), ("pacman hooks", "/etc/pacman.d/hooks"),
+    ("libalpm hooks", "/usr/share/libalpm/hooks"), ("vulkan", "/usr/share/vulkan"),
+    ("vulkan etc", "/etc/vulkan"),
+):
+    rejects(f"forbidden empty {label}", mk(path), "forbidden")
+rejects("boot file", mk("/boot/Image", b"x"), "forbidden")
+rejects("firmware file", mk("/usr/lib/firmware/x.bin", b"x"), "forbidden")
+rejects("systemd unit", mk("/etc/systemd/system/x.service", b"x"), "forbidden")
+rejects("vulkan icd", mk("/usr/share/vulkan/icd.d/x.json", b"{}"), "forbidden")
+rejects("modules tree", mk("/usr/lib/modules/6.12/kernel/x.ko", b"x"), "not empty")
+rejects("modules tree dir", mk("/usr/lib/modules/6.12"), "not empty")
+rejects("modules is file", mk("/usr/lib/modules", b"x"), "not an empty directory")
+
+def forbidden_symlink(tree):
+    (tree / "usr/lib").mkdir(parents=True)
+    (tree / "usr/lib/modules").symlink_to(tree / "usr")
+rejects("modules symlink", forbidden_symlink, "symlink")
+def forbidden_ancestor_symlink(tree):
+    (tree / "etc").symlink_to(tree / "usr", target_is_directory=True)
+rejects("forbidden path through symlink", forbidden_ancestor_symlink, "symlink")
+
+# the archive is validated first, including the manifest selector destination
+module.build_stage_plan(contracts, archive)
+for label, kwargs, ok in (
+    ("matching", {}, True),
+    ("missing", {"drop_selector_destination": True}, False),
+    ("mismatching", {"manifest_extra": {"selector_destination": "/usr/local/bin/elsewhere"}}, False),
+    ("old layout", {"manifest_extra": {"selector_destination": f"{directory}/candidate-module-dir.sh"}}, False),
+    ("wrong type", {"manifest_extra": {"selector_destination": 7}}, False),
+):
+    _, _, _, other_archive, _, _, other = make_fixture("selector-" + label, **kwargs)
+    try:
+        module.build_stage_plan(other, other_archive)
+    except module.ContractError as error:
+        assert not ok and "selector_destination" in str(error), (label, error)
+    else:
+        assert ok, f"{label} selector_destination accepted"
+# verify-kernel without a stage contract keeps ignoring that manifest field
+for label, kwargs in (
+    ("absent", {"drop_selector_destination": True}),
+    ("different", {"manifest_extra": {"selector_destination": "/elsewhere"}}),
+):
+    _, _, _, other_archive, _, _, other = make_fixture("kernel-compat-" + label, **kwargs)
+    assert len(module.verify_module_archive(other.reference, other_archive)) == 2
+
+# stage-contract mutations
+def rejects_contract(label, change):
+    stage = json.loads(json.dumps(contracts.stage))
+    change(stage)
+    try:
+        module.build_stage_plan(
+            module.Contracts(contracts.reference, contracts.reference_sha256, stage, "0" * 64),
+            archive,
+        )
+    except module.ContractError:
+        return
+    raise AssertionError(f"{label}: accepted")
+rejects_contract("unknown field", lambda s: s.update(extra=True))
+rejects_contract("missing field", lambda s: s.pop("forbidden"))
+rejects_contract("wrong binding", lambda s: s.update(reference_sha256="9" * 64))
+rejects_contract("bool as int", lambda s: s["stage"].update(boot_payload=0))
+rejects_contract("image true", lambda s: s["stage"].update(image=True))
+rejects_contract("boot payload true", lambda s: s["stage"].update(boot_payload=True))
+rejects_contract("activation", lambda s: s["stage"].update(activation="enabled"))
+rejects_contract("mutable", lambda s: s["stage"].update(mutability="mutable"))
+rejects_contract("payload", lambda s: s["stage"].update(payload="binary"))
+rejects_contract("schema", lambda s: s.update(schema=True))
+rejects_contract("device", lambda s: s["device"].update(soc="other"))
+rejects_contract("owned file", lambda s: s["layout"].update(owned_files=[]))
+rejects_contract("selector mode", lambda s: s["layout"]["selector"].update(mode="0644"))
+rejects_contract("module mode", lambda s: s["layout"]["module_file"].update(mode="0755"))
+rejects_contract("module subdirectory", lambda s: s["layout"]["module_file"].update(destination=s["layout"]["module_directory"] + "/modules/{name}.ko"))
+rejects_contract("global file mode", lambda s: s["layout"].update(file_mode="0644"))
+rejects_contract("owned dir", lambda s: s["layout"]["owned_directories"].append("/usr/lib/modules"))
+rejects_contract("selector destination", lambda s: s["layout"]["selector"].update(destination="/usr/local/bin/x"))
+rejects_contract("forbidden shrunk", lambda s: s["forbidden"]["absent"].remove("/boot"))
+rejects_contract("module suffix list", lambda s: s["forbidden"]["module_suffixes_outside_owned_files"].pop())
+
+# reference binding: a different reference.json hash is refused
+bad = module.Contracts(contracts.reference, "8" * 64, contracts.stage, contracts.stage_sha256)
+try:
+    module.build_stage_plan(bad, archive)
+except module.ContractError as error:
+    assert "bound" in str(error)
+else:
+    raise AssertionError("wrong reference binding accepted")
+
+# archive-side failures
+for label, mutate in (
+    ("missing archive", lambda p: p.unlink()),
+    ("changed archive", lambda p: p.write_bytes(p.read_bytes() + b"x")),
+):
+    copy = fresh(label) / "assets.tar.gz"
+    shutil.copy(archive, copy)
+    mutate(copy)
+    try:
+        module.build_stage_plan(contracts, copy)
+    except module.ContractError:
+        pass
+    else:
+        raise AssertionError(f"{label} accepted")
+fifo_archive = fresh("fifo-archive") / "assets.tar.gz"
+os.mkfifo(fifo_archive)
+try:
+    module.build_stage_plan(contracts, fifo_archive)
+except module.ContractError as error:
+    assert "not a regular file" in str(error)
+else:
+    raise AssertionError("FIFO archive accepted")
+
+# bounded scan
+original = module.MAX_SCAN_ENTRIES
+module.MAX_SCAN_ENTRIES = 3
+try:
+    module.verify_stage_tree(plan, str(good_tree("bounded")))
+except module.ContractError as error:
+    assert "scan bound" in str(error)
+else:
+    raise AssertionError("scan bound not enforced")
+finally:
+    module.MAX_SCAN_ENTRIES = original
+
+# end-to-end CLI against a synthetic installed layout, with fake system tools
+installed = fresh("cli")
+(installed / "bin").mkdir()
+shutil.copy(bin_path, installed / "bin/omamobile-myron-kernel-verify")
+(installed / "reference.json").write_bytes(reference_bytes)
+(installed / "stage-contract.json").write_bytes(stage_bytes)
+fakes = fresh("fakes")
+calls = fakes / "calls"
+calls.write_text("")
+for command in ("ssh", "scp", "adb", "fastboot", "docker", "mount", "tar", "pacman", "depmod", "modprobe", "systemctl"):
+    script = fakes / command
+    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "{command} $*" >> "{calls}"\nexit 97\n')
+    script.chmod(0o755)
+env = {**os.environ, "PATH": f"{fakes}:{os.environ['PATH']}"}
+cli = [sys.executable, "-I", str(installed / "bin/omamobile-myron-kernel-verify")]
+def run(*args):
+    return subprocess.run(cli + list(args), capture_output=True, text=True, timeout=30, env=env)
+shown = run("show-stage")
+assert shown.returncode == 0 and json.loads(shown.stdout)["schema"] == 1
+first = run("plan-stage", "--assets", str(archive))
+second = run("plan-stage", "--assets", str(archive))
+assert first.returncode == 0 and first.stdout == second.stdout and first.stdout
+assert json.loads(first.stdout) == json.loads(json.dumps(plan))
+tree = good_tree("cli-tree")
+verified = run("verify-stage", "--assets", str(archive), "--root", str(tree))
+assert verified.returncode == 0 and json.loads(verified.stdout)["status"] == "verified", verified.stderr
+rel(tree, alpha).write_bytes(b"changed")
+failed = run("verify-stage", "--assets", str(archive), "--root", str(tree))
+assert failed.returncode == 1 and failed.stderr.startswith("ERROR:") and not failed.stdout
+root_failed = run("verify-stage", "--assets", str(archive), "--root", "/")
+assert root_failed.returncode == 1 and "must not be /" in root_failed.stderr
+fifo_root = fresh("fifo-root") / "root"
+os.mkfifo(fifo_root)
+assert run("verify-stage", "--assets", str(archive), "--root", str(fifo_root)).returncode == 1
+# an unknown or duplicate JSON key in the installed stage contract is refused
+(installed / "stage-contract.json").write_bytes(stage_bytes.replace(b'"schema": 1,', b'"schema": 1, "schema": 1,', 1))
+assert run("show-stage").returncode == 1 and "duplicate" in run("show-stage").stderr
+(installed / "stage-contract.json").write_bytes(stage_bytes)
+(installed / "reference.json").write_bytes(reference_bytes.replace(b'"test-release"', b'"other-release"'))
+assert run("show-stage").returncode == 1 and "bound" in run("show-stage").stderr
+assert run("plan-stage", "--assets", str(archive)).returncode == 1
+assert calls.read_text() == "", "a system tool was invoked"
+PY
+pass "stage plan and verifier accept the exact tree and reject every deviation"

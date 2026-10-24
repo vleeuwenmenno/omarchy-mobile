@@ -271,6 +271,8 @@ else:
 PY
 pass "verifier accepts exact fixtures and rejects changed bytes"
 
+test/stage || fail "stage tests"
+
 ./install "$tmp/stage"
 if [[ -f ../../device/myron/kernel-contract.json ]]; then
   cmp -s reference.json ../../device/myron/kernel-contract.json \
@@ -283,6 +285,7 @@ printf '%s\n' \
   usr/share/doc/omamobile-myron-kernel-contract/README.md \
   usr/share/licenses/omamobile-myron-kernel-contract/LICENSE \
   usr/share/omamobile/myron-kernel-contract/reference.json \
+  usr/share/omamobile/myron-kernel-contract/stage-contract.json \
   usr/share/omamobile/myron-kernel-contract/version > "$tmp/expected-files"
 (cd "$tmp/stage" && find . -type f -print | sed 's#^\./##' | sort) > "$tmp/actual-files"
 cmp -s "$tmp/expected-files" "$tmp/actual-files" \

@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "reference_sha256": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193",
+  "device": {
+    "codename": "myron",
+    "compatible": "qcom,canoe-mtp",
+    "soc": "sm8850",
+    "model_contains": "Myron",
+    "boot_method": "external-android"
+  },
+  "stage": {
+    "kind": "external-kernel-module-stage",
+    "mutability": "immutable",
+    "activation": "disabled",
+    "boot_payload": false,
+    "image": false,
+    "payload": "metadata-only"
+  },
+  "layout": {
+    "ancestor_directories": [
+      "/usr",
+      "/usr/local",
+      "/usr/local/lib",
+      "/usr/local/sbin"
+    ],
+    "module_set_root": "/usr/local/lib/myron-gki-module-sets",
+    "module_directory": "/usr/local/lib/myron-gki-module-sets/8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
+    "owned_directories": [
+      "/usr/local/lib/myron-gki-module-sets",
+      "/usr/local/lib/myron-gki-module-sets/8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608"
+    ],
+    "selector": {
+      "archive_member": "candidate-module-dir.sh",
+      "destination": "/usr/local/sbin/myron-attempt79-module-dir",
+      "mode": "0755"
+    },
+    "module_file": {
+      "archive_member": "modules/{name}.ko",
+      "destination": "/usr/local/lib/myron-gki-module-sets/8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608/{name}.ko",
+      "mode": "0644"
+    },
+    "directory_mode": "0755"
+  },
+  "forbidden": {
+    "absent": [
+      "/boot",
+      "/efi",
+      "/odm",
+      "/vendor",
+      "/usr/lib/firmware",
+      "/usr/local/lib/myron-gpu",
+      "/etc/systemd/system",
+      "/usr/lib/systemd/system",
+      "/etc/modprobe.d",
+      "/usr/lib/modprobe.d",
+      "/etc/modules-load.d",
+      "/usr/lib/modules-load.d",
+      "/etc/udev/rules.d",
+      "/usr/lib/udev/rules.d",
+      "/etc/pacman.d/hooks",
+      "/usr/share/libalpm/hooks",
+      "/etc/vulkan",
+      "/usr/share/vulkan"
+    ],
+    "empty_or_absent_directories": [
+      "/usr/lib/modules"
+    ],
+    "module_suffixes_outside_owned_files": [
+      ".ko",
+      ".ko.gz",
+      ".ko.xz",
+      ".ko.zst"
+    ]
+  }
+}

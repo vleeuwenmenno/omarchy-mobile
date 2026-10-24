@@ -14,6 +14,7 @@ import re
 import stat
 import sys
 import tarfile
+from typing import NamedTuple
 
 
 HEX256 = re.compile(r"[0-9a-f]{64}")
@@ -22,6 +23,25 @@ MODULE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_REFERENCE_BYTES = 1024 * 1024
+MAX_STAGE_CONTRACT_BYTES = 1024 * 1024
+MAX_SCAN_ENTRIES = 200_000
+MAX_SCAN_DEPTH = 40
+MAX_DIRECTORY_ENTRIES = 10_000
+MODULE_SET_ROOT = "/usr/local/lib/myron-gki-module-sets"
+STAGE_ANCESTORS = ["/usr", "/usr/local", "/usr/local/lib", "/usr/local/sbin"]
+STAGE_SELECTOR_DESTINATION = "/usr/local/sbin/myron-attempt79-module-dir"
+STAGE_FORBIDDEN_ABSENT = [
+    "/boot", "/efi", "/odm", "/vendor",
+    "/usr/lib/firmware", "/usr/local/lib/myron-gpu",
+    "/etc/systemd/system", "/usr/lib/systemd/system",
+    "/etc/modprobe.d", "/usr/lib/modprobe.d",
+    "/etc/modules-load.d", "/usr/lib/modules-load.d",
+    "/etc/udev/rules.d", "/usr/lib/udev/rules.d",
+    "/etc/pacman.d/hooks", "/usr/share/libalpm/hooks",
+    "/etc/vulkan", "/usr/share/vulkan",
+]
+STAGE_EMPTY_ONLY = ["/usr/lib/modules"]
+MODULE_NAME_SUFFIX = re.compile(r"\.ko(\.(gz|xz|zst))?$")
 
 
 class ContractError(Exception):
@@ -64,15 +84,20 @@ def open_regular(path: Path | str, label: str, *, directory_fd: int | None = Non
     return descriptor
 
 
-def sha256_descriptor(descriptor: int, label: str) -> str:
+def sha256_descriptor(
+    descriptor: int, label: str, *, expected_size: int | None = None
+) -> str:
     digest = hashlib.sha256()
     try:
         size = os.fstat(descriptor).st_size
     except OSError as error:
         os.close(descriptor)
         raise ContractError(f"{label} metadata is unavailable: {error.strerror}") from error
+    if expected_size is not None and size != expected_size:
+        os.close(descriptor)
+        raise ContractError(f"{label} changed size before being read")
     with os.fdopen(descriptor, "rb") as stream:
-        remaining = size
+        remaining = size if expected_size is None else expected_size
         while remaining:
             block = stream.read(min(1024 * 1024, remaining))
             if not block:
@@ -254,7 +279,9 @@ def validate_reference(reference: dict) -> None:
                 raise ContractError(f"reference has invalid {section}.{name}")
 
 
-def verify_module_archive(reference: dict, archive_path: Path) -> dict[str, str]:
+def read_module_payload(
+    reference: dict, archive_path: Path, selector_destination: str | None = None
+) -> dict[str, bytes]:
     assets = reference["module_assets"]
     kernel = reference["kernel"]
     archive_data = read_limited_regular(
@@ -315,12 +342,27 @@ def verify_module_archive(reference: dict, archive_path: Path) -> dict[str, str]
         raise ContractError("candidate module selector differs")
     if sha256_bytes(payload["previous-module-dir.sh"]) != assets["previous_selector_sha256"]:
         raise ContractError("previous module selector differs")
+    consumed = manifest.get("selector_destination")
+    if selector_destination is not None and (
+        not isinstance(consumed, str) or consumed != selector_destination
+    ):
+        raise ContractError("module asset manifest selector_destination is missing or differs from the stage contract")
     release_marker = b"vermagic=" + kernel["release"].encode("ascii")
     for name in assets["modules"]:
         module = payload[f"modules/{name}.ko"]
         if release_marker + b" " not in module and release_marker + b"\0" not in module:
             raise ContractError(f"module does not carry the exact kernel release: {name}")
-    return {name: sums[f"modules/{name}.ko"] for name in assets["modules"]}
+    return payload
+
+
+def verify_module_archive(
+    reference: dict, archive_path: Path, selector_destination: str | None = None
+) -> dict[str, str]:
+    payload = read_module_payload(reference, archive_path, selector_destination)
+    return {
+        name: sha256_bytes(payload[f"modules/{name}.ko"])
+        for name in reference["module_assets"]["modules"]
+    }
 
 
 def verify_kernel_inputs(reference: dict, paths: dict[str, Path]) -> dict:
@@ -447,7 +489,451 @@ def verify_runtime_assets(reference: dict, manifest_path: Path, root: Path, feat
     }
 
 
-def load_reference() -> dict:
+class Contracts(NamedTuple):
+    reference: dict
+    reference_sha256: str
+    stage: dict
+    stage_sha256: str
+
+
+def strict_equal(left, right) -> bool:
+    """JSON equality that never treats true/1 or 1.0/1 as the same value."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return set(left) == set(right) and all(strict_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(strict_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def expected_stage_contract(reference: dict, reference_sha256: str) -> dict:
+    """Return the only stage contract this reference admits; module data comes from it."""
+    assets = reference["module_assets"]
+    directory = assets["module_directory"]
+    return {
+        "schema": 1,
+        "reference_sha256": reference_sha256,
+        "device": dict(reference["device"]),
+        "stage": {
+            "kind": "external-kernel-module-stage",
+            "mutability": "immutable",
+            "activation": "disabled",
+            "boot_payload": False,
+            "image": False,
+            "payload": "metadata-only",
+        },
+        "layout": {
+            "ancestor_directories": list(STAGE_ANCESTORS),
+            "module_set_root": MODULE_SET_ROOT,
+            "module_directory": directory,
+            "owned_directories": [MODULE_SET_ROOT, directory],
+            "selector": {
+                "archive_member": "candidate-module-dir.sh",
+                "destination": STAGE_SELECTOR_DESTINATION,
+                "mode": "0755",
+            },
+            "module_file": {
+                "archive_member": "modules/{name}.ko",
+                "destination": f"{directory}/{{name}}.ko",
+                "mode": "0644",
+            },
+            "directory_mode": "0755",
+        },
+        "forbidden": {
+            "absent": list(STAGE_FORBIDDEN_ABSENT),
+            "empty_or_absent_directories": list(STAGE_EMPTY_ONLY),
+            "module_suffixes_outside_owned_files": [".ko", ".ko.gz", ".ko.xz", ".ko.zst"],
+        },
+    }
+
+
+def validate_stage_contract(stage: dict, reference: dict, reference_sha256: str) -> None:
+    validate_reference(reference)
+    if not HEX256.fullmatch(reference_sha256):
+        raise ContractError("reference SHA-256 is invalid")
+    if stage.get("reference_sha256") != reference_sha256:
+        raise ContractError("stage contract is not bound to this reference.json")
+    expected = expected_stage_contract(reference, reference_sha256)
+    if set(stage) != set(expected):
+        raise ContractError("stage contract top-level fields differ")
+    for key, value in expected.items():
+        if not strict_equal(stage[key], value):
+            raise ContractError(f"stage contract differs at {key}")
+
+
+def build_stage_plan(contracts: Contracts, archive_path: Path) -> dict:
+    reference, stage = contracts.reference, contracts.stage
+    validate_stage_contract(stage, reference, contracts.reference_sha256)
+    layout = stage["layout"]
+    selector = layout["selector"]
+    payload = read_module_payload(reference, archive_path, selector["destination"])
+    template = layout["module_file"]
+    sources = [(selector["archive_member"], selector["destination"], selector["mode"])]
+    sources += [
+        (
+            template["archive_member"].format(name=name),
+            template["destination"].format(name=name),
+            template["mode"],
+        )
+        for name in reference["module_assets"]["modules"]
+    ]
+    files = sorted(
+        (
+            {
+                "destination": destination,
+                "mode": mode,
+                "sha256": sha256_bytes(payload[member]),
+                "size": len(payload[member]),
+            }
+            for member, destination, mode in sources
+        ),
+        key=lambda entry: entry["destination"],
+    )
+    return {
+        "schema": 1,
+        "status": "planned",
+        "activation_mode": reference["activation"]["mode"],
+        "device": reference["device"]["codename"],
+        "kernel_release": reference["kernel"]["release"],
+        "reference_sha256": contracts.reference_sha256,
+        "stage_contract_sha256": contracts.stage_sha256,
+        "archive_sha256": reference["module_assets"]["archive_sha256"],
+        "ancestor_directories": list(layout["ancestor_directories"]),
+        "directories": [
+            {"destination": path, "mode": layout["directory_mode"]}
+            for path in layout["owned_directories"]
+        ],
+        "files": files,
+        "forbidden": stage["forbidden"],
+    }
+
+
+def stage_flags(*, directory: bool) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ContractError("stage verification needs O_NOFOLLOW")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    return flags | os.O_DIRECTORY if directory else flags
+
+
+def lstat_at(directory_fd: int, name: str, label: str):
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ContractError(f"{label} is unavailable: {error.strerror}") from error
+
+
+def mount_id_for_fd(descriptor: int, label: str) -> int:
+    """Return Linux mount identity for an open descriptor, or fail closed."""
+    try:
+        with open(f"/proc/self/fdinfo/{descriptor}", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("mnt_id:"):
+                    value = line.split(":", 1)[1].strip()
+                    if value.isdecimal() and int(value) > 0:
+                        return int(value)
+                    break
+    except (OSError, UnicodeError) as error:
+        raise ContractError(f"{label} mount identity is unavailable: {error}") from error
+    raise ContractError(f"{label} mount identity is unavailable")
+
+
+def require_mount_id(descriptor: int, expected: int, label: str) -> None:
+    if mount_id_for_fd(descriptor, label) != expected:
+        raise ContractError(f"stage tree crosses a mount point: {label}")
+
+
+def open_directory_at(
+    directory_fd: int, name: str, label: str, *, expected_mount_id: int | None = None
+) -> int:
+    metadata = lstat_at(directory_fd, name, label)
+    if metadata is None:
+        raise ContractError(f"{label} is missing")
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ContractError(f"{label} is a symlink")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ContractError(f"{label} is not a directory")
+    try:
+        descriptor = os.open(name, stage_flags(directory=True), dir_fd=directory_fd)
+    except OSError as error:
+        raise ContractError(f"{label} cannot be opened safely: {error.strerror}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ContractError(f"{label} changed while being opened")
+        if expected_mount_id is not None:
+            require_mount_id(descriptor, expected_mount_id, label)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_stage_root(root: str) -> int:
+    if not root or "\x00" in root:
+        raise ContractError("stage root path is invalid")
+    if not os.path.isabs(root):
+        raise ContractError("stage root must be an absolute path")
+    if root == "/":
+        raise ContractError("stage root must not be /")
+    components = root.split("/")
+    if any(part in (".", "..") for part in components):
+        raise ContractError("stage root must not contain . or .. components")
+    if any(not part for part in components[1:]):
+        raise ContractError("stage root must be a canonical absolute path")
+    try:
+        current = os.open("/", stage_flags(directory=True))
+    except OSError as error:
+        raise ContractError(f"cannot open /: {error.strerror}") from error
+    walked = ""
+    try:
+        for part in components[1:]:
+            walked += "/" + part
+            following = open_directory_at(current, part, f"stage root component {walked}")
+            os.close(current)
+            current = following
+        metadata, top = os.fstat(current), os.stat("/")
+        if (metadata.st_dev, metadata.st_ino) == (top.st_dev, top.st_ino):
+            raise ContractError("stage root must not be /")
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def list_names(directory_fd: int, label: str) -> list[str]:
+    names: list[str] = []
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > MAX_DIRECTORY_ENTRIES:
+                    raise ContractError(f"{label} has too many entries")
+    except OSError as error:
+        raise ContractError(f"{label} cannot be listed: {error.strerror}") from error
+    return sorted(names)
+
+
+def check_absent(
+    root_fd: int, path: str, *, empty_directory_ok: bool, expected_mount_id: int
+) -> None:
+    current = os.dup(root_fd)
+    parts = PurePosixPath(path).parts[1:]
+    try:
+        for number, part in enumerate(parts):
+            metadata = lstat_at(current, part, f"forbidden path {path}")
+            if metadata is None:
+                return
+            last = number == len(parts) - 1
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ContractError(f"forbidden or unsafe symlink at {path}")
+            if not last:
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ContractError(f"forbidden path crosses a non-directory: {path}")
+                following = open_directory_at(
+                    current,
+                    part,
+                    f"forbidden path {path}",
+                    expected_mount_id=expected_mount_id,
+                )
+                os.close(current)
+                current = following
+                continue
+            if not empty_directory_ok:
+                raise ContractError(f"forbidden path exists: {path}")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ContractError(f"forbidden path is not an empty directory: {path}")
+            leaf = open_directory_at(
+                current,
+                part,
+                f"forbidden path {path}",
+                expected_mount_id=expected_mount_id,
+            )
+            try:
+                if list_names(leaf, f"forbidden path {path}"):
+                    raise ContractError(f"forbidden path is not empty: {path}")
+            finally:
+                os.close(leaf)
+    finally:
+        os.close(current)
+
+
+def hash_regular_at(
+    directory_fd: int, name: str, label: str, entry: dict, expected_mount_id: int
+) -> None:
+    metadata = lstat_at(directory_fd, name, label)
+    if metadata is None:
+        raise ContractError(f"{label} is missing")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ContractError(f"{label} is not a regular file")
+    try:
+        descriptor = os.open(name, stage_flags(directory=False), dir_fd=directory_fd)
+    except OSError as error:
+        raise ContractError(f"{label} cannot be opened safely: {error.strerror}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise ContractError(f"{label} changed while being opened")
+        require_mount_id(descriptor, expected_mount_id, label)
+        if stat.S_IMODE(opened.st_mode) != int(entry["mode"], 8):
+            raise ContractError(f"{label} has mode {stat.S_IMODE(opened.st_mode):04o}, expected {entry['mode']}")
+        if opened.st_nlink != 1:
+            raise ContractError(f"{label} has additional hard links")
+        if opened.st_size != entry["size"]:
+            raise ContractError(f"{label} size differs")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    actual = sha256_descriptor(descriptor, label, expected_size=entry["size"])
+    if actual != entry["sha256"]:
+        raise ContractError(f"{label} SHA-256 differs: expected {entry['sha256']}, got {actual}")
+
+
+def scan_stage_tree(
+    root_fd: int,
+    file_entries: dict[str, dict],
+    allowed_directories: set[str],
+    required_directories: set[str],
+    directory_modes: dict[str, str],
+    expected_mount_id: int,
+) -> int:
+    stack = [(os.dup(root_fd), "", 0)]
+    count = 0
+    seen_files: set[str] = set()
+    seen_directories: set[str] = set()
+    try:
+        while stack:
+            directory_fd, prefix, depth = stack.pop()
+            try:
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        count += 1
+                        if count > MAX_SCAN_ENTRIES:
+                            raise ContractError("stage tree exceeds the scan bound")
+                        relative = prefix + entry.name
+                        path = "/" + relative
+                        if MODULE_NAME_SUFFIX.search(entry.name) and path not in file_entries:
+                            raise ContractError(f"extra kernel module path: /{relative}")
+                        if path not in file_entries and path not in allowed_directories:
+                            raise ContractError(f"unexpected stage path: {path}")
+                        is_directory = entry.is_dir(follow_symlinks=False)
+                        if path in allowed_directories and not is_directory:
+                            raise ContractError(f"stage directory is not a real directory: {path}")
+                        if path in file_entries:
+                            hash_regular_at(
+                                directory_fd,
+                                entry.name,
+                                f"owned file {path}",
+                                file_entries[path],
+                                expected_mount_id,
+                            )
+                            seen_files.add(path)
+                            continue
+                        if depth + 1 > MAX_SCAN_DEPTH:
+                            raise ContractError("stage tree exceeds the depth bound")
+                        child = open_directory_at(
+                            directory_fd,
+                            entry.name,
+                            f"/{relative}",
+                            expected_mount_id=expected_mount_id,
+                        )
+                        expected_mode = directory_modes.get(path)
+                        actual_mode = stat.S_IMODE(os.fstat(child).st_mode)
+                        if expected_mode is not None and actual_mode != int(expected_mode, 8):
+                            os.close(child)
+                            raise ContractError(
+                                f"owned directory {path} has mode {actual_mode:04o}, expected {expected_mode}"
+                            )
+                        seen_directories.add(path)
+                        stack.append((child, relative + "/", depth + 1))
+            except OSError as error:
+                raise ContractError(f"stage tree scan failed: {error.strerror}") from error
+            finally:
+                os.close(directory_fd)
+    finally:
+        for directory_fd, _, _ in stack:
+            os.close(directory_fd)
+    missing_files = sorted(set(file_entries) - seen_files)
+    if missing_files:
+        raise ContractError(f"stage tree is missing owned files: {missing_files}")
+    missing_directories = sorted(required_directories - seen_directories)
+    if missing_directories:
+        raise ContractError(f"stage tree is missing required directories: {missing_directories}")
+    return count
+
+
+def verify_stage_tree(plan: dict, root: str) -> dict:
+    root_fd = open_stage_root(root)
+    try:
+        root_mount_id = mount_id_for_fd(root_fd, "stage root")
+        for path in plan["forbidden"]["absent"]:
+            check_absent(
+                root_fd, path, empty_directory_ok=False, expected_mount_id=root_mount_id
+            )
+        for path in plan["forbidden"]["empty_or_absent_directories"]:
+            check_absent(
+                root_fd, path, empty_directory_ok=True, expected_mount_id=root_mount_id
+            )
+        file_entries = {entry["destination"]: entry for entry in plan["files"]}
+        required_directories = {
+            *plan["ancestor_directories"],
+            *(entry["destination"] for entry in plan["directories"]),
+        }
+        directory_modes = {
+            entry["destination"]: entry["mode"] for entry in plan["directories"]
+        }
+        allowed_directories = {
+            *required_directories,
+            *plan["forbidden"]["empty_or_absent_directories"],
+        }
+        for path in tuple(set(file_entries) | allowed_directories):
+            parent = PurePosixPath(path).parent
+            while str(parent) != "/":
+                allowed_directories.add(str(parent))
+                parent = parent.parent
+        scan_stage_tree(
+            root_fd,
+            file_entries,
+            allowed_directories,
+            required_directories,
+            directory_modes,
+            root_mount_id,
+        )
+    except OSError as error:
+        raise ContractError(f"stage verification failed: {error.strerror}") from error
+    finally:
+        os.close(root_fd)
+    return {
+        "status": "verified",
+        "activation_mode": plan["activation_mode"],
+        "device": plan["device"],
+        "kernel_release": plan["kernel_release"],
+        "directory_count": len(plan["directories"]),
+        "file_count": len(plan["files"]),
+        "module_directory": plan["directories"][1]["destination"],
+    }
+
+
+def load_contracts() -> Contracts:
+    reference_path = locate_reference()
+    reference_bytes = read_limited_regular(reference_path, "kernel contract reference", MAX_REFERENCE_BYTES)
+    reference = strict_json(reference_bytes, "kernel contract reference")
+    validate_reference(reference)
+    stage_bytes = read_limited_regular(
+        reference_path.with_name("stage-contract.json"), "stage contract", MAX_STAGE_CONTRACT_BYTES
+    )
+    stage = strict_json(stage_bytes, "stage contract")
+    reference_sha256 = sha256_bytes(reference_bytes)
+    validate_stage_contract(stage, reference, reference_sha256)
+    return Contracts(reference, reference_sha256, stage, sha256_bytes(stage_bytes))
+
+
+def locate_reference() -> Path:
     prefix = Path(__file__).resolve().parent.parent
     candidates = (
         prefix / "reference.json",
@@ -456,14 +942,19 @@ def load_reference() -> dict:
     )
     for path in candidates:
         if path.exists() or path.is_symlink():
-            try:
-                data = read_limited_regular(path, "kernel contract reference", MAX_REFERENCE_BYTES)
-                reference = strict_json(data, "kernel contract reference")
-            except UnicodeDecodeError as error:
-                raise ContractError(f"cannot read kernel contract reference: {error}") from error
-            validate_reference(reference)
-            return reference
+            return path
     raise ContractError("kernel contract reference is unavailable")
+
+
+def load_reference() -> dict:
+    path = locate_reference()
+    try:
+        data = read_limited_regular(path, "kernel contract reference", MAX_REFERENCE_BYTES)
+        reference = strict_json(data, "kernel contract reference")
+    except UnicodeDecodeError as error:
+        raise ContractError(f"cannot read kernel contract reference: {error}") from error
+    validate_reference(reference)
+    return reference
 
 
 def parser() -> argparse.ArgumentParser:
@@ -477,6 +968,12 @@ def parser() -> argparse.ArgumentParser:
     kernel.add_argument("--vmlinux-symvers", type=Path, required=True)
     kernel.add_argument("--module-symvers", type=Path, required=True)
     kernel.add_argument("--assets", type=Path, required=True)
+    subcommands.add_parser("show-stage", help="print the reviewed stage contract; no files are changed")
+    plan = subcommands.add_parser("plan-stage", help="print the exact stage plan for an archive; no files are changed")
+    plan.add_argument("--assets", type=Path, required=True)
+    stage = subcommands.add_parser("verify-stage", help="verify an external stage tree read-only")
+    stage.add_argument("--assets", type=Path, required=True)
+    stage.add_argument("--root", required=True)
     runtime = subcommands.add_parser("verify-runtime", help="verify private runtime assets read-only")
     runtime.add_argument("--manifest", type=Path, required=True)
     runtime.add_argument("--root", type=Path, required=True)
@@ -487,6 +984,16 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "show-stage":
+            print(json.dumps(load_contracts().stage, indent=2, sort_keys=True))
+            return 0
+        if args.command in ("plan-stage", "verify-stage"):
+            plan = build_stage_plan(load_contracts(), args.assets)
+            print(json.dumps(
+                plan if args.command == "plan-stage" else verify_stage_tree(plan, args.root),
+                indent=2, sort_keys=True,
+            ))
+            return 0
         reference = load_reference()
         if args.command == "show":
             print(json.dumps(reference, indent=2, sort_keys=True))

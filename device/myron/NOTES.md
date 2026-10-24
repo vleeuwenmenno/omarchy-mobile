@@ -9,6 +9,18 @@ Phase 2 now provides an activation-disabled, metadata-only kernel contract.
 It verifies externally supplied qualified VT artifacts and the private runtime
 asset manifest; it does not install or load any hardware payload.
 
+Kernel contract 0.2.0 adds `device/myron/stage-contract.json` (a byte-identical
+copy ships in the package) and `omamobile-myron-kernel-verify show-stage`,
+`plan-stage --assets ARCHIVE` and `verify-stage --assets ARCHIVE --root ROOT`.
+They describe and check an external, immutable module stage tree read-only
+(the candidate selector at `/usr/local/sbin/myron-attempt79-module-dir`, mode
+0755, plus seven modules directly under the notes-keyed module directory, mode
+0644; archive metadata is validated but not staged): the
+verifier writes nothing, runs no external command, and never executes staged
+bytes. The release-marker and hash proof is not full ABI, import, provider or
+load-order proof. There is still no stage writer, extraction, `depmod`, module
+install, boot work, or hardware/deployment authorization.
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,

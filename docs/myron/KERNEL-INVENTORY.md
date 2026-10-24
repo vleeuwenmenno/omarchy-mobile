@@ -29,6 +29,19 @@ Phase 2 records the latest systemd/VT-qualified downstream pair as metadata in
 `omamobile-myron-kernel-contract` verifies external inputs but distributes none
 of their bytes.
 
+Version 0.2.0 adds `device/myron/stage-contract.json`, bound to the SHA-256 of
+the reference above. It fixes the exact destination, mode and SHA-256 of the eight
+target files, derived from the reference: the candidate selector at
+`/usr/local/sbin/myron-attempt79-module-dir` (0755) and the seven modules
+directly under `/usr/local/lib/myron-gki-module-sets/<notes sha256>/` (0644).
+Archive checksums, manifest, notes and the previous selector are validated but
+not staged, and the manifest's `selector_destination` must match. It also lists
+the paths that must stay absent. `plan-stage` prints that plan and `verify-stage` compares a tree with it
+using descriptor-confined, `O_NOFOLLOW`, bounded, read-only traversal. The
+verifier writes nothing and executes nothing. It stays limited to byte identity
+and the exact release marker: that is not full ABI, import, provider or
+load-order proof, and it does not authorize hardware access or deployment.
+
 | Input | Qualified SHA-256 |
 | --- | --- |
 | Raw `Image` | `9dc9d4a00544af130e04b534cb566e26329dbaa9b2f0e6596ad52c1e657d9e09` |
