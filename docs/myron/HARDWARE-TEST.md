@@ -338,6 +338,18 @@ may report the battery device itself as `discharging` from instantaneous
 current direction while its daemon correctly reports `on-battery: no`; the
 Omarchy bar uses the daemon-wide external-power state.
 
+The same boot can run the presence-only peripheral inventory:
+
+```text
+sudo myron-peripheral-audit
+```
+
+It never loads camera or fingerprint modules and never starts ModemManager. It
+records only counts and boolean interface presence, so it can establish which
+gaps still exist without collecting a SIM, modem, camera, or nearby-device
+identifier. Telephony interface evidence must therefore come from a separately
+authorized radio boot where ModemManager is already running.
+
 ## Next attended sequence
 
 1. Promote the qualified controller/scan sequence into a device-owned package

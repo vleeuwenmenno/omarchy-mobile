@@ -11,6 +11,7 @@ initramfs=device/myron/hardware-test-initramfs
 input_stage=$overlay/usr/local/sbin/myron-input-stage
 battery_start=$overlay/usr/local/sbin/myron-batterysecret-start
 battery_stage=$overlay/usr/local/sbin/myron-battery-stage
+peripheral_audit=$overlay/usr/local/sbin/myron-peripheral-audit
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
@@ -29,6 +30,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/sbin/myron-bluetooth-stage" \
   "$battery_start" \
   "$battery_stage" \
+  "$peripheral_audit" \
   "$overlay/usr/local/sbin/myron-audio-devnodes" \
   "$overlay/usr/local/sbin/myron-omarchy-prepare" \
   "$overlay/usr/local/sbin/myron-omarchy-qualify"; do
@@ -366,6 +368,29 @@ grep -Fq 'chmod 0755 "$root/usr/local/lib/myron-charging/bin/linker64"' "$compos
 grep -Fq 'myron-batterysecret.service' "$compose" ||
   fail 'composer does not enable battery authentication'
 pass 'battery authentication and read-only power qualification are exact, gated and supervised'
+
+for required in \
+  '/run/myron-omarchy-hardware-ready' \
+  'myron-hardware-watchdog.service' \
+  '/sys/bus/iio/devices/iio:device' \
+  'qcom-hv-haptics' \
+  'module_state camera' \
+  'module_state msm_mmrm' \
+  'module_state mi_fp' \
+  'org.freedesktop.ModemManager1.Modem.Voice' \
+  'org.freedesktop.ModemManager1.Modem.Messaging' \
+  'identifiers=not-collected' \
+  'writes=none'; do
+  grep -Fq "$required" "$peripheral_audit" ||
+    fail "read-only peripheral audit lacks: $required"
+done
+for forbidden in insmod modprobe rmmod mmcli bluetoothctl; do
+  ! grep -Eq "(^|[^[:alnum:]_-])$forbidden([^[:alnum:]_-]|$)" "$peripheral_audit" ||
+    fail "peripheral audit can activate hardware through $forbidden"
+done
+grep -Fq '"$root/usr/local/sbin/myron-peripheral-audit"' "$compose" ||
+  fail 'composer does not explicitly install the peripheral audit as executable'
+pass 'peripheral audit is presence-only, identifier-free and independently supervised'
 
 if grep -REq '(^|[[:space:]/])(fastboot|dd|sgdisk|parted|mkfs|wipefs)([[:space:]]|$)' \
     "$overlay"; then

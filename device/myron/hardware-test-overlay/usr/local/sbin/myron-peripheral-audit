@@ -1,0 +1,96 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Presence-only audit. Never loads a module, opens a device node, or changes hardware.
+set -eu
+
+persist_dir=/run/myron-host/var/log
+persist_log=$persist_dir/myron-omarchy-peripheral-audit.log
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+count_nodes() {
+  find /dev -maxdepth 1 -type c -name "$1" -print 2>/dev/null | wc -l
+}
+module_state() {
+  [ -d "/sys/module/$1" ] && printf loaded || printf absent
+}
+
+[ "$(id -u)" = 0 ] || die 'must run as root'
+[ -f /run/myron-omarchy-hardware-ready ] || die 'hardware preparation marker missing'
+systemctl --quiet is-active myron-hardware-watchdog.service ||
+  die 'independent rollback watchdog is not active'
+
+iio_count=0
+motion_iio_count=0
+for device in /sys/bus/iio/devices/iio:device*; do
+  [ -L "$device" ] || continue
+  iio_count=$((iio_count + 1))
+  if find -L "$device" -maxdepth 1 -type f \
+      '(' -name 'in_accel_*' -o -name 'in_anglvel_*' -o -name 'in_magn_*' ')' \
+      -print -quit 2>/dev/null | grep -q .; then
+    motion_iio_count=$((motion_iio_count + 1))
+  fi
+done
+
+haptic_count=0
+haptic_ff=no
+for event in /sys/class/input/event*; do
+  [ -r "$event/device/name" ] || continue
+  [ "$(cat "$event/device/name")" = qcom-hv-haptics ] || continue
+  haptic_count=$((haptic_count + 1))
+  if [ -r "$event/device/capabilities/ff" ] &&
+     grep -Eq '[1-9a-fA-F]' "$event/device/capabilities/ff"; then
+    haptic_ff=yes
+  fi
+done
+
+video_count=$(count_nodes 'video*')
+media_count=$(count_nodes 'media*')
+v4l_subdev_count=$(count_nodes 'v4l-subdev*')
+fingerprint_node_count=$(find /dev -maxdepth 1 -type c \
+  '(' -iname '*finger*' -o -iname '*xiaomi*fp*' -o -iname '*qbt*' ')' \
+  -print 2>/dev/null | wc -l)
+
+telephony_owner=no
+voice_interface=no
+messaging_interface=no
+modem_object_count=0
+bus_names=$(timeout 5 busctl --system --no-pager list 2>/dev/null || true)
+if printf '%s\n' "$bus_names" | awk '$1 == "org.freedesktop.ModemManager1" { found=1 } END { exit !found }'; then
+  telephony_owner=yes
+  tree=$(timeout 5 busctl --system --no-pager tree org.freedesktop.ModemManager1 2>/dev/null || true)
+  modem_paths=$(printf '%s\n' "$tree" |
+    sed -n 's#.*\(/org/freedesktop/ModemManager1/Modem/[0-9][0-9]*\).*#\1#p' | sort -u)
+  modem_object_count=$(printf '%s\n' "$modem_paths" | grep -c . || true)
+  modem_path=$(printf '%s\n' "$modem_paths" | head -n 1)
+  if [ -n "$modem_path" ]; then
+    interfaces=$(timeout 5 busctl --system --no-pager introspect \
+      org.freedesktop.ModemManager1 "$modem_path" 2>/dev/null || true)
+    printf '%s\n' "$interfaces" |
+      grep -Fq 'org.freedesktop.ModemManager1.Modem.Voice' && voice_interface=yes
+    printf '%s\n' "$interfaces" |
+      grep -Fq 'org.freedesktop.ModemManager1.Modem.Messaging' && messaging_interface=yes
+  fi
+fi
+
+[ -d "$persist_dir" ] && [ ! -L "$persist_dir" ] || die 'persistent log directory is invalid'
+[ ! -L "$persist_log" ] || die 'persistent peripheral log is linked'
+temporary=$(mktemp "$persist_dir/.myron-peripheral-audit.XXXXXX")
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+chmod 0600 "$temporary"
+printf '%s\n' \
+  'stage=peripheral-audit result=complete writes=none identifiers=not-collected' \
+  "iio_devices=$iio_count motion_iio_devices=$motion_iio_count" \
+  "haptic_inputs=$haptic_count force_feedback=$haptic_ff" \
+  "camera_module=$(module_state camera) mmrm_module=$(module_state msm_mmrm) video_nodes=$video_count media_nodes=$media_count v4l_subdev_nodes=$v4l_subdev_count" \
+  "fingerprint_module=$(module_state mi_fp) fingerprint_nodes=$fingerprint_node_count" \
+  "telephony_owner=$telephony_owner modem_objects=$modem_object_count voice_interface=$voice_interface messaging_interface=$messaging_interface" \
+  >"$temporary"
+mv -f "$temporary" "$persist_log"
+trap - EXIT HUP INT TERM
+printf 'result=complete iio=%s motion_iio=%s haptics=%s ff=%s camera_nodes=%s/%s/%s fingerprint_nodes=%s telephony=%s voice=%s messaging=%s writes=none identifiers=not-collected\n' \
+  "$iio_count" "$motion_iio_count" "$haptic_count" "$haptic_ff" \
+  "$video_count" "$media_count" "$v4l_subdev_count" "$fingerprint_node_count" \
+  "$telephony_owner" "$voice_interface" "$messaging_interface"

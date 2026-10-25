@@ -46,6 +46,12 @@ hardware preparation and before the display manager. `myron-battery-stage`
 performs a separate read-only sysfs and UPower qualification while the
 independent rollback watchdog remains active.
 
+`myron-peripheral-audit` is another read-only, watchdog-gated probe. It records
+only aggregate presence for motion-sensor IIO attributes, haptic force
+feedback, camera/media nodes, fingerprint nodes, and already-running
+ModemManager Voice/Messaging interfaces. It neither loads modules nor starts a
+modem service, and it never records modem or SIM identifiers.
+
 The overlay provides a Myron-specific `omamobile-gnss` command for the shell's
 Location tile. It controls the qualified raw/NMEA/MSA/MSB sources through
 ModemManager and does not install the Pixel-specific Broadcom GNSS package.
