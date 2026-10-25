@@ -13,15 +13,23 @@ stays empty, and R4 selection is still not implemented.
 and no tool recomputes an offset, a size, a hash or a coverage range. Every R3
 value the tools accept is a synthetic claim in a fixture. The collector checks
 that the claims are well formed and consistent with each other and with R2. It
-does not, and cannot, check that they are true. Binary parsing is the successor
+does not, and cannot, check that they are true. Binary parsing was the successor
 gate `r3-binary-image-parsers`; R4 stays `r4-selection-source-qualification`.
+
+*Update (Phase 2.15B):* the synthetic, offline, metadata-only binary parsers now
+exist in `tools/myron-bootchain` 0.3.0 ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)).
+They recompute the offsets, sizes, header and table hashes and coverage from
+synthetic image bytes and publish an R3 operation this schema accepts unchanged
+(the schema, the collector and its three R3 limits are not modified). They carry
+no captured provenance. This document describes the schema as of Phase A; the
+bootchain row below is the Phase A state.
 
 | Tool | Version | Change |
 | --- | --- | --- |
 | `tools/myron-preflight` | 0.3.0 | capture schema `myron-capture-evidence-v2`, three separate budgets per requested read, R3 emits as leaf paths |
 | `tools/lib/myron-collect-impl.py` | 0.2.0 | operation schema 2 with `read_domain`, nested typed policy engine, R3 profile and rules |
 | `tools/lib/myron-session-impl.py` | 0.2.0 | R3 summary input generation 2 (1 MiB), nested coverage registry |
-| `tools/lib/myron-bootchain-impl.py` | 0.2.0 | still GPT to R2 only; operation schema 2; R3 stays a successor gate |
+| `tools/lib/myron-bootchain-impl.py` | 0.2.0 (0.3.0 in Phase 2.15B) | GPT to R2 only; operation schema 2; R3 was a successor gate |
 
 The deployment (0.4.0), snapshot (0.2.0), kernel and GPU contracts are
 unchanged. Contract and request documents keep their structural `schema` 1;

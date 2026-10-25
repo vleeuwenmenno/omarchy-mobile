@@ -186,19 +186,30 @@ Android boot-image or device-tree parser exists
 ([SESSION-GATE.md](SESSION-GATE.md)).
 
 Phase 2.14 (laptop-only, synthetic parser done): `device/myron/bootchain-contract.json`
-and `tools/myron-bootchain` (0.2.0 since Phase 2.15A) parse one **synthetic**
+and `tools/myron-bootchain` (0.2.0 since Phase 2.15A, 0.3.0 since Phase 2.15B)
+parse one **synthetic**
 GPT (revision 1.0, 92-byte headers, 128 entries of 128 bytes, primary and backup
 copies) byte for byte into the R2 operation fragment the unchanged collector
 accepts. This is synthetic binary parser qualification only: no captured
 provenance, live transport, hardware evidence, authorization or blocker closure.
-R3 (boot image headers) binary parsing and R4 (selection) are **not**
-implemented and stay required successor gates: the R3 binary parsers
-(`r3-binary-image-parsers`; the schema they fill exists since Phase 2.15A) and
-the R4 selection-source qualification (a concrete selected-index source, an
-actual Myron witness and contract cross-checks; parsing a DTBO or FDT does not
-prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)). Offline R3 parsing
-(2.15B) needs only the format parsers and recomputed hashes and coverage; a
-byte-counting hardware transport is later acquisition qualification.
+R4 (selection) is **not** implemented and stays a required successor gate: the
+R4 selection-source qualification (a concrete selected-index source, an actual
+Myron witness and contract cross-checks; parsing a DTBO or FDT does not prove
+selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
+
+Phase 2.15B (laptop-only, synthetic R3 parsers done): bootchain 0.3.0 adds
+`plan-images`, `parse-images` and `verify-images`, which parse a flat fixture of
+synthetic Android boot v0-v4, vendor boot v3/v4 and DT table v0 images, bound to
+a validated R2 operation, into the metadata-only R3 operation (header and table
+hashes and exact coverage recomputed from immutable captured buffers; no image
+hash, payload hash or full-image coverage). The GPT `parse` still produces only
+R2 and `parse-images` only R3. The 0.3.0 contract pin deliberately breaks 0.2.0
+artifacts. This is synthetic parser qualification only: no captured provenance,
+hardware qualification or authorization, all nine authority flags false and all
+seven blockers open ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)). The next gates
+are R4 selection-source qualification and a separate hardware acquisition gate
+(a transport that counts returned bytes, rereads and overreads separately, with
+provenance and freshness).
 
 Phase 2.15A (laptop-only, schema done): the preflight (0.3.0), collector
 (0.2.0), session (0.2.0) and bootchain (0.2.0) tools migrate to one R3

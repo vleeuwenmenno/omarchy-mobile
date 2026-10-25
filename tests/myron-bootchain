@@ -39,7 +39,7 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import hashlib, json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-synthetic-bootchain-contract"
-assert value["format_version"] == "0.2.0"
+assert value["format_version"] == "0.3.0"
 assert value["pinned_versions"] == {
     "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0",
 }
@@ -531,24 +531,18 @@ assert [row["claim"] for row in contract["coverage"]["unresolved_claims"]] == [
     "geometry-provenance-not-established", "physical-acquisition-and-freshness-not-established",
     "complete-device-disk-inventory-not-established", "protective-mbr-not-parsed",
     "android-slot-semantics-not-established", "bootability-not-established",
-    "r3-binary-parser-successor-required", "r4-selection-provenance-successor-required"]
+    "r3-acquisition-provenance-not-established", "r3-image-freshness-not-established",
+    "r3-hardware-transport-not-established", "r4-selection-provenance-successor-required"]
 assert any("does NOT prove Android slot priority" in t for t in contract["coverage"]["semantic_limits"])
 assert [(row["id"], row["state"], row["successor_gate"]) for row in contract["deferred"]] == [
-    (R3, "not-implemented", "r3-binary-image-parsers"),
     (R4, "not-implemented", "r4-selection-source-qualification")]
-r3_deferred = contract["deferred"][0]
-assert r3_deferred["requires"] == [
-    "format-specific binary parsers for Android boot v0-v4, vendor boot v3 and v4, and DT table v0",
-    "hashes and coverage recomputed from image bytes: the schema generation only represents them"]
-assert len(r3_deferred["later_acquisition_qualification"]) == 1
-assert "hardware transport" in r3_deferred["later_acquisition_qualification"][0]
-assert "not a prerequisite" in r3_deferred["later_acquisition_qualification"][0]
-assert not any("hardware" in text for text in r3_deferred["requires"]), "offline 2.15B needs no hardware transport"
-assert "later_acquisition_qualification" not in contract["deferred"][1]
+assert "later_acquisition_qualification" not in contract["deferred"][0]
 assert contract["qualification"]["captured_provenance"] is False
-assert contract["qualification"]["implemented_operations"] == [R2]
+assert contract["qualification"]["hardware_qualified"] is False
+assert contract["qualification"]["implemented_operations"] == [R2, R3]
+assert contract["qualification"]["command_scope"] == {"parse": [R2], "parse-images": [R3]}
 assert any("successor" in text or "not implemented" in text for text in contract["limitations"])
-assert any("R3" in text and "R4" in text for text in contract["non_goals"])
+assert any("R4" in text and "complete R1-R7 capture" in text for text in contract["non_goals"])
 assert not re.search(r"\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b", bootchain_contract_bytes.decode())
 shown, shown_text = expect_ok("show")
 assert shown == contract and shown_text.encode() == json.dumps(contract, indent=2, sort_keys=True).encode() + b"\n"
@@ -705,7 +699,7 @@ assert plan_a["remote_commands"] == [] and plan_a["blockers"] == D.BLOCKERS
 assert plan_a["authority"] == {flag: False for flag in P.AUTHORITY_FLAGS}
 assert plan_a["implementation"] == B.implementation_binding() and plan_a["complete_capture"] is False
 assert plan_a["output_closure"] == contract["output"]["closure"]
-assert [row["id"] for row in plan_a["deferred"]] == [R3, R4]
+assert [row["id"] for row in plan_a["deferred"]] == [R4]
 assert not re.search(r"\b(adb|fastboot|ssh|scp|rsync|curl|wget|sudo|bash|chmod)\b", plan_text)
 assert "$(" not in plan_text and "export " not in plan_text and "<<" not in plan_text
 for needle in ("/proc", "/sys", "/dev", "pmos_root", "sm8850", "qcom,canoe"):
@@ -777,7 +771,7 @@ assert set(parse_doc) == {
     "complete_capture", "inputs", "operation", "accounting", "coverage", "semantic_limits",
     "unresolved_claims", "deferred", "qualification", "limitations", "non_goals", "blockers",
     "authority"}
-assert parse_doc["kind"] == "myron-synthetic-gpt-parse" and parse_doc["format_version"] == "0.2.0"
+assert parse_doc["kind"] == "myron-synthetic-gpt-parse" and parse_doc["format_version"] == "0.3.0"
 assert parse_doc["profile"] == "gpt-v1-128x128-primary-backup"
 assert parse_doc["inventory_scope"] == "one-synthetic-gpt"
 assert parse_doc["evidence_level"] == "synthetic-binary-parser-only"
@@ -2383,10 +2377,10 @@ assert not [p for p in tracked if re.search(r"(^|/)gpt[-_].*\.bin$|(^|/)geometry
 assert (repo / "tools/myron-bootchain").exists() and "tests/myron-bootchain" in (repo / "tests/all").read_text()
 assert sum(1 for line in (repo / "tests/all").read_text().splitlines() if "tests/myron-bootchain" in line) == 1
 plan_all = json.dumps(plan_a)
-assert "R3 binary parsing and R4 selection are not implemented" in plan_all
-assert "r3-binary-image-parsers" in plan_all and "r3-boot-image-schema-migration" not in plan_all
+assert "R4 selection is not implemented" in plan_all and "neither is a capture" in plan_all
+assert "r3-binary-image-parsers" not in plan_all and "r3-boot-image-schema-migration" not in plan_all
 assert "r4-selection-source-qualification" in plan_all
-ok("existing contracts and tools are untouched, R3 and R4 are recorded successor gates, no raw fixture is committed")
+ok("existing contracts and tools are untouched, R4 is the one recorded successor gate, the GPT parse still produces only R2, no raw fixture is committed")
 
 # --- registry drift and consistency --------------------------------------------------
 
@@ -2420,11 +2414,11 @@ drift("limitation text change", lambda: B.LIMITATIONS.append("x"), lambda: B.LIM
 drift("unresolved claim change", lambda: B.UNRESOLVED.append("x"), lambda: B.UNRESOLVED.pop())
 drift("deferred gate change", lambda: B.DEFERRED[0].update(state="implemented"),
       lambda: B.DEFERRED[0].update(state="not-implemented"))
-drift("R3 later acquisition qualification change",
-      lambda: B.DEFERRED[0]["later_acquisition_qualification"].append("x"),
-      lambda: B.DEFERRED[0]["later_acquisition_qualification"].pop())
-drift("R3 offline prerequisite change", lambda: B.DEFERRED[0]["requires"].append("a hardware transport"),
+drift("R4 prerequisite change", lambda: B.DEFERRED[0]["requires"].append("a hardware transport"),
       lambda: B.DEFERRED[0]["requires"].pop())
+drift("image parser limitation change", lambda: B.IMAGE_LIMITATIONS.append("x"), lambda: B.IMAGE_LIMITATIONS.pop())
+drift("image parser output bound change", lambda: setattr(B, "MAX_OUTPUT_METADATA_BYTES", 65535),
+      lambda: setattr(B, "MAX_OUTPUT_METADATA_BYTES", 65536))
 drift("semantic limit change", lambda: B.SEMANTIC_LIMITS.pop(), lambda: B.SEMANTIC_LIMITS.append(
     "recovery_present is name presence inside this one GPT, not recovery viability"))
 drift("profile constant change", lambda: setattr(B, "BOOTABLE_BIT", 1), lambda: setattr(B, "BOOTABLE_BIT", 2))

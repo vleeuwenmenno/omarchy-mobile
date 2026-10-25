@@ -1,0 +1,1238 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the Myron synthetic R3 image parsers (Phase 2.15B): Android boot v0-v4,
+# vendor_boot v3-v4 and DT table v0 into the metadata-only R3 operation. Everything here is
+# synthetic: no phone, no network, no process, no block device, no real firmware. The image
+# bytes are generated at runtime by tests/myron-fixtures/boot_images.py, independently of the
+# parser, and exist only in a temporary directory: no binary fixture is committed.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+python3 -m py_compile tools/myron-bootchain tools/lib/myron-bootchain-impl.py tests/myron-fixtures/boot_images.py \
+  || fail "tool and fixture builder parse"
+bash -n tests/myron-bootchain-images || fail "runner parses"
+grep -q 'synthetic-binary-image-fixture' tools/lib/myron-bootchain-impl.py || fail "tool lacks the synthetic image transport"
+[[ $(wc -l < tools/myron-bootchain) -le 90 ]] || fail "the trusted loader grew past 90 lines"
+pass "tool and builder parse, the loader stayed small"
+
+tools/myron-bootchain derive-contract > "$tmp/derived.json" || fail "derive-contract failed"
+cmp -s "$tmp/derived.json" device/myron/bootchain-contract.json \
+  || fail "committed bootchain contract differs from derive-contract (regenerate it, see docs/myron/R3-PARSER-GATE.md)"
+tools/myron-bootchain show | cmp -s - "$tmp/derived.json" || fail "show differs from derive-contract"
+pass "derive-contract output equals the committed 0.3.0 bootchain contract byte for byte"
+
+mkdir "$tmp/fixture"
+MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
+  || { cat "$tmp/snapshot-suite.log" >&2; fail "snapshot fixture export"; }
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(repo / "tests/myron-fixtures"))
+import boot_images as F  # noqa: E402
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+B = load("bootchain_tool_images_test", repo / "tools/myron-bootchain")
+C = B.collect()
+P = C.preflight()
+D = P.deploy()
+K = D.kernel()
+paths = {key: Path(value) for key, value in json.loads((work / "fixture/paths.json").read_text()).items()}
+contracts_root = paths["contracts_root"]
+contracts = D.load_contracts(contracts_root)
+_, _, snapshot_sha = P.snapshot().load_snapshot_contract(contracts_root, contracts)
+preflight_bytes = D.render_json(P.expected_preflight_contract(contracts, snapshot_sha))
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).parent.mkdir(parents=True, exist_ok=True)
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes)
+capture_contract_bytes = D.render_json(C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts))
+(contracts_root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes)
+collector_env = C.load_environment(contracts_root)
+bootchain_contract = B.expected_bootchain_contract(collector_env)
+bootchain_contract_bytes = D.render_json(bootchain_contract)
+(contracts_root / B.BOOTCHAIN_CONTRACT_PATH).write_bytes(bootchain_contract_bytes)
+env = B.load_environment(contracts_root)
+BC = env.contract_sha256
+assert BC == hashlib.sha256(bootchain_contract_bytes).hexdigest()
+CANARY = "canaryq7k2"
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def jbytes(value):
+    return D.render_json(value)
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+counter = [0]
+
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{name}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+def invoke(*arguments, root=None):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = B.main([str(value) for value in arguments], contracts_root=root or contracts_root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def expect_ok(*arguments):
+    code, out, err = invoke(*arguments)
+    assert code == 0, (arguments[0], err)
+    return json.loads(out), out
+
+
+def expect_fail(name, arguments, code_name=None, outputs=(), absent=(CANARY,)):
+    code, out, err = invoke(*arguments)
+    assert code != 0, f"{name}: accepted\n{out}"
+    assert out == "", f"{name}: stdout is not empty"
+    assert err.count("\n") == 1 and err.startswith("ERROR: "), f"{name}: not one line: {err!r}"
+    if code_name is not None:
+        assert err.rstrip().endswith(f"(code {code_name})"), f"{name}: expected {code_name}, got {err!r}"
+    for text in absent:
+        assert text not in err, f"{name}: diagnostics echo {text!r}: {err}"
+    for output in outputs:
+        assert not os.path.lexists(output), f"{name}: left output {output}"
+    ok(f"{name} is rejected as {code_name or 'a fixed refusal'}")
+    return err
+
+
+def with_patch(owner, attribute, replacement, run):
+    original = getattr(owner, attribute)
+    setattr(owner, attribute, replacement(original))
+    try:
+        return run()
+    finally:
+        setattr(owner, attribute, original)
+
+
+def set_constant(name, value, run):
+    original = getattr(B, name)
+    setattr(B, name, value)
+    try:
+        return run()
+    finally:
+        setattr(B, name, original)
+
+
+# A real preflight request, built by the pinned preflight tool, is the only request input.
+request = work / "request"
+with contextlib.redirect_stdout(io.StringIO()):
+    code = P.main(
+        ["assess", "--kit", str(paths["kit"]), "--snapshot", str(paths["snapshot"]),
+         "--rootfs-stage", str(paths["rootfs"]), "--rootfs-manifest", str(paths["manifest"]),
+         "--assets", str(paths["archive"]), "--runtime-assets", "none",
+         "--vmlinux-symvers", "none", "--module-symvers", "none", "--out", str(request)],
+        contracts_root=contracts_root)
+assert code == 0
+request_sha256 = digest((request / "SHA256SUMS").read_bytes())
+READS = json.loads((request / "request.json").read_text())["requested_reads"]
+R1, R2, R3, R4, R5, R6, R7 = [row["id"] for row in READS]
+R2_ROW, R3_ROW = READS[1], READS[2]
+assert R3 == B.R3_ID and R2 == B.R2_ID
+assert [R3_ROW[key] for key in ("max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes")] == [
+    1048576, 67108864, 65536], "the three collector R3 limits are distinct and unchanged"
+NAMES = sorted(r + s for r in ("boot", "init_boot", "vendor_boot", "vendor_kernel_boot", "dtbo", "recovery")
+               for s in ("", "_a", "_b"))
+assert NAMES == B.IMAGE_NAMES and len(NAMES) == 18
+
+
+def role_of(name):
+    return name[:-2] if name.endswith(("_a", "_b")) else name
+
+
+# --- scenarios -------------------------------------------------------------------------
+
+
+def r2_operation(partitions, req_sha=None):
+    rows = [{"partition_name": name, "size_bytes": size, "bootable_flag": False,
+             "slot_suffix": name[-2:] if name.endswith(("_a", "_b")) else ""}
+            for name, size in sorted(partitions.items())]
+    return jbytes({
+        "schema": C.OPERATION_SCHEMA, "kind": C.OPERATION_KIND, "id": R2,
+        "request_sha256": req_sha or request_sha256, "transport": C.TRANSPORT,
+        "read_domain": C.READ_DOMAIN, "read_only": True, "bytes_read": 4096,
+        "data": {"partitions": rows, "recovery_present": any(role_of(n) == "recovery" for n in partitions)},
+    })
+
+
+class Scenario:
+    pass
+
+
+def make(images, label="scn", *, capacity=None, extra_parts=None, req_sha=None, inv_sha=None,
+         manifest_edit=None, rows_edit=None, edits=None, drop=(), extra_files=None, manifest_raw=None,
+         inventory_names=None, keep_rows=False):
+    """Write one inventory file and one flat image fixture. IMAGES: name -> (bytes, meta)."""
+    s = Scenario()
+    s.images = images
+    parts = {name: (capacity or {}).get(name, 64 * F.MIB) for name in (inventory_names or images)}
+    parts.update(extra_parts or {"pmos_root": 8 * 1024 ** 3})
+    s.partitions = parts
+    base = fresh(label)
+    s.inv = base / "inventory" / "R2.json"
+    s.inv.parent.mkdir()
+    s.inv_bytes = r2_operation(parts, req_sha)
+    s.inv.write_bytes(s.inv_bytes)
+    s.inv.chmod(0o644)
+    s.inv.parent.chmod(0o755)
+    s.inv_sha = digest(s.inv_bytes)
+    s.imgs = base / "images"
+    s.imgs.mkdir()
+    files = {name: data for name, (data, _meta) in images.items()}
+    original = dict(files)
+    files.update(edits or {})
+    rows = [{"partition_name": n, "present": n in (original if not keep_rows else files),
+             "size_bytes": len((original if not keep_rows else files)[n]) if n in (original if not keep_rows else files) else None,
+             "fixture_sha256": digest((original if not keep_rows else files)[n]) if n in (original if not keep_rows else files) else None}
+            for n in NAMES]
+    if rows_edit:
+        rows_edit(rows)
+    document = {"schema": 1, "kind": B.IMAGES_KIND, "format_version": 1, "bootchain_contract_sha256": BC,
+                "request_sha256": req_sha or request_sha256, "inventory_sha256": inv_sha or s.inv_sha,
+                "synthetic": True, "images": rows}
+    if manifest_edit:
+        manifest_edit(document)
+    s.manifest = manifest_raw if manifest_raw is not None else jbytes(document)
+    s.manifest_doc = document
+    for name, data in {**{f"{n}.img": d for n, d in files.items()}, "images.json": s.manifest,
+                       **(extra_files or {})}.items():
+        if name in drop:
+            continue
+        (s.imgs / name).write_bytes(data)
+        (s.imgs / name).chmod(0o644)
+    s.imgs.chmod(0o755)
+    s.sizes = sum(len(d) for d in original.values())
+    s.S = len(s.manifest) + s.sizes
+    return s
+
+
+def cli(command, s, *extra):
+    if command == "plan-images":
+        return [command, "--request", request, "--inventory", s.inv, *extra]
+    return [command, "--request", request, "--inventory", s.inv, "--images", s.imgs, *extra]
+
+
+def parse_ok(s, label="out"):
+    out = work / f"{label}-{counter[0] + 1}"
+    counter[0] += 1
+    summary, raw = expect_ok(*cli("parse-images", s, "--out", out))
+    return summary, out
+
+
+def image(name, data_meta):
+    return B.image_summary(name, data_meta[0])
+
+
+def reject(name, label, data, code):
+    try:
+        B.image_summary(label, data)
+    except B.ImageError as error:
+        assert error.code == code, f"{name}: expected {code}, got {error.code}: {error}"
+        text = str(error)
+        assert text.endswith(f"(code {code})") and "\n" not in text
+        assert CANARY not in text and not re.search(r"\d{3,}", text.replace("32 bits", "")), text
+    else:
+        raise AssertionError(f"{name}: accepted")
+    ok(f"{name} is {code}")
+
+
+# --- the contract ------------------------------------------------------------------------
+
+contract = json.loads(bootchain_contract_bytes)
+assert contract["format_version"] == "0.3.0"
+assert contract["pinned_versions"] == {"collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0",
+                                       "snapshot": "0.2.0"}
+parser = contract["image_parser"]
+assert parser["version"] == "1.0.0" and parser["independently_versioned"] is True
+assert parser["commands"] == ["plan-images", "parse-images", "verify-images"]
+assert parser["capture"]["produces"] == [R3] and R2 in parser["capture"]["does_not_produce"]
+assert contract["capture"]["produces"] == [R2] and R3 in contract["capture"]["does_not_produce"]
+assert contract["qualification"]["implemented_operations"] == [R2, R3]
+assert contract["qualification"]["command_scope"] == {"parse": [R2], "parse-images": [R3]}
+assert contract["qualification"]["captured_provenance"] is False
+assert contract["qualification"]["hardware_qualified"] is False
+assert [(row["id"], row["state"]) for row in contract["deferred"]] == [(R4, "not-implemented")]
+claims = [row["claim"] for row in contract["coverage"]["unresolved_claims"]]
+assert "r3-binary-parser-successor-required" not in claims
+assert {"r3-acquisition-provenance-not-established", "r3-image-freshness-not-established",
+        "r3-hardware-transport-not-established"} <= set(claims)
+assert len(contract["blockers"]) == 7
+assert len(contract["authority"]) == 9 and all(v is False for v in contract["authority"].values())
+accounting = parser["accounting"]
+assert accounting["bounds"] == {"S_max_bytes_per_gather": 67108864, "image_max_bytes": 16777216,
+                                "M_max_bytes": 65536, "O_max_bytes": 65536}
+assert accounting["hardware_bytes_read"] == 0 and accounting["hardware_transport"] == "none"
+assert accounting["full_image_evidence"] is False
+assert accounting["bound_sources"]["O"].startswith("image parser max_output_metadata_bytes only")
+assert sorted(parser["diagnostics"]["codes"]) == sorted([
+    "image-input-rejected", "image-identity-mismatch", "image-unstable", "image-corrupt",
+    "image-unsupported", "image-budget", "image-operation-rejected", "publish-rejected"])
+assert parser["output"]["files"] == sorted(["SHA256SUMS", "parse.json", f"operations/{R3}.json"])
+assert parser["output"]["binary_copies"] is False
+assert C.policy_registry()["operations"][R3]["budgets"]["max_output_bytes"] == 1048576
+for name in ("capture", "preflight", "deployment", "snapshot", "session", "stage", "kernel"):
+    assert "bootchain" not in (repo / f"device/myron/{name}-contract.json").read_text(), "pins are one-way"
+ok("the 0.3.0 contract binds the independent image-parser contract, the R2/R3 command scopes, R4 alone deferred and every false authority")
+
+# --- positive parsers: every supported version, family, role and page size -------------------
+
+BODY = 3000
+
+
+def check_positive(name, built):
+    data, meta = built
+    got = image(name, built)
+    want = F.expected(data, meta)
+    assert got == want, (name, json.dumps(got, indent=1, sort_keys=True), json.dumps(want, indent=1, sort_keys=True))
+    return got
+
+
+for role in ("boot", "recovery"):
+    for version in (0, 1, 2):
+        for page in (2048, 4096, 8192, 16384):
+            kwargs = dict(kernel=F.blob("k", BODY), ramdisk=F.blob("r", BODY + 7), second=F.blob("s", 500),
+                          page=page)
+            if version >= 1:
+                kwargs["dtbo"] = F.blob("d", 900)
+            if version >= 2:
+                kwargs["dtb"] = F.blob("t", 1100)
+            got = check_positive(role + "_a", F.boot_legacy(version, **kwargs))
+            assert got["os_version"] == F.OS_VERSION and got["sha256"] is None
+            assert got["coverage"]["kind"] == "metadata-only" and len(got["coverage"]["ranges"]) == 1
+            assert all(c["sha256"] is None for c in got["components"]), "payload stays uncovered"
+        check_positive(role, F.boot_legacy(version, os_version=0))  # literal os_version 0 is preserved
+        assert image(role, F.boot_legacy(version, os_version=0))["os_version"] == 0
+    for version in (3, 4):
+        kwargs = dict(kernel=F.blob("k", BODY), ramdisk=F.blob("r", 5000))
+        if version == 4:
+            kwargs["signature"] = F.blob("sig", 700)
+        got = check_positive(role + "_b", F.boot_modern(version, **kwargs))
+        assert got["page_size"] == 4096
+        check_positive(role, F.boot_modern(version))  # every component empty
+for name in ("init_boot", "init_boot_a", "init_boot_b"):
+    got = check_positive(name, F.boot_modern(4, ramdisk=F.blob("r", 6000), signature=F.blob("sig", 300)))
+    assert [c for c in got["components"] if c["role"] == "kernel"][0]["size_bytes"] == 0
+# recovery_dtbo: empty allows the writer's zero and the computed position; the dtb never derives from it
+check_positive("boot", F.boot_legacy(2, kernel=F.blob("k", 100), dtbo=b"", dtb=F.blob("t", 64), dtbo_offset=0))
+data, meta = F.boot_legacy(2, kernel=F.blob("k", 100), dtbo=b"", dtb=F.blob("t", 64))
+dtb = [c for c in image("boot", (data, meta))["components"] if c["role"] == "dtb"][0]
+assert dtb["offset"] == 8192 and dtb["size_bytes"] == 64
+ok("Android boot v0-v2 (four page sizes), v3 and v4, init_boot and literal os_version 0 parse to the independent expectation")
+
+for role in ("vendor_boot", "vendor_kernel_boot"):
+    for page in (2048, 4096, 8192, 16384):
+        check_positive(role + "_a", F.vendor(3, page=page, ramdisk=F.blob("v", 4000), dtb=F.blob("d", 1500)))
+        frags = [F.fragment("f0", 1000, 1), F.fragment("f1", 2500, 2), F.fragment("f2", 3, 3), F.fragment("f3", 77, 0)]
+        got = check_positive(role + "_b", F.vendor(4, page=page, fragments=frags, dtb=F.blob("d", 1500),
+                                                   bootconfig=F.blob("bc", 123)))
+        assert got["table"]["entry_count"] == 4 and got["table"]["size_bytes"] == 432
+        assert [c["ramdisk_type"] for c in got["components"] if c["role"] == "vendor_ramdisk_fragment"] == [1, 2, 3, 0]
+    check_positive(role, F.vendor(3))
+# count zero: the table object stays, hash is SHA-256 of empty and there is no table coverage range
+got = check_positive("vendor_boot", F.vendor(4, dtb=F.blob("d", 10)))
+assert got["table"]["entry_count"] == 0 and got["table"]["size_bytes"] == 0
+assert got["table"]["sha256"] == F.EMPTY_SHA256 and len(got["coverage"]["ranges"]) == 1
+# count 64, zero-size fragments at in-bounds offsets, and one empty name
+many = [F.fragment(f"m{i}", 40 + i, i % 4) for i in range(64)]
+got = check_positive("vendor_boot_a", F.vendor(4, fragments=many))
+assert len(got["components"]) == 64 + 2
+zero = [F.fragment("a", 100, 1), F.fragment("z1", 0, 2, name=b"", rel=100), F.fragment("z2", 0, 3, rel=0),
+        F.fragment("b", 50, 2, rel=100)]
+check_positive("vendor_boot_a", F.vendor(4, fragments=zero, section_size=150))
+# table row order need not equal offset order
+got = check_positive("vendor_boot_a", F.vendor(4, fragments=[
+    F.fragment("late", 300, 1, rel=600), F.fragment("early", 600, 2, rel=0)], section_size=900))
+assert [c["index"] for c in got["components"] if c["role"] == "vendor_ramdisk_fragment"] == [0, 1]
+# adjacent header and table ranges merge when the page is the header span
+ok("vendor_boot v3 and v4 (four page sizes, counts 0..64, reordered rows, zero-size fragments, one empty name) parse to the independent expectation")
+
+for page in (2048, 4096, 8192, 16384):
+    check_positive("dtbo_a", F.dt_table([F.blob("a", 300), F.blob("b", 41), F.blob("c", 1)], page=page))
+check_positive("dtbo_b", F.dt_table([F.blob("only", 5)], trailing=bytes(1000)))
+check_positive("dtbo", F.dt_table([F.blob("p", 10), b"", F.blob("q", 9)], entries_offset=96, gap=b""))
+got = check_positive("dtbo", F.dt_table([F.blob(f"e{i}", 7) for i in range(256)]))
+assert got["table"]["entry_count"] == 256 and len(got["components"]) == 256
+got = check_positive("dtbo_a", F.dt_table([F.blob("a", 20)]))
+assert len(got["coverage"]["ranges"]) == 1 and got["coverage"]["covered_bytes"] == 32 + 32, "header and table merge"
+got = check_positive("dtbo_a", F.dt_table([F.blob("a", 20)], entries_offset=64))
+assert len(got["coverage"]["ranges"]) == 2, "an explicit table offset leaves a gap uncovered"
+unaligned_dt = F.dt_table([F.blob("unaligned", 17)])
+assert len(unaligned_dt[0]) % unaligned_dt[1]["page_size"] != 0
+check_positive("dtbo_a", unaligned_dt)
+text = json.dumps(got)
+for value in (F.CANARY_VALUE, F.CANARY_VALUE + 1):
+    assert str(value) not in text, "DT id, revision and custom values are never emitted"
+ok("DT table v0 (four page sizes, explicit table offset, trailing bytes, 1..256 entries, zero-size entries) parses; ids and revisions are not emitted")
+
+# --- adversarial parsers -----------------------------------------------------------------
+
+good_boot = {v: F.boot_legacy(v, kernel=F.blob("k", 3000), ramdisk=F.blob("r", 100)) for v in (0, 1, 2)}
+good_boot.update({v: F.boot_modern(v, kernel=F.blob("k", 3000), ramdisk=F.blob("r", 100)) for v in (3, 4)})
+for version, (data, _meta) in good_boot.items():
+    for cut in (0, 1, 47, F.BOOT_HEADER[version] - 1):
+        reject(f"boot v{version} truncated to {cut}", "boot_a", data[:cut], "image-corrupt")
+    reject(f"boot v{version} cut inside the payload", "boot_a", data[:-5000], "image-corrupt")
+    broken = bytearray(data)
+    broken[0] ^= 0xFF
+    reject(f"boot v{version} with a wrong magic", "boot_a", bytes(broken), "image-identity-mismatch")
+    reject(f"boot v{version} under a vendor_boot name", "vendor_boot_a", data, "image-identity-mismatch")
+    reject(f"boot v{version} under a dtbo name", "dtbo_a", data, "image-identity-mismatch")
+for bad in (5, 6, 0x10000, 0xFFFFFFFF):
+    data = bytearray(good_boot[0][0])
+    data[40:44] = bad.to_bytes(4, "little")
+    reject(f"boot version {bad}", "boot_a", bytes(data), "image-unsupported")
+    data[40:44] = bad.to_bytes(4, "big")
+    reject(f"boot version {bad} in the wrong endianness", "boot_a", bytes(data),
+           "image-unsupported" if bad.to_bytes(4, "big") != b"\0\0\0\0" else "image-unsupported")
+# the version field read big endian: 1 becomes 0x01000000
+data = bytearray(good_boot[1][0])
+data[40:44] = (1).to_bytes(4, "big")
+reject("boot version written big endian", "boot_a", bytes(data), "image-unsupported")
+reject("init_boot with a v3 image", "init_boot_a", good_boot[3][0], "image-unsupported")
+reject("init_boot with a v2 image", "init_boot_a", good_boot[2][0], "image-unsupported")
+reject("init_boot v4 with a kernel", "init_boot_a", F.boot_modern(4, kernel=F.blob("k", 10))[0], "image-unsupported")
+for page, code in ((1024, "image-unsupported"), (32768, "image-unsupported"), (3000, "image-corrupt"),
+                   (0, "image-corrupt"), (1, "image-unsupported"), (0xFFFFFFFF, "image-corrupt"),
+                   (4097, "image-corrupt")):
+    data = bytearray(good_boot[2][0])
+    data[36:40] = page.to_bytes(4, "little")
+    reject(f"boot page size {page}", "boot_a", bytes(data), code)
+for version in (3, 4):
+    data = bytearray(good_boot[version][0])
+    data[20:24] = (F.BOOT_HEADER[3 if version == 4 else 4]).to_bytes(4, "little")
+    reject(f"boot v{version} header_size of the other version", "boot_a", bytes(data), "image-corrupt")
+    reject(f"boot v{version} header_size zero", "boot_a", F.boot_modern(version, header_size=0)[0], "image-corrupt")
+for version in (1, 2):
+    reject(f"boot v{version} header_size mismatch", "boot_a",
+           F.boot_legacy(version, kernel=F.blob("k", 10), header_size=1)[0], "image-corrupt")
+# recovery_dtbo offsets
+reject("nonempty recovery_dtbo with a zero offset", "boot_a",
+       F.boot_legacy(1, kernel=F.blob("k", 10), dtbo=F.blob("d", 10), dtbo_offset=0)[0], "image-corrupt")
+reject("nonempty recovery_dtbo with a shifted offset", "boot_a",
+       F.boot_legacy(2, kernel=F.blob("k", 10), dtbo=F.blob("d", 10), dtbo_offset=3 * 4096)[0], "image-corrupt")
+reject("nonempty recovery_dtbo offset beyond 32 bits", "boot_a",
+       F.boot_legacy(1, kernel=F.blob("k", 10), dtbo=F.blob("d", 10), dtbo_offset=2 ** 40)[0], "image-corrupt")
+reject("empty recovery_dtbo with a stray offset", "boot_a",
+       F.boot_legacy(1, kernel=F.blob("k", 10), dtbo_offset=77)[0], "image-corrupt")
+# arithmetic: sizes that overflow or run past the image
+for field, label in ((8, "kernel"), (16, "ramdisk"), (24, "second")):
+    for huge in (0xFFFFFFFF, 0xFFFFF000, 1 << 31):
+        data = bytearray(good_boot[0][0])
+        data[field:field + 4] = huge.to_bytes(4, "little")
+        reject(f"boot {label} size {huge:#x}", "boot_a", bytes(data), "image-corrupt")
+data = bytearray(good_boot[4][0])
+data[1580:1584] = (0xFFFFFFFF).to_bytes(4, "little")
+reject("boot v4 signature size overflow", "boot_a", bytes(data), "image-corrupt")
+reject("boot v0 without trailing padding", "boot_a",
+       F.boot_legacy(0, kernel=F.blob("k", 100), pad=False)[0], "image-corrupt")
+for version in (0, 1, 2):
+    kwargs = {"second": F.blob("final", 1)}
+    if version >= 1:
+        kwargs = {"dtbo": F.blob("final", 1)}
+    if version >= 2:
+        kwargs = {"dtb": F.blob("final", 1)}
+    reject(f"boot v{version} missing only final padding", "boot_a",
+           F.boot_legacy(version, pad=False, **kwargs)[0], "image-corrupt")
+for version in (3, 4):
+    kwargs = {"ramdisk": F.blob("final", 1)} if version == 3 else {"signature": F.blob("final", 1)}
+    reject(f"boot v{version} missing only final padding", "boot_a",
+           F.boot_modern(version, pad=False, **kwargs)[0], "image-corrupt")
+reject("boot kernel past the end", "boot_a", F.boot_legacy(0, kernel=F.blob("k", 5000))[0][:4096 + 4000], "image-corrupt")
+ok("boot parsers reject truncation, magic, version, endianness, page size, header_size, recovery_dtbo, overflow and role mismatches with fixed codes")
+
+good_vendor = F.vendor(4, fragments=[F.fragment("a", 1000, 1), F.fragment("b", 500, 2)], dtb=F.blob("d", 200),
+                       bootconfig=F.blob("bc", 50))
+good_v3 = F.vendor(3, ramdisk=F.blob("v", 1000), dtb=F.blob("d", 100))
+for built, version in ((good_v3, 3), (good_vendor, 4)):
+    data = built[0]
+    for cut in (0, 8, 15, F.VENDOR_HEADER[version] - 1):
+        reject(f"vendor v{version} truncated to {cut}", "vendor_boot_a", data[:cut], "image-corrupt")
+    reject(f"vendor v{version} cut inside the dtb", "vendor_boot_a", data[:8200], "image-corrupt")
+    reject(f"vendor v{version} under a boot name", "boot_a", data, "image-identity-mismatch")
+    reject(f"vendor v{version} under a dtbo name", "dtbo_a", data, "image-identity-mismatch")
+    broken = bytearray(data)
+    broken[7] ^= 1
+    reject(f"vendor v{version} wrong magic", "vendor_boot_a", bytes(broken), "image-identity-mismatch")
+    broken = bytearray(data)
+    broken[8:12] = (version - 1 if version == 3 else 5).to_bytes(4, "little") if version == 3 else (5).to_bytes(4, "little")
+    reject(f"vendor v{version} version outside 3..4", "vendor_boot_a", bytes(broken), "image-unsupported")
+    for page, code in ((1024, "image-unsupported"), (3000, "image-corrupt"), (0, "image-corrupt")):
+        broken = bytearray(data)
+        broken[12:16] = page.to_bytes(4, "little")
+        reject(f"vendor v{version} page size {page}", "vendor_boot_a", bytes(broken), code)
+    reject(f"vendor v{version} header_size mismatch", "vendor_boot_a",
+           F.vendor(version, header_size=F.VENDOR_HEADER[7 - version], **({"ramdisk": F.blob("v", 10)} if version == 3 else {}))[0],
+           "image-corrupt")
+    broken = bytearray(data)
+    broken[24:28] = (0xFFFFFFFF).to_bytes(4, "little")
+    reject(f"vendor v{version} ramdisk size overflow", "vendor_boot_a", bytes(broken), "image-corrupt")
+    broken = bytearray(data)
+    broken[2100:2104] = (0xFFFFFFFF).to_bytes(4, "little")
+    reject(f"vendor v{version} dtb size overflow", "vendor_boot_a", bytes(broken), "image-corrupt")
+reject("vendor v4 table entry size 107", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10)], table_entry_size=107)[0], "image-unsupported")
+reject("vendor v4 table entry size 0", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10)], table_entry_size=0)[0], "image-unsupported")
+reject("vendor v4 table of 65 entries", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10)], table_count=65, table_size=65 * 108)[0], "image-budget")
+huge_count = bytearray(F.vendor(4, fragments=[F.fragment("a", 10)])[0])
+huge_count[2112:2120] = (0xFFFFFFFF).to_bytes(4, "little") * 2
+assert len(huge_count) < 64 * F.KIB
+reject("vendor v4 table count 0xFFFFFFFF", "vendor_boot_a", bytes(huge_count), "image-budget")
+reject("vendor v4 table_size not count times entry size", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10)], table_size=100)[0], "image-corrupt")
+reject("vendor v4 count zero with a ramdisk section", "vendor_boot_a",
+       F.vendor(4, fragments=(), section_size=4096)[0], "image-corrupt")
+reject("vendor v4 ramdisk type 4", "vendor_boot_a", F.vendor(4, fragments=[F.fragment("a", 10, 4)])[0], "image-unsupported")
+reject("vendor v4 ramdisk type 0xFFFFFFFF", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10, 0xFFFFFFFF)])[0], "image-unsupported")
+reject("vendor v4 duplicate names", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10, name=b"same"), F.fragment("b", 10, name=b"same")])[0], "image-corrupt")
+reject("vendor v4 two empty names", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10, name=b""), F.fragment("b", 10, name=b"")])[0], "image-corrupt")
+reject("vendor v4 names equal before the first NUL", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10, name=b"x\0aaa"), F.fragment("b", 10, name=b"x\0bbb")])[0],
+       "image-corrupt")
+reject("vendor v4 unterminated name", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 10)], name_fill=b"N" * 32)[0], "image-unsupported")
+for names in ((b"Case", b"case"), (b"x", b"x "), (b"a", b"A"), (b"", b"zero")):
+    check_positive("vendor_boot_a", F.vendor(4, fragments=[F.fragment("a", 10, name=names[0]),
+                                                           F.fragment("b", 10, name=names[1])]))
+reject("vendor v4 gap between fragments", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 100, rel=0), F.fragment("b", 100, rel=150)], section_size=250)[0],
+       "image-corrupt")
+reject("vendor v4 leading gap", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 100, rel=10)], section_size=110)[0], "image-corrupt")
+reject("vendor v4 trailing gap", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 100)], section_size=200)[0], "image-corrupt")
+reject("vendor v4 overlapping fragments", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 100, rel=0), F.fragment("b", 100, rel=50)], section_size=150)[0],
+       "image-corrupt")
+reject("vendor v4 identical fragment extents", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 100, rel=0), F.fragment("b", 100, rel=0)], section_size=100)[0],
+       "image-corrupt")
+reject("vendor v4 fragment past its section", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 100, rel=0)], section_size=50)[0], "image-corrupt")
+reject("vendor v4 fragment offset past its section", "vendor_boot_a",
+       F.vendor(4, fragments=[F.fragment("a", 100), F.fragment("z", 0, rel=101, name=b"zz")], section_size=100)[0],
+       "image-corrupt")
+small_overflow, small_overflow_meta = F.vendor(4, fragments=[F.fragment("a", 100)], section_size=100)
+small_overflow = bytearray(small_overflow)
+small_overflow[small_overflow_meta["table"]["offset"] + 4:
+               small_overflow_meta["table"]["offset"] + 8] = (0xFFFFFFF0).to_bytes(4, "little")
+assert len(small_overflow) < 64 * F.KIB
+reject("vendor v4 fragment offset past its section", "vendor_boot_a", bytes(small_overflow), "image-corrupt")
+try:
+    F.vendor(4, fragments=[F.fragment("a", 100, rel=0xFFFFFFF0)], section_size=100)
+except ValueError as error:
+    assert str(error) == "synthetic fixture placement exceeds its allocation bound"
+else:
+    raise AssertionError("oversized synthetic placement allocated instead of failing")
+for build in (
+    lambda: F.vendor(4, fragments=[F.fragment("a", 1)], table_size=0xFFFFFFFF),
+    lambda: F.dt_table([F.blob("a", 1)], entries_offset=0xFFFFFFFF),
+    lambda: F.dt_table([F.blob("a", 1)], total_size=0xFFFFFFFF),
+):
+    try:
+        build()
+    except ValueError as error:
+        assert str(error) == "synthetic fixture placement exceeds its allocation bound"
+    else:
+        raise AssertionError("oversized synthetic padding allocated instead of failing")
+original_fixture_limit = F.MAX_SYNTHETIC_IMAGE_BYTES
+payload_fragments_consumed = 0
+
+
+def oversized_payload_stream():
+    global payload_fragments_consumed
+    for index in range(64):
+        payload_fragments_consumed += 1
+        yield F.fragment(f"payload-{index}", 16 * F.KIB)
+
+
+try:
+    F.MAX_SYNTHETIC_IMAGE_BYTES = 16 * F.KIB
+    F.vendor(4, fragments=oversized_payload_stream())
+except ValueError as error:
+    assert str(error) == "synthetic fixture placement exceeds its allocation bound"
+    assert payload_fragments_consumed == 1
+else:
+    raise AssertionError("synthetic vendor payloads accumulated before bounded placement")
+finally:
+    F.MAX_SYNTHETIC_IMAGE_BYTES = original_fixture_limit
+consumed_fragments = 0
+
+
+def oversized_fragment_stream():
+    global consumed_fragments
+    for index in range(1000):
+        consumed_fragments += 1
+        yield F.fragment(f"bounded-{index}", 0, name=f"f{index}".encode())
+
+
+try:
+    F.MAX_SYNTHETIC_IMAGE_BYTES = 4096
+    F.vendor(4, fragments=oversized_fragment_stream())
+except ValueError as error:
+    assert str(error) == "synthetic fixture placement exceeds its allocation bound"
+    assert consumed_fragments == 38
+else:
+    raise AssertionError("synthetic vendor table exceeded its reduced allocation bound")
+finally:
+    F.MAX_SYNTHETIC_IMAGE_BYTES = original_fixture_limit
+try:
+    F.vendor(4, fragments=(F.fragment(f"count-{index}", 0) for index in range(65)))
+except ValueError as error:
+    assert str(error) == "synthetic fixture placement exceeds its allocation bound"
+else:
+    raise AssertionError("synthetic vendor fragment rows exceeded their count bound")
+for version in (3, 4):
+    kwargs = {"dtb": F.blob("final", 1)} if version == 3 else {"bootconfig": F.blob("final", 1)}
+    reject(f"vendor v{version} missing only final padding", "vendor_boot_a",
+           F.vendor(version, pad=False, **kwargs)[0], "image-corrupt")
+reject("vendor v4 table cut by the end of the image", "vendor_boot_a", good_vendor[0][:8192 + 4096 + 100], "image-corrupt")
+reject("vendor v4 sizes lying about the entries", "vendor_boot_a",
+       F.vendor(4, fragments=[dict(F.fragment("a", 100), size=200)])[0], "image-corrupt")
+ok("vendor_boot parsers reject layout, relative offsets, gaps, overlaps, duplicates, table and name defects with fixed codes")
+
+good_dt = F.dt_table([F.blob("a", 100), F.blob("b", 100)])
+data = good_dt[0]
+for cut in (0, 31):
+    reject(f"DT table truncated to {cut}", "dtbo_a", data[:cut], "image-corrupt")
+reject("DT table cut inside its payload", "dtbo_a", data[:-10], "image-corrupt")
+reject("DT table under a boot name", "boot_a", data, "image-identity-mismatch")
+broken = bytearray(data)
+broken[0] ^= 1
+reject("DT table wrong magic", "dtbo_a", bytes(broken), "image-identity-mismatch")
+little = bytearray(data)
+little[0:4] = (0xD7B7AB1E).to_bytes(4, "little")
+reject("DT table magic little endian", "dtbo_a", bytes(little), "image-identity-mismatch")
+reject("DT table version 1", "dtbo_a", F.dt_table([F.blob("a", 10)], version=1)[0], "image-unsupported")
+reject("DT table header_size 36", "dtbo_a", F.dt_table([F.blob("a", 10)], header_size=36)[0], "image-unsupported")
+reject("DT table entry stride 40", "dtbo_a", F.dt_table([F.blob("a", 10)], entry_size=40)[0], "image-unsupported")
+reject("DT table entry stride 0", "dtbo_a", F.dt_table([F.blob("a", 10)], entry_size=0)[0], "image-unsupported")
+reject("DT table count 0", "dtbo_a", F.dt_table([], count=0)[0] + bytes(64), "image-unsupported")
+reject("DT table count 257", "dtbo_a", F.dt_table([F.blob("a", 10)], count=257)[0], "image-budget")
+reject("DT table count 0xFFFFFFFF", "dtbo_a", F.dt_table([F.blob("a", 10)], count=0xFFFFFFFF)[0], "image-budget")
+reject("DT table count above its table", "dtbo_a", F.dt_table([F.blob("a", 10)], count=3)[0], "image-corrupt")
+for page, code in ((1024, "image-unsupported"), (3000, "image-corrupt"), (0, "image-corrupt")):
+    reject(f"DT table page size {page}", "dtbo_a", F.dt_table([F.blob("a", 10)], page=page)[0], code)
+reject("DT table total_size beyond the fixture", "dtbo_a", F.dt_table([F.blob("a", 10)], total_size=500, trailing=b"")[0][:200],
+       "image-corrupt")
+reject("DT table total_size below its table", "dtbo_a", F.dt_table([F.blob("a", 10)] * 2, total_size=40)[0], "image-corrupt")
+reject("DT table total_size 0", "dtbo_a", F.dt_table([F.blob("a", 10)], total_size=0)[0], "image-corrupt")
+inside = bytearray(good_dt[0])
+inside[20:24] = (16).to_bytes(4, "big")
+reject("DT table entries offset inside the header", "dtbo_a", bytes(inside), "image-corrupt")
+reject("DT table entries offset overflow", "dtbo_a",
+       bytes(bytearray(good_dt[0][:20]) + (0xFFFFFFE0).to_bytes(4, "big") + good_dt[0][24:]), "image-corrupt")
+reject("DT payload past total_size", "dtbo_a", F.dt_table([F.blob("a", 10)], offsets=[10 ** 6], total_size=200, gap=bytes(200))[0],
+       "image-corrupt")
+overflow = bytearray(good_dt[0])
+overflow[36:40] = (0xFFFFFFF0).to_bytes(4, "big")
+reject("DT payload offset plus size overflow", "dtbo_a", bytes(overflow), "image-corrupt")
+for label, moved in (("header", 0), ("entry table", 40), ("entry table end", 90)):
+    over_data = bytearray(good_dt[0])
+    over_data[36:40] = moved.to_bytes(4, "big")
+    reject(f"DT payload over the {label}", "dtbo_a", bytes(over_data), "image-corrupt")
+reject("DT shared identical payload extents", "dtbo_a",
+       F.dt_table([F.blob("a", 100), F.blob("a", 100)], offsets=[None, 96])[0], "image-unsupported")
+reject("DT partially overlapping payload extents", "dtbo_a",
+       F.dt_table([F.blob("a", 100), F.blob("b", 100)], offsets=[None, 150])[0], "image-unsupported")
+reject("DT metadata covering the whole image", "dtbo_a", F.dt_table([b""])[0], "image-unsupported")
+ok("DT table parsers reject endian, version, stride, count, total_size, extents, shared payloads and full coverage with fixed codes")
+
+# --- the CLI: plan, parse, verify -----------------------------------------------------------
+
+STANDARD = {
+    "boot": F.boot_legacy(0, kernel=F.blob("k0", 3000), ramdisk=F.blob("r0", 200), os_version=0),
+    "boot_a": F.boot_legacy(2, kernel=F.blob("k2", 2000), ramdisk=F.blob("r2", 300), dtbo=F.blob("o2", 90),
+                            dtb=F.blob("t2", 120), page=2048),
+    "boot_b": F.boot_modern(4, kernel=F.blob("k4", 5000), ramdisk=F.blob("r4", 700), signature=F.blob("s4", 64)),
+    "init_boot_a": F.boot_modern(4, ramdisk=F.blob("ri", 9000)),
+    "recovery_a": F.boot_legacy(1, kernel=F.blob("kr", 1000), dtbo=F.blob("or", 33)),
+    "recovery_b": F.boot_modern(3, kernel=F.blob("kb", 777), ramdisk=F.blob("rb", 8200)),
+    "vendor_boot_a": F.vendor(4, fragments=[F.fragment("v0", 900, 1), F.fragment("v1", 1400, 3, name=CANARY.encode())],
+                              dtb=F.blob("vd", 600), bootconfig=F.blob("vb", 90)),
+    "vendor_boot_b": F.vendor(3, page=2048, ramdisk=F.blob("vr", 2222), dtb=F.blob("vt", 300)),
+    "vendor_kernel_boot_a": F.vendor(4, fragments=[], dtb=F.blob("kd", 100)),
+    "dtbo_a": F.dt_table([F.blob("d0", 500), F.blob("d1", 77), F.blob("d2", 3000)]),
+}
+scn = make(STANDARD, f"{CANARY}-standard")
+expected_rows = [{"partition_name": n, "role": role_of(n), "image": F.expected(*STANDARD[n]) if n in STANDARD else None}
+                 for n in NAMES]
+plan, _ = expect_ok(*cli("plan-images", scn))
+assert plan["kind"] == B.IMAGE_PLAN_KIND and plan["inventory_sha256"] == scn.inv_sha
+assert plan["expected_images"]["present"] == sorted(STANDARD)
+assert plan["expected_images"]["files"] == ["images.json"] + [f"{n}.img" for n in sorted(STANDARD)]
+assert plan["image_parser"] == contract["image_parser"] and plan["blockers"] == contract["blockers"]
+assert all(v is False for v in plan["authority"].values()) and plan["remote_commands"] == []
+assert plan["request_binding"]["max_output_metadata_bytes"] == 65536
+assert CANARY not in json.dumps(plan)
+out_dir = work / "standard-out"
+summary, _raw = expect_ok(*cli("parse-images", scn, "--out", out_dir))
+assert summary["status"] == "parsed" and summary["operation"] == R3 and summary["image_count"] == len(STANDARD)
+assert summary["hardware_bytes_read"] == 0 and summary["bytes_read"] == scn.S
+assert all(summary[key] is False for key in contract["authority"]) and summary["blocker_count"] == 7
+assert sorted(os.listdir(out_dir)) == ["SHA256SUMS", "operations", "parse.json"]
+assert sorted(os.listdir(out_dir / "operations")) == [f"{R3}.json"]
+assert stat.S_IMODE((out_dir / "parse.json").stat().st_mode) == 0o644
+operation_bytes = (out_dir / f"operations/{R3}.json").read_bytes()
+operation = json.loads(operation_bytes)
+assert operation["schema"] == 2 and operation["read_domain"] == "fixture" and operation["transport"] == C.TRANSPORT
+assert operation["bytes_read"] == scn.S and operation["data"] == {"images": expected_rows}
+assert len(operation_bytes) <= 65536 and operation_bytes == jbytes(operation)
+document, _ = C.validate_operation(operation_bytes, R3_ROW, request_sha256, collector_env.identity)
+C.check_r3_against_r2(document["data"]["images"], json.loads(scn.inv_bytes)["data"]["partitions"],
+                      C.policy_registry()["operations"][R3])
+parse_doc = json.loads((out_dir / "parse.json").read_text())
+M = sum(F.expected(*STANDARD[n])["coverage"]["covered_bytes"] for n in STANDARD)
+O = len(operation_bytes)
+acc = parse_doc["accounting"]
+assert {key: acc[key] for key in ("scope", "fixture_payload_bytes", "fixture_payload_read_bytes",
+                                  "fixture_image_hash_bytes", "represented_metadata_bytes",
+                                  "operation_output_bytes", "hardware_bytes_read", "hardware_transport",
+                                  "full_image_evidence")} == {
+    "scope": "one-admitted-fixture-snapshot", "fixture_payload_bytes": scn.S,
+    "fixture_payload_read_bytes": scn.S, "fixture_image_hash_bytes": scn.sizes,
+    "represented_metadata_bytes": M, "operation_output_bytes": O, "hardware_bytes_read": 0,
+    "hardware_transport": "none", "full_image_evidence": False}
+assert parse_doc["kind"] == B.IMAGE_PARSE_KIND and parse_doc["format_version"] == "0.3.0"
+assert parse_doc["provenance"] == {"kind": "synthetic-parser-provenance", "captured": False,
+                                   "hardware_qualified": False, "collector_labels_are_not_provenance": True}
+assert parse_doc["bootchain_contract_sha256"] == BC and parse_doc["inventory_sha256"] == scn.inv_sha
+assert parse_doc["images_sha256"] == digest(scn.manifest) and parse_doc["operation"]["bytes"] == O
+assert parse_doc["operation"]["bytes_read"] == scn.S and parse_doc["operation"]["image_count"] == len(STANDARD)
+assert parse_doc["operation"]["max_output_metadata_bytes"] == 65536
+assert parse_doc["operation"]["max_output_bytes"] == 1048576, "the collector's output bound is unchanged"
+assert parse_doc["operation"]["max_hardware_read_bytes"] == 65536
+assert [row["path"] for row in parse_doc["inputs"]] == sorted(["images.json"] + [f"{n}.img" for n in STANDARD])
+assert parse_doc["qualification"] == contract["qualification"] and parse_doc["deferred"] == contract["deferred"]
+assert parse_doc["unresolved_claims"] == contract["coverage"]["unresolved_claims"]
+assert len(parse_doc["blockers"]) == 7 and all(v is False for v in parse_doc["authority"].values())
+assert parse_doc["synthetic"] is True and parse_doc["live"] is False and parse_doc["executes"] is False
+assert parse_doc["remote_commands"] == [] and parse_doc["complete_capture"] is False
+sums = (out_dir / "SHA256SUMS").read_text()
+assert sums == "".join(f"{digest((out_dir / p).read_bytes())}  {p}\n" for p in sorted(["parse.json", f"operations/{R3}.json"], key=lambda p: p.encode()))
+for path in out_dir.rglob("*"):
+    if path.is_file():
+        blob_bytes = path.read_bytes()
+        for forbidden in (CANARY.encode(), str(F.CANARY_VALUE).encode(), str(work).encode(),
+                          F.blob("k0", 64), F.blob("vd", 64)):
+            assert forbidden not in blob_bytes, (path.name, forbidden[:8])
+        assert not path.name.endswith(".img"), "no binary copy is published"
+verify, _ = expect_ok(*cli("verify-images", scn, "--parse", out_dir))
+assert verify["status"] == "verified" and verify["parse_sha256"] == summary["parse_sha256"]
+assert verify["operation_sha256"] == summary["operation_sha256"]
+ok("plan, parse and verify agree: exact R3 rows, collector validation, bound accounting S/M/O, value-free output, no binary copies")
+
+# determinism: a second parse of the same inputs yields identical bytes
+second = work / "standard-out-2"
+summary2, _ = expect_ok(*cli("parse-images", scn, "--out", second))
+for relative in ("SHA256SUMS", "parse.json", f"operations/{R3}.json"):
+    assert (out_dir / relative).read_bytes() == (second / relative).read_bytes(), relative
+assert summary2["parse_sha256"] == summary["parse_sha256"]
+no_leftovers = [p.name for p in work.iterdir() if ".tmp-" in p.name]
+assert not no_leftovers, no_leftovers
+ok("parse-images is deterministic and leaves no temporary directory")
+
+# all absent: only images.json, every row null
+empty = make({}, "absent", extra_parts={"pmos_root": 8 * 1024 ** 3, "boot_x": 4096})
+summary_empty, _ = expect_ok(*cli("parse-images", empty, "--out", work / "absent-out"))
+op = json.loads((work / "absent-out" / f"operations/{R3}.json").read_text())
+assert op["bytes_read"] == len(empty.manifest) and all(r["image"] is None for r in op["data"]["images"])
+assert len(op["data"]["images"]) == 18 and summary_empty["image_count"] == 0
+pdoc = json.loads((work / "absent-out/parse.json").read_text())
+assert pdoc["accounting"]["represented_metadata_bytes"] == 0 and pdoc["accounting"]["fixture_image_hash_bytes"] == 0
+assert sorted(os.listdir(empty.imgs)) == ["images.json"]
+expect_ok(*cli("verify-images", empty, "--parse", work / "absent-out"))
+ok("an all-absent fixture parses and verifies: image null means absence from the bound inventory")
+
+# all eighteen present: sizes, roles and suffixes across every supported combination
+ALL = {}
+for index, name in enumerate(NAMES):
+    role = role_of(name)
+    if role in ("boot", "recovery"):
+        ALL[name] = F.boot_legacy(index % 3, kernel=F.blob(name, 100 + index)) if index % 2 else F.boot_modern(3 + index % 2, kernel=F.blob(name, 100))
+    elif role == "init_boot":
+        ALL[name] = F.boot_modern(4, ramdisk=F.blob(name, 5000))
+    elif role == "dtbo":
+        ALL[name] = F.dt_table([F.blob(name, 50 + index)])
+    else:
+        ALL[name] = F.vendor(3 + index % 2, ramdisk=F.blob(name, 1200)) if index % 2 == 0 else F.vendor(4, fragments=[F.fragment(name, 600)])
+full = make(ALL, "all18")
+summary_full, _ = expect_ok(*cli("parse-images", full, "--out", work / "all18-out"))
+assert summary_full["image_count"] == 18
+op = json.loads((work / "all18-out" / f"operations/{R3}.json").read_text())
+assert [r["partition_name"] for r in op["data"]["images"]] == NAMES
+assert all(r["image"] == F.expected(*ALL[r["partition_name"]]) for r in op["data"]["images"])
+expect_ok(*cli("verify-images", full, "--parse", work / "all18-out"))
+ok("all eighteen supported names parse in one fixture with zero-size slots preserved")
+
+# --- budgets: exact and plus one -------------------------------------------------------------
+
+S = scn.S
+for name, constant, exact, code in (("S", "MAX_FIXTURE_INPUT_BYTES", S, "image-budget"),
+                                    ("M", "MAX_REPRESENTED_METADATA_BYTES", M, "image-budget"),
+                                    ("O", "MAX_OUTPUT_METADATA_BYTES", O, "image-budget")):
+    # The patched constant would change the derived contract, so the commands run directly
+    # against the already loaded environment instead of through main().
+    out_exact = work / f"budget-{name}-exact"
+    namespace = lambda **kw: type("Args", (), dict(request=str(request), inventory=str(scn.inv),
+                                                    images=str(scn.imgs), **kw))
+    result = set_constant(constant, exact, lambda: B.command_parse_images(env, namespace(out=str(out_exact))))
+    assert os.path.isdir(out_exact) and result["status"] == "parsed", name
+    set_constant(constant, exact, lambda: B.command_verify_images(env, namespace(parse=str(out_exact))))
+    for label, run in (("parse", lambda: B.command_parse_images(env, namespace(out=str(work / f"budget-{name}-over")))),
+                       ("verify", lambda: B.command_verify_images(env, namespace(parse=str(out_dir))))):
+        try:
+            set_constant(constant, exact - 1, run)
+        except B.ImageError as error:
+            assert error.code == code and CANARY not in str(error), (name, label, error)
+        else:
+            raise AssertionError(f"{name} one byte over its bound was accepted by {label}")
+        assert not os.path.lexists(work / f"budget-{name}-over")
+ok("S, M and O are exact at their bound and refused one byte over, each against its own limit")
+# the three collector limits stay distinct from the parser-only O cap
+assert B.MAX_OUTPUT_METADATA_BYTES == 65536 < R3_ROW["max_output_bytes"] == 1048576
+assert B.MAX_FIXTURE_INPUT_BYTES == R3_ROW["max_fixture_input_bytes"] and B.MAX_REPRESENTED_METADATA_BYTES == R3_ROW["max_hardware_read_bytes"]
+# a natural M and O overflow: every table at its profile limit
+HEAVY = {
+    "dtbo_a": F.dt_table([F.blob(f"a{i}", 4) for i in range(256)]),
+    "dtbo_b": F.dt_table([F.blob(f"b{i}", 4) for i in range(256)]),
+    "dtbo": F.dt_table([F.blob(f"c{i}", 4) for i in range(256)]),
+}
+heavy = make(HEAVY, "heavy")
+expect_fail("three 256-entry DT tables overflow the operation output bound", cli("parse-images", heavy, "--out", work / "heavy-out"),
+            "image-budget", [work / "heavy-out"])
+METADATA = {n: F.vendor(4, fragments=[F.fragment(f"{n}{i}", 8) for i in range(64)]) for n in
+            ("vendor_boot", "vendor_boot_a", "vendor_boot_b", "vendor_kernel_boot", "vendor_kernel_boot_a",
+             "vendor_kernel_boot_b", "dtbo", "dtbo_a")}
+METADATA["dtbo"] = F.dt_table([F.blob(f"d{i}", 3) for i in range(256)])
+METADATA["dtbo_a"] = F.dt_table([F.blob(f"e{i}", 3) for i in range(256)])
+metadata_heavy = make(METADATA, "metadata-heavy")
+expect_fail("represented metadata above 65536 bytes", cli("parse-images", metadata_heavy, "--out", work / "meta-out"),
+            "image-budget", [work / "meta-out"])
+# image size bounds: 16 MiB exactly parses; 16 MiB + 1 cannot be declared
+big = F.boot_modern(3, kernel=F.blob("big", 16 * F.MIB - 4096))
+assert len(big[0]) == 16 * F.MIB
+scn_big = make({"boot_a": big}, "big16", capacity={"boot_a": 64 * F.MIB})
+summary_big, _ = expect_ok(*cli("parse-images", scn_big, "--out", work / "big-out"))
+assert summary_big["bytes_read"] == len(big[0]) + len(scn_big.manifest)
+assert json.loads((work / "big-out" / f"operations/{R3}.json").read_text())["bytes_read"] == scn_big.S
+over = make({"boot_a": (big[0] + bytes(4096), big[1])}, "big16p1", capacity={"boot_a": 64 * F.MIB})
+expect_fail("an image above 16 MiB", cli("parse-images", over, "--out", work / "over-out"), "image-input-rejected",
+            [work / "over-out"])
+# a parser-level size rule: an image smaller than its R2 partition is fine, larger is not
+small = make({"boot_a": STANDARD["boot_b"]}, "smallpart", capacity={"boot_a": 4096})
+expect_fail("an image larger than its R2 partition", cli("parse-images", small, "--out", work / "small-out"),
+            "image-identity-mismatch", [work / "small-out"])
+ok("16 MiB images parse, 16 MiB + 1 and over-capacity images are refused, natural M and O overflows are budget refusals")
+
+# --- bindings and the R2 inventory ---------------------------------------------------------
+
+other_inventory = make({"boot_a": STANDARD["boot_a"]}, "other-inv")
+mismatch = make(STANDARD, "bad-inv-hash", inv_sha="0" * 64)
+expect_fail("manifest bound to another inventory", cli("parse-images", mismatch, "--out", work / "b1"),
+            "image-identity-mismatch", [work / "b1"])
+wrong_request = make(STANDARD, "bad-req", manifest_edit=lambda d: d.update(request_sha256="1" * 64))
+expect_fail("manifest bound to another request", cli("parse-images", wrong_request, "--out", work / "b2"),
+            "image-identity-mismatch", [work / "b2"])
+stale = make(STANDARD, "stale-contract")
+stale_doc = json.loads(stale.manifest)
+stale_doc["bootchain_contract_sha256"] = "2" * 64
+(stale.imgs / "images.json").write_bytes(jbytes(stale_doc))
+expect_fail("manifest bound to an old 0.2.0 contract", cli("parse-images", stale, "--out", work / "b3"),
+            "image-identity-mismatch", [work / "b3"])
+no_inventory = make(STANDARD, "inventory-rejected", req_sha="3" * 64)
+expect_fail("an inventory bound to another request", cli("parse-images", no_inventory, "--out", work / "b4"),
+            "image-operation-rejected", [work / "b4"])
+bad_inventory = make(STANDARD, "inventory-garbage")
+bad_inventory.inv.write_bytes(b'{"x": 1}\n')
+expect_fail("an inventory that is not an R2 operation", cli("parse-images", bad_inventory, "--out", work / "b5"),
+            "image-operation-rejected", [work / "b5"])
+expect_fail("plan-images with a bad inventory", cli("plan-images", bad_inventory), "image-operation-rejected")
+forged_presence = make(STANDARD, "presence")
+forged = json.loads(forged_presence.inv_bytes)
+forged["data"]["partitions"] = [r for r in forged["data"]["partitions"] if r["partition_name"] != "boot_a"]
+forged_presence.inv.write_bytes(jbytes(forged))
+expect_fail("an R2 inventory missing a present image (file absence is not inventory absence)",
+            cli("parse-images", forged_presence, "--out", work / "b6"), "image-identity-mismatch", [work / "b6"])
+extra_inv = make({k: v for k, v in STANDARD.items() if k != "boot_a"}, "inv-listed", inventory_names=list(STANDARD))
+expect_fail("an inventoried partition marked absent in the manifest",
+            cli("parse-images", extra_inv, "--out", work / "b7"), "image-identity-mismatch", [work / "b7"])
+unknown_part = make(STANDARD, "extra-partition", extra_parts={"pmos_root": 1 << 33, "userdata": 1 << 35, "boot_c": 4096})
+expect_ok(*cli("parse-images", unknown_part, "--out", work / "unknown-ok"))
+ok("bindings, collector validation of the inventory, presence and capacity are enforced; unrelated inventory rows are ignored")
+
+# --- the fixture tree: files, links, races, privacy -----------------------------------------
+
+def tampered(label, mutate, code, build=lambda: make(STANDARD, f"{CANARY}-t")):
+    s = build()
+    mutate(s)
+    out = work / f"t-{counter[0]}"
+    expect_fail(label, cli("parse-images", s, "--out", out), code, [out])
+    return s
+
+
+tampered("an extra file in the fixture", lambda s: (s.imgs / f"{CANARY}.img").write_bytes(b"x"), "image-input-rejected")
+tampered("an extra directory in the fixture", lambda s: (s.imgs / CANARY).mkdir(), "image-input-rejected")
+tampered("a missing image file", lambda s: (s.imgs / "boot_a.img").unlink(), "image-input-rejected")
+tampered("a missing manifest", lambda s: (s.imgs / "images.json").unlink(), "image-input-rejected")
+tampered("an image file for an absent row", lambda s: (s.imgs / "boot_x.img").write_bytes(b"x"), "image-input-rejected")
+tampered("an image file for an absent name", lambda s: (s.imgs / "recovery.img").write_bytes(b"x" * 64), "image-input-rejected")
+tampered("a wrong-size image file", lambda s: (s.imgs / "boot_a.img").write_bytes(b"x" * 64), "image-identity-mismatch")
+tampered("a same-size image with other bytes", lambda s: (s.imgs / "dtbo_a.img").write_bytes(
+    bytes(len((s.imgs / "dtbo_a.img").read_bytes()))), "image-identity-mismatch")
+tampered("a corrupt manifest", lambda s: (s.imgs / "images.json").write_bytes(b"{"), "image-input-rejected")
+tampered("a noncanonical manifest", lambda s: (s.imgs / "images.json").write_bytes(
+    json.dumps(json.loads(s.manifest), indent=2).encode()), "image-input-rejected")
+tampered("a duplicate-key manifest", lambda s: (s.imgs / "images.json").write_bytes(
+    s.manifest.replace(b'  "schema": 1,\n', b'  "schema": 1,\n  "schema": 1,\n', 1)), "image-input-rejected")
+tampered("an empty manifest", lambda s: (s.imgs / "images.json").write_bytes(b""), "image-identity-mismatch")
+tampered("an oversized manifest", lambda s: (s.imgs / "images.json").write_bytes(b" " * 20000), "image-identity-mismatch")
+tampered("a manifest with an extra key", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "extra": 1})), "image-input-rejected")
+tampered("a manifest row path field", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "images": [dict(r, path="/etc/passwd") for r in s.manifest_doc["images"]]})),
+    "image-input-rejected")
+tampered("a manifest with a boolean size", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "images": [dict(r, size_bytes=True) if r["present"] else r for r in s.manifest_doc["images"]]})),
+    "image-input-rejected")
+tampered("a manifest with unsorted rows", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "images": list(reversed(s.manifest_doc["images"]))})), "image-input-rejected")
+tampered("a manifest with 17 rows", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "images": s.manifest_doc["images"][1:]})), "image-input-rejected")
+tampered("a manifest with a present row lacking its hash", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "images": [dict(r, fixture_sha256=None) if r["present"] else r for r in s.manifest_doc["images"]]})),
+    "image-input-rejected")
+tampered("a manifest with an absent row carrying a size", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "images": [dict(r, size_bytes=5) if not r["present"] else r for r in s.manifest_doc["images"]]})),
+    "image-input-rejected")
+tampered("a manifest row with a canary partition name", lambda s: (s.imgs / "images.json").write_bytes(
+    jbytes({**s.manifest_doc, "images": [dict(s.manifest_doc["images"][0], partition_name=CANARY)] + s.manifest_doc["images"][1:]})),
+    "image-input-rejected")
+
+
+def make_symlink(s):
+    (s.imgs / "boot_a.img").unlink()
+    (s.imgs / "boot_a.img").symlink_to(work)
+
+
+tampered("a symlinked image", make_symlink, "image-input-rejected")
+tampered("a symlinked manifest", lambda s: ((s.imgs / "images.json").unlink(), (s.imgs / "images.json").symlink_to(s.inv)),
+         "image-input-rejected")
+tampered("a hard-linked image", lambda s: os.link(s.imgs / "boot_a.img", s.imgs.parent / "alias.img"), "image-input-rejected")
+tampered("an executable image", lambda s: (s.imgs / "boot_a.img").chmod(0o755), "image-input-rejected")
+tampered("a group-writable image", lambda s: (s.imgs / "boot_a.img").chmod(0o664), "image-input-rejected")
+tampered("a world-writable manifest", lambda s: (s.imgs / "images.json").chmod(0o666), "image-input-rejected")
+tampered("a FIFO in place of an image", lambda s: ((s.imgs / "boot_a.img").unlink(), os.mkfifo(s.imgs / "boot_a.img")),
+         "image-input-rejected")
+tampered("a directory in place of an image", lambda s: ((s.imgs / "boot_a.img").unlink(), (s.imgs / "boot_a.img").mkdir()),
+         "image-input-rejected")
+unsafe = make(STANDARD, f"{CANARY}-unsafe")
+unsafe.imgs.chmod(0o777)
+try:
+    expect_fail("a writable fixture directory", cli("parse-images", unsafe, "--out", work / "u1"), "image-input-rejected", [work / "u1"])
+finally:
+    unsafe.imgs.chmod(0o755)
+expect_fail("a writable inventory file", cli("parse-images", (lambda s: (s.inv.chmod(0o666), s)[1])(make(STANDARD, "inv-w")),
+                                              "--out", work / "u2"), "image-input-rejected", [work / "u2"])
+expect_fail("an executable inventory file", cli("parse-images", (lambda s: (s.inv.chmod(0o755), s)[1])(make(STANDARD, "inv-x")),
+                                                "--out", work / "u3"), "image-input-rejected", [work / "u3"])
+hard_inv = make(STANDARD, "inv-hard")
+os.link(hard_inv.inv, hard_inv.inv.parent / "second.json")
+expect_fail("a hard-linked inventory file", cli("parse-images", hard_inv, "--out", work / "u4"), "image-input-rejected", [work / "u4"])
+sym_inv = make(STANDARD, "inv-sym")
+(sym_inv.inv.parent / "link.json").symlink_to(sym_inv.inv)
+sym_inv.inv = sym_inv.inv.parent / "link.json"
+expect_fail("a symlinked inventory file", cli("parse-images", sym_inv, "--out", work / "u5"), "image-input-rejected", [work / "u5"])
+expect_fail("a relative images path", ["parse-images", "--request", request, "--inventory", scn.inv, "--images", "images",
+                                       "--out", work / "u6"], "image-input-rejected", [work / "u6"])
+expect_fail("a missing images directory", ["parse-images", "--request", request, "--inventory", scn.inv,
+                                           "--images", work / f"{CANARY}-nothing", "--out", work / "u7"],
+            "image-input-rejected", [work / "u7"])
+expect_fail("a missing inventory", ["parse-images", "--request", request, "--inventory", work / f"{CANARY}-nothing.json",
+                                    "--images", scn.imgs, "--out", work / "u8"], "image-input-rejected", [work / "u8"])
+expect_fail("an inventory inside the images directory", ["parse-images", "--request", request, "--inventory",
+                                                         scn.imgs / "images.json", "--images", scn.imgs, "--out", work / "u9"],
+            "image-input-rejected", [work / "u9"])
+expect_fail("an output inside the images directory", cli("parse-images", scn, "--out", scn.imgs / "out"),
+            "image-input-rejected")
+expect_fail("an output over the request tree", cli("parse-images", scn, "--out", request / "out"), "image-input-rejected")
+expect_fail("an output that equals the inventory", cli("parse-images", scn, "--out", scn.inv), "image-input-rejected")
+existing = work / "existing-out"
+existing.mkdir()
+expect_fail("an existing output", cli("parse-images", scn, "--out", existing), "publish-rejected")
+alias_dir = fresh("alias")
+alias_target = alias_dir / "images"
+os.symlink(scn.imgs, alias_target)
+expect_fail("a symlinked images path", ["parse-images", "--request", request, "--inventory", scn.inv, "--images",
+                                        alias_target, "--out", work / "u10"], "image-input-rejected", [work / "u10"])
+ok("extra, missing, forged, symlinked, hard-linked, executable, writable, special and aliased inputs are refused with fixed codes")
+
+# mount crossing and unstable reads
+real_mount = K.mount_id_for_fd
+
+
+def crossing(original):
+    def patched(*a, **kw):
+        calls = [0]
+
+        def mount(descriptor, label):
+            calls[0] += 1
+            return real_mount(descriptor, label) + (calls[0] > 1)
+        K.mount_id_for_fd = mount
+        try:
+            return original(*a, **kw)
+        finally:
+            K.mount_id_for_fd = real_mount
+    return patched
+
+
+mount_case = make(STANDARD, "mount")
+with_patch(B, "read_image_fixture", crossing, lambda: expect_fail(
+    "a mount crossing inside the fixture", cli("parse-images", mount_case, "--out", work / "m1"), "image-input-rejected", [work / "m1"]))
+
+
+def race(action, which=1):
+    def replacement(original):
+        calls = [0]
+
+        def patched(item):
+            data = original(item)
+            calls[0] += 1
+            if calls[0] == which:
+                action(item)
+            return data
+        return patched
+    return replacement
+
+
+def append_byte(s, name):
+    def action(_item):
+        with open(s.imgs / name, "ab") as handle:
+            handle.write(b"x")
+    return action
+
+
+for label, action_for in (
+    ("a file that grows after its read", lambda s: append_byte(s, "boot_a.img")),
+    ("a new file created while reading", lambda s: (lambda _i: (s.imgs / "late.img").write_bytes(b"x"))),
+    ("a file replaced while reading", lambda s: (lambda _i: ((s.imgs / "boot_b.img").rename(s.imgs / "tmp.x"),
+                                                               (s.imgs / "tmp.x").rename(s.imgs / "boot_b.img")))),
+    ("a file removed while reading", lambda s: (lambda _i: (s.imgs / "dtbo_a.img").unlink())),
+    ("a file chmod-ed while reading", lambda s: (lambda _i: (s.imgs / "boot_b.img").chmod(0o600))),
+    ("a fixture directory touched while reading", lambda s: (lambda _i: os.utime(s.imgs, (1, 1)))),
+):
+    s = make(STANDARD, "race")
+    out = work / f"raceout-{counter[0]}"
+    with_patch(B, "read_image_pinned", race(action_for(s), which=2), lambda: expect_fail(
+        label, cli("parse-images", s, "--out", out), "image-unstable", [out]))
+# mutation between the final read and verification: verification against a changed source rejects
+changed = make(STANDARD, "changed-after")
+published = work / "changed-after-out"
+expect_ok(*cli("parse-images", changed, "--out", published))
+with open(changed.imgs / "boot_a.img", "r+b") as handle:
+    handle.seek(100)
+    handle.write(b"\xff")
+expect_fail("verification against a changed image", cli("verify-images", changed, "--parse", published),
+            "image-identity-mismatch")
+inventory_race = make(STANDARD, "inventory-race")
+out = work / "inventory-race-out"
+with_patch(B, "read_image_fixture", lambda original: (lambda *a, **kw: (original(*a, **kw), os.utime(inventory_race.inv, (5, 5)))[0]),
+           lambda: expect_fail("an inventory touched during the gather", cli("parse-images", inventory_race, "--out", out),
+                               "image-unstable", [out]))
+ok("a mount crossing and every race observable before return are refused; a later verify against a changed source rejects")
+
+# zero image payload bytes are read when the closure is wrong
+reads = [0]
+real_read = os.read
+
+
+def counting(descriptor, count):
+    block = real_read(descriptor, count)
+    try:
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+    except OSError:
+        target = ""
+    if target.endswith(".img"):
+        reads[0] += len(block)
+    return block
+
+
+os.read = counting
+try:
+    for label, mutate in (("extra file", lambda s: (s.imgs / "zzz").write_bytes(b"x")),
+                          ("missing file", lambda s: (s.imgs / "boot_a.img").unlink()),
+                          ("symlink", make_symlink),
+                          ("executable", lambda s: (s.imgs / "boot_b.img").chmod(0o755)),
+                          ("writable", lambda s: (s.imgs / "boot_b.img").chmod(0o666)),
+                          ("wrong size", lambda s: (s.imgs / "boot_b.img").write_bytes(b"short"))):
+        s = make(STANDARD, "zero-read")
+        mutate(s)
+        code, _out, _err = invoke(*cli("parse-images", s, "--out", work / f"zr-{counter[0]}"))
+        assert code != 0 and reads[0] == 0, (label, reads[0])
+finally:
+    os.read = real_read
+ok("a closure or metadata defect found before traversal reads zero image bytes")
+
+# each image byte is read from one buffer: the hash and the parse see the same bytes
+seen = []
+real_summary = B.image_summary
+
+
+def spy(name, data):
+    seen.append((name, digest(data), id(data)))
+    return real_summary(name, data)
+
+
+B.image_summary = spy
+try:
+    single = make({"boot_a": STANDARD["boot_b"]}, "single")
+    s_out = work / "single-out"
+    expect_ok(*cli("parse-images", single, "--out", s_out))
+finally:
+    B.image_summary = real_summary
+assert seen and all(entry[1] == digest(single.images[entry[0]][0]) for entry in seen)
+ok("the parser sees exactly the bytes whose fixture hash was checked")
+
+# --- forged outputs and cross-command refusals ----------------------------------------------
+
+def forge(label, mutate, code=None):
+    target = work / f"forged-{counter[0] + 1}"
+    counter[0] += 1
+    import shutil
+    shutil.copytree(out_dir, target)
+    os.chmod(target, 0o755)
+    for path in target.rglob("*"):
+        os.chmod(path, 0o755 if path.is_dir() else 0o644)
+    mutate(target)
+    expect_fail(label, cli("verify-images", scn, "--parse", target), code)
+
+
+def rewrite(relative, edit):
+    def mutate(target):
+        path = target / relative
+        value = json.loads(path.read_text())
+        edit(value)
+        path.write_bytes(jbytes(value))
+        sums = "".join(f"{digest((target / p).read_bytes())}  {p}\n" for p in ("operations/" + R3 + ".json", "parse.json"))
+        (target / "SHA256SUMS").write_text(sums)
+    return mutate
+
+
+forge("an extra file in the parse", lambda t: (t / "extra").write_text("x"))
+forge("a binary copy in the parse", lambda t: (t / "boot_a.img").write_bytes(b"x"))
+forge("a missing SHA256SUMS", lambda t: (t / "SHA256SUMS").unlink())
+forge("a changed SHA256SUMS", lambda t: (t / "SHA256SUMS").write_text("0" * 64 + "  parse.json\n"))
+forge("a changed operation byte", lambda t: (t / f"operations/{R3}.json").write_bytes(
+    (t / f"operations/{R3}.json").read_bytes().replace(b"metadata-only", b"metadata-onlx", 1)))
+forge("a parse with a hash flipped", rewrite(f"operations/{R3}.json", lambda v: v["data"]["images"][0]["image"].update(sha256="a" * 64)
+                                            if v["data"]["images"][0]["image"] else v["data"]["images"][2]["image"]["header"].update(sha256="b" * 64)))
+forge("a full-image claim", rewrite(f"operations/{R3}.json", lambda v: [r["image"]["coverage"].update(kind="full-image") for r in v["data"]["images"] if r["image"]]))
+forge("an operation with bytes_read changed", rewrite(f"operations/{R3}.json", lambda v: v.update(bytes_read=v["bytes_read"] + 1)))
+forge("a parse with a stale 0.2.0 format_version", rewrite("parse.json", lambda v: v.update(format_version="0.2.0")))
+forge("a parse with an authority flag set", rewrite("parse.json", lambda v: v["authority"].update(
+    {next(iter(v["authority"])): True})))
+forge("a parse with a blocker dropped", rewrite("parse.json", lambda v: v["blockers"].pop()))
+forge("a parse with changed accounting", rewrite("parse.json", lambda v: v["accounting"].update(hardware_bytes_read=1)))
+forge("a parse claiming hardware qualification", rewrite("parse.json", lambda v: v["qualification"].update(hardware_qualified=True)))
+forge("a parse claiming captured provenance", rewrite("parse.json", lambda v: v["provenance"].update(captured=True)))
+forge("a parse bound to another request", rewrite("parse.json", lambda v: v.update(request_sha256="4" * 64)))
+forge("a mode change", lambda t: os.chmod(t / "parse.json", 0o600))
+forge("a symlinked parse file", lambda t: ((t / "parse.json").unlink(), (t / "parse.json").symlink_to(t / "SHA256SUMS")))
+forge("an executable parse file", lambda t: os.chmod(t / "parse.json", 0o755))
+expect_fail("verify against another inventory", ["verify-images", "--request", request, "--inventory", other_inventory.inv,
+                                                 "--images", scn.imgs, "--parse", out_dir], None)
+expect_fail("verify against another fixture", cli("verify-images", full, "--parse", out_dir), None)
+expect_fail("verify with a missing parse", cli("verify-images", scn, "--parse", work / f"{CANARY}-none"), "image-input-rejected")
+expect_fail("verify with a parse inside the images", cli("verify-images", scn, "--parse", scn.imgs / "sub"), "image-input-rejected")
+expect_fail("verify-parse refuses an image artifact", ["verify-parse", "--request", request, "--reads", scn.imgs, "--parse", out_dir])
+expect_fail("a parse under another name is not the R2 artifact", ["verify-parse", "--request", request, "--reads", out_dir,
+                                                                  "--parse", out_dir])
+ok("forged outputs, bindings, authority, accounting, provenance and stale-version artifacts are refused")
+
+# --- privacy -------------------------------------------------------------------------------
+
+hostile = make(STANDARD, f"{CANARY}-privacy")
+for name in ("boot_a", "dtbo_a", "vendor_boot_a"):
+    (hostile.imgs / f"{name}.img").write_bytes(b"\xff" * 64 + CANARY.encode() * 4)
+code, out_text, err_text = invoke(*cli("parse-images", hostile, "--out", work / f"{CANARY}-out"))
+assert code != 0 and out_text == "" and CANARY not in err_text and str(work) not in err_text, err_text
+code, out_text, err_text = invoke("parse-images", "--request", f"{work}/{CANARY}/\x1b[31m", "--inventory", scn.inv,
+                                  "--images", scn.imgs, "--out", work / "pv")
+assert code != 0 and CANARY not in err_text and "\x1b" not in err_text and err_text.count("\n") == 1, err_text
+code, out_text, err_text = invoke("parse-images", f"--{CANARY}", "x")
+assert code != 0 and CANARY not in err_text and err_text.count("\n") == 1, err_text
+for label, value in (("canary board id", F.CANARY_VALUE),):
+    text = json.dumps(json.loads(operation_bytes)) + (out_dir / "parse.json").read_text()
+    assert str(value) not in text
+ok("hostile paths, names, bytes and options never reach a diagnostic or an output")
+
+# --- GPT command compatibility ---------------------------------------------------------------
+
+code, out_text, err_text = invoke("show")
+assert code == 0 and json.loads(out_text)["format_version"] == "0.3.0"
+for command in ("parse", "verify-parse"):
+    code, _o, err_text = invoke(command, "--request", request)
+    assert code != 0 and err_text.startswith("ERROR: invalid command line"), command
+gpt_plan, _ = expect_ok("plan", "--request", request)
+assert gpt_plan["kind"] == "myron-synthetic-gpt-parse-plan" and gpt_plan["format_version"] == "0.3.0"
+assert gpt_plan["request_binding"]["operation"] == R2 and gpt_plan["qualification"]["command_scope"]["parse"] == [R2]
+assert "R4 selection is not implemented" in json.dumps(gpt_plan)
+assert gpt_plan["output_closure"]["files"] == sorted(["SHA256SUMS", "parse.json", f"operations/{R2}.json"])
+ok("the GPT show/plan commands keep their R2 scope and output closure under 0.3.0 (the full GPT matrix runs in tests/myron-bootchain)")
+
+# --- descriptors ---------------------------------------------------------------------------
+
+before = len(os.listdir("/proc/self/fd"))
+expect_ok(*cli("verify-images", scn, "--parse", out_dir))
+expect_fail("a failing verify", cli("verify-images", full, "--parse", out_dir), None)
+assert len(os.listdir("/proc/self/fd")) == before, "descriptors leaked"
+print("ok - myron bootchain image parser tests passed")
+PY
+
+pass "myron bootchain image parser tests passed"

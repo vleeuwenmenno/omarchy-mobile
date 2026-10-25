@@ -2,14 +2,20 @@
 # Myron synthetic GPT-to-R2 parser (Phase 2.14)
 
 Status (2026-10-25): offline, deterministic, **synthetic binary parser
-qualification**. `tools/myron-bootchain` 0.2.0 proves one thing: one narrow GPT
-profile, supplied as synthetic bytes, parses byte for byte into the exact R2
-operation (`R2-gpt-and-recovery-inventory`) that `tools/myron-collect` 0.2.0
-already consumes, and the collector accepts the result unchanged. Version 0.2.0
-(Phase 2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) only moves the R2 envelope
-to schema 2 with `read_domain: "fixture"`, splits the old `max_bytes` into the
-three request budgets and re-pins the collector 0.2.0 and preflight 0.3.0. It is
-still GPT to R2 only: R3 binary parsing and R4 selection stay successor gates.
+qualification**. The GPT half of `tools/myron-bootchain` proves one thing: one
+narrow GPT profile, supplied as synthetic bytes, parses byte for byte into the
+exact R2 operation (`R2-gpt-and-recovery-inventory`) that `tools/myron-collect`
+0.2.0 already consumes, and the collector accepts the result unchanged. Version
+0.2.0 (Phase 2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) moved the R2 envelope
+to schema 2 with `read_domain: "fixture"`, split the old `max_bytes` into the
+three request budgets and re-pinned the collector 0.2.0 and preflight 0.3.0.
+Version 0.3.0 (Phase 2.15B, [R3-PARSER-GATE.md](R3-PARSER-GATE.md)) adds the
+independent `plan-images`, `parse-images` and `verify-images` commands that
+parse synthetic boot, vendor boot and DT table images into the R3 operation, and
+deliberately breaks the contract pin and artifact format (0.2.0 manifests and
+artifacts refuse). The GPT commands keep their semantics and emit equivalent R2
+operation bytes: `parse` still produces only R2. R4 selection stays a successor
+gate.
 
 It is **not** real captured provenance, **not** a live transport, **not**
 hardware evidence, **not** authorization, **not** blocker closure, and **not**
@@ -29,13 +35,14 @@ unique GUID), so it stays private: the tests build theirs in a temporary
 directory, and no raw binary fixture is committed. The parsed artifact omits
 every GUID and never copies raw bytes.
 
-## Staged scope: R3 and R4 are successor gates
+## Staged scope: R3 is implemented separately, R4 is a successor gate
 
-The independent design review rejected a combined R2/R3/R4 phase: the current
-R3 row cannot honestly represent the OS version of a vendor boot or DTBO image,
-and the current R4 row cannot prove a selection. This phase therefore parses R2
-only. R3 and R4 stay in the final scope; each is a **required successor gate**
-and nothing here implements or claims either.
+The independent design review rejected a combined R2/R3/R4 phase: the R3 row
+could not honestly represent the OS version of a vendor boot or DTBO image, and
+the R4 row cannot prove a selection. This phase (the GPT `parse` command)
+therefore parses R2 only. R3 followed as its own gate (Phase 2.15B,
+[R3-PARSER-GATE.md](R3-PARSER-GATE.md)) through separate commands; R4 stays a
+**required successor gate** and nothing here implements or claims it.
 
 - **R3 schema migration** (`r3-boot-image-schema-migration`, done in Phase
   2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)). Boot images are
@@ -43,22 +50,27 @@ and nothing here implements or claims either.
   images are distinct formats. The collector and preflight now carry R3 rows
   that represent them (raw OS version, 0 or not applicable, typed components,
   exact header and table hash coverage, metadata-only versus full-image
-  coverage). That is schema only; the **R3 binary parsers**
-  (`r3-binary-image-parsers`) that would fill those rows from image bytes are the
-  remaining successor gate, and this tool still has none. Offline Phase 2.15B
-  needs only the binary format parsers and hashes and coverage recomputed from
-  image bytes. A hardware transport that counts returned bytes, rereads and
-  overreads separately is **later acquisition qualification**, not a
-  prerequisite of 2.15B; the contract lists it as
-  `later_acquisition_qualification`.
+  coverage). That was schema only. The **R3 binary parsers** now exist as
+  synthetic, offline, metadata-only parsers (Phase 2.15B,
+  [R3-PARSER-GATE.md](R3-PARSER-GATE.md)): they fill those rows from image
+  bytes in a bound fixture, with hashes and coverage recomputed from the admitted
+  buffers. They carry no captured provenance. A hardware transport that counts
+  returned bytes, rereads and overreads separately, with provenance and
+  freshness, is a separate **later acquisition gate**; the contract records it as
+  the unresolved claims `r3-acquisition-provenance-not-established`,
+  `r3-image-freshness-not-established` and
+  `r3-hardware-transport-not-established`.
 - **R4 selection-source qualification** (`r4-selection-source-qualification`).
   There is no concrete selected-index source. Parsing a DTBO or a device-tree
   blob does not prove which entry the bootloader selects. R4 needs an actual
   Myron witness for the selection and cross-checks against the contracts before
   any parser may claim `selected_board_id` or `selected_board_revision`.
 
-Both appear in the contract, the plan and every parse artifact as
-`not-implemented` rows, and the parser has no R3 or R4 code.
+R4 appears in the contract, the plan and every parse artifact as the one
+`not-implemented` row, and the parser has no R4 code. The contract's
+qualification lists R2 and R3 as implemented with a per-command scope
+(`parse`: R2, `parse-images`: R3), `captured_provenance: false` and
+`hardware_qualified: false`.
 
 ## Commands
 
@@ -66,7 +78,10 @@ Both appear in the contract, the plan and every parse artifact as
 | --- | --- |
 | `show` | Verify the committed bootchain contract against its derived form and print it. |
 | `derive-contract` | Print the canonical contract derived from the pinned upstream contracts and the loaded implementation bytes. Stdout only: it needs no committed contract, writes nothing and authorizes nothing. |
-| `plan --request R` | Print the deterministic, value-free plan: the supported profile, the exact input closure and bounds, the field mappings, the request binding, the deferred R3/R4 rows, and no authority. |
+| `plan --request R` | Print the deterministic, value-free plan: the supported profile, the exact input closure and bounds, the field mappings, the request binding, the deferred R4 row, and no authority. |
+| `plan-images --request R --inventory O` | R3 counterpart of `plan`: see [R3-PARSER-GATE.md](R3-PARSER-GATE.md). |
+| `parse-images --request R --inventory O --images D --out P` | Parse synthetic boot, vendor boot and DT table images into the metadata-only R3 operation. |
+| `verify-images --request R --inventory O --images D --parse P` | Recompute the image parse; `P` must match byte for byte. |
 | `parse --request R --reads D --out O` | Parse the synthetic reads in `D` and publish a new parse artifact. |
 | `verify-parse --request R --reads D --parse O` | Recompute the whole parse from `R` and `D`; `O` must match byte for byte. |
 
@@ -237,7 +252,7 @@ implementation and dependency bindings; the profile and inventory scope
 (`one-synthetic-gpt`); sorted length and hash rows for every input; the
 operation's length, hash and `bytes_read`; the coverage rows (field,
 classification, source, semantics) and semantic limits; the unresolved claims;
-the qualification and the deferred R3/R4 rows; all nine authority flags `false`;
+the qualification and the deferred R4 row; all nine authority flags `false`;
 and all seven blockers as `missing` (there is no `blocker_cleared` field). It
 states `synthetic: true`, `live: false`, `executes: false`, `remote_commands: []`,
 `evidence_level: synthetic-binary-parser-only`, `status:
@@ -248,11 +263,14 @@ canonical lines; `parse.json` binds the operation's bytes and hash but not
 
 **Unresolved:** geometry provenance, physical acquisition and freshness, the
 complete device and disk inventory (one GPT only), the protective MBR (not
-parsed), Android slot semantics, bootability, the R3 binary parsers
-(`r3-binary-parser-successor-required`), and R4 selection provenance.
+parsed), Android slot semantics, bootability, R3 acquisition provenance, image
+freshness and hardware transport (`r3-acquisition-provenance-not-established`,
+`r3-image-freshness-not-established`, `r3-hardware-transport-not-established`),
+and R4 selection provenance. (Version 0.2.0 listed
+`r3-binary-parser-successor-required`; the synthetic R3 parsers resolve it.)
 
 The standalone parse is an **operation fragment**, never a complete capture. The
-tool produces no R1 or R3-R7 operation. `tests/myron-bootchain` composes the
+`parse` command produces no R1 or R3-R7 operation. `tests/myron-bootchain` composes the
 generated R2 into a complete synthetic R1-R7 fixture, built by independent test
 logic, and runs the unchanged collector's `read_capture`, `collect` and
 `verify-evidence` on it. The R3 in that fixture is the migrated, synthetic
@@ -268,8 +286,12 @@ semantics differ from the recomputation.
 
 ## Bootchain contract
 
-`device/myron/bootchain-contract.json` (0.2.0) is derived and canonical; the
-tool refuses any other bytes. It binds:
+`device/myron/bootchain-contract.json` (0.3.0) is derived and canonical; the
+tool refuses any other bytes. Regenerate it deliberately with
+`tools/myron-bootchain derive-contract` whenever the implementation changes (the
+digest of the implementation bytes is part of it). It also carries the
+independently versioned `image_parser` contract (1.0.0, see
+[R3-PARSER-GATE.md](R3-PARSER-GATE.md)). It binds:
 
 - the preflight contract (0.3.0) and the capture contract (collector 0.2.0)
   hashes, and the deployment, snapshot and kernel-reference hashes they carry;
@@ -280,7 +302,7 @@ tool refuses any other bytes. It binds:
   claim the pin;
 - the profile, the input closure and schemas, the output closure and accounting
   rule, the field mappings, the coverage classes and semantic limits, the
-  unresolved claims, the deferred R3/R4 rows, `synthetic: true`, `live: false`,
+  unresolved claims, the deferred R4 row, `synthetic: true`, `live: false`,
   `executes: false`, every authority flag `false`, all seven blockers `missing`,
   and the limitations and non-goals.
 
@@ -357,7 +379,8 @@ Residuals, as in Phase 2.13:
   compile or implementation-import failure as one fixed `loader-rejected` line.
 - `bootable_flag` is a bit, not a bootability claim.
 - The dependency imports are version-pinned, not byte-pinned.
-- R3 binary parsing and R4 selection are not implemented.
+- R4 selection is not implemented; R3 is parsed from synthetic fixtures only
+  ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)).
 
 ## Later producer (not part of this phase)
 

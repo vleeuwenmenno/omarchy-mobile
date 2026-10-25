@@ -114,13 +114,25 @@ collector. It is synthetic binary parser qualification only: sector size and
 disk length are explicit synthetic claims, `bootable_flag` is the literal GPT
 attributes bit 2 (`legacy-bios-bootable-bit`, no Android priority, success,
 active-slot, bootability or recovery claim), and nothing is acquired from a
-phone. R3 binary parsing and R4 are not implemented: the R3 binary parsers and
-the R4 selection-source qualification are required successor gates. See
+phone. R4 is not implemented: the R4 selection-source qualification is a
+required successor gate. See
 [BOOTCHAIN-GATE.md](../../docs/myron/BOOTCHAIN-GATE.md).
+
+Phase 2.15B moves the bootchain to 0.3.0 and adds `plan-images`, `parse-images`
+and `verify-images`: synthetic Android boot v0-v4, vendor boot v3/v4 and DT table
+v0 images (a flat fixture bound to a validated R2 operation) parse into the
+metadata-only R3 operation, with header and table hashes and coverage recomputed
+from immutable captured buffers. The GPT `parse` still produces only R2. It is
+synthetic parser qualification only: no captured provenance, no hardware
+qualification, authority all false, seven blockers missing, R4 unimplemented, and
+the collector, preflight, session, snapshot and deployment versions are
+unchanged. The bootchain contract pin changed on purpose (0.2.0 artifacts
+refuse). See [R3-PARSER-GATE.md](../../docs/myron/R3-PARSER-GATE.md).
 
 Phase 2.15A moves the preflight to 0.3.0 (capture schema
 `myron-capture-evidence-v2`, three separate budgets per read), the collector to
-0.2.0, the session to 0.2.0 and the bootchain to 0.2.0 (still GPT to R2 only).
+0.2.0, the session to 0.2.0 and the bootchain to 0.2.0 (then GPT to R2 only; 0.3.0
+is Phase 2.15B below).
 Every R1-R7 operation envelope is now integer `schema` 2 with
 `read_domain: "fixture"`; schema 1 and mixed captures are refused with no
 adapters. R3 becomes 18 typed image rows that can represent Android boot v0-v4,

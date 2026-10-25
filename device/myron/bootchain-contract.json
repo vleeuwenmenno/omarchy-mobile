@@ -143,7 +143,15 @@
         "state": "unresolved"
       },
       {
-        "claim": "r3-binary-parser-successor-required",
+        "claim": "r3-acquisition-provenance-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r3-image-freshness-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r3-hardware-transport-not-established",
         "state": "unresolved"
       },
       {
@@ -153,18 +161,6 @@
     ]
   },
   "deferred": [
-    {
-      "id": "R3-boot-image-headers",
-      "later_acquisition_qualification": [
-        "a hardware transport that counts actual returned bytes, rereads and overreads separately: a later acquisition gate, not a prerequisite of the offline parser phase"
-      ],
-      "requires": [
-        "format-specific binary parsers for Android boot v0-v4, vendor boot v3 and v4, and DT table v0",
-        "hashes and coverage recomputed from image bytes: the schema generation only represents them"
-      ],
-      "state": "not-implemented",
-      "successor_gate": "r3-binary-image-parsers"
-    },
     {
       "id": "R4-dtb-dtbo-selection",
       "requires": [
@@ -188,7 +184,7 @@
   },
   "evidence_level": "synthetic-binary-parser-only",
   "executes": false,
-  "format_version": "0.2.0",
+  "format_version": "0.3.0",
   "human_approval_required": true,
   "identity": {
     "device.codename": "myron",
@@ -197,10 +193,512 @@
     "kernel.notes_sha256": "8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
     "kernel.release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
   },
+  "image_parser": {
+    "accounting": {
+      "M": "union bytes of exact header structures and nonempty tables represented as metadata coverage: represented_metadata_bytes, no hardware read",
+      "O": "canonical serialized R3 operation bytes including newline and whitespace",
+      "S": "canonical images.json bytes plus every present image file's bytes: operation bytes_read, fixture_payload_bytes and fixture_payload_read_bytes",
+      "bound_sources": {
+        "M": "collector R3 max_hardware_read_bytes",
+        "O": "image parser max_output_metadata_bytes only: the collector's max_output_bytes is unchanged",
+        "S": "collector R3 max_fixture_input_bytes"
+      },
+      "bounds": {
+        "M_max_bytes": 65536,
+        "O_max_bytes": 65536,
+        "S_max_bytes_per_gather": 67108864,
+        "image_max_bytes": 16777216
+      },
+      "fixture_image_hash_bytes": "sum of the present image sizes",
+      "full_image_evidence": false,
+      "hardware_bytes_read": 0,
+      "hardware_transport": "none",
+      "rereads": "parse-images gathers three times and verify-images twice: each gather is bounded by S separately",
+      "scope": "one-admitted-fixture-snapshot"
+    },
+    "capture": {
+      "collector_transport_label_is_not_provenance": true,
+      "complete_capture": false,
+      "does_not_produce": [
+        "R1-identity-and-slot",
+        "R2-gpt-and-recovery-inventory",
+        "R4-dtb-dtbo-selection",
+        "R5-module-load-order",
+        "R6-storage-and-mount-model",
+        "R7-kernel-identity-revalidation"
+      ],
+      "operation_kind": "myron-precaptured-operation",
+      "operation_schema": 2,
+      "produces": [
+        "R3-boot-image-headers"
+      ],
+      "read_domain": "fixture",
+      "transport": "external-precaptured-fixture",
+      "validated_by": [
+        "validate_operation",
+        "check_r3_against_r2"
+      ]
+    },
+    "commands": [
+      "plan-images",
+      "parse-images",
+      "verify-images"
+    ],
+    "diagnostics": {
+      "codes": {
+        "image-budget": "a count, size or accounting bound was exceeded",
+        "image-corrupt": "the image bytes are internally inconsistent",
+        "image-identity-mismatch": "the image fixture disagrees with its bindings, the R2 inventory or its role",
+        "image-input-rejected": "the image fixture, request or inventory failed safe admission",
+        "image-operation-rejected": "the collector refused the R2 inventory or the produced R3 operation",
+        "image-unstable": "an input changed while it was admitted or read",
+        "image-unsupported": "the image bytes may be valid but lie outside the supported profile",
+        "publish-rejected": "the output could not be published safely"
+      },
+      "value_free": "fixed categories only: untrusted paths, names, bytes, sizes, hashes, board ids, command lines, addresses and exception text are never echoed"
+    },
+    "evidence": {
+      "component_sha256": "null unless the whole component lies inside covered metadata",
+      "coverage": "exact header structures plus nonempty tables, adjacent ranges merged, no padding, payload, EOF or full image",
+      "full_image_coverage": "refused",
+      "header_sha256": "recomputed from the admitted buffer",
+      "image_sha256": null,
+      "metadata_only": true,
+      "rows": "exactly 18 sorted rows, zero-size component slots preserved",
+      "table_sha256": "recomputed from the admitted buffer; SHA-256 of empty bytes for an empty table"
+    },
+    "evidence_level": "synthetic-binary-image-parser-only",
+    "executes": false,
+    "formats": [
+      {
+        "endian": "little",
+        "fields": [
+          [
+            "magic",
+            0,
+            8
+          ],
+          [
+            "version",
+            40,
+            4
+          ],
+          [
+            "kernel_size",
+            8,
+            4
+          ],
+          [
+            "ramdisk_size",
+            16,
+            4
+          ],
+          [
+            "second_size",
+            24,
+            4
+          ],
+          [
+            "page_size",
+            36,
+            4
+          ],
+          [
+            "os_version",
+            44,
+            4
+          ],
+          [
+            "recovery_dtbo_size",
+            1632,
+            4
+          ],
+          [
+            "recovery_dtbo_offset",
+            1636,
+            8
+          ],
+          [
+            "header_size",
+            1644,
+            4
+          ],
+          [
+            "dtb_size",
+            1648,
+            4
+          ]
+        ],
+        "format": "android-boot",
+        "header_bytes": [
+          1632,
+          1648,
+          1660
+        ],
+        "layout": "kernel at one page, then page-aligned ramdisk, second, recovery_dtbo and dtb",
+        "versions": [
+          0,
+          1,
+          2
+        ]
+      },
+      {
+        "endian": "little",
+        "fields": [
+          [
+            "magic",
+            0,
+            8
+          ],
+          [
+            "version",
+            40,
+            4
+          ],
+          [
+            "kernel_size",
+            8,
+            4
+          ],
+          [
+            "ramdisk_size",
+            12,
+            4
+          ],
+          [
+            "os_version",
+            16,
+            4
+          ],
+          [
+            "header_size",
+            20,
+            4
+          ],
+          [
+            "signature_size",
+            1580,
+            4
+          ]
+        ],
+        "format": "android-boot",
+        "header_bytes": [
+          1580,
+          1584
+        ],
+        "layout": "page 4096: header page, kernel, ramdisk, then the v4 boot_signature",
+        "versions": [
+          3,
+          4
+        ]
+      },
+      {
+        "endian": "little",
+        "fields": [
+          [
+            "magic",
+            0,
+            8
+          ],
+          [
+            "version",
+            8,
+            4
+          ],
+          [
+            "page_size",
+            12,
+            4
+          ],
+          [
+            "vendor_ramdisk_size",
+            24,
+            4
+          ],
+          [
+            "header_size",
+            2096,
+            4
+          ],
+          [
+            "dtb_size",
+            2100,
+            4
+          ],
+          [
+            "table_size",
+            2112,
+            4
+          ],
+          [
+            "table_entry_count",
+            2116,
+            4
+          ],
+          [
+            "table_entry_size",
+            2120,
+            4
+          ],
+          [
+            "bootconfig_size",
+            2124,
+            4
+          ]
+        ],
+        "format": "android-vendor-boot",
+        "header_bytes": [
+          2112,
+          2128
+        ],
+        "layout": "header span, vendor ramdisk section, dtb, v4 vendor ramdisk table, v4 bootconfig; each page-aligned",
+        "table_entry": {
+          "bytes": 108,
+          "fields": [
+            [
+              "ramdisk_size",
+              0,
+              4
+            ],
+            [
+              "ramdisk_offset",
+              4,
+              4
+            ],
+            [
+              "ramdisk_type",
+              8,
+              4
+            ],
+            [
+              "name",
+              12,
+              32
+            ]
+          ]
+        },
+        "versions": [
+          3,
+          4
+        ]
+      },
+      {
+        "endian": "big",
+        "fields": [
+          [
+            "magic",
+            0,
+            4
+          ],
+          [
+            "total_size",
+            4,
+            4
+          ],
+          [
+            "header_size",
+            8,
+            4
+          ],
+          [
+            "dt_entry_size",
+            12,
+            4
+          ],
+          [
+            "dt_entry_count",
+            16,
+            4
+          ],
+          [
+            "dt_entries_offset",
+            20,
+            4
+          ],
+          [
+            "page_size",
+            24,
+            4
+          ],
+          [
+            "version",
+            28,
+            4
+          ]
+        ],
+        "format": "android-dt-table",
+        "header_bytes": [
+          32
+        ],
+        "layout": "explicit table offset, explicit payload offsets, no page alignment",
+        "table_entry": {
+          "bytes": 32,
+          "fields": [
+            [
+              "dt_size",
+              0,
+              4
+            ],
+            [
+              "dt_offset",
+              4,
+              4
+            ]
+          ]
+        },
+        "versions": [
+          0
+        ]
+      }
+    ],
+    "independently_versioned": true,
+    "input": {
+      "capture": "pin every closure file, read each once into a bounded immutable buffer, hash and parse those same bytes",
+      "closure": "images.json plus one fixed file per present row: derived from the admitted manifest and checked exactly before any image byte is read",
+      "entries_max": 20,
+      "file_name_rule": "partition_name plus .img: derived internally, never an input path",
+      "layout": "flat",
+      "manifest": {
+        "binds": [
+          "bootchain_contract_sha256",
+          "request_sha256",
+          "inventory_sha256"
+        ],
+        "format_version": 1,
+        "json": "strict canonical ASCII",
+        "kind": "myron-synthetic-r3-images",
+        "max_bytes": 16384,
+        "path": "images.json",
+        "rows": {
+          "absent": "present false, size_bytes null, fixture_sha256 null, no file",
+          "count": 18,
+          "fields": [
+            "partition_name",
+            "present",
+            "size_bytes",
+            "fixture_sha256"
+          ],
+          "present_rule": "present true, size_bytes 1..16777216 exact, fixture_sha256 exact, one fixed regular file",
+          "sorted_by": "partition_name"
+        }
+      },
+      "partition_names": [
+        "boot",
+        "boot_a",
+        "boot_b",
+        "dtbo",
+        "dtbo_a",
+        "dtbo_b",
+        "init_boot",
+        "init_boot_a",
+        "init_boot_b",
+        "recovery",
+        "recovery_a",
+        "recovery_b",
+        "vendor_boot",
+        "vendor_boot_a",
+        "vendor_boot_b",
+        "vendor_kernel_boot",
+        "vendor_kernel_boot_a",
+        "vendor_kernel_boot_b"
+      ],
+      "safety": [
+        "flat-tree-only",
+        "exact-closure-before-payload-read",
+        "no-symlinks",
+        "no-hardlinks",
+        "no-executable-files",
+        "no-special-files",
+        "no-mount-crossing",
+        "no-writable-ancestry",
+        "no-aliases-of-inputs",
+        "stable-while-read",
+        "metadata-admitted-before-payload-read",
+        "names-revalidated-after-read",
+        "closure-derived-from-admitted-manifest",
+        "immutable-captured-buffers",
+        "value-free-diagnostics",
+        "trusted-inventory-file"
+      ],
+      "snapshot_claim": "descriptor-read snapshot only: not atomic, no writer exclusion"
+    },
+    "inventory": {
+      "bound_by": "exact bytes (inventory_sha256 in images.json and parse.json)",
+      "image_null_means": "absence from the bound R2 inventory, never mere file absence",
+      "operand": "a separately validated request-bound R2 operation file",
+      "validated_by": "validate_operation for the R2 request row, before any image byte is read"
+    },
+    "kinds": {
+      "manifest": "myron-synthetic-r3-images",
+      "parse": "myron-synthetic-r3-image-parse",
+      "plan": "myron-synthetic-r3-image-parse-plan"
+    },
+    "limitations": [
+      "synthetic binary parser qualification only: the fixture bytes were never read from a phone or a block device and carry no captured provenance",
+      "the parser establishes no hardware qualification, freshness, slot semantics, bootability or flash safety",
+      "metadata-only evidence: no image hash, no payload hash and no full-image coverage is ever produced",
+      "boot v0-v4, vendor_boot v3 and v4 and DT table v0 only, with the page sizes, counts and limits of the collector's R3 profile; other valid variants are refused as unsupported",
+      "DT table payload extents that are shared, reused or overlapping are valid AOSP but outside the collector's disjoint-extent profile: refused as unsupported, not corrupt",
+      "a metadata-only image whose covered metadata equals the whole image is refused as unsupported (the collector would reject it as full coverage)",
+      "an image shorter than its aligned layout is refused as corrupt: components past the file end are never emitted",
+      "operation bytes_read is S (images.json plus every present image file) and is fixture payload accounting, no device I/O; hardware_bytes_read is 0 with hardware_transport none",
+      "each complete gather admits at most 64 MiB (S): parse-images gathers three times (admission, temporary and published verification) and verify-images twice, so total invocation I/O exceeds S",
+      "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot and not writer exclusion; a later verify against a changed source rejects",
+      "the R2 inventory is bound by its exact bytes after separate collector validation; it proves nothing about a device",
+      "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
+      "publication is durable only if the output parent's fsync succeeds; a failure there removes the just-published output by identity on a best-effort basis"
+    ],
+    "live": false,
+    "operation": "R3-boot-image-headers",
+    "output": {
+      "binary_copies": false,
+      "checksums": {
+        "covers": [
+          "parse.json",
+          "operations/R3-boot-image-headers.json"
+        ],
+        "path": "SHA256SUMS",
+        "sorted": "canonical-byte-order-of-path"
+      },
+      "deterministic": true,
+      "directories": [
+        "operations"
+      ],
+      "extra_entries": "reject",
+      "files": [
+        "SHA256SUMS",
+        "operations/R3-boot-image-headers.json",
+        "parse.json"
+      ],
+      "kind": "myron-synthetic-r3-image-parse",
+      "modes": {
+        "directories": "0755",
+        "files": "0644"
+      },
+      "published": "atomic-no-replace",
+      "verification": "recompute-from-request-inventory-and-images-byte-for-byte"
+    },
+    "profile": "r3-android-boot-v0-v4-vendor-v3-v4-dt-table-v0-metadata-only",
+    "semantic_limits": [
+      "evidence is metadata-only: header and table hashes are recomputed from the admitted bytes, image sha256 is always null",
+      "coverage is the exact header structures plus nonempty tables with adjacent ranges merged: never page padding, payload, EOF or the full image",
+      "component sha256 is null unless a component lies wholly inside covered metadata (payload normally does not)",
+      "a boot_signature extent is a structure extent only: no cryptographic or verified-boot claim",
+      "os_version is the literal packed header value, zero included: no version text is derived",
+      "recovery_dtbo offsets are checked against the computed layout and never used to derive the dtb offset",
+      "vendor ramdisk fragment order is the table index order: no load order, selection or R4 inference",
+      "vendor ramdisk names, DT ids, revisions, custom values and board ids are never emitted",
+      "image: null means absence from the bound R2 inventory, never mere file absence and never proof about the device"
+    ],
+    "status": "synthetic-r3-parse-recorded",
+    "synthetic": true,
+    "transport": "synthetic-binary-image-fixture",
+    "version": "1.0.0"
+  },
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-bootchain-impl.py",
-    "sha256": "3fa8d0f868657fd5b77acb77e43b461b101c0b049ab89cf9a26ceb45654c9b66"
+    "sha256": "0906017a0f8dbc5e09bba06b71fdeae95a65823046975c9e06173df88fde9573"
   },
   "input": {
     "closure": [
@@ -384,7 +882,7 @@
     "header bytes after the 92-byte header must be zero: a profile restriction, not universal GPT validity",
     "a partition name fills at most 35 UTF-16 units and must be NUL terminated (a profile restriction)",
     "bootable_flag is legacy-bios-bootable-bit and proves no Android priority, success, active slot, bootability or recovery viability",
-    "R3 binary parsing and R4 selection are not implemented: each is a recorded successor gate (the R3 schema generation exists, with no parser) and the parse is an operation fragment, not a capture",
+    "R4 selection is not implemented: it is a recorded successor gate. The GPT parse produces only the R2 operation fragment and the image parse produces only the R3 operation fragment: neither is a capture",
     "bytes_read is fixture payload accounting only: it counts consumed fixture bytes and is no device I/O",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the bootchain contract pins the bootchain implementation bytes; the collector implementation is bound only through the capture contract",
@@ -399,7 +897,7 @@
     "hardware evidence or captured provenance",
     "authorization of any read, deployment or boot",
     "closing any blocker",
-    "R3 boot image header parsing, R4 DTB or DTBO selection, or any complete R1-R7 capture",
+    "R4 DTB or DTBO selection, hardware acquisition of images, or any complete R1-R7 capture",
     "Android slot, priority, success or recovery qualification"
   ],
   "output": {
@@ -639,20 +1137,25 @@
   "qualification": {
     "binary_parser": "synthetic-fixtures-only",
     "captured_provenance": false,
+    "command_scope": {
+      "parse": [
+        "R2-gpt-and-recovery-inventory"
+      ],
+      "parse-images": [
+        "R3-boot-image-headers"
+      ]
+    },
     "deferred_operations": [
-      {
-        "id": "R3-boot-image-headers",
-        "state": "not-implemented",
-        "successor_gate": "r3-binary-image-parsers"
-      },
       {
         "id": "R4-dtb-dtbo-selection",
         "state": "not-implemented",
         "successor_gate": "r4-selection-source-qualification"
       }
     ],
+    "hardware_qualified": false,
     "implemented_operations": [
-      "R2-gpt-and-recovery-inventory"
+      "R2-gpt-and-recovery-inventory",
+      "R3-boot-image-headers"
     ]
   },
   "remote_commands": [],

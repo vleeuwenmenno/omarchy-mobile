@@ -256,11 +256,12 @@ failure.
 
 - The reads are synthetic projections. Nothing shows a real phone, GPT, boot
   image or device tree would produce them.
-- No GPT, Android boot image or device-tree parser exists here; a real one needs
-  its own gate and its own qualification against real captures. Phase 2.14 adds
-  a separate, synthetic-only GPT-to-R2 byte parser
-  ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)); it does not change this rehearsal,
-  and R3 and R4 still have no parser.
+- No real-capture qualification exists here. Phase 2.14 adds a separate,
+  synthetic-only GPT-to-R2 byte parser
+  ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)), and Phase 2.15B adds separate,
+  synthetic-only Android boot/vendor_boot/DT-table parsers into R3
+  ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)); neither changes this descriptor
+  rehearsal, and R4 still has no parser.
 - R3 image summaries (including all hashes and coverage) and the R4 selection
   are claims, not parsed values. Full-image coverage proves no provenance or
   hardware freshness; metadata-only coverage leaves payload, padding and EOF
@@ -279,6 +280,6 @@ failure.
   while the command reports failure.
 
 A passing rehearsal says only that the adapter and the collector agree on
-synthetic structure. A live transport, a real format parser and the human
+synthetic structure. Live transport, real-capture qualification and human
 approval of one bounded read-only session remain separate, later, reviewed
 gates, and all seven blockers remain open.
