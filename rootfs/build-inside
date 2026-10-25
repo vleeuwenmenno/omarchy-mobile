@@ -33,6 +33,7 @@ case $ROOTFS_INTEGRATION in kernel-modules|external-contract) ;; *) die "bad ROO
 if [[ $ROOTFS_PACKAGE_PROFILE == myron ]]; then
   [[ ${DEVICE:-} == myron && $STAGE_ONLY == 1 && $ROOTFS_INTEGRATION == external-contract ]] ||
     die "ROOTFS_PACKAGE_PROFILE=myron needs DEVICE=myron, STAGE_ONLY=1 and ROOTFS_INTEGRATION=external-contract"
+  source /src/rootfs/lib/myron-package-closure.sh
 elif [[ ${DEVICE:-} == myron && $STAGE_ONLY == 1 ]]; then
   die "a myron stage needs ROOTFS_PACKAGE_PROFILE=myron, not $ROOTFS_PACKAGE_PROFILE"
 fi
@@ -124,18 +125,7 @@ pacstrap -C /etc/pacman.conf -c -M "$T" --needed "${ours_present[@]}" >/var/log/
 
 package_closure="not applicable"
 if [[ $ROOTFS_PACKAGE_PROFILE == myron ]]; then
-  required=(omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile)
-  forbidden=(omamobile-apps omacam neard libcamera libcamera-ipa pipewire-libcamera
-             gst-plugin-libcamera libfprint vulkan-panfrost)
-  absent=() present=()
-  for p in "${required[@]}"; do
-    pacman -r "$T" -Qq "$p" >/dev/null 2>&1 || absent+=("$p")
-  done
-  ((${#absent[@]} == 0)) || die "Myron stage misses required packages: ${absent[*]}"
-  for p in "${forbidden[@]}"; do
-    pacman -r "$T" -Qq "$p" >/dev/null 2>&1 && present+=("$p")
-  done
-  ((${#present[@]} == 0)) || die "Myron stage resolved forbidden packages: ${present[*]}"
+  check_myron_package_closure "$T"
   package_closure="required present; forbidden absent"
 fi
 

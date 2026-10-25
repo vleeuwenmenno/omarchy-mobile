@@ -232,6 +232,44 @@ grep -q 'sed "s/@OMARCHY_CHANNEL@/\$OMARCHY_CHANNEL/" /src/rootfs/pacman.conf' r
 grep -q 'SigLevel = Required DatabaseOptional' rootfs/pacman.conf || fail "the committed pacman.conf no longer says Required DatabaseOptional"
 pass "build-inside stages the committed pacman.conf after the per-run stanza"
 
+grep -Fq 'source /src/rootfs/lib/myron-package-closure.sh' rootfs/build-inside || fail "build-inside no longer loads the Myron closure helper"
+grep -Fq 'check_myron_package_closure "$T"' rootfs/build-inside || fail "build-inside no longer checks the Myron package closure"
+if grep -Fq -- '-Qq "$p"' rootfs/build-inside; then fail "build-inside queries package targets instead of exact installed names"; fi
+pass "build-inside wires the exact-name Myron package closure"
+
+# pacman -Q TARGET accepts an installed provider of TARGET.  Myron's
+# omamobile-apps-myron intentionally provides omamobile-apps, so the closure
+# gate must compare exact names from one complete -Qq listing instead.
+closure=$t/closure
+mkdir -p "$closure/bin"
+cat > "$closure/bin/pacman" <<'SH'
+#!/bin/bash
+[[ $1 == -r && $3 == -Qq && $# == 3 ]] || exit 90
+[[ ${CLOSURE_FAIL:-0} == 0 ]] || exit 91
+for package in ${CLOSURE_PACKAGES-}; do printf '%s\n' "$package"; done
+SH
+chmod +x "$closure/bin/pacman"
+closure_check() {
+  (PATH="$closure/bin:$PATH" CLOSURE_PACKAGES="$1" CLOSURE_FAIL="${2:-0}" bash -c '
+    set -euo pipefail
+    die() { printf "error: %s\n" "$*" >&2; exit 1; }
+    source rootfs/lib/myron-package-closure.sh
+    check_myron_package_closure /fixture
+  ') >"$t/log" 2>&1
+}
+required='omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile'
+closure_check "$required" || fail "the exact Myron provider set is rejected"
+[[ ! -s $t/log ]] || fail "the successful closure check writes output"
+if closure_check "$required omamobile-apps"; then fail "the exact forbidden package is accepted"; fi
+grep -q 'resolved forbidden packages: omamobile-apps' "$t/log" || fail "the forbidden package is rejected for the wrong reason"
+if closure_check 'mesa-myron-zink-turnip omamobile-myron-gpu-profile'; then fail "a missing required provider is accepted"; fi
+grep -q 'misses required packages: omamobile-apps-myron' "$t/log" || fail "the missing provider is rejected for the wrong reason"
+if closure_check ''; then fail "an empty installed-package listing is accepted"; fi
+grep -q 'misses required packages:' "$t/log" || fail "the empty package listing is rejected for the wrong reason"
+if closure_check "$required" 1; then fail "a failed installed-package listing is accepted"; fi
+grep -q 'cannot list installed packages for the Myron closure' "$t/log" || fail "the failed package listing is rejected for the wrong reason"
+pass "the Myron package closure compares exact installed names, not virtual providers"
+
 # Execute the exact embedded mirrorlist copier against hostile destination
 # types. It must validate an opened descriptor before changing any bytes and
 # must never block on a FIFO supplied by staged package contents.

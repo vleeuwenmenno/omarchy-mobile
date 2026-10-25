@@ -378,6 +378,8 @@ for bad in "DEVICE=cheetah STAGE_ONLY=1 ROOTFS_INTEGRATION=external-contract ROO
            "DEVICE=myron STAGE_ONLY=1 ROOTFS_INTEGRATION=external-contract ROOTFS_PACKAGE_PROFILE=default"; do
   # shellcheck disable=SC2086 # intentional word splitting of NAME=value pairs
   if env $bad bash rootfs/build-inside > "$t/log" 2>&1; then fail "build-inside accepts: $bad"; fi
-  grep -q 'myron' "$t/log" || fail "build-inside rejects '$bad' for the wrong reason"
+  expected='ROOTFS_PACKAGE_PROFILE=myron needs DEVICE=myron, STAGE_ONLY=1 and ROOTFS_INTEGRATION=external-contract'
+  [[ $bad == *ROOTFS_PACKAGE_PROFILE=default ]] && expected='a myron stage needs ROOTFS_PACKAGE_PROFILE=myron'
+  grep -Fq "$expected" "$t/log" || fail "build-inside rejects '$bad' for the wrong reason"
 done
 echo 'ok - the myron profile is bound to the myron stage-only contract, in both scripts'
