@@ -2060,11 +2060,44 @@ def publish(
                 raise DeploymentError("temp directory changed while being opened")
             if kernel().mount_id_for_fd(descriptor, "temp directory") != owned[2]:
                 raise DeploymentError("temp directory crossed a mount point")
-            if os.listdir(descriptor):
-                raise DeploymentError("private temp directory was not empty")
+            # Listing a directory file descriptor can advance its directory
+            # offset.  On filesystems that do not expose subsequently created
+            # entries after that cookie, reusing the descriptor for the
+            # verification walk makes a populated tree appear empty.  Inspect
+            # emptiness through a separate open file description instead.
+            empty_check = os.open(".", DIR_FLAGS, dir_fd=descriptor)
+            try:
+                if os.listdir(empty_check):
+                    raise DeploymentError("private temp directory was not empty")
+            finally:
+                os.close(empty_check)
             write_spec(descriptor, spec, created_entries)
             os.fchmod(descriptor, 0o755)
             os.fsync(descriptor)
+            # A descriptor opened while the directory was empty can retain an
+            # end-of-directory cookie that hides children created later
+            # (observed on btrfs). Reopen the same inode after construction so
+            # verification always starts with a fresh directory cursor.
+            refreshed = -1
+            try:
+                refreshed = os.open(".", DIR_FLAGS, dir_fd=descriptor)
+                refreshed_metadata = os.fstat(refreshed)
+                if (refreshed_metadata.st_dev, refreshed_metadata.st_ino) != owned[:2]:
+                    raise DeploymentError("temp directory changed while being refreshed")
+                if kernel().mount_id_for_fd(refreshed, "refreshed temp directory") != owned[2]:
+                    raise DeploymentError("refreshed temp directory crossed a mount point")
+            except OSError as error:
+                if refreshed >= 0:
+                    os.close(refreshed)
+                raise DeploymentError(
+                    f"cannot refresh the populated temp directory: {error.strerror}"
+                ) from error
+            except BaseException:
+                if refreshed >= 0:
+                    os.close(refreshed)
+                raise
+            os.close(descriptor)
+            descriptor = refreshed
             temporary_path = "/" + "/".join([*parts[:-1], temporary])
             verify_built(temporary_path, descriptor)
             named = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
