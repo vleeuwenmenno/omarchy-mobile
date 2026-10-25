@@ -94,22 +94,38 @@ printf '%s\n' "$devices_json" | grep -Eq 'focaltech|touch' ||
 # disarming rollback. Keep detailed output bounded in /run and only append the
 # renderer lines to the persistent diagnostic log.
 client_log=/run/myron-eglinfo.log
-if ! timeout 60 runuser -u "$owner" -- env \
+client_status=0
+timeout 60 runuser -u "$owner" -- env \
   LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu \
   LIBGL_DRIVERS_PATH=/usr/lib/omamobile/myron-gpu/dri \
   MESA_LOADER_DRIVER_OVERRIDE=zink \
   VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json \
   XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="$wayland" EGL_PLATFORM=wayland \
-  /usr/bin/eglinfo -B >"$client_log" 2>&1; then
+  /usr/bin/eglinfo -B >"$client_log" 2>&1 || client_status=$?
+case "$client_status" in
+  124|137)
   tail -n 80 "$client_log" >>"$log"
-  die 'native Wayland EGL client probe failed'
-fi
-grep -Ei 'renderer|device|version' "$client_log" | tail -n 40 >>"$log" || true
-grep -Eq 'Adreno.*840.*MESA_TURNIP|MESA_TURNIP.*Adreno.*840' "$client_log" ||
+  die 'native Wayland EGL client probe timed out'
+  ;;
+esac
+client_wayland_log=/run/myron-eglinfo-wayland.log
+awk '
+  /^Wayland platform:$/ { capture = 1 }
+  capture && /^X11 platform:$/ { exit }
+  capture { print }
+' "$client_log" >"$client_wayland_log"
+[ -s "$client_wayland_log" ] || {
+  tail -n 80 "$client_log" >>"$log"
+  die 'native Wayland EGL client probe produced no Wayland section'
+}
+grep -Ei 'renderer|device|version' "$client_wayland_log" | tail -n 40 >>"$log" || true
+grep -Eq 'Adreno.*840.*MESA_TURNIP|MESA_TURNIP.*Adreno.*840' "$client_wayland_log" ||
   die 'native Wayland EGL client did not report Adreno 840 Turnip'
-if grep -Eqi 'llvmpipe|swrast' "$client_log"; then
+if grep -Eqi 'llvmpipe|swrast' "$client_wayland_log"; then
   die 'native Wayland EGL client selected software rendering'
 fi
+[ "$client_status" -eq 0 ] ||
+  say "client_egl_exit=$client_status state=unrelated-platform-failure-accepted"
 
 mkdir -p "$host_state"
 printf 'qualified_pid=%s\nstable_seconds=%s\n' "$pid" "$stable_seconds" \

@@ -45,12 +45,20 @@ enable() {
     printf '%s\n' 'omamobile-gnss: ModemManager is not running' >&2
     exit 1
   }
+  cleanup_enable() {
+    "$mmcli" -m "$modem" \
+      --location-disable-gps-raw \
+      --location-disable-gps-nmea \
+      --location-set-disable-signal >/dev/null 2>&1 || true
+    "$mmcli" -m "$modem" --location-disable-agps-msb >/dev/null 2>&1 || true
+  }
+  trap cleanup_enable EXIT HUP INT TERM
+  "$mmcli" -m "$modem" --location-enable-agps-msb
   "$mmcli" -m "$modem" \
     --location-enable-gps-raw \
     --location-enable-gps-nmea \
-    --location-enable-agps-msa \
-    --location-enable-agps-msb \
     --location-set-enable-signal
+  trap - EXIT HUP INT TERM
 }
 
 disable() {
@@ -58,9 +66,9 @@ disable() {
   "$mmcli" -m "$modem" \
     --location-disable-gps-nmea \
     --location-disable-gps-raw \
-    --location-disable-agps-msa \
-    --location-disable-agps-msb \
-    --location-set-disable-signal
+    --location-set-disable-signal >/dev/null 2>&1 || true
+  "$mmcli" -m "$modem" --location-disable-agps-msb >/dev/null 2>&1 || true
+  "$mmcli" -m "$modem" --location-disable-agps-msa >/dev/null 2>&1 || true
 }
 
 case ${1:-} in

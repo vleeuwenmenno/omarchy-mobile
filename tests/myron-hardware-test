@@ -72,6 +72,10 @@ grep -Fq 'runuser -u "$owner" -- test -w /dev/dma_heap/system' "$qualify" ||
   fail 'qualification does not prove the compositor user can access the DMA heap'
 grep -Fq '/usr/bin/eglinfo -B' "$qualify" ||
   fail 'qualification does not exercise a separate native Wayland EGL client'
+grep -Fq 'client_wayland_log=/run/myron-eglinfo-wayland.log' "$qualify" ||
+  fail 'qualification does not isolate the native Wayland EGL result'
+grep -Fq 'capture && /^X11 platform:$/ { exit }' "$qualify" ||
+  fail 'qualification does not bound the Wayland EGL result before X11'
 grep -Fq 'Adreno.*840.*MESA_TURNIP' "$qualify" ||
   fail 'native client qualification does not require Adreno 840 Turnip'
 grep -Fq 'node_from_class /sys/class/dma_heap/system/dev /dev/dma_heap/system video 0660' "$prepare" ||
@@ -151,10 +155,13 @@ grep -Fq -- '--location-enable-gps-raw' "$gnss" ||
   fail 'Myron Location switch does not enable Qualcomm raw GPS'
 grep -Fq -- '--location-enable-gps-nmea' "$gnss" ||
   fail 'Myron Location switch does not enable Qualcomm NMEA GPS'
-grep -Fq -- '--location-enable-agps-msa' "$gnss" ||
-  fail 'Myron Location switch does not retain MSA assisted GPS'
 grep -Fq -- '--location-enable-agps-msb' "$gnss" ||
   fail 'Myron Location switch does not retain MSB assisted GPS'
+if grep -Fq -- '--location-enable-agps-msa' "$gnss"; then
+  fail 'Myron Location switch enables mutually exclusive MSA and MSB assisted GPS'
+fi
+grep -Fq 'trap cleanup_enable EXIT HUP INT TERM' "$gnss" ||
+  fail 'Myron Location switch does not clean up a partial enable'
 grep -Fq '"installed":%s' "$gnss" ||
   fail 'Myron Location switch does not implement shell status JSON'
 pass 'Location tile uses the qualified Qualcomm ModemManager GNSS path'

@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Myron temporary Omarchy hardware test
 
-Status: the r4 temporary Arch payload booted and qualified native DSI,
-Hyprland, touch, the isolated GPU stack, Wi-Fi, modem registration and a GNSS
-fix on 2026-10-25. It exposed a missing DMA-heap device node and an unsafe
-audio sequencing assumption. postmarketOS has been restored; r5 fixes are
-implemented offline but have not yet been boot-tested.
+Status: the r5 temporary Arch payload booted and qualified native DSI,
+Hyprland, touch, DMA-heap-backed application rendering, the isolated GPU stack,
+Wi-Fi, modem registration and a GNSS fix on 2026-10-25. Audio remains isolated
+to a separate clean boot because the r4 mixed radio/audio sequence hard-reset
+the phone.
 
 This is a reversible development test around the existing downstream Myron
 kernel and extracted runtime assets. It is not the production installer, does
@@ -73,6 +73,40 @@ experiment-105 stack in this image. The test session therefore shadows only
 the `quickshell` executable with `QT_QUICK_BACKEND=software`; Hyprland and
 ordinary applications retain the isolated accelerated stack.
 
+## r5 live evidence
+
+The r5 payload booted in about 104 seconds and retained USB NCM SSH. It passed
+the 90-second Hyprland window on `DSI-1` at 1200x2608 with scale `2.0`; the
+touch device and Squeekboard were present. Both DMA-heap names resolved to the
+same `248:1` character device with `0660 root:video` permissions. A separate
+Wayland EGL client reported Zink on Adreno 840 Turnip. Its complete `eglinfo`
+run returned nonzero because unrelated GBM and X11 platform probes failed, so
+the qualifier now isolates and evaluates only the bounded `Wayland platform:`
+section. It still rejects a timeout, a missing Wayland section, llvmpipe or
+swrast before disarming rollback.
+
+Nautilus and GNOME Maps both mapped as native Wayland clients without the r4
+DMA-heap, swapchain or `VK_ERROR_OUT_OF_DEVICE_MEMORY` failures. The shell,
+app grid and keyboard remained running. The panel backlight accepted bounded
+writes and restored its configured value, although the downstream
+`actual_brightness` attribute remained zero and needs a visible attended
+check. A one-step white flash LED test read back and restored zero. Battery
+sysfs reported 100%, charging, good health and USB-PD supplies.
+
+The exact CNSS link rule produced `wlan0` for the managed interface; `wlp1s0`
+was correctly the P2P interface. NetworkManager scanned seven access points,
+associated through the preserved reference profile, obtained DHCP, resolved
+DNS and supported SSH over WLAN. The patched ModemManager discovered the modem,
+registered home, attached packet service, reported LTE plus 5G NR and 59%
+signal. No bearer, APN, SMS or voice action was performed.
+
+The first Location-tile attempt failed closed because MSA and MSB A-GPS are
+mutually exclusive. The helper now follows the proven reference sequence:
+enable MSB first, then raw GPS and NMEA, with cleanup on partial failure. The
+corrected helper obtained a GGA fix in six seconds using six satellites,
+suppressed coordinates from logs, disabled every managed source afterwards,
+and left the modem registered.
+
 ## First boot and mobile shell fixes
 
 The temporary first boot no longer waits on unsupported nftables/UFW setup.
@@ -82,9 +116,10 @@ until Wi-Fi exists, while still applying the packaged mobile shell profile.
 No completion marker is forged, so the full user provisioner can be run later.
 
 The r5 overlay supplies the `omamobile-gnss` command expected by the Location
-quick-setting tile. It uses the qualified Qualcomm ModemManager raw, NMEA,
-MSA and MSB location sources rather than installing the Pixel-specific
-Broadcom GNSS package.
+quick-setting tile. It uses the qualified Qualcomm ModemManager raw, NMEA and
+MSB-assisted location path rather than installing the Pixel-specific Broadcom
+GNSS package. The modem still advertises MSA capability, but the helper never
+enables mutually exclusive MSA and MSB together.
 
 ## Audio incident and hard sequencing rule
 
@@ -117,21 +152,29 @@ The exact known-good postmarketOS rollback image is:
 535d8e2fe0db2b35dc003e329fafc2b76dd82705df70cef63dc74accf653ec24  init_boot_a.img
 ```
 
-The r5 payload and init_boot pair must be rebuilt together after the current
-offline tests pass. The initramfs watchdog remains 900 seconds, writes only
-`init_boot_a`, checks both candidate and rollback hashes, and never references
-a slot-B partition.
+The initial r5 pair that booted and was then live-patched with the qualifier
+and GNSS fixes was:
+
+```text
+539b328f43b31fa5919c94008cdf974a221c74e6201f0c90c83a2ddd3429c9ee  myron-omarchy-hardware-test-20261025-r5.img
+285bbb7598401f56c092c63fedce3b05f284095cefa54d0d69002ec0e73f6bf9  init_boot_a-myron-omarchy-hardware-test-20261025-r5-v1.img
+```
+
+This pair is evidence, not the reproducible successor: rebuild both artifacts
+after the committed live fixes before another boot. The initramfs watchdog
+remains 900 seconds, writes only `init_boot_a`, checks both candidate and
+rollback hashes, and never references a slot-B partition.
 
 ## Next attended sequence
 
-1. Boot r5 and qualify DSI, touch, DMA-heap access, Adreno client EGL, shell,
-   launcher, Nautilus, brightness, battery reporting and physical buttons.
-2. Arm and start only the radio bridge. Verify `wlan0`, Wi-Fi and WLAN SSH.
-3. Start patched ModemManager, verify registration, then run one bounded GNSS
-   fix. Do not create a cellular bearer or run telephony actions.
-4. Restore postmarketOS. On a separate clean r5 boot, qualify audio foundation
-   step by step before ModemManager/GNSS, then test microphone and a guarded
-   low-volume speaker route.
+1. Restore postmarketOS, rebuild the r5 successor with both live fixes, and
+   verify its payload/init-boot hash pair offline.
+2. On a separate clean boot, qualify the audio foundation step by step before
+   ModemManager/GNSS, then test microphone and a guarded low-volume speaker
+   route.
+3. Add attended physical power/volume, visible brightness and haptics probes.
+4. Bring up Bluetooth, sensors, telephony, fingerprint and camera as isolated
+   subsystem phases; none is implied by the successful graphical/radio boot.
 
 Bluetooth discovery/audio, sensors and rotation, telephony, fingerprint and
 camera capture remain required later phases; none may be inferred from the
