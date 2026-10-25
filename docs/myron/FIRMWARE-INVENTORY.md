@@ -40,11 +40,13 @@ Canonical reference metadata is
 105 pinned asset records: 98 stock-extracted inputs, six source-built outputs,
 and one repository-generated manifest.
 
-`tools/myron-deployment` 0.2.0 can bind the required `gpu`, `wifi` and `touch`
-stock-extracted rows of that manifest into kit evidence by hashes only. That is
-not provisioning, extraction, redistribution clearance, ABI or hardware
-qualification; no private bytes or manifest are copied, and no real runtime tree
-has been bound.
+`tools/myron-deployment` can stage the required `gpu`, `wifi` and `touch`
+stock-extracted rows into an exact private local closure, then bind that closure
+into kit evidence by hashes. The stager traverses the full 105-record source
+tree safely but copies only the 25 required files, with private normalized
+storage modes. Assembly still copies no runtime or manifest byte into the kit.
+This is not provisioning, extraction, redistribution clearance, ABI or
+hardware qualification, and no real runtime tree has yet been bound to a kit.
 
 ## GPU firmware observed live
 

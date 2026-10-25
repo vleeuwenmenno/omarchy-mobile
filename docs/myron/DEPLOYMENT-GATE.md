@@ -13,6 +13,9 @@ would be `not-bound`. Version 0.4.0 can also bind the staged-set ABI
 verifier report from the exact archive and two exact symvers files. No real
 archive or symvers pair has been bound. Standard AArch64/GKI layouts have
 synthetic coverage, but the parser remains unqualified on real modules.
+The current tool also provides a local-only writer for the exact required
+private runtime closure. This does not change the 0.4.0 kit format and does not
+put those bytes in a kit, package or release.
 
 ## What it binds
 
@@ -44,6 +47,7 @@ components or symlinks. No command runs an external program or `depmod`.
 | --- | --- |
 | `show` | print the validated contract |
 | `stage-modules --assets ARCHIVE --out DIR` | validate archive and contract with the kernel verifier, then write exactly the selector and seven modules (planned paths and modes) |
+| `stage-runtime --runtime-assets SOURCE_DIR --runtime-manifest FILE --out DIR` | traverse the bounded private source, validate the pinned manifest, and publish only the required `gpu`, `wifi` and `touch` closure with private storage modes |
 | `assemble --rootfs-stage DIR --rootfs-manifest FILE --module-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] --vmlinux-symvers none\|FILE --module-symvers none\|FILE --out DIR` | validate both inputs against the archive, bind or explicitly not-bind runtime and ABI evidence, reject collisions, write the kit |
 | `verify --kit DIR --rootfs-stage DIR --assets ARCHIVE --runtime-assets none\|DIR [--runtime-manifest FILE] --vmlinux-symvers none\|FILE --module-symvers none\|FILE [--rootfs-manifest FILE]` | recompute every binding, content, mode and closure, including runtime and ABI evidence |
 | `gate` (same arguments) | `verify`, then print `artifact_verified: true`, `deployment_authorized: false` and the blockers |
@@ -128,6 +132,24 @@ redistribution clearance, ABI compatibility or hardware qualification. It does
 not clear `private-runtime-asset-bytes-not-bound-to-kit` or reorder any blocker,
 and the gate still refuses. The gate reports `runtime_status`,
 `runtime_asset_count` and `runtime_digest`.
+
+`stage-runtime` is the local preparation step for a source tree that also
+contains optional features. It safely traverses the complete source under the
+same bounds, retains only the selected manifest bytes, validates their hashes,
+and atomically publishes an exact no-replace closure. Optional files never
+enter the output. Staged ancestors use mode `0700`, files use `0600`, and the
+stage root created by the common publisher uses `0755`; these are private
+storage modes, not final installation permissions. Assembly recomputes its
+digest from those normalized modes. Source and manifest paths remain pinned and
+are rechecked during both pre- and post-publication verification.
+
+The staging output contains private, `extract-only` bytes. Keep it in a
+dedicated access-controlled local directory, for example
+`/absolute/private/myron-runtime-stage`, and never commit, package, publish or
+redistribute it. `out/` is ignored by Git but is not a secrecy boundary.
+Staging proves only that the selected closure matches the pinned manifest; it
+does not prove an atomic source snapshot, ABI compatibility, redistribution
+rights, hardware operation or deployment authorization.
 
 ## Staged-set ABI binding (0.4.0)
 

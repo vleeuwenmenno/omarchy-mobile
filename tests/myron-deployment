@@ -1616,6 +1616,87 @@ def expected_evidence():
     }
 
 
+# stage-runtime trims an optional-bearing private source into the exact
+# contract-required closure, with deterministic private storage modes.
+runtime_source = make_runtime({**RUNTIME_FILES, **RUNTIME_OPTIONAL})
+runtime_source_before = snapshot(runtime_source)
+runtime_manifest_before = RT_MANIFEST.read_bytes()
+runtime_stage_a = work / "runtime-stage-a"
+runtime_stage_b = work / "runtime-stage-b"
+stage_result = expect_ok(
+    root,
+    "stage-runtime",
+    "--runtime-assets", runtime_source,
+    "--runtime-manifest", RT_MANIFEST,
+    "--out", runtime_stage_a,
+)
+assert stage_result["status"] == "staged" and stage_result["asset_count"] == 3
+assert stage_result["features"] == ["gpu", "wifi", "touch"]
+assert stage_result["manifest_sha256"] == digest(RT_MANIFEST.read_bytes())
+assert stage_result["deployment_authorized"] is False
+expect_ok(
+    root,
+    "stage-runtime",
+    "--runtime-assets", runtime_source,
+    "--runtime-manifest", RT_MANIFEST,
+    "--out", runtime_stage_b,
+)
+assert snapshot(runtime_stage_a) == snapshot(runtime_stage_b)
+stage_entries, _ = snapshot(runtime_stage_a)
+stage_files = {entry.path: entry for entry in stage_entries if entry.kind == "file"}
+assert set(stage_files) == {target.lstrip("/") for target in RUNTIME_FILES}
+assert all(entry.mode == 0o600 for entry in stage_files.values())
+assert all(entry.mode == 0o700 for entry in stage_entries if entry.kind == "dir" and entry.path != ".")
+assert next(entry for entry in stage_entries if entry.path == ".").mode == 0o755
+assert not any("optional.bin" in entry.path for entry in stage_entries)
+assert snapshot(runtime_source) == runtime_source_before
+assert RT_MANIFEST.read_bytes() == runtime_manifest_before
+
+staged_runtime_kit = work / "staged-runtime-kit"
+assembled = expect_ok(root, *rt_asm(staged_runtime_kit, runtime_stage_a))
+assert assembled["runtime_status"] == "verified" and assembled["runtime_asset_count"] == 3
+assert assembled["runtime_digest"] == stage_result["runtime_digest"]
+ok("stage-runtime publishes the exact deterministic private closure and assembly binds it")
+
+for name, source, reason in (
+    ("a runtime source missing a selected file",
+     make_runtime({k: v for k, v in RUNTIME_FILES.items() if "touch" not in k}),
+     "missing required file"),
+    ("a runtime source with a wrong selected hash",
+     make_runtime({**RUNTIME_FILES, "/usr/local/lib/myron-touch/touch.fw": ("touch", b"wrong")}),
+     "SHA-256 differs"),
+):
+    output = fresh("runtime-stage-refusal") / "out"
+    rt_fail(
+        name,
+        ["stage-runtime", "--runtime-assets", source, "--runtime-manifest", RT_MANIFEST,
+         "--out", output],
+        reason,
+        output,
+    )
+
+existing_runtime_output = fresh("runtime-stage-existing") / "out"
+existing_runtime_output.mkdir()
+code, _, err = run_exact(
+    root, "stage-runtime", "--runtime-assets", runtime_source,
+    "--runtime-manifest", RT_MANIFEST, "--out", existing_runtime_output,
+)
+assert code != 0 and "already exists" in err
+inside_runtime_output = runtime_source / "inside-output"
+rt_fail(
+    "a runtime stage output inside its source",
+    ["stage-runtime", "--runtime-assets", runtime_source, "--runtime-manifest", RT_MANIFEST,
+     "--out", inside_runtime_output],
+    "overlaps the output",
+    inside_runtime_output,
+)
+code, _, err = run_exact(
+    root, "stage-runtime", "--runtime-assets", "none",
+    "--runtime-manifest", RT_MANIFEST, "--out", work / "runtime-none",
+)
+assert code != 0 and "only valid" in err
+ok("stage-runtime refuses missing, changed, overlapping, existing and none inputs")
+
 runtime_a = make_runtime({**RUNTIME_FILES})
 runtime_before = snapshot(runtime_a)
 rt_manifest_before = RT_MANIFEST.read_bytes()

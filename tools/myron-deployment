@@ -20,8 +20,10 @@ prints the permanent blockers and refuses. Nothing here is bootable, flashable,
 an image, an atomic-snapshot proof, or hardware-qualified.
 
 No external command is run and nothing outside the requested output is
-written. Inputs are only read; the rootfs stage, the runtime assets (and their
-manifest) and the symvers files are bound by hash, never copied.
+written. Inputs are only read. ``stage-runtime`` copies only the manifest-bound
+private closure into its requested private staging output; assembly never
+copies runtime bytes into the kit. The rootfs stage, runtime stage and manifest,
+and symvers files are otherwise bound by hash.
 """
 
 from __future__ import annotations
@@ -1429,6 +1431,93 @@ def inspect_runtime(
     return evidence, tree.directory_ids, frozenset({manifest_handle.parent_identity})
 
 
+def command_stage_runtime(contracts: Contracts, runtime: RuntimeInput, out: str) -> dict:
+    """Publish the exact required private runtime closure into a new local tree.
+
+    The source may contain optional manifest rows and bytes.  Every source
+    entry is still traversed under the runtime bounds, while only required
+    gpu/wifi/touch bytes are retained.  Output modes are deliberately private;
+    this is staging storage, not an installation permission contract.
+    """
+    if runtime.root is None:
+        raise DeploymentError("stage-runtime requires a --runtime-assets directory")
+    check_runtime_scope(runtime, {"output": out})
+    selected, manifest_handle = runtime_selection(contracts, runtime.manifest)
+    try:
+        wanted = {row["target"].lstrip("/"): row for row in selected}
+        descriptor, source_identity = open_trusted_artifact(runtime.root, "runtime source root")
+        try:
+            tree = walk_tree(
+                descriptor,
+                RUNTIME_LIMITS,
+                allow_symlinks=False,
+                capture=lambda path, size: size if path in wanted else None,
+                capture_total_bytes=RUNTIME_LIMITS.total_bytes,
+                trusted_ownership=True,
+                label="runtime source assets",
+            )
+        finally:
+            os.close(descriptor)
+
+        index = {entry.path: entry for entry in tree.entries}
+        directories = set()
+        rows = []
+        spec = []
+        for path in sorted(wanted, key=lambda item: item.encode("utf-8")):
+            entry, row = index.get(path), wanted[path]
+            data = tree.data.get(path)
+            if entry is None or entry.kind != "file" or data is None:
+                raise DeploymentError(f"runtime source is missing required file: {row['target']}")
+            if entry.sha256 != row["sha256"] or sha256_bytes(data) != row["sha256"]:
+                raise DeploymentError(f"runtime source asset SHA-256 differs: {row['target']}")
+            parts = path.split("/")
+            directories.update("/".join(parts[:number]) for number in range(1, len(parts)))
+            spec.append((path, "file", 0o600, data))
+            rows.append({
+                "target": row["target"], "sha256": entry.sha256, "size": entry.size,
+                "mode": "0600", "feature": row["feature"], "provenance": row["provenance"],
+            })
+        spec.extend((path, "dir", 0o700, None) for path in directories)
+        spec.sort(key=lambda item: item[0].encode("utf-8"))
+        expected = spec_entries(spec)
+        manifest_parent_ids = frozenset({manifest_handle.parent_identity})
+        check_runtime_alias(tree.directory_ids, manifest_parent_ids, frozenset())
+        recheck_trusted_artifact(runtime.root, source_identity, "runtime source root")
+        recheck_runtime_manifest(runtime.manifest, manifest_handle)
+
+        def verify_built(temporary_path: str, output_descriptor: int) -> None:
+            built = walk_tree(
+                output_descriptor,
+                RUNTIME_LIMITS,
+                allow_symlinks=False,
+                trusted_ownership=True,
+                label="runtime stage",
+            )
+            diff_entries(built.entries, expected, "runtime stage")
+            recheck_trusted_artifact(runtime.root, source_identity, "runtime source root")
+            recheck_runtime_manifest(runtime.manifest, manifest_handle)
+
+        publish(
+            out,
+            [runtime.root, runtime.manifest],
+            tree.directory_ids | manifest_parent_ids,
+            spec,
+            verify_built,
+        )
+        features = list(contracts.deployment["runtime"]["required_features"])
+        manifest_sha256 = contracts.deployment["runtime"]["manifest_sha256"]
+        return {
+            "status": "staged",
+            "asset_count": len(rows),
+            "features": features,
+            "manifest_sha256": manifest_sha256,
+            "runtime_digest": runtime_digest(manifest_sha256, features, rows),
+            "deployment_authorized": False,
+        }
+    finally:
+        os.close(manifest_handle.pinned)
+
+
 def bind_runtime(
     contracts: Contracts, runtime: RuntimeInput
 ) -> tuple[dict, frozenset, frozenset]:
@@ -2399,6 +2488,12 @@ def build_parser() -> argparse.ArgumentParser:
     stage = commands.add_parser("stage-modules", help="stage the qualified module overlay into a new directory")
     stage.add_argument("--assets", required=True)
     stage.add_argument("--out", required=True)
+    runtime_stage = commands.add_parser(
+        "stage-runtime", help="stage the manifest-bound private runtime closure into a new directory"
+    )
+    runtime_stage.add_argument("--runtime-assets", required=True, help="canonical absolute source root")
+    runtime_stage.add_argument("--runtime-manifest", required=True, help="pinned runtime manifest TSV")
+    runtime_stage.add_argument("--out", required=True)
     assemble = commands.add_parser("assemble", help="bind rootfs, overlay and contracts into a new kit")
     assemble.add_argument("--rootfs-stage", required=True)
     assemble.add_argument("--rootfs-manifest", required=True)
@@ -2429,6 +2524,10 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
             result = command_show(contracts)
         elif args.command == "stage-modules":
             result = command_stage_modules(contracts, args.assets, args.out)
+        elif args.command == "stage-runtime":
+            result = command_stage_runtime(
+                contracts, runtime_input(args.runtime_assets, args.runtime_manifest), args.out
+            )
         elif args.command == "assemble":
             result = command_assemble(
                 contracts, args.rootfs_stage, args.rootfs_manifest, args.module_stage, args.out, args.assets,
