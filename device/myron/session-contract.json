@@ -48,11 +48,11 @@
   "components": {
     "capture_contract": {
       "path": "device/myron/capture-contract.json",
-      "sha256": "b5ccb100cf28c7d58ce40fc634719bb9ceede6a3e94476c546914af7a443edce"
+      "sha256": "e9fe948063f73fdb38818c07e5e7bea0da67d3f03fb340373cadd4acb10d7d89"
     },
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "9fe3d28d4f2843bf652efb3081f61c21791421e45e021a3842d1a6b84185fb1b"
+      "sha256": "420b98ccf4e9dc8d900f2584b5af7d44dc5b38110c8a035ba56d8cf575d8dc4d"
     }
   },
   "coverage": {
@@ -129,42 +129,137 @@
       },
       {
         "classification": "synthetic-projection",
-        "field": "images.absent",
+        "field": "images.role",
         "operation": "R3-boot-image-headers"
       },
       {
         "classification": "unverified-source-claim",
-        "field": "images.header_version",
+        "field": "images.image.format",
         "operation": "R3-boot-image-headers"
       },
       {
         "classification": "unverified-source-claim",
-        "field": "images.page_size",
+        "field": "images.image.version",
         "operation": "R3-boot-image-headers"
       },
       {
         "classification": "unverified-source-claim",
-        "field": "images.os_version",
+        "field": "images.image.page_size",
         "operation": "R3-boot-image-headers"
       },
       {
         "classification": "unverified-source-claim",
-        "field": "images.component_sizes",
+        "field": "images.image.os_version",
         "operation": "R3-boot-image-headers"
       },
       {
         "classification": "unverified-source-claim",
-        "field": "images.component_offsets",
+        "field": "images.image.size_bytes",
         "operation": "R3-boot-image-headers"
       },
       {
         "classification": "unverified-source-claim",
-        "field": "images.segment_count",
+        "field": "images.image.sha256",
         "operation": "R3-boot-image-headers"
       },
       {
         "classification": "unverified-source-claim",
-        "field": "images.header_sha256",
+        "field": "images.image.header.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.header.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.header.sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.components.*.role",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.components.*.index",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.components.*.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.components.*.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.components.*.sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.components.*.ramdisk_type",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.table.role",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.table.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.table.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.table.sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.table.entry_size",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.table.entry_count",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.coverage.kind",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.coverage.ranges.*.index",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.coverage.ranges.*.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.coverage.ranges.*.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "classification": "unverified-source-claim",
+        "field": "images.image.coverage.covered_bytes",
         "operation": "R3-boot-image-headers"
       },
       {
@@ -275,38 +370,133 @@
         "operation": "R2-gpt-and-recovery-inventory"
       },
       {
-        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
-        "field": "images.header_version",
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.format",
         "operation": "R3-boot-image-headers"
       },
       {
-        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
-        "field": "images.page_size",
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.version",
         "operation": "R3-boot-image-headers"
       },
       {
-        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
-        "field": "images.os_version",
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.page_size",
         "operation": "R3-boot-image-headers"
       },
       {
-        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
-        "field": "images.component_sizes",
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.os_version",
         "operation": "R3-boot-image-headers"
       },
       {
-        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
-        "field": "images.component_offsets",
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.size_bytes",
         "operation": "R3-boot-image-headers"
       },
       {
-        "claim": "header-summary-supplied-not-parsed-from-image-bytes",
-        "field": "images.segment_count",
+        "claim": "hash-supplied-not-recomputed-from-image-bytes",
+        "field": "images.image.sha256",
         "operation": "R3-boot-image-headers"
       },
       {
-        "claim": "header-hash-supplied-not-verified-against-image-bytes",
-        "field": "images.header_sha256",
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.header.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.header.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "hash-supplied-not-recomputed-from-image-bytes",
+        "field": "images.image.header.sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.components.*.role",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.components.*.index",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.components.*.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.components.*.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "hash-supplied-not-recomputed-from-image-bytes",
+        "field": "images.image.components.*.sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.components.*.ramdisk_type",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.table.role",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.table.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.table.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "hash-supplied-not-recomputed-from-image-bytes",
+        "field": "images.image.table.sha256",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.table.entry_size",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.table.entry_count",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.coverage.kind",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.coverage.ranges.*.index",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.coverage.ranges.*.offset",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.coverage.ranges.*.size_bytes",
+        "operation": "R3-boot-image-headers"
+      },
+      {
+        "claim": "image-summary-supplied-not-parsed-from-image-bytes",
+        "field": "images.image.coverage.covered_bytes",
         "operation": "R3-boot-image-headers"
       },
       {
@@ -344,7 +534,7 @@
   },
   "evidence_level": "synthetic-adapter-rehearsal-only",
   "executes": false,
-  "format_version": "0.1.0",
+  "format_version": "0.2.0",
   "human_approval_required": true,
   "identity": {
     "device.codename": "myron",
@@ -356,7 +546,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-session-impl.py",
-    "sha256": "f6f2ce9c0c320740cbcda92108c478372ea47e57f46544d35344a018b787c8d5"
+    "sha256": "244e8136bc2930e84d04c9b5f8ef3a9411fcb24339ab77ac3870fe4a130225d6"
   },
   "input": {
     "closure": [
@@ -403,10 +593,10 @@
       },
       {
         "format": "json",
-        "max_bytes": 32768,
+        "max_bytes": 1048576,
         "min_bytes": 1,
         "operation": "R3-boot-image-headers",
-        "parser": "synthetic-header-summaries-v1",
+        "parser": "synthetic-header-summaries-v2",
         "path": "r3-header-summaries.json"
       },
       {
@@ -466,7 +656,7 @@
         "path": "r7-bootconfig.txt"
       }
     ],
-    "format_version": "0.1.0",
+    "format_version": "0.2.0",
     "json": "strict canonical ASCII; duplicate keys, floats, booleans for integers rejected",
     "json_depth_max": 8,
     "kind": "myron-synthetic-reads",
@@ -666,7 +856,7 @@
               "type": "bool"
             }
           },
-          "sorted_unique_by": "name",
+          "sorted_unique_by": null,
           "type": "rows"
         },
         "rows_field": "rows"
@@ -680,127 +870,148 @@
             ]
           },
           "schema": {
-            "max": 1,
-            "min": 1,
+            "max": 2,
+            "min": 2,
             "type": "int"
           }
         },
         "rows": {
-          "max": 12,
-          "min": 1,
+          "max": 18,
+          "min": 18,
           "row": {
-            "absent": {
-              "type": "bool"
-            },
-            "partition_name": {
-              "pattern": "(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?",
-              "type": "text"
-            }
-          },
-          "sorted_unique_by": "partition_name",
-          "type": "rows",
-          "variants": {
-            "cases": [
-              {
-                "constraints": [
-                  {
-                    "count": "segment_count",
-                    "lists": [
-                      "component_sizes",
-                      "component_offsets"
-                    ],
-                    "type": "list_lengths"
-                  }
-                ],
+            "image": {
+              "of": {
                 "fields": {
-                  "component_offsets": {
-                    "item": {
-                      "max": 4294967296,
-                      "min": 0,
-                      "type": "int"
+                  "components": {
+                    "max": 256,
+                    "min": 1,
+                    "row": {
+                      "index": {
+                        "max": 255,
+                        "min": 0,
+                        "type": "int"
+                      },
+                      "offset": {
+                        "max": 16777216,
+                        "min": 0,
+                        "type": "int"
+                      },
+                      "ramdisk_type": {
+                        "of": {
+                          "max": 3,
+                          "min": 0,
+                          "type": "int"
+                        },
+                        "type": "nullable"
+                      },
+                      "role": {
+                        "type": "enum",
+                        "values": [
+                          "kernel",
+                          "ramdisk",
+                          "second",
+                          "recovery_dtbo",
+                          "dtb",
+                          "boot_signature",
+                          "vendor_ramdisk",
+                          "vendor_ramdisk_fragment",
+                          "bootconfig",
+                          "dt_entry"
+                        ]
+                      },
+                      "sha256": {
+                        "of": {
+                          "pattern": "[0-9a-f]{64}",
+                          "type": "hash"
+                        },
+                        "type": "nullable"
+                      },
+                      "size_bytes": {
+                        "max": 16777216,
+                        "min": 0,
+                        "type": "int"
+                      }
                     },
-                    "max": 0,
-                    "min": 0,
-                    "sorted_unique": false,
-                    "type": "list"
+                    "sorted_unique_by": [
+                      "role",
+                      "index"
+                    ],
+                    "type": "rows"
                   },
-                  "component_sizes": {
-                    "item": {
-                      "max": 4294967296,
-                      "min": 0,
-                      "type": "int"
+                  "coverage": {
+                    "fields": {
+                      "covered_bytes": {
+                        "max": 16777216,
+                        "min": 1,
+                        "type": "int"
+                      },
+                      "kind": {
+                        "type": "enum",
+                        "values": [
+                          "metadata-only",
+                          "full-image"
+                        ]
+                      },
+                      "ranges": {
+                        "max": 32,
+                        "min": 1,
+                        "row": {
+                          "index": {
+                            "max": 31,
+                            "min": 0,
+                            "type": "int"
+                          },
+                          "offset": {
+                            "max": 16777215,
+                            "min": 0,
+                            "type": "int"
+                          },
+                          "size_bytes": {
+                            "max": 16777216,
+                            "min": 1,
+                            "type": "int"
+                          }
+                        },
+                        "sorted_unique_by": "index",
+                        "type": "rows"
+                      }
                     },
-                    "max": 0,
-                    "min": 0,
-                    "sorted_unique": false,
-                    "type": "list"
+                    "type": "object"
                   },
-                  "header_sha256": {
-                    "type": "null"
+                  "format": {
+                    "type": "enum",
+                    "values": [
+                      "android-boot",
+                      "android-vendor-boot",
+                      "android-dt-table"
+                    ]
                   },
-                  "header_version": {
-                    "type": "null"
+                  "header": {
+                    "fields": {
+                      "offset": {
+                        "max": 0,
+                        "min": 0,
+                        "type": "int"
+                      },
+                      "sha256": {
+                        "pattern": "[0-9a-f]{64}",
+                        "type": "hash"
+                      },
+                      "size_bytes": {
+                        "max": 2128,
+                        "min": 32,
+                        "type": "int"
+                      }
+                    },
+                    "type": "object"
                   },
                   "os_version": {
-                    "type": "null"
-                  },
-                  "page_size": {
-                    "type": "null"
-                  },
-                  "segment_count": {
-                    "max": 0,
-                    "min": 0,
-                    "type": "int"
-                  }
-                },
-                "when": true
-              },
-              {
-                "constraints": [
-                  {
-                    "count": "segment_count",
-                    "lists": [
-                      "component_sizes",
-                      "component_offsets"
-                    ],
-                    "type": "list_lengths"
-                  }
-                ],
-                "fields": {
-                  "component_offsets": {
-                    "item": {
-                      "max": 4294967296,
+                    "of": {
+                      "max": 4294967295,
                       "min": 0,
                       "type": "int"
                     },
-                    "max": 8,
-                    "min": 1,
-                    "sorted_unique": false,
-                    "type": "list"
-                  },
-                  "component_sizes": {
-                    "item": {
-                      "max": 4294967296,
-                      "min": 0,
-                      "type": "int"
-                    },
-                    "max": 8,
-                    "min": 1,
-                    "sorted_unique": false,
-                    "type": "list"
-                  },
-                  "header_sha256": {
-                    "pattern": "[0-9a-f]{64}",
-                    "type": "hash"
-                  },
-                  "header_version": {
-                    "max": 4,
-                    "min": 0,
-                    "type": "int"
-                  },
-                  "os_version": {
-                    "pattern": "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
-                    "type": "text"
+                    "type": "nullable"
                   },
                   "page_size": {
                     "type": "int_enum",
@@ -811,17 +1022,87 @@
                       16384
                     ]
                   },
-                  "segment_count": {
-                    "max": 8,
-                    "min": 1,
+                  "sha256": {
+                    "of": {
+                      "pattern": "[0-9a-f]{64}",
+                      "type": "hash"
+                    },
+                    "type": "nullable"
+                  },
+                  "size_bytes": {
+                    "max": 16777216,
+                    "min": 32,
+                    "type": "int"
+                  },
+                  "table": {
+                    "of": {
+                      "fields": {
+                        "entry_count": {
+                          "max": 256,
+                          "min": 0,
+                          "type": "int"
+                        },
+                        "entry_size": {
+                          "type": "int_enum",
+                          "values": [
+                            108,
+                            32
+                          ]
+                        },
+                        "offset": {
+                          "max": 16777216,
+                          "min": 0,
+                          "type": "int"
+                        },
+                        "role": {
+                          "type": "enum",
+                          "values": [
+                            "vendor_ramdisk_table",
+                            "dt_entry_table"
+                          ]
+                        },
+                        "sha256": {
+                          "pattern": "[0-9a-f]{64}",
+                          "type": "hash"
+                        },
+                        "size_bytes": {
+                          "max": 8192,
+                          "min": 0,
+                          "type": "int"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "nullable"
+                  },
+                  "version": {
+                    "max": 4,
+                    "min": 0,
                     "type": "int"
                   }
                 },
-                "when": false
-              }
-            ],
-            "discriminator": "absent"
-          }
+                "type": "object"
+              },
+              "type": "nullable"
+            },
+            "partition_name": {
+              "pattern": "(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?",
+              "type": "text"
+            },
+            "role": {
+              "type": "enum",
+              "values": [
+                "boot",
+                "init_boot",
+                "vendor_boot",
+                "vendor_kernel_boot",
+                "dtbo",
+                "recovery"
+              ]
+            }
+          },
+          "sorted_unique_by": "partition_name",
+          "type": "rows"
         },
         "rows_field": "images"
       },
@@ -965,7 +1246,7 @@
           "format_version": {
             "type": "enum",
             "values": [
-              "0.1.0"
+              "0.2.0"
             ]
           },
           "kind": {
@@ -997,7 +1278,7 @@
           "min": 11,
           "row": {
             "bytes": {
-              "max": 524288,
+              "max": 1048576,
               "min": 0,
               "type": "int"
             },
@@ -1043,10 +1324,11 @@
     "synthetic input adaptation only: the fixture bytes were never read from a phone",
     "collector validation proves structure and cross-checks only, not that any value is true",
     "R2 is a synthetic projection, not a GPT binary parse",
-    "R3 header values and the R4 selection are explicit claims, not parsed from image or device-tree bytes",
+    "R3 image summaries (every offset, size, hash and coverage range) and the R4 selection are explicit claims, not parsed from image or device-tree bytes; R3 has no parser in this phase",
+    "R3 coverage and hash values are unverified-source-claims: full-image coverage proves no provenance or hardware freshness, and metadata-only coverage leaves payload, padding and EOF unverified",
     "R5 order is the fixture file order, not historical load chronology",
     "R7 command line and bootconfig are deliberately narrow projections, not full parsers",
-    "bytes_read is fixture accounting only: it counts consumed fixture payload bytes",
+    "bytes_read is fixture accounting only: it counts consumed fixture payload bytes (the R3 summary file), never R3 coverage bytes and never hardware bytes",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the session contract pins the session implementation bytes; the collector implementation is bound only through the capture contract",
     "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot: the caller-owned source can diverge after any file's final observation, a writable shared mapping can change bytes without changing metadata, and a later verify against a changed source rejects",
@@ -1066,8 +1348,16 @@
       "bytes_read": "exact-consumed-fixture-payload-bytes",
       "excludes": [
         "reads.json",
-        "verification-rereads"
+        "verification-rereads",
+        "r3-coverage-bytes",
+        "hardware-bytes"
       ],
+      "future_hardware_accounting": [
+        "actual-returned-bytes",
+        "rereads-counted-separately",
+        "overreads-counted-separately"
+      ],
+      "hardware_transport": "none",
       "meaning": "fixture-accounting-only",
       "operation_inputs": {
         "R1-identity-and-slot": [
@@ -1095,7 +1385,9 @@
           "r7-cmdline.txt",
           "r7-bootconfig.txt"
         ]
-      }
+      },
+      "r3_coverage_bytes": "unverified-source-claims-not-bytes-read",
+      "read_domain": "fixture"
     },
     "closure": {
       "checksums": {
@@ -1129,9 +1421,9 @@
     "verification": "recompute-from-request-and-reads-byte-for-byte"
   },
   "pinned_versions": {
-    "collector": "0.1.0",
+    "collector": "0.2.0",
     "deployment": "0.4.0",
-    "preflight": "0.2.1",
+    "preflight": "0.3.0",
     "snapshot": "0.2.0"
   },
   "registry": {
@@ -1166,16 +1458,17 @@
       },
       {
         "derivations": [
-          "rows are explicit synthetic header summaries copied as supplied",
-          "header_sha256 is an unverified fixture claim, never recomputed",
-          "every R2 partition that names a boot image needs a present row; no row is inferred",
-          "an absent row is only accepted where R2 lacks the partition"
+          "rows are explicit synthetic image summaries copied as supplied: exactly 18 rows, one per supported partition name",
+          "every offset, size, hash and coverage range is an unverified fixture claim, never recomputed from image bytes",
+          "the collector's R3 profile and semantic rules judge the claims: they prove consistency, not truth",
+          "a null image is accepted only where R2 lacks the name, and a present name needs an image no larger than its R2 partition",
+          "metadata-only and full-image coverage are different claims and are never treated as equivalent"
         ],
         "id": "R3-boot-image-headers",
         "inputs": [
           "r3-header-summaries.json"
         ],
-        "parser": "synthetic-header-summaries-v1"
+        "parser": "synthetic-header-summaries-v2"
       },
       {
         "derivations": [

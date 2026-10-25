@@ -20,13 +20,13 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 REPO = Path(__file__).resolve().parent.parent
 SNAPSHOT_TOOL = REPO / "tools/myron-snapshot"
 PREFLIGHT_CONTRACT_PATH = "device/myron/preflight-contract.json"
 CONTRACT_KIND = "myron-hardware-read-preflight-contract"
 REQUEST_KIND = "myron-hardware-read-approval-request"
-CAPTURE_SCHEMA = "myron-capture-evidence-v1"
+CAPTURE_SCHEMA = "myron-capture-evidence-v2"
 DECISION = "refused-pending-live-evidence"
 REQUEST_MAX_JSON_DEPTH = 8  # the deepest legitimate request (R7 field policy) nests exactly 8 levels
 HEX256 = re.compile(r"[0-9a-f]{64}")
@@ -124,6 +124,33 @@ R7_BOOTCONFIG_ALLOWLIST = [
         "allowed_values": ["myron"],
     },
 ]
+R3_BUDGETS = (
+    1024 * 1024,  # max_output_bytes: the serialized R3 operation document
+    64 * 1024 * 1024,  # max_fixture_input_bytes: fixture payload a rehearsal may consume
+    64 * 1024,  # max_hardware_read_bytes: aggregate metadata coverage of any future read
+)
+# R3 emits are leaf paths of the typed nested image structure (`*` is a list index). The
+# collector recomputes the same paths from its policy registry and refuses a difference.
+R3_EMITS = [
+    "partition-name", "role",
+    "image.format", "image.version", "image.page-size", "image.os-version",
+    "image.size-bytes", "image.sha256",
+    "image.header.offset", "image.header.size-bytes", "image.header.sha256",
+    "image.components.*.role", "image.components.*.index", "image.components.*.offset",
+    "image.components.*.size-bytes", "image.components.*.sha256",
+    "image.components.*.ramdisk-type",
+    "image.table.role", "image.table.offset", "image.table.size-bytes", "image.table.sha256",
+    "image.table.entry-size", "image.table.entry-count",
+    "image.coverage.kind", "image.coverage.ranges.*.index", "image.coverage.ranges.*.offset",
+    "image.coverage.ranges.*.size-bytes", "image.coverage.covered-bytes",
+]
+
+
+def uniform(limit: int) -> tuple[int, int, int]:
+    """An unchanged operation keeps its one numeric ceiling for all three separate budgets."""
+    return (limit, limit, limit)
+
+
 STATUS_TEXT = (
     "Omarchy Mobile Myron hardware-read approval request (offline only)\n"
     "\n"
@@ -329,17 +356,25 @@ def evidence_plan() -> list[dict]:
 def read_operation(
     operation_id: str,
     purpose: list[str],
-    max_bytes: int,
+    budgets: tuple[int, int, int],
     targets: list[str],
     emits: list[str],
     field_policy: dict | None = None,
 ) -> dict:
+    """BUDGETS is (max_output_bytes, max_fixture_input_bytes, max_hardware_read_bytes).
+
+    The three bounds are separate: the serialized operation document, the fixture payload a
+    structural rehearsal may consume, and the bytes any future approved hardware read may
+    return. Schema support for one never authorizes another, and no hardware read exists."""
+    output, fixture, hardware = budgets
     return {
         "id": operation_id,
         "purpose": purpose,
         "transport": "approved-read-only-recovery-session",
         "read_only": True,
-        "max_bytes": max_bytes,
+        "max_output_bytes": output,
+        "max_fixture_input_bytes": fixture,
+        "max_hardware_read_bytes": hardware,
         "targets": targets,
         "emits": emits,
         "field_policy": field_policy or {},
@@ -354,46 +389,45 @@ def requested_reads() -> list[dict]:
     module = d.BLOCKERS[1]
     return [
         read_operation(
-            "R1-identity-and-slot", [boot], 64 * 1024,
+            "R1-identity-and-slot", [boot], uniform(64 * 1024),
             ["bootloader-current-slot", "ro.boot.slot_suffix", "ro.boot.slot",
              "verified-boot-state", "device-tree-compatible"],
             ["codename", "soc", "compatible-prefix", "current-slot", "slot-suffix",
              "verified-boot-state", "sources-agree"],
         ),
         read_operation(
-            "R2-gpt-and-recovery-inventory", [boot], 1024 * 1024,
+            "R2-gpt-and-recovery-inventory", [boot], uniform(1024 * 1024),
             ["read-only-gpt-header-and-entry-array", "recovery-partition-presence"],
             ["partition-name", "size-bytes", "bootable-flag", "slot-suffix",
              "recovery-present"],
         ),
         read_operation(
-            "R3-boot-image-headers", [boot], 64 * 1024,
-            ["boot_* header", "init_boot_* header", "vendor_boot_* header",
-             "vendor_kernel_boot_* header", "dtbo_* header", "recovery_* header"],
-            ["partition-name", "header-version", "page-size", "os-version",
-             "component-sizes", "component-offsets", "segment-count", "header-sha256",
-             "absent"],
+            "R3-boot-image-headers", [boot], R3_BUDGETS,
+            ["boot_* header", "init_boot_* header", "vendor_boot_* header and ramdisk table",
+             "vendor_kernel_boot_* header and ramdisk table", "dtbo_* header and entry table",
+             "recovery_* header"],
+            R3_EMITS,
         ),
         read_operation(
-            "R4-dtb-dtbo-selection", [boot], 64 * 1024,
+            "R4-dtb-dtbo-selection", [boot], uniform(64 * 1024),
             ["live-bootconfig-dt-selection-fields", "live-device-tree-compatible-prefix",
              "dtbo-header-selection-fields"],
             ["dtb-count", "selected-board-id", "selected-board-revision",
              "dtbo-entry-count", "compatible-prefix", "selection-source"],
         ),
         read_operation(
-            "R5-module-load-order", [module], 1024 * 1024,
+            "R5-module-load-order", [module], uniform(1024 * 1024),
             ["/proc/modules names-order-taint-only"],
             ["module-names", "load-order-index", "taint-flags", "order-matches-declared"],
         ),
         read_operation(
-            "R6-storage-and-mount-model", [boot], 64 * 1024,
+            "R6-storage-and-mount-model", [boot], uniform(64 * 1024),
             ["root-mount-by-gpt-name", "root-filesystem-statistics"],
             ["root-source-gpt-name", "filesystem-type", "mount-options", "block-size",
              "rounded-total-bytes", "rounded-free-bytes"],
         ),
         read_operation(
-            "R7-kernel-identity-revalidation", [boot], 1024 * 1024,
+            "R7-kernel-identity-revalidation", [boot], uniform(1024 * 1024),
             ["/sys/kernel/notes hash-only", "/proc/version release-only",
              "allowlisted-kernel-command-line", "allowlisted-bootconfig"],
             ["kernel-release", "notes-sha256", "allowlisted-cmdline",

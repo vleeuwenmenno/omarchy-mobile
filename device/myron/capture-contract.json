@@ -22,15 +22,18 @@
   "capture": {
     "extra_entries": "reject",
     "kind": "myron-precaptured-fixture",
+    "legacy_generations": "reject-no-adapters",
     "operation_kind": "myron-precaptured-operation",
+    "operation_schema": 2,
+    "read_domain": "fixture",
     "total_max_bytes": 4194304,
     "trusted_local_files_only": true
   },
-  "capture_schema": "myron-capture-evidence-v1",
+  "capture_schema": "myron-capture-evidence-v2",
   "components": {
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "9fe3d28d4f2843bf652efb3081f61c21791421e45e021a3842d1a6b84185fb1b"
+      "sha256": "420b98ccf4e9dc8d900f2584b5af7d44dc5b38110c8a035ba56d8cf575d8dc4d"
     }
   },
   "evidence": {
@@ -60,7 +63,7 @@
     "package-install",
     "network-access"
   ],
-  "format_version": "0.1.0",
+  "format_version": "0.2.0",
   "identity": {
     "device.codename": "myron",
     "device.compatible": "qcom,canoe-mtp",
@@ -71,12 +74,12 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-collect-impl.py",
-    "sha256": "a8de431db790968f399459d3d4d3bd951e51d7f3ad3df2037795ded5049fdeb9"
+    "sha256": "8fc49e1d14c68d225d6bc52c3f8886bec5ab720f6c7beb69a0909618c181776a"
   },
   "kind": "myron-capture-collector-contract",
   "pinned_versions": {
     "deployment": "0.4.0",
-    "preflight": "0.2.1",
+    "preflight": "0.3.0",
     "snapshot": "0.2.0"
   },
   "policy": {
@@ -133,8 +136,35 @@
         "module_bytes"
       ]
     },
+    "operation_envelope": {
+      "budget_keys": [
+        "max_output_bytes",
+        "max_fixture_input_bytes",
+        "max_hardware_read_bytes"
+      ],
+      "bytes_read": "fixture-payload-acquisition-within-max_fixture_input_bytes",
+      "hardware_bytes_read": "none-no-hardware-transport-exists",
+      "keys": [
+        "schema",
+        "kind",
+        "id",
+        "request_sha256",
+        "transport",
+        "read_domain",
+        "read_only",
+        "bytes_read",
+        "data"
+      ],
+      "read_domain": "fixture",
+      "schema": 2
+    },
     "operations": {
       "R1-identity-and-slot": {
+        "budgets": {
+          "max_fixture_input_bytes": 65536,
+          "max_hardware_read_bytes": 65536,
+          "max_output_bytes": 65536
+        },
         "constraints": [],
         "container": null,
         "fields": {
@@ -184,6 +214,11 @@
         ]
       },
       "R2-gpt-and-recovery-inventory": {
+        "budgets": {
+          "max_fixture_input_bytes": 1048576,
+          "max_hardware_read_bytes": 1048576,
+          "max_output_bytes": 1048576
+        },
         "constraints": [],
         "container": {
           "row_fields": [
@@ -235,138 +270,162 @@
         ]
       },
       "R3-boot-image-headers": {
+        "budgets": {
+          "max_fixture_input_bytes": 67108864,
+          "max_hardware_read_bytes": 65536,
+          "max_output_bytes": 1048576
+        },
         "constraints": [],
         "container": {
           "row_fields": [
             "partition_name",
-            "absent",
-            "header_version",
-            "page_size",
-            "os_version",
-            "component_sizes",
-            "component_offsets",
-            "segment_count",
-            "header_sha256"
+            "role",
+            "image"
           ],
           "rows_field": "images"
         },
+        "cross_rules": [
+          "r3-presence-matches-r2-inventory",
+          "r3-image-fits-r2-partition"
+        ],
         "fields": {
           "images": {
-            "max": 12,
-            "min": 1,
+            "max": 18,
+            "min": 18,
             "row": {
-              "absent": {
-                "type": "bool"
-              },
-              "partition_name": {
-                "pattern": "(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?",
-                "type": "text"
-              }
-            },
-            "sorted_unique_by": "partition_name",
-            "type": "rows",
-            "variants": {
-              "cases": [
-                {
-                  "constraints": [
-                    {
-                      "count": "segment_count",
-                      "lists": [
-                        "component_sizes",
-                        "component_offsets"
-                      ],
-                      "type": "list_lengths"
-                    }
-                  ],
+              "image": {
+                "of": {
                   "fields": {
-                    "component_offsets": {
-                      "item": {
-                        "max": 4294967296,
-                        "min": 0,
-                        "type": "int"
+                    "components": {
+                      "max": 256,
+                      "min": 1,
+                      "row": {
+                        "index": {
+                          "max": 255,
+                          "min": 0,
+                          "type": "int"
+                        },
+                        "offset": {
+                          "max": 16777216,
+                          "min": 0,
+                          "type": "int"
+                        },
+                        "ramdisk_type": {
+                          "of": {
+                            "max": 3,
+                            "min": 0,
+                            "type": "int"
+                          },
+                          "type": "nullable"
+                        },
+                        "role": {
+                          "type": "enum",
+                          "values": [
+                            "kernel",
+                            "ramdisk",
+                            "second",
+                            "recovery_dtbo",
+                            "dtb",
+                            "boot_signature",
+                            "vendor_ramdisk",
+                            "vendor_ramdisk_fragment",
+                            "bootconfig",
+                            "dt_entry"
+                          ]
+                        },
+                        "sha256": {
+                          "of": {
+                            "pattern": "[0-9a-f]{64}",
+                            "type": "hash"
+                          },
+                          "type": "nullable"
+                        },
+                        "size_bytes": {
+                          "max": 16777216,
+                          "min": 0,
+                          "type": "int"
+                        }
                       },
-                      "max": 0,
-                      "min": 0,
-                      "sorted_unique": false,
-                      "type": "list"
+                      "sorted_unique_by": [
+                        "role",
+                        "index"
+                      ],
+                      "type": "rows"
                     },
-                    "component_sizes": {
-                      "item": {
-                        "max": 4294967296,
-                        "min": 0,
-                        "type": "int"
+                    "coverage": {
+                      "fields": {
+                        "covered_bytes": {
+                          "max": 16777216,
+                          "min": 1,
+                          "type": "int"
+                        },
+                        "kind": {
+                          "type": "enum",
+                          "values": [
+                            "metadata-only",
+                            "full-image"
+                          ]
+                        },
+                        "ranges": {
+                          "max": 32,
+                          "min": 1,
+                          "row": {
+                            "index": {
+                              "max": 31,
+                              "min": 0,
+                              "type": "int"
+                            },
+                            "offset": {
+                              "max": 16777215,
+                              "min": 0,
+                              "type": "int"
+                            },
+                            "size_bytes": {
+                              "max": 16777216,
+                              "min": 1,
+                              "type": "int"
+                            }
+                          },
+                          "sorted_unique_by": "index",
+                          "type": "rows"
+                        }
                       },
-                      "max": 0,
-                      "min": 0,
-                      "sorted_unique": false,
-                      "type": "list"
+                      "type": "object"
                     },
-                    "header_sha256": {
-                      "type": "null"
+                    "format": {
+                      "type": "enum",
+                      "values": [
+                        "android-boot",
+                        "android-vendor-boot",
+                        "android-dt-table"
+                      ]
                     },
-                    "header_version": {
-                      "type": "null"
+                    "header": {
+                      "fields": {
+                        "offset": {
+                          "max": 0,
+                          "min": 0,
+                          "type": "int"
+                        },
+                        "sha256": {
+                          "pattern": "[0-9a-f]{64}",
+                          "type": "hash"
+                        },
+                        "size_bytes": {
+                          "max": 2128,
+                          "min": 32,
+                          "type": "int"
+                        }
+                      },
+                      "type": "object"
                     },
                     "os_version": {
-                      "type": "null"
-                    },
-                    "page_size": {
-                      "type": "null"
-                    },
-                    "segment_count": {
-                      "max": 0,
-                      "min": 0,
-                      "type": "int"
-                    }
-                  },
-                  "when": true
-                },
-                {
-                  "constraints": [
-                    {
-                      "count": "segment_count",
-                      "lists": [
-                        "component_sizes",
-                        "component_offsets"
-                      ],
-                      "type": "list_lengths"
-                    }
-                  ],
-                  "fields": {
-                    "component_offsets": {
-                      "item": {
-                        "max": 4294967296,
+                      "of": {
+                        "max": 4294967295,
                         "min": 0,
                         "type": "int"
                       },
-                      "max": 8,
-                      "min": 1,
-                      "sorted_unique": false,
-                      "type": "list"
-                    },
-                    "component_sizes": {
-                      "item": {
-                        "max": 4294967296,
-                        "min": 0,
-                        "type": "int"
-                      },
-                      "max": 8,
-                      "min": 1,
-                      "sorted_unique": false,
-                      "type": "list"
-                    },
-                    "header_sha256": {
-                      "pattern": "[0-9a-f]{64}",
-                      "type": "hash"
-                    },
-                    "header_version": {
-                      "max": 4,
-                      "min": 0,
-                      "type": "int"
-                    },
-                    "os_version": {
-                      "pattern": "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
-                      "type": "text"
+                      "type": "nullable"
                     },
                     "page_size": {
                       "type": "int_enum",
@@ -377,22 +436,369 @@
                         16384
                       ]
                     },
-                    "segment_count": {
-                      "max": 8,
-                      "min": 1,
+                    "sha256": {
+                      "of": {
+                        "pattern": "[0-9a-f]{64}",
+                        "type": "hash"
+                      },
+                      "type": "nullable"
+                    },
+                    "size_bytes": {
+                      "max": 16777216,
+                      "min": 32,
+                      "type": "int"
+                    },
+                    "table": {
+                      "of": {
+                        "fields": {
+                          "entry_count": {
+                            "max": 256,
+                            "min": 0,
+                            "type": "int"
+                          },
+                          "entry_size": {
+                            "type": "int_enum",
+                            "values": [
+                              108,
+                              32
+                            ]
+                          },
+                          "offset": {
+                            "max": 16777216,
+                            "min": 0,
+                            "type": "int"
+                          },
+                          "role": {
+                            "type": "enum",
+                            "values": [
+                              "vendor_ramdisk_table",
+                              "dt_entry_table"
+                            ]
+                          },
+                          "sha256": {
+                            "pattern": "[0-9a-f]{64}",
+                            "type": "hash"
+                          },
+                          "size_bytes": {
+                            "max": 8192,
+                            "min": 0,
+                            "type": "int"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "nullable"
+                    },
+                    "version": {
+                      "max": 4,
+                      "min": 0,
                       "type": "int"
                     }
                   },
-                  "when": false
-                }
-              ],
-              "discriminator": "absent"
-            }
+                  "type": "object"
+                },
+                "type": "nullable"
+              },
+              "partition_name": {
+                "pattern": "(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?",
+                "type": "text"
+              },
+              "role": {
+                "type": "enum",
+                "values": [
+                  "boot",
+                  "init_boot",
+                  "vendor_boot",
+                  "vendor_kernel_boot",
+                  "dtbo",
+                  "recovery"
+                ]
+              }
+            },
+            "sorted_unique_by": "partition_name",
+            "type": "rows"
           }
         },
-        "input_path": "operations/R3-boot-image-headers.json"
+        "input_path": "operations/R3-boot-image-headers.json",
+        "profile": {
+          "empty_bytes_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "fragment_role": "vendor_ramdisk_fragment",
+          "init_boot_kernel_bytes": 0,
+          "layouts": [
+            {
+              "fixed_page_size": null,
+              "format": "android-boot",
+              "header_bytes": 1632,
+              "slots": [
+                {
+                  "count": 1,
+                  "role": "kernel"
+                },
+                {
+                  "count": 1,
+                  "role": "ramdisk"
+                },
+                {
+                  "count": 1,
+                  "role": "second"
+                }
+              ],
+              "table": null,
+              "version": 0
+            },
+            {
+              "fixed_page_size": null,
+              "format": "android-boot",
+              "header_bytes": 1648,
+              "slots": [
+                {
+                  "count": 1,
+                  "role": "kernel"
+                },
+                {
+                  "count": 1,
+                  "role": "ramdisk"
+                },
+                {
+                  "count": 1,
+                  "role": "second"
+                },
+                {
+                  "count": 1,
+                  "role": "recovery_dtbo"
+                }
+              ],
+              "table": null,
+              "version": 1
+            },
+            {
+              "fixed_page_size": null,
+              "format": "android-boot",
+              "header_bytes": 1660,
+              "slots": [
+                {
+                  "count": 1,
+                  "role": "kernel"
+                },
+                {
+                  "count": 1,
+                  "role": "ramdisk"
+                },
+                {
+                  "count": 1,
+                  "role": "second"
+                },
+                {
+                  "count": 1,
+                  "role": "recovery_dtbo"
+                },
+                {
+                  "count": 1,
+                  "role": "dtb"
+                }
+              ],
+              "table": null,
+              "version": 2
+            },
+            {
+              "fixed_page_size": 4096,
+              "format": "android-boot",
+              "header_bytes": 1580,
+              "slots": [
+                {
+                  "count": 1,
+                  "role": "kernel"
+                },
+                {
+                  "count": 1,
+                  "role": "ramdisk"
+                }
+              ],
+              "table": null,
+              "version": 3
+            },
+            {
+              "fixed_page_size": 4096,
+              "format": "android-boot",
+              "header_bytes": 1584,
+              "slots": [
+                {
+                  "count": 1,
+                  "role": "kernel"
+                },
+                {
+                  "count": 1,
+                  "role": "ramdisk"
+                },
+                {
+                  "count": 1,
+                  "role": "boot_signature"
+                }
+              ],
+              "table": null,
+              "version": 4
+            },
+            {
+              "fixed_page_size": null,
+              "format": "android-vendor-boot",
+              "header_bytes": 2112,
+              "slots": [
+                {
+                  "count": 1,
+                  "role": "vendor_ramdisk"
+                },
+                {
+                  "count": 1,
+                  "role": "dtb"
+                }
+              ],
+              "table": null,
+              "version": 3
+            },
+            {
+              "fixed_page_size": null,
+              "format": "android-vendor-boot",
+              "header_bytes": 2128,
+              "slots": [
+                {
+                  "count": "table-entries",
+                  "role": "vendor_ramdisk_fragment"
+                },
+                {
+                  "count": 1,
+                  "role": "dtb"
+                },
+                {
+                  "count": 1,
+                  "role": "bootconfig"
+                }
+              ],
+              "table": {
+                "entry_bytes": 108,
+                "max_entries": 64,
+                "min_entries": 0,
+                "role": "vendor_ramdisk_table"
+              },
+              "version": 4
+            },
+            {
+              "fixed_page_size": null,
+              "format": "android-dt-table",
+              "header_bytes": 32,
+              "slots": [
+                {
+                  "count": "table-entries",
+                  "role": "dt_entry"
+                }
+              ],
+              "table": {
+                "entry_bytes": 32,
+                "max_entries": 256,
+                "min_entries": 1,
+                "role": "dt_entry_table"
+              },
+              "version": 0
+            }
+          ],
+          "max_coverage_ranges": 32,
+          "max_dt_entries": 256,
+          "max_image_bytes": 16777216,
+          "max_vendor_fragments": 64,
+          "page_sizes": [
+            2048,
+            4096,
+            8192,
+            16384
+          ],
+          "partitions": [
+            {
+              "format": "android-boot",
+              "role": "boot",
+              "versions": [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            },
+            {
+              "format": "android-boot",
+              "role": "init_boot",
+              "versions": [
+                4
+              ]
+            },
+            {
+              "format": "android-vendor-boot",
+              "role": "vendor_boot",
+              "versions": [
+                3,
+                4
+              ]
+            },
+            {
+              "format": "android-vendor-boot",
+              "role": "vendor_kernel_boot",
+              "versions": [
+                3,
+                4
+              ]
+            },
+            {
+              "format": "android-dt-table",
+              "role": "dtbo",
+              "versions": [
+                0
+              ]
+            },
+            {
+              "format": "android-boot",
+              "role": "recovery",
+              "versions": [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            }
+          ],
+          "ramdisk_types": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "row_count": 18,
+          "suffixes": [
+            "",
+            "_a",
+            "_b"
+          ]
+        },
+        "rules": [
+          "r3-exact-partition-rows",
+          "r3-role-from-partition-name",
+          "r3-format-version-profile",
+          "r3-page-size-profile",
+          "r3-os-version-semantics",
+          "r3-header-region",
+          "r3-table-profile",
+          "r3-component-slots",
+          "r3-extents-bounded-disjoint",
+          "r3-coverage-canonical",
+          "r3-coverage-by-kind",
+          "r3-hash-iff-covered",
+          "r3-coverage-budgets"
+        ]
       },
       "R4-dtb-dtbo-selection": {
+        "budgets": {
+          "max_fixture_input_bytes": 65536,
+          "max_hardware_read_bytes": 65536,
+          "max_output_bytes": 65536
+        },
         "constraints": [
           {
             "fields": [
@@ -446,6 +852,11 @@
         "input_path": "operations/R4-dtb-dtbo-selection.json"
       },
       "R5-module-load-order": {
+        "budgets": {
+          "max_fixture_input_bytes": 1048576,
+          "max_hardware_read_bytes": 1048576,
+          "max_output_bytes": 1048576
+        },
         "constraints": [],
         "container": null,
         "fields": {
@@ -502,6 +913,11 @@
         ]
       },
       "R6-storage-and-mount-model": {
+        "budgets": {
+          "max_fixture_input_bytes": 65536,
+          "max_hardware_read_bytes": 65536,
+          "max_output_bytes": 65536
+        },
         "constraints": [],
         "container": null,
         "fields": {
@@ -570,6 +986,11 @@
       },
       "R7-kernel-identity-revalidation": {
         "allowlist_unknown_keys": "reject",
+        "budgets": {
+          "max_fixture_input_bytes": 1048576,
+          "max_hardware_read_bytes": 1048576,
+          "max_output_bytes": 1048576
+        },
         "constraints": [],
         "container": null,
         "fields": {
@@ -615,7 +1036,9 @@
       ],
       "field_policy": {},
       "id": "R1-identity-and-slot",
-      "max_bytes": 65536,
+      "max_fixture_input_bytes": 65536,
+      "max_hardware_read_bytes": 65536,
+      "max_output_bytes": 65536,
       "never_emits": [
         "serial",
         "imei",
@@ -661,7 +1084,9 @@
       ],
       "field_policy": {},
       "id": "R2-gpt-and-recovery-inventory",
-      "max_bytes": 1048576,
+      "max_fixture_input_bytes": 1048576,
+      "max_hardware_read_bytes": 1048576,
+      "max_output_bytes": 1048576,
       "never_emits": [
         "serial",
         "imei",
@@ -697,18 +1122,39 @@
     {
       "emits": [
         "partition-name",
-        "header-version",
-        "page-size",
-        "os-version",
-        "component-sizes",
-        "component-offsets",
-        "segment-count",
-        "header-sha256",
-        "absent"
+        "role",
+        "image.format",
+        "image.version",
+        "image.page-size",
+        "image.os-version",
+        "image.size-bytes",
+        "image.sha256",
+        "image.header.offset",
+        "image.header.size-bytes",
+        "image.header.sha256",
+        "image.components.*.role",
+        "image.components.*.index",
+        "image.components.*.offset",
+        "image.components.*.size-bytes",
+        "image.components.*.sha256",
+        "image.components.*.ramdisk-type",
+        "image.table.role",
+        "image.table.offset",
+        "image.table.size-bytes",
+        "image.table.sha256",
+        "image.table.entry-size",
+        "image.table.entry-count",
+        "image.coverage.kind",
+        "image.coverage.ranges.*.index",
+        "image.coverage.ranges.*.offset",
+        "image.coverage.ranges.*.size-bytes",
+        "image.coverage.covered-bytes"
       ],
       "field_policy": {},
       "id": "R3-boot-image-headers",
-      "max_bytes": 65536,
+      "max_fixture_input_bytes": 67108864,
+      "max_hardware_read_bytes": 65536,
+      "max_output_bytes": 1048576,
       "never_emits": [
         "serial",
         "imei",
@@ -738,9 +1184,9 @@
       "targets": [
         "boot_* header",
         "init_boot_* header",
-        "vendor_boot_* header",
-        "vendor_kernel_boot_* header",
-        "dtbo_* header",
+        "vendor_boot_* header and ramdisk table",
+        "vendor_kernel_boot_* header and ramdisk table",
+        "dtbo_* header and entry table",
         "recovery_* header"
       ],
       "transport": "approved-read-only-recovery-session"
@@ -756,7 +1202,9 @@
       ],
       "field_policy": {},
       "id": "R4-dtb-dtbo-selection",
-      "max_bytes": 65536,
+      "max_fixture_input_bytes": 65536,
+      "max_hardware_read_bytes": 65536,
+      "max_output_bytes": 65536,
       "never_emits": [
         "serial",
         "imei",
@@ -799,7 +1247,9 @@
       ],
       "field_policy": {},
       "id": "R5-module-load-order",
-      "max_bytes": 1048576,
+      "max_fixture_input_bytes": 1048576,
+      "max_hardware_read_bytes": 1048576,
+      "max_output_bytes": 1048576,
       "never_emits": [
         "serial",
         "imei",
@@ -842,7 +1292,9 @@
       ],
       "field_policy": {},
       "id": "R6-storage-and-mount-model",
-      "max_bytes": 65536,
+      "max_fixture_input_bytes": 65536,
+      "max_hardware_read_bytes": 65536,
+      "max_output_bytes": 65536,
       "never_emits": [
         "serial",
         "imei",
@@ -958,7 +1410,9 @@
         }
       },
       "id": "R7-kernel-identity-revalidation",
-      "max_bytes": 1048576,
+      "max_fixture_input_bytes": 1048576,
+      "max_hardware_read_bytes": 1048576,
+      "max_output_bytes": 1048576,
       "never_emits": [
         "serial",
         "imei",

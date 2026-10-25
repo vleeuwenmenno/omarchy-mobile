@@ -23,15 +23,19 @@ done
 grep -q 'synthetic-adapter-rehearsal' "$impl" || fail "tool lacks the synthetic transport"
 [[ $(wc -l < tools/myron-session) -le 90 ]] || fail "the trusted loader grew past 90 lines"
 pass "loader and implementation parse and have no process, network, archive, or live-transport facility"
+grep -Eq '^BOOT_METHOD=external-android$' device/myron/device.conf || fail "device.conf boot method changed"
+grep -Eq '^BOOT_IMAGES=""$' device/myron/device.conf || fail "device.conf BOOT_IMAGES is not empty"
+grep -Eq '^UFS_RW=""$' device/myron/device.conf || fail "device.conf UFS_RW is not empty"
+pass "the R3 migration leaves device.conf external-android with empty BOOT_IMAGES and UFS_RW"
 
 tools/myron-session show > "$tmp/show.json" || fail "repository session contract failed"
 python3 - "$tmp/show.json" <<'PY' || exit 1
 import hashlib, json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-synthetic-session-contract"
-assert value["format_version"] == "0.1.0"
+assert value["format_version"] == "0.2.0"
 assert value["pinned_versions"] == {
-    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0",
+    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0",
 }
 assert value["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert value["dependencies"]["byte_pinned"] is False
@@ -264,15 +268,8 @@ ROWS, END_LBA = gpt_rows()
 DISK_LBAS = END_LBA + 1000
 
 
-def header_row(name, absent):
-    if absent:
-        return {"partition_name": name, "absent": True, "header_version": None, "page_size": None,
-                "os_version": None, "component_sizes": [], "component_offsets": [],
-                "segment_count": 0, "header_sha256": None}
-    return {"partition_name": name, "absent": False, "header_version": 4, "page_size": 4096,
-            "os_version": "16.0.0", "component_sizes": [4096, 8192],
-            "component_offsets": [4096, 8192], "segment_count": 2,
-            "header_sha256": digest(name.encode())}
+fixtures = load("myron_r3_fixtures", repo / "tests/myron-fixtures/r3.py")
+IMAGE_ROWS = fixtures.default_rows()  # 18 rows: six present (all formats' kinds), twelve null
 
 
 MODULES = [("pwrseq_core", ""), ("bluetooth", ""), ("extra_mod", "O"), ("btbcm", ""),
@@ -300,10 +297,8 @@ def good_files():
             "projection": "synthetic-gpt-projection-v1", "sector_bytes": SECTOR,
             "disk_lbas": DISK_LBAS, "rows": copy.deepcopy(ROWS)}),
         "r3-header-summaries.json": jbytes({
-            "schema": 1, "kind": "myron-synthetic-header-summaries",
-            "images": [header_row(n, a) for n, a in (
-                ("boot_a", False), ("boot_b", False), ("dtbo_a", False), ("init_boot_a", False),
-                ("recovery_a", False), ("vendor_boot_a", False), ("vendor_kernel_boot_a", True))]}),
+            "schema": 2, "kind": "myron-synthetic-header-summaries",
+            "images": copy.deepcopy(IMAGE_ROWS)}),
         "r4-selection.json": jbytes({
             "schema": 1, "kind": "myron-synthetic-selection", "compatible_prefix": "qcom,canoe-mtp",
             "dtb_count": 2, "dtbo_entry_count": 3, "selected_board_id": 7,
@@ -322,7 +317,7 @@ def good_files():
 
 def manifest_document(files, req_sha=None, **overrides):
     value = {
-        "schema": 1, "kind": S.READS_KIND, "format_version": "0.1.0",
+        "schema": 1, "kind": S.READS_KIND, "format_version": "0.2.0",
         "session_contract_sha256": SC, "request_sha256": req_sha or request_sha256,
         "synthetic": True,
         "files": [{"path": name, "bytes": len(files[name]), "sha256": digest(files[name])}
@@ -368,9 +363,7 @@ EXPECTED = {
         {"partition_name": n, "size_bytes": s * SECTOR, "bootable_flag": b,
          "slot_suffix": n[-2:] if n.endswith(("_a", "_b")) else ""} for n, s, b in LAYOUT),
         key=lambda row: row["partition_name"]), "recovery_present": True},
-    R3: {"images": [header_row(n, a) for n, a in (
-        ("boot_a", False), ("boot_b", False), ("dtbo_a", False), ("init_boot_a", False),
-        ("recovery_a", False), ("vendor_boot_a", False), ("vendor_kernel_boot_a", True))]},
+    R3: {"images": copy.deepcopy(IMAGE_ROWS)},
     R4: {"dtb_count": 2, "selected_board_id": 7, "selected_board_revision": 1,
          "dtbo_entry_count": 3, "compatible_prefix": "qcom,canoe-mtp",
          "selection_source": "bootconfig"},
@@ -404,7 +397,7 @@ assert contract["bound_contracts"]["deployment_contract"]["sha256"] == contracts
 assert contract["bound_contracts"]["kernel_reference"]["sha256"] == contracts.reference_sha256
 assert contract["bound_contracts"]["snapshot_contract"]["sha256"] == snapshot_sha
 assert contract["pinned_versions"] == {
-    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0"}
+    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0"}
 assert contract["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert contract["dependencies"]["byte_pinned"] is False
 assert "not pinned" in contract["dependencies"]["note"]
@@ -434,6 +427,17 @@ assert contract["output"]["closure"]["files"] == sorted([
 assert contract["output"]["closure"]["checksums"]["sufficient_for_verification"] is False
 assert contract["output"]["accounting"]["meaning"] == "fixture-accounting-only"
 assert contract["output"]["accounting"]["bytes_read"] == "exact-consumed-fixture-payload-bytes"
+accounting = contract["output"]["accounting"]
+assert accounting["read_domain"] == "fixture" and accounting["hardware_transport"] == "none"
+assert accounting["future_hardware_accounting"] == [
+    "actual-returned-bytes", "rereads-counted-separately", "overreads-counted-separately"]
+assert {"r3-coverage-bytes", "hardware-bytes"} <= set(accounting["excludes"])
+assert accounting["r3_coverage_bytes"] == "unverified-source-claims-not-bytes-read"
+r3_input = next(row for row in contract["input"]["files"] if row["operation"] == "R3-boot-image-headers")
+assert r3_input["max_bytes"] == 1048576 and r3_input["parser"] == "synthetic-header-summaries-v2"
+assert contract["input"]["schemas"]["r3-header-summaries.json"]["fields"]["schema"] == {
+    "type": "int", "min": 2, "max": 2}
+assert not any("max_bytes" in row for row in contract["registry"]["operations"])
 assert contract["capture"]["unchanged_for_collector"] is True
 assert contract["identity"] == C.identity_values(contracts)
 assert any("byte-pinned" in text for text in contract["limitations"])
@@ -462,7 +466,8 @@ contract_tamper("contract without a pin", lambda v: v["components"].pop("capture
 contract_tamper("contract capture hash", lambda v: v["components"]["capture_contract"].update(sha256="0" * 64))
 contract_tamper("contract preflight hash", lambda v: v["components"]["preflight_contract"].update(sha256="0" * 64))
 contract_tamper("contract bound deployment hash", lambda v: v["bound_contracts"]["deployment_contract"].update(sha256="0" * 64))
-contract_tamper("contract version pin", lambda v: v["pinned_versions"].update(collector="0.2.0"))
+contract_tamper("contract version pin", lambda v: v["pinned_versions"].update(collector="0.1.0"))
+contract_tamper("contract preflight version pin", lambda v: v["pinned_versions"].update(preflight="0.2.1"))
 contract_tamper("contract dependencies claim byte pin", lambda v: v["dependencies"].update(byte_pinned=True))
 contract_tamper("contract dependency trust label", lambda v: v["dependencies"].update(trust="byte-pinned"))
 contract_tamper("contract implementation hash", lambda v: v["implementation"].update(sha256="0" * 64))
@@ -631,9 +636,9 @@ assert "$(" not in result_text and "export " not in result_text
 for operation in OPERATION_IDS:
     document = json.loads(data[f"capture/operations/{operation}.json"])
     assert document == {
-        "schema": 1, "kind": C.OPERATION_KIND, "id": operation, "request_sha256": request_sha256,
-        "transport": C.TRANSPORT, "read_only": True, "bytes_read": BYTES_READ[operation],
-        "data": EXPECTED[operation]}, operation
+        "schema": 2, "kind": C.OPERATION_KIND, "id": operation, "request_sha256": request_sha256,
+        "transport": C.TRANSPORT, "read_domain": "fixture", "read_only": True,
+        "bytes_read": BYTES_READ[operation], "data": EXPECTED[operation]}, operation
     assert data[f"capture/operations/{operation}.json"] == D.render_json(document)
 rehearsal = json.loads(data["rehearsal.json"])
 manifest = json.loads(data["manifest.json"])
@@ -657,12 +662,21 @@ assert rehearsal["accounting"]["meaning"] == "fixture-accounting-only"
 assert rehearsal["accounting"]["total_fixture_payload_bytes"] == sum(len(v) for v in FILES.values())
 assert "reads.json" in rehearsal["accounting"]["excludes"]
 classes = {(row["operation"], row["field"]): row["classification"] for row in rehearsal["coverage"]}
-assert classes[(R3, "images.header_sha256")] == "unverified-source-claim"
+assert classes[(R3, "images.partition_name")] == "synthetic-projection"
+assert classes[(R3, "images.role")] == "synthetic-projection"
+r3_classes = {field: klass for (operation, field), klass in classes.items() if operation == R3}
+assert {field for field, klass in r3_classes.items() if klass == "unverified-source-claim"} == {
+    f"images.{leaf}" for leaf in S.R3_IMAGE_LEAVES}, "every nested R3 value is an unverified claim"
+for field in ("images.image.header.sha256", "images.image.sha256", "images.image.components.*.sha256",
+              "images.image.table.sha256", "images.image.coverage.covered_bytes",
+              "images.image.coverage.ranges.*.offset", "images.image.os_version"):
+    assert classes[(R3, field)] == "unverified-source-claim", field
+assert not any(klass == "parsed-bytes" for field, klass in r3_classes.items())
 assert classes[(R7, "notes_sha256")] == "parsed-bytes" and classes[(R5, "module_names")] == "parsed-bytes"
 assert classes[(R2, "partitions.size_bytes")] == "synthetic-projection"
 assert {(row["operation"], row["field"]) for row in rehearsal["unresolved_claims"]} == {
     key for key, value in classes.items() if value == "unverified-source-claim"}
-assert {(R3, "images.header_sha256"), (R2, "partitions.bootable_flag")} <= {
+assert {(R3, "images.image.header.sha256"), (R2, "partitions.bootable_flag")} <= {
     (row["operation"], row["field"]) for row in rehearsal["unresolved_claims"]}
 assert rehearsal["limitations"] == contract["limitations"] and rehearsal["non_goals"] == contract["non_goals"]
 assert rehearsal["dependencies"] == {"trust": "trusted-version-pinned-imports", "byte_pinned": False}
@@ -729,7 +743,7 @@ for count, free, unit, block in (
     assert derived["block_size"] == block and derived["mount_options"] == ["noatime", "rw"]
 ok("R6 totals use block counts times the allocation unit and floor to MiB at every boundary")
 
-for sector, last_offset in ((512, 0), (4096, 0), (4096, 7)):
+for sector, last_offset in ((512, 63), (4096, 5), (4096, 7)):  # boot_a must hold its R3 image
     rows = [{"name": "boot_a", "first_lba": 6, "last_lba": 6 + last_offset, "simulated_bootable": False},
             {"name": "pmos_root", "first_lba": 7 + last_offset, "last_lba": 7 + last_offset + 99,
              "simulated_bootable": True}]
@@ -739,8 +753,8 @@ for sector, last_offset in ((512, 0), (4096, 0), (4096, 7)):
             "projection": "synthetic-gpt-projection-v1", "sector_bytes": sector,
             "disk_lbas": 7 + last_offset + 100, "rows": rows}),
         "r3-header-summaries.json": jbytes({
-            "schema": 1, "kind": "myron-synthetic-header-summaries",
-            "images": [header_row("boot_a", False)]}),
+            "schema": 2, "kind": "myron-synthetic-header-summaries",
+            "images": fixtures.image_rows({"boot_a": fixtures.make_image("boot_a", 4)})}),
     })
     out = work / f"r2-derive-out-{counter[0]}"
     expect_ok("rehearse", "--request", request, "--reads", work / f"r2-derive-{counter[0]}/reads", "--out", out)
@@ -751,6 +765,76 @@ for sector, last_offset in ((512, 0), (4096, 0), (4096, 7)):
         {"partition_name": "pmos_root", "size_bytes": 100 * sector, "bootable_flag": True,
          "slot_suffix": ""}]
 ok("R2 derives sizes from LBA geometry, suffixes from names, and keeps simulated flags as supplied")
+
+# Every supported image format and version passes the whole session path: the session reads the
+# 18-row summary with the collector's own typed rows and rules, builds the capture, and the
+# collector then accepts, collects and re-verifies it. No image bytes exist at any point.
+ALL_LAYOUT = [(name, 24576, False) for name in sorted(fixtures.NAMES)] + [("pmos_root", 10485760, False)]
+ALL_ROWS, ALL_END = gpt_rows(ALL_LAYOUT)
+ALL_R2 = jbytes({
+    "schema": 1, "kind": "myron-synthetic-gpt-projection", "projection": "synthetic-gpt-projection-v1",
+    "sector_bytes": SECTOR, "disk_lbas": ALL_END + 1000, "rows": ALL_ROWS})
+
+
+def summary_bytes(rows):
+    return jbytes({"schema": 2, "kind": "myron-synthetic-header-summaries", "images": rows})
+
+
+def matrix_images(run):
+    images = {}
+    for index, name in enumerate(fixtures.NAMES):
+        versions = fixtures.ROLE_VERSIONS[fixtures.role_of(name)]
+        kind = "full-image" if (run + index) % 2 else "metadata-only"
+        images[name] = fixtures.make_image(name, versions[(run + index) % len(versions)], kind)
+    return images
+
+
+seen = set()
+for run in range(5):
+    images = matrix_images(run)
+    seen |= {(image["format"], image["version"], image["coverage"]["kind"]) for image in images.values()}
+    rows = fixtures.image_rows(images)
+    summary = summary_bytes(rows)
+    base = fresh("matrix") / "reads"
+    write_reads(base, {"r2-partitions.json": ALL_R2, "r3-header-summaries.json": summary})
+    out = work / f"matrix-out-{counter[0]}"
+    expect_ok("rehearse", "--request", request, "--reads", base, "--out", out)
+    expect_ok("verify-rehearsal", "--request", request, "--reads", base, "--rehearsal", out)
+    document = json.loads(walk(out)[1][f"capture/operations/{R3}.json"])
+    assert document["data"]["images"] == rows and document["schema"] == 2
+    assert document["read_domain"] == "fixture" and document["bytes_read"] == len(summary)
+    code_out, code_err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(code_out), contextlib.redirect_stderr(code_err):
+        code = CT.main(["collect", "--request", str(request), "--capture", str(out / "capture"),
+                        "--out", str(work / f"matrix-evidence-{run}")], contracts_root=contracts_root)
+    assert code == 0, code_err.getvalue()
+assert {(fmt, version) for fmt, version, _kind in seen} == {
+    ("android-boot", v) for v in range(5)} | {("android-vendor-boot", 3), ("android-vendor-boot", 4),
+                                              ("android-dt-table", 0)}
+assert {kind for _f, _v, kind in seen} == {"metadata-only", "full-image"}
+ok("every supported format and version, in both coverage kinds, rehearses and is accepted by the collector")
+
+# Coverage is a claim, not bytes read: a 16 MiB full-image claim costs only its summary bytes.
+big = fixtures.make_image("boot_a", 4, "full-image")
+big["size_bytes"] = 2**24
+big["coverage"]["ranges"] = [{"index": 0, "offset": 0, "size_bytes": 2**24}]
+big["coverage"]["covered_bytes"] = 2**24
+claim_rows = fixtures.image_rows({**matrix_images(0), "boot_a": big})
+claim = summary_bytes(claim_rows)
+base = fresh("claim") / "reads"
+write_reads(base, {"r2-partitions.json": ALL_R2, "r3-header-summaries.json": claim})
+out = work / f"claim-out-{counter[0]}"
+expect_ok("rehearse", "--request", request, "--reads", base, "--out", out)
+document = json.loads(walk(out)[1][f"capture/operations/{R3}.json"])
+assert document["bytes_read"] == len(claim) < 2**20 < big["coverage"]["covered_bytes"]
+rehearsal_claim = json.loads(walk(out)[1]["rehearsal.json"])
+r3_operation = next(row for row in rehearsal_claim["operations"] if row["id"] == R3)
+assert r3_operation["bytes_read"] == len(claim)
+assert [r3_operation[key] for key in ("max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes")] == [
+    1048576, 67108864, 65536]
+assert "max_bytes" not in r3_operation
+ok("R3 coverage bytes are unverified claims and never counted as bytes_read")
+assert [row["max_bytes"] for row in S.INPUT_FILES if row["operation"] == R3] == [MIB]
 
 modules = rehearse_ok("r5", {"r5-modules.tsv": b"rmnet\t\nbluetooth\tO\n"})["R5-module-load-order"]
 assert modules == {"module_names": ["rmnet", "bluetooth"], "load_order_index": [0, 1],
@@ -1103,7 +1187,7 @@ bad_reads("manifest wrong contract", manifest_edit=lambda m: m.update(session_co
           match="session contract binding")
 bad_reads("manifest synthetic false", manifest_edit=lambda m: m.update(synthetic=False))
 bad_reads("manifest kind", manifest_edit=lambda m: m.update(kind="myron-precaptured-fixture"))
-bad_reads("manifest version", manifest_edit=lambda m: m.update(format_version="0.2.0"))
+bad_reads("manifest version", manifest_edit=lambda m: m.update(format_version="0.1.0"))
 bad_reads("manifest extra field", manifest_edit=lambda m: m.update(parser="module-name-taint-tsv-v1"),
           match="fields differ")
 bad_reads("manifest missing field", manifest_edit=lambda m: m.pop("synthetic"))
@@ -1149,7 +1233,9 @@ for name in ("r1-source-a.json", "r2-partitions.json", "r3-header-summaries.json
     json_case(f"{name} missing field", name, lambda v: v.pop("kind"), match="fields differ")
     json_case(f"{name} wrong kind", name, lambda v: v.update(kind="other"))
     json_case(f"{name} schema as bool", name, lambda v: v.update(schema=True))
-    json_case(f"{name} schema 2", name, lambda v: v.update(schema=2))
+    other = 1 if name == "r3-header-summaries.json" else 2  # R3's summaries are generation 2
+    json_case(f"{name} schema {other}", name, lambda v, other=other: v.update(schema=other))
+    json_case(f"{name} schema 3", name, lambda v: v.update(schema=3))
     bad_reads(f"{name} not canonical", {name: json.dumps(json.loads(good_files()[name])).encode()},
               match="not canonical JSON")
     bad_reads(f"{name} duplicate key", {name: b'{"schema": 1, "schema": 1}\n'}, match="repeats a JSON key")
@@ -1226,32 +1312,68 @@ json_case("R2 extra row field", "r2-partitions.json", lambda v: v["rows"][0].upd
 json_case("R2 recovery supplied", "r2-partitions.json", lambda v: v.update(recovery_present=False),
           match="fields differ")
 
-json_case("R3 unknown image", "r3-header-summaries.json",
-          lambda v: v["images"][0].update(partition_name="vbmeta_a"))
-json_case("R3 unsorted", "r3-header-summaries.json", lambda v: v["images"].reverse(), match="unique and sorted")
-json_case("R3 duplicate", "r3-header-summaries.json", lambda v: v["images"].append(dict(v["images"][-1])),
+R3F = "r3-header-summaries.json"
+
+
+def r3_row(v, name):
+    return next(row for row in v["images"] if row["partition_name"] == name)
+
+
+json_case("R3 unknown image", R3F, lambda v: v["images"][0].update(partition_name="vbmeta_a"))
+json_case("R3 unsorted", R3F, lambda v: v["images"].reverse(), match="unique and sorted")
+json_case("R3 duplicate row", R3F, lambda v: v["images"].__setitem__(1, dict(v["images"][0])),
           match="unique and sorted")
-json_case("R3 missing summary for an inventoried image", "r3-header-summaries.json",
-          lambda v: v["images"].pop(1), match="no header summary")
-json_case("R3 missing recovery summary", "r3-header-summaries.json",
-          lambda v: v["images"].pop(4), match="no header summary")
-json_case("R3 empty means nothing", "r3-header-summaries.json", lambda v: v.update(images=[]))
-json_case("R3 absent claimed for an inventoried partition", "r3-header-summaries.json",
-          lambda v: v["images"].__setitem__(0, header_row("boot_a", True)), match="presence differs")
-json_case("R3 present claimed for a missing partition", "r3-header-summaries.json",
-          lambda v: v["images"].__setitem__(-1, header_row("vendor_kernel_boot_a", False)),
-          match="presence differs")
-json_case("R3 absent with a header", "r3-header-summaries.json",
-          lambda v: v["images"][-1].update(header_version=4))
-json_case("R3 present without a hash", "r3-header-summaries.json",
-          lambda v: v["images"][0].update(header_sha256=None))
-json_case("R3 header hash shape", "r3-header-summaries.json",
-          lambda v: v["images"][0].update(header_sha256="abc"))
-json_case("R3 page size", "r3-header-summaries.json", lambda v: v["images"][0].update(page_size=1234))
-json_case("R3 segment mismatch", "r3-header-summaries.json", lambda v: v["images"][0].update(segment_count=1))
-json_case("R3 os version", "r3-header-summaries.json", lambda v: v["images"][0].update(os_version="16"))
-json_case("R3 absent as integer", "r3-header-summaries.json", lambda v: v["images"][0].update(absent=0))
-json_case("R3 absent missing", "r3-header-summaries.json", lambda v: v["images"][0].pop("absent"))
+json_case("R3 nineteenth row", R3F, lambda v: v["images"].append(dict(v["images"][-1])),
+          match="must hold 18..18 entries")
+json_case("R3 omitted row", R3F, lambda v: v["images"].pop(1), match="must hold 18..18 entries")
+json_case("R3 omitted recovery row", R3F, lambda v: v["images"].pop(9), match="must hold 18..18 entries")
+json_case("R3 empty means nothing", R3F, lambda v: v.update(images=[]), match="must hold 18..18 entries")
+json_case("R3 role differs from the name", R3F, lambda v: r3_row(v, "boot_a").update(role="dtbo"),
+          match="role differs from its partition name")
+json_case("R3 image claimed for a name R2 lacks", R3F, lambda v: r3_row(v, "vendor_kernel_boot_a").update(
+    image=fixtures.make_image("vendor_kernel_boot_a", 4)), match="presence differs")
+json_case("R3 null claimed for an inventoried partition", R3F,
+          lambda v: r3_row(v, "boot_a").update(image=None), match="presence differs")
+json_case("R3 image larger than its R2 partition", R3F,
+          lambda v: r3_row(v, "init_boot_a")["image"].update(size_bytes=2**24),
+          match="larger than its R2 partition")
+json_case("R3 old parallel-array row", R3F, lambda v: v["images"].__setitem__(0, {
+    "partition_name": "boot", "absent": True, "header_version": None, "page_size": None,
+    "os_version": None, "component_sizes": [], "component_offsets": [], "segment_count": 0,
+    "header_sha256": None}), match="fields differ")
+json_case("R3 absent flag added", R3F, lambda v: v["images"][0].update(absent=True), match="fields differ")
+json_case("R3 header hash shape", R3F, lambda v: r3_row(v, "boot_a")["image"]["header"].update(sha256="abc"))
+json_case("R3 header hash null", R3F, lambda v: r3_row(v, "boot_a")["image"]["header"].update(sha256=None))
+json_case("R3 format and partition disagree", R3F,
+          lambda v: r3_row(v, "boot_a")["image"].update(format="android-vendor-boot"),
+          match="outside its partition profile")
+json_case("R3 page size", R3F, lambda v: r3_row(v, "boot_b")["image"].update(page_size=1234))
+json_case("R3 os version as text", R3F, lambda v: r3_row(v, "boot_a")["image"].update(os_version="16"))
+json_case("R3 os version null on a boot image", R3F,
+          lambda v: r3_row(v, "boot_a")["image"].update(os_version=None), match="os_version")
+json_case("R3 os version on a DT table", R3F, lambda v: r3_row(v, "dtbo_a")["image"].update(os_version=0),
+          match="os_version")
+json_case("R3 component hash outside coverage", R3F,
+          lambda v: r3_row(v, "boot_a")["image"]["components"][0].update(sha256=digest(b"x")),
+          match="whole extent is covered")
+json_case("R3 adjacent ranges", R3F, lambda v: r3_row(v, "boot_a")["image"]["coverage"].update(
+    ranges=[{"index": 0, "offset": 0, "size_bytes": 1000}, {"index": 1, "offset": 1000, "size_bytes": 584}]),
+    match="adjacent and not merged")
+def over_budget(v):
+    image = r3_row(v, "boot_a")["image"]
+    image["size_bytes"] = 200000
+    image["coverage"]["ranges"].append({"index": 1, "offset": 30000, "size_bytes": 70000})
+    image["coverage"]["covered_bytes"] += 70000
+
+
+json_case("R3 metadata coverage over the hardware allowance", R3F, over_budget,
+          match="metadata coverage exceeds the hardware read budget")
+json_case("R3 image hash on metadata-only coverage", R3F,
+          lambda v: r3_row(v, "boot_a")["image"].update(sha256=digest(b"i")), match="image sha256 is required")
+# An R3 summary over its own 1 MiB input bound is refused at admission, before any payload read.
+bad_reads("R3 summary over 1 MiB", {R3F: b" " * (MIB + 1)}, match="byte bounds")
+json_case("R3 nested unknown key", R3F, lambda v: r3_row(v, "boot_a")["image"]["coverage"].update(extra=1),
+          match="fields differ")
 
 json_case("R4 half selection id", "r4-selection.json", lambda v: v.update(selected_board_revision=None),
           match="both be set or both be null")
@@ -1406,8 +1528,14 @@ bad_reads("canary as a bootconfig value", {"r7-bootconfig.txt": f"androidboot.ha
 bad_reads("canary as an excluded-name module", {"r5-modules.tsv": f"{SERIAL_NAME}_{TOKEN_CANARY}\t\n".encode()},
           absent=(TOKEN_CANARY,))
 bad_reads("canary in the manifest", manifest_edit=lambda m: m.update({TOKEN_CANARY: 1}), absent=(TOKEN_CANARY,))
-bad_reads("canary header hash field", edit_json("r3-header-summaries.json", lambda v: v["images"][0].update(
-    os_version=TOKEN_CANARY)), absent=(TOKEN_CANARY,))
+bad_reads("canary in a nested R3 value", edit_json("r3-header-summaries.json", lambda v: r3_row(
+    v, "boot_a")["image"].update(os_version=TOKEN_CANARY)), absent=(TOKEN_CANARY,))
+bad_reads("canary as a nested R3 key", edit_json("r3-header-summaries.json", lambda v: r3_row(
+    v, "boot_a")["image"]["header"].update({TOKEN_CANARY: 1})), absent=(TOKEN_CANARY,))
+bad_reads("canary as an R3 component role", edit_json("r3-header-summaries.json", lambda v: r3_row(
+    v, "boot_a")["image"]["components"][0].update(role=TOKEN_CANARY)), absent=(TOKEN_CANARY,))
+bad_reads("hash-shaped canary in an R3 coverage kind", edit_json("r3-header-summaries.json", lambda v: r3_row(
+    v, "boot_a")["image"]["coverage"].update(kind=digest(b"canary"))), absent=(digest(b"canary"),))
 canary_dir = fresh("canary-name") / "reads"
 write_reads(canary_dir)
 (canary_dir / (TOKEN_CANARY + ".json")).write_text("x")
@@ -1485,7 +1613,15 @@ tampered("rehearsal operation parser", edit_document("rehearsal.json", lambda v:
 tampered("rehearsal input hash", edit_document("rehearsal.json", lambda v: v["inputs"][0].update(sha256="0" * 64)))
 tampered("rehearsal coverage class", edit_document("rehearsal.json", lambda v: v["coverage"][0].update(classification="parsed-bytes")))
 tampered("rehearsal header claim reclassified", edit_document("rehearsal.json", lambda v: [
-    row.update(classification="parsed-bytes") for row in v["coverage"] if row["field"] == "images.header_sha256"]))
+    row.update(classification="parsed-bytes") for row in v["coverage"]
+    if row["field"] == "images.image.header.sha256"]))
+tampered("rehearsal coverage hash reclassified as parsed", edit_document("rehearsal.json", lambda v: [
+    row.update(classification="parsed-bytes") for row in v["coverage"]
+    if row["operation"] == R3 and row["field"].endswith("sha256")]))
+tampered("rehearsal accounting claims hardware bytes", edit_document("rehearsal.json", lambda v: v[
+    "accounting"].update(hardware_transport="usb")))
+tampered("rehearsal accounting counts coverage as bytes read", edit_document("rehearsal.json", lambda v: v[
+    "accounting"].update(r3_coverage_bytes="bytes-read")))
 tampered("rehearsal accounting", edit_document("rehearsal.json", lambda v: v["accounting"].update(meaning="hardware-read")))
 for field, value in (
     ("schema", 2), ("kind", "x"), ("format_version", "9"), ("session_contract_sha256", "0" * 64),
@@ -1510,6 +1646,12 @@ for operation in OPERATION_IDS:
              lambda v: v.update(request_sha256="0" * 64)))
     tampered(f"operation {operation} read-only claim", edit_document(f"capture/operations/{operation}.json",
              lambda v: v.update(read_only=False)))
+    tampered(f"operation {operation} back at schema 1 (a hybrid generation)",
+             edit_document(f"capture/operations/{operation}.json", lambda v: v.update(schema=1)))
+    tampered(f"operation {operation} without its read domain",
+             edit_document(f"capture/operations/{operation}.json", lambda v: v.pop("read_domain")))
+    tampered(f"operation {operation} in a hardware read domain",
+             edit_document(f"capture/operations/{operation}.json", lambda v: v.update(read_domain="hardware")))
 tampered("operation value changed to another valid one", edit_document(
     f"capture/operations/{R5}.json", lambda v: v["data"]["module_names"].__setitem__(2, "other_mod")))
 tampered("operation transport", edit_document(f"capture/operations/{R1}.json", lambda v: v.update(transport="live")))
@@ -2490,9 +2632,9 @@ def version_pin(label, tool, old, new, expect):
 
 
 version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
-            'VERSION = "0.1.0"', 'VERSION = "0.1.1"', "unsupported verifier versions")
+            'VERSION = "0.2.0"', 'VERSION = "0.2.1"', "unsupported verifier versions")
 version_pin("a preflight at another version", "tools/myron-preflight",
-            'VERSION = "0.2.1"', 'VERSION = "0.2.0"', "unsupported verifier versions")
+            'VERSION = "0.3.0"', 'VERSION = "0.2.1"', "unsupported verifier versions")
 ok("dependency version pins are enforced")
 
 print("ok - myron session rehearsal tests passed")

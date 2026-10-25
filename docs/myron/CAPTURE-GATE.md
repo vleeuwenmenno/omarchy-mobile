@@ -2,10 +2,18 @@
 # Myron fixture capture gate (Phase 2.12)
 
 Status (2026-10-24): offline, deterministic, structure-only.
-`tools/myron-collect` 0.1.0 checks a **pre-captured fixture** against one
+`tools/myron-collect` 0.2.0 checks a **pre-captured fixture** against one
 preflight request and records that it matched. It is **not live evidence**,
 **not approval**, and **clears no blocker**. It has **no live transport**: it
 executes nothing, contacts no phone, and reads only local files.
+
+Version 0.2.0 (Phase 2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) moves every
+operation envelope to integer `schema` 2 with `read_domain: "fixture"`, splits
+the old `max_bytes` into three budgets, nests the typed policy and migrates R3
+to 18 typed image rows. Version 0.1.0 captures (schema 1) and any capture that
+mixes generations are refused; there are no adapters. The collector still has
+no parser: every R3 value is a fixture claim it judges for consistency, not
+truth.
 
 The only transport is `external-precaptured-fixture`: a trusted local tree
 that someone else produced earlier. Nothing here proves the fixture came from
@@ -62,15 +70,21 @@ operations/R7-kernel-identity-revalidation.json
 
 `capture.json` binds the capture contract hash, the request hash, the
 transport, `live: false`, and each operation file's SHA-256 and size.
-Each operation file binds the request hash, the transport, `read_only: true`,
-`bytes_read`, and one `data` object whose fields are the request's `emits`
-list for that operation.
+Each operation file binds the integer `schema` 2, the request hash, the
+transport, `read_domain: "fixture"`, `read_only: true`, `bytes_read`, and one
+`data` object whose leaf fields are the request's `emits` list for that
+operation (nested R3 fields are dotted paths; the collector recomputes them from
+its policy registry).
 
 Bounds and rejections:
 
-- each operation file and its `bytes_read` stay within the request's
-  `max_bytes` for that operation (64 KiB or 1 MiB); the whole tree stays
-  within 4 MiB;
+- each operation file stays within the request's `max_output_bytes`, its
+  `bytes_read` within `max_fixture_input_bytes`, and an R3 capture's metadata
+  coverage within `max_hardware_read_bytes` (the three are exact and separate,
+  see [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)); each file stays within 1 MiB and
+  the whole tree within 4 MiB;
+- schema 1 operations, a missing or non-`fixture` `read_domain`, and any
+  capture mixing generations are refused;
 - no extra, missing, nested, symlinked, hard-linked, FIFO/special, executable,
   or mount-crossing entry; no symlinked root or ancestor; no writable parent;
 - strict schemas: exact keys, no booleans for integers, no floats, ranges,
@@ -83,10 +97,12 @@ Bounds and rejections:
   of whole tokens split on any non-alphanumeric character, so `android_id`,
   `android-id`, `android_id_2` and `x_raw_payload` all reject, while
   `android_idx` or `serials` do not. A bare 64-hex SHA-256 value is exempt
-  only at a declared hash field: R3 `header_sha256`, R7 `notes_sha256`, the
+  only at a declared hash field: the R3 `image.sha256`, `image.header.sha256`,
+  `image.components.*.sha256` and `image.table.sha256`, R7 `notes_sha256`, the
   request hash of each operation file and the contract, request and operation
   hashes of `capture.json`. The same string in any other value, or as a key,
-  is rejected as an identifier-shaped value;
+  is rejected as an identifier-shaped value. A hash can still fingerprint a
+  private build: the exemption does not make it anonymous;
 - R5 lists at most 256 modules (names, load-order index and taint flags);
 - R7 accepts only the command-line and bootconfig keys and values the request
   lists; any other key or value fails;
@@ -117,16 +133,21 @@ pin and the claims above:
   `tools/lib/myron-collect-impl.py`, and the SHA-256 of the bytes the loader
   captured and is executing.
 
-Nullable fields and branch rules are policy data, not code. A `nullable` or
-`null` type says where `null` is allowed; a `rows` spec may carry `variants`
-selected by a boolean field. R3 uses that for `absent`: an absent image has
-null `header_version`, `page_size`, `os_version` and `header_sha256`, empty
-component lists and `segment_count` 0, a present image has every field set
-with `segment_count` 1..8, and both lists match the count. R4's board id and
-revision are `nullable` integers with a `null_together` constraint. The
-validators evaluate exactly these specs, so the serialized policy and the
-accepted forms cannot disagree, and `check_policy` refuses a registry whose
-variants, constraints or bounds contradict each other.
+Nullable fields, nesting and sorting are policy data, not code. A `nullable`
+or `null` type says where `null` is allowed; an `object` is an exact-key nested
+structure; `rows` hold exact-key objects and name the field or fields they must
+be unique and sorted by. These nest (R3 rows hold an `image` object that holds
+`components` rows and a `coverage` object that holds `ranges` rows), and the
+validator, the hash-path discovery and the emitted leaf paths all recurse over
+the same spec. R3's `image` is `nullable`; the profile and the named semantic
+rules (`policy.operations.R3.rules`, `profile`, `cross_rules`) are serialized
+beside it and read back by the validator, and `check_policy` refuses a registry
+that lists a rule it does not implement or a profile constant that contradicts a
+typed bound. R4's board id and revision are `nullable` integers with a
+`null_together` constraint. The previous boolean variants (R3 `absent`) and
+`list_lengths` constraints are gone. The validators evaluate exactly these
+specs, so the serialized policy and the accepted forms cannot disagree, and the
+recursive shape check is depth-bounded.
 
 Changing any validator constant, pattern, enum, bound, null form or
 constraint changes the derived contract, and the tool refuses a committed
@@ -175,8 +196,8 @@ Exactly five files:
 - `STATUS.txt`
 - `SHA256SUMS`
 
-`evidence.json` records, per operation, its file hash, size, `bytes_read`,
-`max_bytes` and the exact validated `data`: only the allowlisted, typed fields,
+`evidence.json` records, per operation, its file hash, size, `read_domain`,
+`bytes_read`, the three budgets and the exact validated `data`: only the allowlisted, typed fields,
 with identifiers and raw payloads already rejected, so it holds no raw payload.
 Evidence therefore carries the (fixture) values: treat it with the same care as
 the capture. The artifact is deterministic: `verify-evidence` recomputes every
@@ -184,7 +205,7 @@ byte, including the data, from the request and the capture.
 
 ## Safety and publication
 
-The tool imports exact `myron-preflight` 0.2.1, `myron-snapshot` 0.2.0 and
+The tool imports exact `myron-preflight` 0.3.0, `myron-snapshot` 0.2.0 and
 `myron-deployment` 0.4.0 in-process and refuses any other version. The capture
 contract pins the preflight contract hash; the preflight contract does not
 reference the capture contract. The tool starts no process and has no network
@@ -203,8 +224,9 @@ no output.
 fixture of exactly this shape from a flat tree of synthetic projections and
 checks it with this collector's `validate_operation`, `cross_check` and
 `read_capture`. `capture/` in its rehearsal artifact is consumed by `collect`
-unchanged. The collector (0.1.0) is not modified, and its fixture evidence stays
-`artifact-structure-only`: the rehearsal adds no provenance to it.
+unchanged. The collector is not modified by the rehearsal, and its fixture
+evidence stays `artifact-structure-only`: the rehearsal adds no provenance to
+it.
 
 ## Boundary after Phase 2.12
 

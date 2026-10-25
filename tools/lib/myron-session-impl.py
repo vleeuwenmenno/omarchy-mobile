@@ -25,11 +25,11 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = Path(__file__).resolve().parent.parent
 COLLECT_TOOL = REPO / "tools/myron-collect"
 PINNED_VERSIONS = {
-    "collector": "0.1.0", "preflight": "0.2.1", "snapshot": "0.2.0", "deployment": "0.4.0",
+    "collector": "0.2.0", "preflight": "0.3.0", "snapshot": "0.2.0", "deployment": "0.4.0",
 }
 SESSION_CONTRACT_PATH = "device/myron/session-contract.json"
 IMPLEMENTATION_PATH = "tools/lib/myron-session-impl.py"
@@ -47,10 +47,11 @@ MIB = 1024 * 1024
 TOTAL_READS_BYTES = 4 * MIB
 MANIFEST_PATH = "reads.json"
 MANIFEST_MAX_BYTES = 64 * 1024
-FILE_CEILING_BYTES = 512 * 1024  # no single payload file may be bounded above this
+FILE_CEILING_BYTES = MIB  # no single payload file may be bounded above this (R3's summary is the largest)
 READS_ENTRIES = 13  # the closure (manifest included) plus one: anything past it is overbound
 JSON_DEPTH = 8
 PLAN_DEPTH = 8
+R3_SUMMARY_SCHEMA = 2  # the nested R3 generation; the parallel-array schema 1 form is refused
 HEX256 = re.compile(r"[0-9a-f]{64}")
 RECOVERY_NAME = re.compile(r"recovery(_a|_b)?")
 IMAGE_NAME_LIKE = re.compile(
@@ -90,7 +91,7 @@ INPUT_FILES = [
     {"path": "r2-partitions.json", "operation": R2_ID, "format": "json",
      "parser": "synthetic-gpt-projection-v1", "min_bytes": 1, "max_bytes": 64 * 1024},
     {"path": "r3-header-summaries.json", "operation": R3_ID, "format": "json",
-     "parser": "synthetic-header-summaries-v1", "min_bytes": 1, "max_bytes": 32 * 1024},
+     "parser": "synthetic-header-summaries-v2", "min_bytes": 1, "max_bytes": MIB},
     {"path": "r4-selection.json", "operation": R4_ID, "format": "json",
      "parser": "synthetic-selection-record-v1", "min_bytes": 1, "max_bytes": 16 * 1024},
     {"path": "r5-modules.tsv", "operation": R5_ID, "format": "tsv",
@@ -115,7 +116,7 @@ OPERATION_INPUTS = {
 OPERATION_PARSERS = {
     R1_ID: "synthetic-two-source-compare-v1",
     R2_ID: "synthetic-gpt-projection-v1",
-    R3_ID: "synthetic-header-summaries-v1",
+    R3_ID: "synthetic-header-summaries-v2",
     R4_ID: "synthetic-selection-record-v1",
     R5_ID: "module-name-taint-tsv-v1",
     R6_ID: "synthetic-filesystem-statistics-v1",
@@ -136,10 +137,11 @@ DERIVATIONS = {
         "simulated_bootable is copied to bootable_flag; no flag is inferred",
     ],
     R3_ID: [
-        "rows are explicit synthetic header summaries copied as supplied",
-        "header_sha256 is an unverified fixture claim, never recomputed",
-        "every R2 partition that names a boot image needs a present row; no row is inferred",
-        "an absent row is only accepted where R2 lacks the partition",
+        "rows are explicit synthetic image summaries copied as supplied: exactly 18 rows, one per supported partition name",
+        "every offset, size, hash and coverage range is an unverified fixture claim, never recomputed from image bytes",
+        "the collector's R3 profile and semantic rules judge the claims: they prove consistency, not truth",
+        "a null image is accepted only where R2 lacks the name, and a present name needs an image no larger than its R2 partition",
+        "metadata-only and full-image coverage are different claims and are never treated as equivalent",
     ],
     R4_ID: [
         "the record is copied field by field; no selection is inferred",
@@ -166,6 +168,20 @@ DERIVATIONS = {
         "only keys and values the request lists are accepted; nothing else is filtered out",
     ],
 }
+R3_VALUE_CLAIM = "image-summary-supplied-not-parsed-from-image-bytes"
+R3_HASH_CLAIM = "hash-supplied-not-recomputed-from-image-bytes"
+R3_IMAGE_LEAVES = [
+    "image.format", "image.version", "image.page_size", "image.os_version", "image.size_bytes",
+    "image.sha256",
+    "image.header.offset", "image.header.size_bytes", "image.header.sha256",
+    "image.components.*.role", "image.components.*.index", "image.components.*.offset",
+    "image.components.*.size_bytes", "image.components.*.sha256",
+    "image.components.*.ramdisk_type",
+    "image.table.role", "image.table.offset", "image.table.size_bytes", "image.table.sha256",
+    "image.table.entry_size", "image.table.entry_count",
+    "image.coverage.kind", "image.coverage.ranges.*.index", "image.coverage.ranges.*.offset",
+    "image.coverage.ranges.*.size_bytes", "image.coverage.covered_bytes",
+]
 # (operation, field, class, unresolved claim or None)
 COVERAGE = [
     (R1_ID, "codename", PROJECTION, None),
@@ -181,14 +197,12 @@ COVERAGE = [
     (R2_ID, "partitions.slot_suffix", PROJECTION, None),
     (R2_ID, "recovery_present", PROJECTION, None),
     (R3_ID, "images.partition_name", PROJECTION, None),
-    (R3_ID, "images.absent", PROJECTION, None),
-    (R3_ID, "images.header_version", CLAIM, "header-summary-supplied-not-parsed-from-image-bytes"),
-    (R3_ID, "images.page_size", CLAIM, "header-summary-supplied-not-parsed-from-image-bytes"),
-    (R3_ID, "images.os_version", CLAIM, "header-summary-supplied-not-parsed-from-image-bytes"),
-    (R3_ID, "images.component_sizes", CLAIM, "header-summary-supplied-not-parsed-from-image-bytes"),
-    (R3_ID, "images.component_offsets", CLAIM, "header-summary-supplied-not-parsed-from-image-bytes"),
-    (R3_ID, "images.segment_count", CLAIM, "header-summary-supplied-not-parsed-from-image-bytes"),
-    (R3_ID, "images.header_sha256", CLAIM, "header-hash-supplied-not-verified-against-image-bytes"),
+    (R3_ID, "images.role", PROJECTION, None),
+    *[
+        (R3_ID, f"images.{leaf}", CLAIM,
+         R3_HASH_CLAIM if leaf.endswith("sha256") else R3_VALUE_CLAIM)
+        for leaf in R3_IMAGE_LEAVES
+    ],
     (R4_ID, "dtb_count", CLAIM, "selection-supplied-not-derived-from-boot-image-bytes"),
     (R4_ID, "selected_board_id", CLAIM, "selection-supplied-not-derived-from-boot-image-bytes"),
     (R4_ID, "selected_board_revision", CLAIM, "selection-supplied-not-derived-from-boot-image-bytes"),
@@ -214,10 +228,11 @@ LIMITATIONS = [
     "synthetic input adaptation only: the fixture bytes were never read from a phone",
     "collector validation proves structure and cross-checks only, not that any value is true",
     "R2 is a synthetic projection, not a GPT binary parse",
-    "R3 header values and the R4 selection are explicit claims, not parsed from image or device-tree bytes",
+    "R3 image summaries (every offset, size, hash and coverage range) and the R4 selection are explicit claims, not parsed from image or device-tree bytes; R3 has no parser in this phase",
+    "R3 coverage and hash values are unverified-source-claims: full-image coverage proves no provenance or hardware freshness, and metadata-only coverage leaves payload, padding and EOF unverified",
     "R5 order is the fixture file order, not historical load chronology",
     "R7 command line and bootconfig are deliberately narrow projections, not full parsers",
-    "bytes_read is fixture accounting only: it counts consumed fixture payload bytes",
+    "bytes_read is fixture accounting only: it counts consumed fixture payload bytes (the R3 summary file), never R3 coverage bytes and never hardware bytes",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the session contract pins the session implementation bytes; the collector implementation is bound only through the capture contract",
     "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot: the caller-owned source can diverge after any file's final observation, a writable shared mapping can change bytes without changing metadata, and a later verify against a changed source rejects",
@@ -341,15 +356,20 @@ def raw_schemas() -> dict:
                 "disk_lbas": c._int(2, GPT_LBA_LIMIT),
             },
             "rows_field": "rows",
+            # Rows follow ascending first_lba, not name order, so no central name sort applies;
+            # derive_r2 checks name uniqueness and the LBA order itself.
             "rows": c._rows({
                 "name": c._text(PARTITION_NAME),
                 "first_lba": c._int(1, GPT_LBA_LIMIT),
                 "last_lba": c._int(1, GPT_LBA_LIMIT),
                 "simulated_bootable": c._bool(),
-            }, 1, MAX_PARTITIONS, "name"),
+            }, 1, MAX_PARTITIONS, None),
         },
         "r3-header-summaries.json": {
-            "fields": {"schema": schema, "kind": kind("myron-synthetic-header-summaries")},
+            "fields": {
+                "schema": c._int(R3_SUMMARY_SCHEMA, R3_SUMMARY_SCHEMA),
+                "kind": kind("myron-synthetic-header-summaries"),
+            },
             "rows_field": "images",
             "rows": c.IMAGE_ROWS,
         },
@@ -411,14 +431,8 @@ def check_registry_consistency(c) -> None:
             raise SessionError("session coverage registry is inconsistent")
         declared.setdefault(operation, []).append(field)
     for operation in OPERATION_IDS:
-        policy = registry[operation]
-        container = policy["container"]
-        expected = set(policy["fields"])
-        if container is not None:
-            expected = {name for name in expected if name != container["rows_field"]} | {
-                f"{container['rows_field']}.{name}" for name in container["row_fields"]
-            }
-        if sorted(declared.get(operation, [])) != sorted(expected) or len(set(declared[operation])) != len(
+        expected = c.field_paths(registry[operation], container_prefix=True)
+        if sorted(declared.get(operation, [])) != expected or len(set(declared[operation])) != len(
             declared[operation]
         ):
             raise SessionError("session coverage registry differs from the collector's fields")
@@ -429,7 +443,7 @@ def check_registry_consistency(c) -> None:
             raise SessionError("session input bounds are inconsistent")
     if sum(row["max_bytes"] for row in INPUT_FILES) + MANIFEST_MAX_BYTES > TOTAL_READS_BYTES:
         raise SessionError("session input bounds exceed the total byte bound")
-    limits = {row["id"]: row["max_bytes"] for row in c.preflight().requested_reads()}
+    limits = {row["id"]: row["max_fixture_input_bytes"] for row in c.preflight().requested_reads()}
     for operation in OPERATION_IDS:
         if sum(INPUT_ROWS[path]["max_bytes"] for path in OPERATION_INPUTS[operation]) > limits[operation]:
             raise SessionError("session input bounds exceed an operation's byte bound")
@@ -471,7 +485,13 @@ def accounting_policy() -> dict:
     return {
         "bytes_read": "exact-consumed-fixture-payload-bytes",
         "meaning": "fixture-accounting-only",
-        "excludes": ["reads.json", "verification-rereads"],
+        "read_domain": "fixture",
+        "excludes": ["reads.json", "verification-rereads", "r3-coverage-bytes", "hardware-bytes"],
+        "r3_coverage_bytes": "unverified-source-claims-not-bytes-read",
+        "hardware_transport": "none",
+        "future_hardware_accounting": [
+            "actual-returned-bytes", "rereads-counted-separately", "overreads-counted-separately",
+        ],
         "operation_inputs": {name: list(OPERATION_INPUTS[name]) for name in OPERATION_IDS},
     }
 
@@ -771,18 +791,11 @@ def derive_r3(raw: bytes, inventory: list) -> dict:
     schema = raw_schemas()["r3-header-summaries.json"]
     document = parse_json(raw, "R3 header summaries")
     split_header(document, schema, "images", "R3 header summaries")
-    rows = c.check_rows(schema["rows"], document["images"], "R3 images", "R3 image", {})
-    names = [row["partition_name"] for row in rows]
-    if names != sorted(set(names)):
-        raise SessionError("R3 images are not unique and sorted")
-    present = {row["partition_name"] for row in inventory}
-    for row in rows:
-        listed = row["partition_name"] in present
-        if row["absent"] == listed:
-            raise SessionError("R3 summary presence differs from the R2 inventory")
-    missing = [name for name in sorted(present) if IMAGE_NAME_LIKE.fullmatch(name) and name not in names]
-    if missing:
-        raise SessionError("R3 has no header summary for an inventoried boot image")
+    # The collector's own typed rows and named semantic rules, then its R2 cross rules; the
+    # session adds nothing of its own, so the two cannot disagree about what is admitted.
+    policy = c.policy_registry()["operations"][R3_ID]
+    rows = c.check_r3({"images": document["images"]}, policy, {})
+    c.check_r3_against_r2(rows, inventory, policy)
     return {"images": rows}
 
 
@@ -1221,11 +1234,12 @@ def adapt(env: Environment, inputs: Inputs) -> dict:
 def operation_document(operation: str, request_sha256: str, result: dict) -> dict:
     c = collect()
     return {
-        "schema": 1,
+        "schema": c.OPERATION_SCHEMA,
         "kind": c.OPERATION_KIND,
         "id": operation,
         "request_sha256": request_sha256,
         "transport": c.TRANSPORT,
+        "read_domain": c.READ_DOMAIN,
         "read_only": True,
         "bytes_read": result["bytes_read"],
         "data": result["data"],
@@ -1308,7 +1322,7 @@ def rehearsal_document(env: Environment, inputs: Inputs, results: dict, capture:
                 "parser": OPERATION_PARSERS[row["id"]],
                 "inputs": list(OPERATION_INPUTS[row["id"]]),
                 "bytes_read": results[row["id"]]["bytes_read"],
-                "max_bytes": row["max_bytes"],
+                **{key: row[key] for key in collect().BUDGET_KEYS},
                 "output": f"capture/operations/{row['id']}.json",
                 "output_bytes": len(capture[f"operations/{row['id']}.json"]),
                 "output_sha256": d.sha256_bytes(capture[f"operations/{row['id']}.json"]),
@@ -1432,7 +1446,7 @@ def plan_document(env: Environment, request: dict, request_sha256: str) -> dict:
                 "id": operation,
                 "parser": OPERATION_PARSERS[operation],
                 "inputs": list(OPERATION_INPUTS[operation]),
-                "max_bytes": reads[operation]["max_bytes"],
+                **{key: reads[operation][key] for key in collect().BUDGET_KEYS},
                 "emits": list(reads[operation]["emits"]),
                 "never_emits": list(reads[operation]["never_emits"]),
             }

@@ -2,8 +2,12 @@
 # Myron hardware-read preflight gate (Phase 2.10)
 
 Status (2026-10-24): offline, deterministic, refusal-only.
-`tools/myron-preflight` 0.2.1 consumes a fully re-verified deployment kit and
+`tools/myron-preflight` 0.3.0 consumes a fully re-verified deployment kit and
 snapshot candidate and produces a bounded hardware-read **approval request**.
+Version 0.3.0 (Phase 2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) moves the
+capture schema to `myron-capture-evidence-v2`, replaces each read's single
+`max_bytes` with three separate budgets and gives R3 nested emits; it grants
+nothing new.
 It executes no operation, collects no evidence, contacts no phone, and grants
 no approval. No real request exists yet because no real kit or snapshot has
 been assembled from the owner-supplied archive and runtime tree.
@@ -40,7 +44,7 @@ manifest, symvers, firmware, boot image, partition, or source byte.
 ## Refusal state
 
 The contract pins the deployment and snapshot contracts, the exact seven
-blockers, capture schema `myron-capture-evidence-v1`, and nine false authority
+blockers, capture schema `myron-capture-evidence-v2`, and nine false authority
 flags. Every request has:
 
 ```text
@@ -62,15 +66,20 @@ keeps `blocker_cleared: false`.
 The request names seven stable operations for a future separately approved
 collector. These are identifiers and field allowlists, not shell commands:
 
-| ID | Purpose | Maximum captured input |
+| ID | Purpose | `max_output_bytes` / `max_fixture_input_bytes` / `max_hardware_read_bytes` |
 | --- | --- | --- |
-| `R1-identity-and-slot` | Two-source identity, verified-boot, and slot agreement | 64 KiB |
-| `R2-gpt-and-recovery-inventory` | Partition names/sizes/flags and recovery presence, without GUIDs | 1 MiB |
-| `R3-boot-image-headers` | Header fields and header hashes only | 64 KiB |
-| `R4-dtb-dtbo-selection` | Selected DT/overlay facts and compatible prefix | 64 KiB |
-| `R5-module-load-order` | Module names/order/taint only | 1 MiB |
-| `R6-storage-and-mount-model` | Root GPT name, filesystem, options, rounded sizes | 64 KiB |
-| `R7-kernel-identity-revalidation` | Release, notes hash, allowlisted boot fields | 1 MiB |
+| `R1-identity-and-slot` | Two-source identity, verified-boot, and slot agreement | 64 KiB each |
+| `R2-gpt-and-recovery-inventory` | Partition names/sizes/flags and recovery presence, without GUIDs | 1 MiB each |
+| `R3-boot-image-headers` | Typed header, table and component summaries with exact coverage and hashes of declared bounded reads (18 rows, see [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) | 1,048,576 / 67,108,864 / 65,536 (aggregate metadata coverage) |
+| `R4-dtb-dtbo-selection` | Selected DT/overlay facts and compatible prefix | 64 KiB each |
+| `R5-module-load-order` | Module names/order/taint only | 1 MiB each |
+| `R6-storage-and-mount-model` | Root GPT name, filesystem, options, rounded sizes | 64 KiB each |
+| `R7-kernel-identity-revalidation` | Release, notes hash, allowlisted boot fields | 1 MiB each |
+
+The three budgets are separate: the serialized operation document, the fixture
+payload a rehearsal may consume, and the bytes a future approved hardware read
+may return. An unchanged operation keeps its one numeric ceiling in all three.
+Schema support for one never authorizes another; no hardware read exists.
 
 Every operation says read-only, uses the future transport name
 `approved-read-only-recovery-session`, and stops on identity mismatch,
@@ -122,7 +131,7 @@ and before the canonical renderer runs, against a fixed nesting bound
 (`request.max_json_depth` in the contract, 8, which is exactly the depth of the
 real request). A deeper document is refused with `request.json nests too
 deeply`, so a small hostile request cannot be expanded into megabytes by the
-renderer. Version 0.2.1 adds this bound; 0.2.0 rendered first.
+renderer. Version 0.2.1 added this bound; 0.2.0 rendered first.
 
 Any changed byte, unknown or duplicate key, non-canonical JSON, extra/missing
 file, symlink, hardlink, special file, changed blocker/order, collected
@@ -131,7 +140,7 @@ emission, or changed component binding fails closed.
 
 ## Downstream gates
 
-The preflight 0.2.1 contract is unchanged by the later gates and does not
+The preflight 0.3.0 contract is unchanged by the later gates and does not
 reference them. The fixture collector ([CAPTURE-GATE.md](CAPTURE-GATE.md)) and
 the synthetic adapter rehearsal ([SESSION-GATE.md](SESSION-GATE.md)) read a
 request with this tool's `read_request` and import this tool as a trusted,

@@ -58,11 +58,11 @@
   "components": {
     "capture_contract": {
       "path": "device/myron/capture-contract.json",
-      "sha256": "b5ccb100cf28c7d58ce40fc634719bb9ceede6a3e94476c546914af7a443edce"
+      "sha256": "e9fe948063f73fdb38818c07e5e7bea0da67d3f03fb340373cadd4acb10d7d89"
     },
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "9fe3d28d4f2843bf652efb3081f61c21791421e45e021a3842d1a6b84185fb1b"
+      "sha256": "420b98ccf4e9dc8d900f2584b5af7d44dc5b38110c8a035ba56d8cf575d8dc4d"
     }
   },
   "coverage": {
@@ -143,7 +143,7 @@
         "state": "unresolved"
       },
       {
-        "claim": "r3-format-schema-successor-required",
+        "claim": "r3-binary-parser-successor-required",
         "state": "unresolved"
       },
       {
@@ -156,12 +156,12 @@
     {
       "id": "R3-boot-image-headers",
       "requires": [
-        "format-specific parsers for Android boot v0-v4, vendor boot v3 and v4, and DTBO",
-        "nullable or not-applicable OS version semantics",
-        "component roles, hash coverage and profile limits"
+        "format-specific binary parsers for Android boot v0-v4, vendor boot v3 and v4, and DT table v0",
+        "hashes and coverage recomputed from image bytes: the schema generation only represents them",
+        "a hardware transport that counts actual returned bytes, rereads and overreads separately"
       ],
       "state": "not-implemented",
-      "successor_gate": "r3-boot-image-schema-migration"
+      "successor_gate": "r3-binary-image-parsers"
     },
     {
       "id": "R4-dtb-dtbo-selection",
@@ -186,7 +186,7 @@
   },
   "evidence_level": "synthetic-binary-parser-only",
   "executes": false,
-  "format_version": "0.1.0",
+  "format_version": "0.2.0",
   "human_approval_required": true,
   "identity": {
     "device.codename": "myron",
@@ -198,7 +198,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-bootchain-impl.py",
-    "sha256": "51ad5499c2935536a9f931bfd42c993af130961010b23c3109a527b62366c1f6"
+    "sha256": "8abbf2e3aa34f289393f5423924a04dc367d6227038fffa7037512c3dcfde00a"
   },
   "input": {
     "closure": [
@@ -382,7 +382,7 @@
     "header bytes after the 92-byte header must be zero: a profile restriction, not universal GPT validity",
     "a partition name fills at most 35 UTF-16 units and must be NUL terminated (a profile restriction)",
     "bootable_flag is legacy-bios-bootable-bit and proves no Android priority, success, active slot, bootability or recovery viability",
-    "R3 and R4 are not implemented: each is a recorded successor gate and the parse is an operation fragment, not a capture",
+    "R3 binary parsing and R4 selection are not implemented: each is a recorded successor gate (the R3 schema generation exists, with no parser) and the parse is an operation fragment, not a capture",
     "bytes_read is fixture payload accounting only: it counts consumed fixture bytes and is no device I/O",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the bootchain contract pins the bootchain implementation bytes; the collector implementation is bound only through the capture contract",
@@ -406,8 +406,15 @@
       "excludes": [
         "reads.json",
         "manifest-validation-rereads",
-        "verification-reruns"
+        "verification-reruns",
+        "hardware-bytes"
       ],
+      "future_hardware_accounting": [
+        "actual-returned-bytes",
+        "rereads-counted-separately",
+        "overreads-counted-separately"
+      ],
+      "hardware_transport": "none",
       "includes": [
         "geometry.json",
         "gpt-primary-header.bin",
@@ -416,7 +423,8 @@
         "gpt-backup-entries.bin"
       ],
       "max": 41984,
-      "meaning": "fixture-payload-accounting-not-device-io"
+      "meaning": "fixture-payload-accounting-not-device-io",
+      "read_domain": "fixture"
     },
     "closure": {
       "checksums": {
@@ -449,9 +457,9 @@
     "verification": "recompute-from-request-and-reads-byte-for-byte"
   },
   "pinned_versions": {
-    "collector": "0.1.0",
+    "collector": "0.2.0",
     "deployment": "0.4.0",
-    "preflight": "0.2.1",
+    "preflight": "0.3.0",
     "snapshot": "0.2.0"
   },
   "profile": {
@@ -633,7 +641,7 @@
       {
         "id": "R3-boot-image-headers",
         "state": "not-implemented",
-        "successor_gate": "r3-boot-image-schema-migration"
+        "successor_gate": "r3-binary-image-parsers"
       },
       {
         "id": "R4-dtb-dtbo-selection",

@@ -14,6 +14,7 @@ import os
 import sys
 import argparse
 import copy
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -23,10 +24,17 @@ import stat
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = Path(__file__).resolve().parent.parent
 PREFLIGHT_TOOL = REPO / "tools/myron-preflight"
-PINNED_VERSIONS = {"preflight": "0.2.1", "snapshot": "0.2.0", "deployment": "0.4.0"}
+PINNED_VERSIONS = {"preflight": "0.3.0", "snapshot": "0.2.0", "deployment": "0.4.0"}
+OPERATION_SCHEMA = 2  # every R1-R7 envelope; schema 1 and a mix of generations are refused
+READ_DOMAIN = "fixture"  # the only domain: no hardware transport exists
+ENVELOPE_KEYS = [
+    "schema", "kind", "id", "request_sha256", "transport", "read_domain", "read_only",
+    "bytes_read", "data",
+]
+BUDGET_KEYS = ["max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes"]
 CAPTURE_CONTRACT_PATH = "device/myron/capture-contract.json"
 PREFLIGHT_CONTRACT_PATH = "device/myron/preflight-contract.json"
 CONTRACT_KIND = "myron-capture-collector-contract"
@@ -43,13 +51,13 @@ CAPTURE_ENTRIES = 16
 CAPTURE_DEPTH = 2
 MAX_DEPTH = 8
 PLAN_MAX_DEPTH = 32  # a saved plan embeds the typed policy registry
+POLICY_SPEC_DEPTH = 12  # the deepest typed spec (R3 range rows) nests 5 levels below its field
 MAX_MODULES = 256
 MEBIBYTE = 1024 * 1024
 HEX256 = re.compile(r"[0-9a-f]{64}")
 PARTITION_NAME = re.compile(r"[a-z0-9_]{1,36}")
 MODULE_NAME = re.compile(r"[A-Za-z0-9_-]{1,56}")
 TAINT_FLAGS = re.compile(r"[A-Z]{0,8}")
-OS_VERSION = re.compile(r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}")
 IMAGE_NAME = re.compile(
     r"(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?"
 )
@@ -186,35 +194,29 @@ def _list(item: dict, low: int, high: int, sorted_unique: bool = False) -> dict:
     }
 
 
-def _case(when: bool, fields: dict, constraints=()) -> dict:
-    return {"when": when, "fields": fields, "constraints": list(constraints)}
+def _object(fields: dict) -> dict:
+    """An exact-key nested object: every field required, no other key accepted."""
+    return {"type": "object", "fields": fields}
 
 
-def _variants(discriminator: str, cases: list) -> dict:
-    return {"discriminator": discriminator, "cases": cases}
-
-
-def _rows(row: dict, low: int, high: int, key: str, variants=None) -> dict:
-    spec = {"type": "rows", "row": row, "min": low, "max": high, "sorted_unique_by": key}
-    if variants is not None:
-        spec["variants"] = variants
-    return spec
+def _rows(row: dict, low: int, high: int, key) -> dict:
+    """Rows of exact-key objects. KEY names the field (or the list of fields) that every
+    row set must be unique and sorted by; None leaves ordering to the caller."""
+    return {"type": "rows", "row": row, "min": low, "max": high, "sorted_unique_by": key}
 
 
 def _null_together(*fields: str) -> dict:
     return {"type": "null_together", "fields": list(fields)}
 
 
-def _list_lengths(lists, count: str) -> dict:
-    return {"type": "list_lengths", "lists": list(lists), "count": count}
-
-
 def row_fields(spec: dict) -> list:
-    """Every field a row may carry: the base fields, then each variant's fields."""
-    names = list(spec["row"])
-    for case in spec.get("variants", {}).get("cases", []):
-        names += [name for name in case["fields"] if name not in names]
-    return names
+    """Every field a row carries."""
+    return list(spec["row"])
+
+
+def row_key_fields(spec: dict) -> list:
+    key = spec["sorted_unique_by"]
+    return [] if key is None else [key] if type(key) is str else list(key)
 
 
 def _container(rows_field: str, spec: dict) -> dict:
@@ -247,36 +249,139 @@ PARTITION_ROW = {
     "slot_suffix": _enum(["", "_a", "_b"]),
 }
 PARTITION_ROWS = _rows(PARTITION_ROW, 1, 128, "partition_name")
+# --- R3 boot image schema (generation R3, Phase A: schema only, no image parser) -----
+# One row per supported partition name; `image` is null where R2 lacks the name (that is
+# absence from the bound inventory, not proof the physical device has no such partition),
+# else a nested exact-key image summary. Every value in it is a claim of the fixture: no
+# binary parser exists in this phase, so no offset, size or hash is recomputed from bytes.
+MAX_IMAGE_BYTES = 16 * MEBIBYTE
+MAX_VENDOR_FRAGMENTS = 64
+MAX_DT_ENTRIES = 256
+MAX_COVERAGE_RANGES = 32
+MIN_HEADER_BYTES = 32
+MAX_HEADER_BYTES = 2128
+MAX_TABLE_BYTES = 8192
+PAGE_SIZES = [2048, 4096, 8192, 16384]
+RAMDISK_TYPES = [0, 1, 2, 3]
+IMAGE_ROLES = ["boot", "init_boot", "vendor_boot", "vendor_kernel_boot", "dtbo", "recovery"]
+IMAGE_SUFFIXES = ["", "_a", "_b"]
+IMAGE_FORMATS = ["android-boot", "android-vendor-boot", "android-dt-table"]
+COMPONENT_ROLES = [
+    "kernel", "ramdisk", "second", "recovery_dtbo", "dtb", "boot_signature", "vendor_ramdisk",
+    "vendor_ramdisk_fragment", "bootconfig", "dt_entry",
+]
+TABLE_ROLES = ["vendor_ramdisk_table", "dt_entry_table"]
+COVERAGE_KINDS = ["metadata-only", "full-image"]
+FRAGMENT_ROLE = "vendor_ramdisk_fragment"
+TABLE_COUNT = "table-entries"  # a slot whose count is the table's entry_count
+R3_HEADER = _object({
+    "offset": _int(0, 0),
+    "size_bytes": _int(MIN_HEADER_BYTES, MAX_HEADER_BYTES),
+    "sha256": _hash(),
+})
+R3_COMPONENT_ROW = {
+    "role": _enum(COMPONENT_ROLES),
+    "index": _int(0, MAX_DT_ENTRIES - 1),
+    "offset": _int(0, MAX_IMAGE_BYTES),
+    "size_bytes": _int(0, MAX_IMAGE_BYTES),
+    "sha256": _nullable(_hash()),
+    "ramdisk_type": _nullable(_int(0, 3)),
+}
+R3_COMPONENTS = _rows(R3_COMPONENT_ROW, 1, MAX_DT_ENTRIES, ["role", "index"])
+R3_TABLE = _nullable(_object({
+    "role": _enum(TABLE_ROLES),
+    "offset": _int(0, MAX_IMAGE_BYTES),
+    "size_bytes": _int(0, MAX_TABLE_BYTES),
+    "sha256": _hash(),
+    "entry_size": _int_enum([108, 32]),
+    "entry_count": _int(0, MAX_DT_ENTRIES),
+}))
+R3_RANGE_ROW = {
+    "index": _int(0, MAX_COVERAGE_RANGES - 1),
+    "offset": _int(0, MAX_IMAGE_BYTES - 1),
+    "size_bytes": _int(1, MAX_IMAGE_BYTES),
+}
+R3_COVERAGE = _object({
+    "kind": _enum(COVERAGE_KINDS),
+    "ranges": _rows(R3_RANGE_ROW, 1, MAX_COVERAGE_RANGES, "index"),
+    "covered_bytes": _int(1, MAX_IMAGE_BYTES),
+})
+R3_IMAGE = _object({
+    "format": _enum(IMAGE_FORMATS),
+    "version": _int(0, 4),
+    "page_size": _int_enum(PAGE_SIZES),
+    "os_version": _nullable(_int(0, 2**32 - 1)),
+    "size_bytes": _int(MIN_HEADER_BYTES, MAX_IMAGE_BYTES),
+    "sha256": _nullable(_hash()),
+    "header": R3_HEADER,
+    "components": R3_COMPONENTS,
+    "table": R3_TABLE,
+    "coverage": R3_COVERAGE,
+})
 IMAGE_ROW = {
     "partition_name": _text(IMAGE_NAME),
-    "absent": _bool(),
+    "role": _enum(IMAGE_ROLES),
+    "image": _nullable(R3_IMAGE),
 }
-# The header fields depend on `absent`: an absent image has null headers, empty
-# lists and no segments; a present image has every header field set.
-IMAGE_ABSENT = {
-    "header_version": _null(),
-    "page_size": _null(),
-    "os_version": _null(),
-    "component_sizes": _list(_int(0, 2**32), 0, 0),
-    "component_offsets": _list(_int(0, 2**32), 0, 0),
-    "segment_count": _int(0, 0),
-    "header_sha256": _null(),
-}
-IMAGE_PRESENT = {
-    "header_version": _int(0, 4),
-    "page_size": _int_enum([2048, 4096, 8192, 16384]),
-    "os_version": _text(OS_VERSION),
-    "component_sizes": _list(_int(0, 2**32), 1, 8),
-    "component_offsets": _list(_int(0, 2**32), 1, 8),
-    "segment_count": _int(1, 8),
-    "header_sha256": _hash(),
-}
-IMAGE_SEGMENT_LISTS = ["component_sizes", "component_offsets"]
-IMAGE_VARIANTS = _variants("absent", [
-    _case(True, IMAGE_ABSENT, [_list_lengths(IMAGE_SEGMENT_LISTS, "segment_count")]),
-    _case(False, IMAGE_PRESENT, [_list_lengths(IMAGE_SEGMENT_LISTS, "segment_count")]),
-])
-IMAGE_ROWS = _rows(IMAGE_ROW, 1, 12, "partition_name", IMAGE_VARIANTS)
+IMAGE_PARTITION_NAMES = sorted(role + suffix for role in IMAGE_ROLES for suffix in IMAGE_SUFFIXES)
+IMAGE_ROWS = _rows(IMAGE_ROW, len(IMAGE_PARTITION_NAMES), len(IMAGE_PARTITION_NAMES), "partition_name")
+
+
+def _slot(role: str, count=1) -> dict:
+    return {"role": role, "count": count}
+
+
+def _layout(fmt, version, header_bytes, slots, fixed_page_size=None, table=None) -> dict:
+    return {
+        "format": fmt, "version": version, "header_bytes": header_bytes,
+        "fixed_page_size": fixed_page_size, "slots": slots, "table": table,
+    }
+
+
+def r3_profile() -> dict:
+    """The one supported R3 profile: what each format, version and partition role admits."""
+    boot = "android-boot"
+    vendor = "android-vendor-boot"
+    dt = "android-dt-table"
+    kernel_ramdisk = [_slot("kernel"), _slot("ramdisk")]
+    return {
+        "row_count": len(IMAGE_PARTITION_NAMES),
+        "suffixes": list(IMAGE_SUFFIXES),
+        "partitions": [
+            {"role": "boot", "format": boot, "versions": [0, 1, 2, 3, 4]},
+            {"role": "init_boot", "format": boot, "versions": [4]},
+            {"role": "vendor_boot", "format": vendor, "versions": [3, 4]},
+            {"role": "vendor_kernel_boot", "format": vendor, "versions": [3, 4]},
+            {"role": "dtbo", "format": dt, "versions": [0]},
+            {"role": "recovery", "format": boot, "versions": [0, 1, 2, 3, 4]},
+        ],
+        "page_sizes": list(PAGE_SIZES),
+        "max_image_bytes": MAX_IMAGE_BYTES,
+        "max_vendor_fragments": MAX_VENDOR_FRAGMENTS,
+        "max_dt_entries": MAX_DT_ENTRIES,
+        "max_coverage_ranges": MAX_COVERAGE_RANGES,
+        "ramdisk_types": list(RAMDISK_TYPES),
+        "fragment_role": FRAGMENT_ROLE,
+        "init_boot_kernel_bytes": 0,
+        "empty_bytes_sha256": hashlib.sha256(b"").hexdigest(),
+        "layouts": [
+            _layout(boot, 0, 1632, [*kernel_ramdisk, _slot("second")]),
+            _layout(boot, 1, 1648, [*kernel_ramdisk, _slot("second"), _slot("recovery_dtbo")]),
+            _layout(boot, 2, 1660, [*kernel_ramdisk, _slot("second"), _slot("recovery_dtbo"),
+                                    _slot("dtb")]),
+            _layout(boot, 3, 1580, kernel_ramdisk, fixed_page_size=4096),
+            _layout(boot, 4, 1584, [*kernel_ramdisk, _slot("boot_signature")],
+                    fixed_page_size=4096),
+            _layout(vendor, 3, 2112, [_slot("vendor_ramdisk"), _slot("dtb")]),
+            _layout(vendor, 4, 2128,
+                    [_slot(FRAGMENT_ROLE, TABLE_COUNT), _slot("dtb"), _slot("bootconfig")],
+                    table={"role": "vendor_ramdisk_table", "entry_bytes": 108,
+                           "min_entries": 0, "max_entries": MAX_VENDOR_FRAGMENTS}),
+            _layout(dt, 0, 32, [_slot("dt_entry", TABLE_COUNT)],
+                    table={"role": "dt_entry_table", "entry_bytes": 32,
+                           "min_entries": 1, "max_entries": MAX_DT_ENTRIES}),
+        ],
+    }
 # The board id and revision are null together (no board selected) or set together.
 DTB_FIELDS = {
     "dtb_count": _int(0, 64),
@@ -296,6 +401,15 @@ def policy_registry() -> dict:
 
 
 def _policy_registry() -> dict:
+    registry = _policy_registry_base()
+    # The three budgets come from the preflight request constants, the one place they are
+    # declared; the validator refuses a request row that differs from them.
+    for row in preflight().requested_reads():
+        registry["operations"][row["id"]]["budgets"] = {key: row[key] for key in BUDGET_KEYS}
+    return registry
+
+
+def _policy_registry_base() -> dict:
     p = preflight()
     return {
         "capture_limits": {
@@ -304,6 +418,14 @@ def _policy_registry() -> dict:
             "file_bytes": MAX_FILE_BYTES,
             "total_bytes": TOTAL_CAPTURE_BYTES,
             "json_depth": MAX_DEPTH,
+        },
+        "operation_envelope": {
+            "schema": OPERATION_SCHEMA,
+            "read_domain": READ_DOMAIN,
+            "keys": list(ENVELOPE_KEYS),
+            "budget_keys": list(BUDGET_KEYS),
+            "bytes_read": "fixture-payload-acquisition-within-max_fixture_input_bytes",
+            "hardware_bytes_read": "none-no-hardware-transport-exists",
         },
         "exclusions": {
             "never_emits": list(p.NEVER_EMITS),
@@ -336,7 +458,8 @@ def _policy_registry() -> dict:
                 rules=["slot-suffix-matches-name", "recovery-flag-matches-inventory"]),
             R3_ID: _operation_policy(R3_ID, {
                 "images": IMAGE_ROWS,
-            }, _container("images", IMAGE_ROWS)),
+            }, _container("images", IMAGE_ROWS),
+                rules=list(R3_RULES), cross_rules=list(R3_CROSS_RULES), profile=r3_profile()),
             R4_ID: _operation_policy(R4_ID, DTB_FIELDS, constraints=DTB_CONSTRAINTS),
             R5_ID: _operation_policy(R5_ID, {
                 "module_names": _list(_text(MODULE_NAME), 0, MAX_MODULES),
@@ -382,22 +505,44 @@ def policy_error(message: str):
     raise CollectError(f"policy registry is inconsistent: {message}")
 
 
-def check_spec_shape(spec, where: str) -> None:
-    """A typed spec is well formed: known type, ordered bounds, nested specs sound."""
+SORT_KEY_TYPES = ("text", "int", "enum", "int_enum")
+
+
+def check_spec_shape(spec, where: str, depth: int = 0) -> None:
+    """A typed spec is well formed: known type, ordered bounds, nested specs sound.
+
+    Recursion is bounded by POLICY_SPEC_DEPTH, so a hostile or drifted registry cannot
+    nest the check without limit."""
+    if depth > POLICY_SPEC_DEPTH:
+        policy_error(f"{where} nests too deeply")
     if type(spec) is not dict or "type" not in spec:
         policy_error(f"{where} is not a typed spec")
     kind = spec["type"]
-    if kind in ("int", "list") and spec["min"] > spec["max"]:
+    if kind in ("int", "list", "rows") and spec["min"] > spec["max"]:
         policy_error(f"{where} has min above max")
     if kind == "list":
-        check_spec_shape(spec["item"], f"{where} item")
+        check_spec_shape(spec["item"], f"{where} item", depth + 1)
     elif kind == "nullable":
-        check_spec_shape(spec["of"], f"{where} value")
+        check_spec_shape(spec["of"], f"{where} value", depth + 1)
         if spec["of"]["type"] in ("null", "nullable"):
             policy_error(f"{where} nests a null type in a nullable")
+    elif kind == "object":
+        fields = spec.get("fields")
+        if type(fields) is not dict or not fields or any(type(name) is not str for name in fields):
+            policy_error(f"{where} object has no named fields")
+        for name, field in fields.items():
+            check_spec_shape(field, f"{where} {name}", depth + 1)
     elif kind == "rows":
-        for name, field in spec["row"].items():
-            check_spec_shape(field, f"{where} {name}")
+        row = spec["row"]
+        if type(row) is not dict or not row:
+            policy_error(f"{where} rows have no row fields")
+        for name, field in row.items():
+            check_spec_shape(field, f"{where} {name}", depth + 1)
+        names = row_key_fields(spec)
+        if len(set(names)) != len(names) or any(name not in row for name in names):
+            policy_error(f"{where} sort key names unknown or repeated row fields")
+        if any(row[name]["type"] not in SORT_KEY_TYPES for name in names):
+            policy_error(f"{where} sort key is not a sortable scalar field")
     elif kind not in (
         "enum", "int", "int_enum", "bool", "text", "hash", "identity", "null", "request-allowlist"
     ):
@@ -414,58 +559,96 @@ def check_constraint_shape(constraint: dict, fields: dict, where: str) -> None:
         for name in names:
             if fields[name]["type"] not in ("nullable", "null"):
                 policy_error(f"{where} null_together field {name} cannot be null")
-    elif kind == "list_lengths":
-        names = constraint["lists"]
-        if not names or set(names) - set(fields) or constraint["count"] not in fields:
-            policy_error(f"{where} list_lengths names unknown fields")
-        if any(fields[name]["type"] != "list" for name in names):
-            policy_error(f"{where} list_lengths names a non-list field")
-        if fields[constraint["count"]]["type"] != "int":
-            policy_error(f"{where} list_lengths count is not an integer")
     else:
         policy_error(f"{where} has unknown constraint {kind}")
 
 
-def check_rows_shape(name: str, spec: dict, where: str) -> None:
-    variants = spec.get("variants")
-    if variants is None:
-        return
-    discriminator = variants["discriminator"]
-    selector = spec["row"].get(discriminator)
-    if selector is None or selector["type"] != "bool" or "const" in selector:
-        policy_error(f"{where} discriminator {discriminator} is not a free boolean field")
-    cases = variants["cases"]
-    whens = [case["when"] for case in cases]
-    if any(type(when) is not bool for when in whens) or sorted(whens) != [False, True]:
-        policy_error(f"{where} variants must cover true and false exactly once")
-    names = [set(case["fields"]) for case in cases]
-    if names[0] != names[1] or names[0] & set(spec["row"]):
-        policy_error(f"{where} variants do not share one disjoint field set")
-    for case in cases:
-        for field, field_spec in case["fields"].items():
-            check_spec_shape(field_spec, f"{where} {field} when {case['when']}")
-        for constraint in case["constraints"]:
-            check_constraint_shape(
-                constraint, {**spec["row"], **case["fields"]}, f"{where} when {case['when']}"
-            )
+def check_budgets_shape(budgets, where: str) -> None:
+    if type(budgets) is not dict or set(budgets) != set(BUDGET_KEYS):
+        policy_error(f"{where} budgets differ from the three separate bounds")
+    if any(type(value) is not int or value < 1 for value in budgets.values()):
+        policy_error(f"{where} budgets are not positive integers")
+
+
+def check_r3_policy_shape(policy: dict, where: str) -> None:
+    """The serialized R3 rules and profile are exactly what the validator implements and the
+    typed bounds admit: a published rule with no implementation, or a profile constant that
+    contradicts a typed bound, is refused."""
+    if sorted(policy["rules"]) != sorted(R3_RULES) or len(set(policy["rules"])) != len(R3_RULES):
+        policy_error(f"{where} rules differ from the implemented semantic rules")
+    if sorted(policy["cross_rules"]) != sorted(R3_CROSS_RULES) or (
+        len(set(policy["cross_rules"])) != len(R3_CROSS_RULES)
+    ):
+        policy_error(f"{where} cross rules differ from the implemented cross rules")
+    profile = policy["profile"]
+    rows = policy["fields"]["images"]
+    image = rows["row"]["image"]["of"]["fields"]
+    names = [entry["role"] + suffix for entry in profile["partitions"] for suffix in profile["suffixes"]]
+    if len(set(names)) != len(names) or profile["row_count"] != len(names):
+        policy_error(f"{where} profile partitions are not unique or miscounted")
+    if not rows["min"] == rows["max"] == profile["row_count"]:
+        policy_error(f"{where} row count differs from the profile")
+    if profile["empty_bytes_sha256"] != hashlib.sha256(b"").hexdigest():
+        policy_error(f"{where} empty-bytes hash is not the SHA-256 of empty bytes")
+    if image["size_bytes"]["max"] != profile["max_image_bytes"]:
+        policy_error(f"{where} image size bound differs from the profile")
+    if image["coverage"]["fields"]["ranges"]["max"] != profile["max_coverage_ranges"]:
+        policy_error(f"{where} coverage range bound differs from the profile")
+    if image["components"]["max"] != profile["max_dt_entries"] or (
+        profile["max_vendor_fragments"] > profile["max_dt_entries"]
+    ):
+        policy_error(f"{where} component bound differs from the profile")
+    if image["page_size"]["values"] != profile["page_sizes"]:
+        policy_error(f"{where} page sizes differ from the profile")
+    seen = set()
+    for layout in profile["layouts"]:
+        key = (layout["format"], layout["version"])
+        if key in seen or not layout["slots"] or not MIN_HEADER_BYTES <= layout["header_bytes"] <= MAX_HEADER_BYTES:
+            policy_error(f"{where} profile layout is repeated or unbounded")
+        seen.add(key)
+        roles = [slot["role"] for slot in layout["slots"]]
+        if len(set(roles)) != len(roles) or set(roles) - set(COMPONENT_ROLES):
+            policy_error(f"{where} profile layout names unknown or repeated component roles")
+        table = layout["table"]
+        counted = [slot for slot in layout["slots"] if slot["count"] == TABLE_COUNT]
+        if (table is None) != (not counted) or (table is not None and len(counted) != 1):
+            policy_error(f"{where} profile layout and table disagree about counted slots")
+        if table is not None and not (
+            0 <= table["min_entries"] <= table["max_entries"] <= profile["max_dt_entries"]
+            and table["entry_bytes"] * table["max_entries"] <= MAX_TABLE_BYTES
+            and table["role"] in TABLE_ROLES
+        ):
+            policy_error(f"{where} profile table bounds are inconsistent")
+    for entry in profile["partitions"]:
+        if any((entry["format"], version) not in seen for version in entry["versions"]):
+            policy_error(f"{where} profile partition names an unknown format version")
 
 
 def check_policy(registry: dict) -> None:
-    """Refuse a registry whose parts contradict each other (nulls, variants, containers)."""
+    """Refuse a registry whose parts contradict each other (nulls, nesting, containers)."""
+    envelope = registry["operation_envelope"]
+    if envelope["schema"] != OPERATION_SCHEMA or envelope["read_domain"] != READ_DOMAIN or (
+        envelope["keys"] != ENVELOPE_KEYS
+    ):
+        policy_error("operation envelope differs from the reviewed generation")
     for operation_id, policy in registry["operations"].items():
         where = operation_id.split("-")[0]
         fields = policy["fields"]
         for name, spec in fields.items():
             check_spec_shape(spec, f"{where} {name}")
-            if spec["type"] == "rows":
-                check_rows_shape(name, spec, f"{where} {name}")
         for constraint in policy["constraints"]:
             check_constraint_shape(constraint, fields, where)
+        check_budgets_shape(policy["budgets"], where)
         container = policy["container"]
         if container is not None:
             rows = fields.get(container["rows_field"])
             if rows is None or rows["type"] != "rows" or container["row_fields"] != row_fields(rows):
                 policy_error(f"{where} container differs from its row spec")
+        if operation_id == R3_ID:
+            try:
+                check_r3_policy_shape(policy, where)
+            except (KeyError, TypeError, IndexError):
+                policy_error(f"{where} R3 policy is not the reviewed shape")
 
 
 # --- implementation pin ---------------------------------------------------------
@@ -511,6 +694,9 @@ def expected_capture_contract(preflight_contract_sha256: str, contracts) -> dict
         "capture": {
             "kind": CAPTURE_KIND,
             "operation_kind": OPERATION_KIND,
+            "operation_schema": OPERATION_SCHEMA,
+            "read_domain": READ_DOMAIN,
+            "legacy_generations": "reject-no-adapters",
             "total_max_bytes": TOTAL_CAPTURE_BYTES,
             "extra_entries": "reject",
             "trusted_local_files_only": True,
@@ -656,13 +842,43 @@ def hash_paths_of(spec: dict, path: tuple) -> set:
     if kind == "list":
         return hash_paths_of(spec["item"], path + ("*",))
     found = set()
-    if kind == "rows":
-        fields = dict(spec["row"])
-        for case in spec.get("variants", {}).get("cases", []):
-            fields.update(case["fields"])
-        for name, field in fields.items():
+    if kind == "object":
+        for name, field in spec["fields"].items():
+            found |= hash_paths_of(field, path + (name,))
+    elif kind == "rows":
+        for name, field in spec["row"].items():
             found |= hash_paths_of(field, path + ("*", name))
     return found
+
+
+def leaf_paths(spec: dict, path: tuple) -> list:
+    """Every leaf of one typed spec as a path (`*` is a row index); a nullable adds none."""
+    kind = spec["type"]
+    if kind == "nullable":
+        return leaf_paths(spec["of"], path)
+    if kind == "object":
+        return [leaf for name, field in spec["fields"].items()
+                for leaf in leaf_paths(field, path + (name,))]
+    if kind == "rows":
+        return [leaf for name, field in spec["row"].items()
+                for leaf in leaf_paths(field, path + ("*", name))]
+    return [path]
+
+
+def field_paths(policy: dict, *, container_prefix: bool) -> list:
+    """The sorted dotted leaf paths an operation may emit. Rows of the container field are
+    named by their own fields (`partition_name`), or, with CONTAINER_PREFIX, under the
+    container (`images.partition_name`); nested rows keep their `*` segment either way."""
+    container = policy["container"]
+    paths = []
+    for name, spec in policy["fields"].items():
+        if container is not None and name == container["rows_field"]:
+            root = (name,) if container_prefix else ()
+            for row_name, field in spec["row"].items():
+                paths += leaf_paths(field, root + (row_name,))
+        else:
+            paths += leaf_paths(spec, (name,))
+    return sorted(".".join(path) for path in paths)
 
 
 def hash_scope(registry: dict, document: str, operation_id: str | None = None) -> frozenset:
@@ -756,6 +972,14 @@ def check_spec(spec: dict, value, label: str, identity: dict):
         if spec["sorted_unique"]:
             need_sorted_unique(items, label)
         return items
+    if kind == "object":
+        need_dict(value, spec["fields"], label)
+        return {
+            name: check_spec(field, value[name], f"{label} {name}", identity)
+            for name, field in spec["fields"].items()
+        }
+    if kind == "rows":
+        return check_rows(spec, value, label, f"{label} row", identity)
     raise CollectError(f"{label} has an unknown policy type")
 
 
@@ -768,34 +992,28 @@ def check_constraints(constraints: list, values: dict, label: str) -> None:
                 raise CollectError(
                     f"{label} {', '.join(constraint['fields'])} must all be set or all be null"
                 )
-        elif kind == "list_lengths":
-            count = values[constraint["count"]]
-            if any(len(values[name]) != count for name in constraint["lists"]):
-                raise CollectError(f"{label} lists differ from {constraint['count']}")
         else:
             raise CollectError(f"{label} has an unknown constraint type")
 
 
 def check_rows(spec: dict, value, label: str, row_label: str, identity: dict) -> list[dict]:
-    """Check each row against the base fields and the variant its discriminator selects."""
+    """Check each row against its exact fields, then the sort and uniqueness the spec names.
+
+    Rows nest: a row field may itself be an object or rows, checked by the same recursion.
+    The ordering rule is read from the spec here, once, for every rows spec."""
     rows = need_list(value, label, spec["min"], spec["max"])
-    variants = spec.get("variants")
     checked = []
     for row in rows:
         need_dict(row, row_fields(spec), f"{label} row")
-        values = {
+        checked.append({
             name: check_spec(field, row[name], f"{row_label} {name}", identity)
             for name, field in spec["row"].items()
-        }
-        if variants is not None:
-            selector = values[variants["discriminator"]]
-            case = next((item for item in variants["cases"] if item["when"] is selector), None)
-            if case is None:
-                raise CollectError(f"{row_label} has no policy variant for {selector}")
-            for name, field in case["fields"].items():
-                values[name] = check_spec(field, row[name], f"{row_label} {name}", identity)
-            check_constraints(case["constraints"], values, row_label)
-        checked.append(values)
+        })
+    key = row_key_fields(spec)
+    if key:
+        keys = [tuple(values[name] for name in key) for values in checked]
+        if keys != sorted(set(keys)):
+            raise CollectError(f"{label} is not unique and sorted")
     return checked
 
 
@@ -817,18 +1035,291 @@ def check_r2(data: dict, policy: dict, identity: dict) -> None:
         if suffix != (name[-2:] if name.endswith(("_a", "_b")) else ""):
             raise CollectError("R2 slot suffix differs from the partition name")
         names.append(name)
-    need_sorted_unique(names, "R2 partitions")
     recovery = any(re.fullmatch(policy["recovery_pattern"], name) for name in names)
     flag = check_spec(policy["fields"]["recovery_present"], data["recovery_present"], "R2 recovery present", identity)
     if flag != recovery:
         raise CollectError("R2 recovery flag differs from the inventory")
 
 
-def check_r3(data: dict, policy: dict, identity: dict) -> None:
-    rows = check_rows(
-        policy["fields"]["images"], data["images"], "R3 images", "R3 image", identity
+# --- R3 semantic rules ----------------------------------------------------------
+# The typed spec bounds every field; these named rules check what a type cannot: the
+# profile for each format and version, exact extents, canonical coverage, and that a hash
+# exists exactly where the coverage reaches. Each rule reads its constants from the
+# serialized profile and budgets, so the contract states exactly what is enforced. They
+# judge claims in a fixture: no image bytes exist here, nothing is recomputed or verified.
+
+
+def base_role(name: str) -> str:
+    return name[:-2] if name.endswith(("_a", "_b")) else name
+
+
+def present_images(rows: list):
+    return [(row, row["image"]) for row in rows if row["image"] is not None]
+
+
+def layout_of(profile: dict, image: dict) -> dict:
+    for layout in profile["layouts"]:
+        if layout["format"] == image["format"] and layout["version"] == image["version"]:
+            return layout
+    raise CollectError("R3 image format and version have no profile layout")
+
+
+def extent_end(offset: int, size: int) -> int:
+    end = offset + size
+    if end > 2**32:
+        raise CollectError("R3 extent overflows 32 bits")
+    return end
+
+
+def covers(ranges: list, offset: int, size: int) -> bool:
+    return any(
+        item["offset"] <= offset and offset + size <= item["offset"] + item["size_bytes"]
+        for item in ranges
     )
-    need_sorted_unique([values["partition_name"] for values in rows], "R3 images")
+
+
+def r3_exact_rows(rows, profile, budgets) -> None:
+    names = sorted(
+        entry["role"] + suffix for entry in profile["partitions"] for suffix in profile["suffixes"]
+    )
+    if [row["partition_name"] for row in rows] != names or len(names) != profile["row_count"]:
+        raise CollectError("R3 images are not exactly the supported partition rows")
+
+
+def r3_role_from_name(rows, profile, budgets) -> None:
+    for row in rows:
+        if row["role"] != base_role(row["partition_name"]):
+            raise CollectError("R3 role differs from its partition name")
+
+
+def r3_format_version(rows, profile, budgets) -> None:
+    allowed = {entry["role"]: entry for entry in profile["partitions"]}
+    for row, image in present_images(rows):
+        entry = allowed.get(row["role"])
+        if entry is None or image["format"] != entry["format"] or image["version"] not in entry["versions"]:
+            raise CollectError("R3 image format or version is outside its partition profile")
+
+
+def r3_page_size(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        fixed = layout_of(profile, image)["fixed_page_size"]
+        if image["page_size"] not in profile["page_sizes"] or (
+            fixed is not None and image["page_size"] != fixed
+        ):
+            raise CollectError("R3 image page size is outside its format profile")
+
+
+def r3_os_version(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        # Raw packed uint32 where the header carries one (literal 0 included), else null.
+        if (image["format"] == "android-boot") == (image["os_version"] is None):
+            raise CollectError("R3 image os_version is not the raw value or null its format requires")
+
+
+def r3_header_region(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        header = image["header"]
+        if header["offset"] != 0 or header["size_bytes"] != layout_of(profile, image)["header_bytes"]:
+            raise CollectError("R3 header region is not at offset 0 with its exact structure size")
+
+
+def r3_table(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        wanted, table = layout_of(profile, image)["table"], image["table"]
+        if wanted is None:
+            if table is not None:
+                raise CollectError("R3 image carries a table its format does not have")
+            continue
+        if table is None:
+            raise CollectError("R3 image lacks the table its format requires")
+        if table["role"] != wanted["role"] or table["entry_size"] != wanted["entry_bytes"]:
+            raise CollectError("R3 table role or entry size differs from its profile")
+        if not wanted["min_entries"] <= table["entry_count"] <= wanted["max_entries"]:
+            raise CollectError("R3 table entry count is outside its profile")
+        if table["size_bytes"] != table["entry_count"] * table["entry_size"]:
+            raise CollectError("R3 table size is not entry count times entry size")
+        if table["size_bytes"] == 0 and table["sha256"] != profile["empty_bytes_sha256"]:
+            raise CollectError("R3 empty table hash is not the SHA-256 of empty bytes")
+
+
+def r3_components(rows, profile, budgets) -> None:
+    for row, image in present_images(rows):
+        layout, table = layout_of(profile, image), image["table"]
+        expected = []
+        for slot in layout["slots"]:
+            if slot["count"] == TABLE_COUNT:
+                if table is None:
+                    raise CollectError("R3 component slots need the table their format requires")
+                count = table["entry_count"]
+            else:
+                count = slot["count"]
+            expected += [(slot["role"], index) for index in range(count)]
+        found = [(item["role"], item["index"]) for item in image["components"]]
+        if found != sorted(expected):
+            raise CollectError("R3 components differ from the slots of the format version")
+        for item in image["components"]:
+            fragment = item["role"] == profile["fragment_role"]
+            if (item["ramdisk_type"] is not None) != fragment or (
+                fragment and item["ramdisk_type"] not in profile["ramdisk_types"]
+            ):
+                raise CollectError("R3 ramdisk_type is set only on vendor ramdisk fragments")
+            if row["role"] == "init_boot" and item["role"] == "kernel" and (
+                item["size_bytes"] != profile["init_boot_kernel_bytes"]
+            ):
+                raise CollectError("R3 init_boot kernel size is not zero")
+
+
+def r3_extents(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        limit = image["size_bytes"]
+        if limit > profile["max_image_bytes"]:
+            raise CollectError("R3 image is larger than the profile bound")
+        header = image["header"]
+        extents = [(header["offset"], header["size_bytes"])]
+        table = image["table"]
+        zero_offsets = [] if table is None or table["size_bytes"] else [table["offset"]]
+        if table is not None and table["size_bytes"]:
+            extents.append((table["offset"], table["size_bytes"]))
+        for item in image["components"]:
+            if item["size_bytes"]:
+                extents.append((item["offset"], item["size_bytes"]))
+            else:
+                zero_offsets.append(item["offset"])
+        if any(offset > limit for offset in zero_offsets):
+            raise CollectError("R3 empty extent lies past the image")
+        previous_end = 0
+        for offset, size in sorted(extents):
+            if extent_end(offset, size) > limit:
+                raise CollectError("R3 extent runs past the image")
+            if offset < previous_end:
+                raise CollectError("R3 extents overlap")
+            previous_end = offset + size
+
+
+def r3_coverage_canonical(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        coverage, limit = image["coverage"], image["size_bytes"]
+        ranges = coverage["ranges"]
+        if len(ranges) > profile["max_coverage_ranges"]:
+            raise CollectError("R3 coverage holds more ranges than the profile allows")
+        previous_end = None
+        for position, item in enumerate(ranges):
+            if item["index"] != position:
+                raise CollectError("R3 coverage range indices are not sequential")
+            end = extent_end(item["offset"], item["size_bytes"])
+            if end > limit:
+                raise CollectError("R3 coverage range runs past the image")
+            if previous_end is not None:
+                if item["offset"] < previous_end:
+                    raise CollectError("R3 coverage ranges overlap or are not sorted")
+                if item["offset"] == previous_end:
+                    raise CollectError("R3 coverage ranges are adjacent and not merged")
+            previous_end = end
+        if coverage["covered_bytes"] != sum(item["size_bytes"] for item in ranges):
+            raise CollectError("R3 covered_bytes is not the exact sum of its ranges")
+
+
+def r3_coverage_kind(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        coverage, limit = image["coverage"], image["size_bytes"]
+        ranges = coverage["ranges"]
+        header, table = image["header"], image["table"]
+        if not covers(ranges, header["offset"], header["size_bytes"]):
+            raise CollectError("R3 coverage does not reach the whole header")
+        if table is not None and table["size_bytes"] and not covers(
+            ranges, table["offset"], table["size_bytes"]
+        ):
+            raise CollectError("R3 coverage does not reach the whole table")
+        if coverage["kind"] == "full-image":
+            if [(item["offset"], item["size_bytes"]) for item in ranges] != [(0, limit)]:
+                raise CollectError("R3 full-image coverage is not exactly the whole image")
+        elif coverage["covered_bytes"] >= limit:
+            raise CollectError("R3 metadata-only coverage leaves no unverified byte; use full-image")
+
+
+def r3_hash_iff_covered(rows, profile, budgets) -> None:
+    for _row, image in present_images(rows):
+        coverage = image["coverage"]
+        if (image["sha256"] is not None) != (coverage["kind"] == "full-image"):
+            raise CollectError("R3 image sha256 is required for full-image coverage and null otherwise")
+        for item in image["components"]:
+            reached = item["size_bytes"] > 0 and covers(
+                coverage["ranges"], item["offset"], item["size_bytes"]
+            )
+            if (item["sha256"] is not None) != reached:
+                raise CollectError("R3 component sha256 is present only where its whole extent is covered")
+
+
+def r3_coverage_budgets(rows, profile, budgets) -> None:
+    metadata = sum(
+        image["coverage"]["covered_bytes"] for _row, image in present_images(rows)
+        if image["coverage"]["kind"] == "metadata-only"
+    )
+    full = sum(
+        image["coverage"]["covered_bytes"] for _row, image in present_images(rows)
+        if image["coverage"]["kind"] == "full-image"
+    )
+    if metadata > budgets["max_hardware_read_bytes"]:
+        raise CollectError("R3 metadata coverage exceeds the hardware read budget")
+    if full > budgets["max_fixture_input_bytes"]:
+        raise CollectError("R3 full-image coverage exceeds the fixture input budget")
+
+
+R3_RULES = {
+    "r3-exact-partition-rows": r3_exact_rows,
+    "r3-role-from-partition-name": r3_role_from_name,
+    "r3-format-version-profile": r3_format_version,
+    "r3-page-size-profile": r3_page_size,
+    "r3-os-version-semantics": r3_os_version,
+    "r3-header-region": r3_header_region,
+    "r3-table-profile": r3_table,
+    "r3-component-slots": r3_components,
+    "r3-extents-bounded-disjoint": r3_extents,
+    "r3-coverage-canonical": r3_coverage_canonical,
+    "r3-coverage-by-kind": r3_coverage_kind,
+    "r3-hash-iff-covered": r3_hash_iff_covered,
+    "r3-coverage-budgets": r3_coverage_budgets,
+}
+
+
+def r3_presence(rows, partitions, profile) -> None:
+    inventory = {row["partition_name"] for row in partitions}
+    for row in rows:
+        if (row["partition_name"] in inventory) != (row["image"] is not None):
+            raise CollectError("R3 presence differs from the R2 inventory")
+
+
+def r3_capacity(rows, partitions, profile) -> None:
+    sizes = {row["partition_name"]: row["size_bytes"] for row in partitions}
+    for row, image in present_images(rows):
+        if image["size_bytes"] > sizes.get(row["partition_name"], 0):
+            raise CollectError("R3 image is larger than its R2 partition")
+
+
+R3_CROSS_RULES = {
+    "r3-presence-matches-r2-inventory": r3_presence,
+    "r3-image-fits-r2-partition": r3_capacity,
+}
+
+
+def check_r3(data: dict, policy: dict, identity: dict) -> list:
+    """The typed rows, then every named semantic rule the serialized policy lists."""
+    rows = check_spec(policy["fields"]["images"], data["images"], "R3 images", identity)
+    for name in policy["rules"]:
+        rule = R3_RULES.get(name)
+        if rule is None:
+            raise CollectError("R3 policy names a rule with no implementation")
+        rule(rows, policy["profile"], policy["budgets"])
+    return rows
+
+
+def check_r3_against_r2(images: list, partitions: list, policy: dict) -> None:
+    """The R3 rows against the R2 inventory they were bound to: presence and capacity."""
+    for name in policy["cross_rules"]:
+        rule = R3_CROSS_RULES.get(name)
+        if rule is None:
+            raise CollectError("R3 policy names a cross rule with no implementation")
+        rule(images, partitions, policy["profile"])
 
 
 def check_r4(data: dict, policy: dict, identity: dict) -> None:
@@ -924,19 +1415,20 @@ def validate_operation(
     policy = registry["operations"].get(operation_id)
     if policy is None:
         raise CollectError(f"unknown operation {operation_id}")
-    if len(raw) > spec["max_bytes"]:
-        raise CollectError(f"{operation_id} exceeds its {spec['max_bytes']}-byte bound")
+    budgets = {key: spec.get(key) for key in BUDGET_KEYS}
+    if budgets != policy["budgets"] or "max_bytes" in spec:
+        raise CollectError(f"{operation_id} request budgets differ from the policy's three bounds")
+    if len(raw) > budgets["max_output_bytes"]:
+        raise CollectError(
+            f"{operation_id} exceeds its {budgets['max_output_bytes']}-byte output bound"
+        )
     document = d.strict_json(raw, operation_id)
     check_json_depth(document, operation_id)
     if raw != d.render_json(document):
         raise CollectError(f"{operation_id} is not canonical JSON")
     reject_identifiers(document, operation_id, hash_scope(registry, "operation", operation_id))
-    need_dict(
-        document,
-        ["schema", "kind", "id", "request_sha256", "transport", "read_only", "bytes_read", "data"],
-        operation_id,
-    )
-    if type(document["schema"]) is not int or document["schema"] != 1:
+    need_dict(document, registry["operation_envelope"]["keys"], operation_id)
+    if type(document["schema"]) is not int or document["schema"] != OPERATION_SCHEMA:
         raise CollectError(f"{operation_id} schema differs")
     if document["kind"] != OPERATION_KIND or document["id"] != operation_id:
         raise CollectError(f"{operation_id} identity differs")
@@ -944,18 +1436,14 @@ def validate_operation(
         raise CollectError(f"{operation_id} request binding differs")
     if document["transport"] != TRANSPORT or document["read_only"] is not True:
         raise CollectError(f"{operation_id} transport or read-only claim differs")
-    limit = spec["max_bytes"]
-    need_int(document["bytes_read"], f"{operation_id} bytes_read", 1, limit)
-    emitted = {field_key(emit) for emit in spec["emits"]}
-    container = policy["container"]
-    keys = emitted
-    if container is not None:
-        if not set(container["row_fields"]) <= emitted:
-            raise CollectError(f"{operation_id} row fields are not emitted fields")
-        keys = (emitted - set(container["row_fields"])) | {container["rows_field"]}
-    if keys != set(policy["fields"]):
+    if document["read_domain"] != READ_DOMAIN:
+        raise CollectError(f"{operation_id} read domain differs")
+    need_int(
+        document["bytes_read"], f"{operation_id} bytes_read", 1, budgets["max_fixture_input_bytes"]
+    )
+    if sorted(field_key(emit) for emit in spec["emits"]) != field_paths(policy, container_prefix=False):
         raise CollectError(f"{operation_id} emitted fields differ from the policy registry")
-    data = need_dict(document["data"], keys, f"{operation_id} data")
+    data = need_dict(document["data"], set(policy["fields"]), f"{operation_id} data")
     if operation_id == R7_ID:
         return document, check_r7(data, policy, identity, spec)
     OPERATION_CHECKS[operation_id](data, policy, identity)
@@ -964,10 +1452,11 @@ def validate_operation(
 
 def cross_check(documents: dict, r7: dict) -> None:
     r1 = documents["R1-identity-and-slot"]["data"]
-    r2 = {row["partition_name"] for row in documents["R2-gpt-and-recovery-inventory"]["data"]["partitions"]}
-    for image in documents["R3-boot-image-headers"]["data"]["images"]:
-        if (image["partition_name"] in r2) == image["absent"]:
-            raise CollectError("R3 presence differs from the R2 inventory")
+    partitions = documents[R2_ID]["data"]["partitions"]
+    r2 = {row["partition_name"] for row in partitions}
+    check_r3_against_r2(
+        documents[R3_ID]["data"]["images"], partitions, policy_registry()["operations"][R3_ID]
+    )
     if documents["R6-storage-and-mount-model"]["data"]["root_source_gpt_name"] not in r2:
         raise CollectError("R6 root partition is not in the R2 inventory")
     for source in (r7["cmdline"], r7["bootconfig"]):
@@ -1106,7 +1595,7 @@ def plan_operation(row: dict) -> dict:
         "path": policy["input_path"],
         "purpose": list(row["purpose"]),
         "read_only": row["read_only"],
-        "max_bytes": row["max_bytes"],
+        **{key: row[key] for key in BUDGET_KEYS},
         "emits": list(row["emits"]),
         "fields": [field_key(emit) for emit in row["emits"]],
         "field_policy": row["field_policy"],
@@ -1177,8 +1666,9 @@ def evidence_document(env: Environment, inputs: Inputs) -> dict:
                     if item["id"] == row["id"]
                 ),
                 "bytes": inputs.capture.sizes[row["id"]],
+                "read_domain": READ_DOMAIN,
                 "bytes_read": inputs.capture.documents[row["id"]]["bytes_read"],
-                "max_bytes": row["max_bytes"],
+                **{key: row[key] for key in BUDGET_KEYS},
                 "data": inputs.capture.documents[row["id"]]["data"],
             }
             for row in reads

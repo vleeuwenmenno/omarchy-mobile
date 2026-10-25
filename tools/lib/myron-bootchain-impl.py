@@ -26,11 +26,11 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = Path(__file__).resolve().parent.parent
 COLLECT_TOOL = REPO / "tools/myron-collect"
 PINNED_VERSIONS = {
-    "collector": "0.1.0", "preflight": "0.2.1", "snapshot": "0.2.0", "deployment": "0.4.0",
+    "collector": "0.2.0", "preflight": "0.3.0", "snapshot": "0.2.0", "deployment": "0.4.0",
 }
 BOOTCHAIN_CONTRACT_PATH = "device/myron/bootchain-contract.json"
 IMPLEMENTATION_PATH = "tools/lib/myron-bootchain-impl.py"
@@ -128,16 +128,16 @@ UNRESOLVED = [
     "protective-mbr-not-parsed",
     "android-slot-semantics-not-established",
     "bootability-not-established",
-    "r3-format-schema-successor-required",
+    "r3-binary-parser-successor-required",
     "r4-selection-provenance-successor-required",
 ]
 DEFERRED = [
     {
-        "id": R3_ID, "state": "not-implemented", "successor_gate": "r3-boot-image-schema-migration",
+        "id": R3_ID, "state": "not-implemented", "successor_gate": "r3-binary-image-parsers",
         "requires": [
-            "format-specific parsers for Android boot v0-v4, vendor boot v3 and v4, and DTBO",
-            "nullable or not-applicable OS version semantics",
-            "component roles, hash coverage and profile limits",
+            "format-specific binary parsers for Android boot v0-v4, vendor boot v3 and v4, and DT table v0",
+            "hashes and coverage recomputed from image bytes: the schema generation only represents them",
+            "a hardware transport that counts actual returned bytes, rereads and overreads separately",
         ],
     },
     {
@@ -156,7 +156,7 @@ LIMITATIONS = [
     "header bytes after the 92-byte header must be zero: a profile restriction, not universal GPT validity",
     "a partition name fills at most 35 UTF-16 units and must be NUL terminated (a profile restriction)",
     "bootable_flag is legacy-bios-bootable-bit and proves no Android priority, success, active slot, bootability or recovery viability",
-    "R3 and R4 are not implemented: each is a recorded successor gate and the parse is an operation fragment, not a capture",
+    "R3 binary parsing and R4 selection are not implemented: each is a recorded successor gate (the R3 schema generation exists, with no parser) and the parse is an operation fragment, not a capture",
     "bytes_read is fixture payload accounting only: it counts consumed fixture bytes and is no device I/O",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the bootchain contract pins the bootchain implementation bytes; the collector implementation is bound only through the capture contract",
@@ -359,8 +359,8 @@ def check_registry_consistency(c) -> None:
     if any(TABLE_BYTES % sector for sector in SECTOR_SIZES) or ENTRY_COUNT * ENTRY_BYTES != TABLE_BYTES:
         raise BootchainError("bootchain table geometry is inconsistent")
     limits = {row["id"]: row for row in c.preflight().requested_reads()}
-    if R2_ID not in limits or limits[R2_ID]["max_bytes"] < MAX_BYTES_READ:
-        raise BootchainError("bootchain byte accounting exceeds the operation's byte bound")
+    if R2_ID not in limits or limits[R2_ID]["max_fixture_input_bytes"] < MAX_BYTES_READ:
+        raise BootchainError("bootchain byte accounting exceeds the operation's fixture input bound")
 
 
 def coverage_rows() -> list[dict]:
@@ -399,8 +399,14 @@ def accounting_policy() -> dict:
     return {
         "bytes_read": "exact-consumed-fixture-payload-bytes",
         "meaning": "fixture-payload-accounting-not-device-io",
+        "read_domain": "fixture",
         "includes": [GEOMETRY_PATH, PRIMARY_HEADER, PRIMARY_ENTRIES, BACKUP_HEADER, BACKUP_ENTRIES],
-        "excludes": [MANIFEST_PATH, "manifest-validation-rereads", "verification-reruns"],
+        "excludes": [MANIFEST_PATH, "manifest-validation-rereads", "verification-reruns",
+                     "hardware-bytes"],
+        "hardware_transport": "none",
+        "future_hardware_accounting": [
+            "actual-returned-bytes", "rereads-counted-separately", "overreads-counted-separately",
+        ],
         "max": MAX_BYTES_READ,
     }
 
@@ -1129,11 +1135,12 @@ def adapt(inputs: Inputs) -> dict:
 def operation_document(request_sha256: str, result: dict) -> dict:
     c = collect()
     return {
-        "schema": 1,
+        "schema": c.OPERATION_SCHEMA,
         "kind": c.OPERATION_KIND,
         "id": R2_ID,
         "request_sha256": request_sha256,
         "transport": c.TRANSPORT,
+        "read_domain": c.READ_DOMAIN,
         "read_only": True,
         "bytes_read": result["bytes_read"],
         "data": result["data"],
@@ -1143,8 +1150,8 @@ def operation_document(request_sha256: str, result: dict) -> dict:
 def validate_operation(env: Environment, request: dict, request_sha256: str, raw: bytes) -> dict:
     """The unchanged collector validates the fragment; its messages hold labels, never values."""
     row = request_row(request)
-    if len(raw) > row["max_bytes"]:
-        raise BootchainError("R2 operation exceeds the collector's byte bound")
+    if len(raw) > row["max_output_bytes"]:
+        raise BootchainError("R2 operation exceeds the collector's output bound")
     document, _outcome = collect().validate_operation(raw, row, request_sha256, env.identity)
     return document
 
@@ -1199,7 +1206,7 @@ def parse_document(env: Environment, inputs: Inputs, result: dict, operation: by
             "bytes": len(operation),
             "sha256": sha256_hex(operation),
             "bytes_read": result["bytes_read"],
-            "max_bytes": row["max_bytes"],
+            **{key: row[key] for key in collect().BUDGET_KEYS},
             "partition_count": len(result["data"]["partitions"]),
         },
         "accounting": {
@@ -1281,7 +1288,7 @@ def plan_document(env: Environment, request: dict, request_sha256: str) -> dict:
         "request_sha256": request_sha256,
         "request_binding": {
             "operation": R2_ID,
-            "max_bytes": row["max_bytes"],
+            **{key: row[key] for key in collect().BUDGET_KEYS},
             "emits": list(row["emits"]),
             "never_emits": list(row["never_emits"]),
             "request_sha256_is": "sha256-of-the-verified-request-SHA256SUMS-bytes",

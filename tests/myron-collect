@@ -22,18 +22,28 @@ done
 grep -q 'external-precaptured-fixture' "$impl" || fail "tool lacks the fixture transport"
 [[ $(wc -l < tools/myron-collect) -le 90 ]] || fail "the trusted loader grew past 90 lines"
 pass "loader and implementation parse and have no process, network, broad-copy, or live-transport facility"
+grep -Eq '^BOOT_METHOD=external-android$' device/myron/device.conf || fail "device.conf boot method changed"
+grep -Eq '^BOOT_IMAGES=""$' device/myron/device.conf || fail "device.conf BOOT_IMAGES is not empty"
+grep -Eq '^UFS_RW=""$' device/myron/device.conf || fail "device.conf UFS_RW is not empty"
+pass "R3 schema support leaves device.conf external-android with empty BOOT_IMAGES and UFS_RW"
 
 tools/myron-collect show > "$tmp/show.json" || fail "repository capture contract failed"
 python3 - "$tmp/show.json" <<'PY' || exit 1
 import hashlib, json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-capture-collector-contract"
-assert value["format_version"] == "0.1.0"
+assert value["format_version"] == "0.2.0"
 assert value["pinned_versions"] == {
-    "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0",
+    "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0",
 }
 assert value["transport"] == "external-precaptured-fixture"
-assert value["capture_schema"] == "myron-capture-evidence-v1"
+assert value["capture_schema"] == "myron-capture-evidence-v2"
+assert value["capture"]["operation_schema"] == 2 and value["capture"]["read_domain"] == "fixture"
+assert value["capture"]["legacy_generations"] == "reject-no-adapters"
+envelope = value["policy"]["operation_envelope"]
+assert envelope["schema"] == 2 and envelope["read_domain"] == "fixture"
+assert envelope["keys"] == ["schema", "kind", "id", "request_sha256", "transport", "read_domain",
+                            "read_only", "bytes_read", "data"]
 assert len(value["blockers"]) == 7
 assert len(value["authority"]) == 9 and all(v is False for v in value["authority"].values())
 assert value["evidence"]["level"] == "artifact-structure-only"
@@ -174,32 +184,16 @@ OPERATION_IDS = [row["id"] for row in READS]
 
 # --- a valid capture fixture --------------------------------------------------
 
+fixtures = load("myron_r3_fixtures", repo / "tests/myron-fixtures/r3.py")
+IMAGE_ROWS = fixtures.default_rows()
+PRESENT_IMAGES = [row["partition_name"] for row in IMAGE_ROWS if row["image"] is not None]
 PARTITIONS = [
-    ("boot_a", 100663296, True, "_a"), ("boot_b", 100663296, False, "_b"),
-    ("dtbo_a", 25165824, False, "_a"), ("init_boot_a", 8388608, False, "_a"),
-    ("pmos_root", 42949672960, False, ""),
-    ("recovery_a", 104857600, False, "_a"),
-    ("vendor_boot_a", 100663296, False, "_a"),
+    (row["partition_name"], row["size_bytes"], row["bootable_flag"], row["slot_suffix"])
+    for row in sorted(
+        fixtures.partition_rows(IMAGE_ROWS, extra=[("pmos_root", 42949672960)]),
+        key=lambda row: row["partition_name"])
 ]
-IMAGES = [
-    ("boot_a", False), ("dtbo_a", False), ("init_boot_a", False),
-    ("recovery_a", False), ("vendor_boot_a", False), ("vendor_kernel_boot_a", True),
-]
-
-
-def image_row(name, absent):
-    if absent:
-        return {
-            "partition_name": name, "absent": True, "header_version": None,
-            "page_size": None, "os_version": None, "component_sizes": [],
-            "component_offsets": [], "segment_count": 0, "header_sha256": None,
-        }
-    return {
-        "partition_name": name, "absent": False, "header_version": 4, "page_size": 4096,
-        "os_version": "16.0.0", "component_sizes": [4096, 8192],
-        "component_offsets": [4096, 8192], "segment_count": 2,
-        "header_sha256": digest(name.encode()),
-    }
+assert [name for name, *_ in PARTITIONS if name != "pmos_root"] == sorted(PRESENT_IMAGES)
 
 
 DATA = {
@@ -215,7 +209,7 @@ DATA = {
         ],
         "recovery_present": True,
     },
-    "R3-boot-image-headers": {"images": [image_row(n, a) for n, a in IMAGES]},
+    "R3-boot-image-headers": {"images": IMAGE_ROWS},
     "R4-dtb-dtbo-selection": {
         "dtb_count": 2, "selected_board_id": 7, "selected_board_revision": 1,
         "dtbo_entry_count": 3, "compatible_prefix": "qcom,canoe-mtp",
@@ -247,9 +241,9 @@ DATA = {
 
 def operation_document(operation_id, req_sha=None, data=None, **overrides):
     value = {
-        "schema": 1, "kind": C.OPERATION_KIND, "id": operation_id,
+        "schema": 2, "kind": C.OPERATION_KIND, "id": operation_id,
         "request_sha256": req_sha or request_sha256, "transport": C.TRANSPORT,
-        "read_only": True, "bytes_read": 4096,
+        "read_domain": "fixture", "read_only": True, "bytes_read": 4096,
         "data": copy.deepcopy(data if data is not None else DATA[operation_id]),
     }
     value.update(overrides)
@@ -441,13 +435,26 @@ bad_capture("unknown operation field", {R1: lambda d: d.update(extra=1)})
 bad_capture("unknown data field", {R1: lambda d: d["data"].update(extra=1)})
 bad_capture("missing data field", {R1: lambda d: d["data"].pop("soc")})
 bad_capture("operation schema bool", {R1: lambda d: d.update(schema=True)})
+bad_capture("operation schema 1 (previous generation)", {R1: lambda d: d.update(schema=1)},
+            match="R1-identity-and-slot schema differs")
+bad_capture("operation schema 3", {R1: lambda d: d.update(schema=3)})
+bad_capture("operation schema float", {R1: lambda d: d.update(schema=2.0)})
+bad_capture("operation schema string", {R1: lambda d: d.update(schema="2")})
+bad_capture("schema 1 envelope without a read domain",
+            {R1: lambda d: (d.update(schema=1), d.pop("read_domain"))})
+bad_capture("hybrid capture: one operation back at schema 1", {R6: lambda d: d.update(schema=1)},
+            match="R6-storage-and-mount-model schema differs")
+bad_capture("hybrid capture: every operation but the last at schema 1", {
+    operation: (lambda d: d.update(schema=1)) for operation in (R1, R2, R3, R4, R5, R6)})
 bad_capture("wrong operation id", {R1: lambda d: d.update(id=R2)})
 bad_capture("wrong request binding", {R1: lambda d: d.update(request_sha256="0" * 64)})
 bad_capture("wrong transport", {R1: lambda d: d.update(transport="live-session")})
 bad_capture("read_only false", {R1: lambda d: d.update(read_only=False)})
 bad_capture("bytes_read zero", {R1: lambda d: d.update(bytes_read=0)})
-bad_capture("bytes_read over operation bound",
-            {R1: lambda d: d.update(bytes_read=READS[0]["max_bytes"] + 1)})
+bad_capture("bytes_read over the fixture input bound",
+            {R1: lambda d: d.update(bytes_read=READS[0]["max_fixture_input_bytes"] + 1)})
+bad_capture("R3 bytes_read over the 64 MiB fixture input bound",
+            {R3: lambda d: d.update(bytes_read=64 * 1024 * 1024 + 1)})
 bad_capture("bytes_read float", {R1: lambda d: d.update(bytes_read=1.5)})
 bad_capture("bytes_read bool", {R1: lambda d: d.update(bytes_read=True)})
 bad_capture("R1 wrong codename", {R1: lambda d: d["data"].update(codename="cheetah")},
@@ -469,17 +476,29 @@ bad_capture("R2 suffix mismatch", {R2: lambda d: d["data"]["partitions"][0].upda
 bad_capture("R2 recovery flag mismatch", {R2: lambda d: d["data"].update(recovery_present=False)})
 bad_capture("R2 extra row field", {R2: lambda d: d["data"]["partitions"][0].update(guid="x")})
 bad_capture("R2 empty list", {R2: lambda d: d["data"].update(partitions=[])})
+R3_BOOT_A = next(i for i, row in enumerate(IMAGE_ROWS) if row["partition_name"] == "boot_a")
+R3_NULL = next(i for i, row in enumerate(IMAGE_ROWS) if row["partition_name"] == "vendor_kernel_boot_a")
 bad_capture("R3 unknown image", {R3: lambda d: d["data"]["images"][0].update(partition_name="vbmeta_a")})
-bad_capture("R3 absent image with header", {R3: lambda d: d["data"]["images"][-1].update(header_version=4)})
-bad_capture("R3 header version", {R3: lambda d: d["data"]["images"][0].update(header_version=9)})
-bad_capture("R3 page size", {R3: lambda d: d["data"]["images"][0].update(page_size=1234)})
-bad_capture("R3 segment mismatch", {R3: lambda d: d["data"]["images"][0].update(segment_count=1)})
-bad_capture("R3 too many components", {R3: lambda d: d["data"]["images"][0].update(
-    component_sizes=[1] * 9, component_offsets=[1] * 9, segment_count=9)})
-bad_capture("R3 presence differs from R2", {R3: lambda d: d["data"]["images"][-1].update(
-    image_row("vendor_kernel_boot_a", False))})
-bad_capture("R3 os version", {R3: lambda d: d["data"]["images"][0].update(os_version="16.0")})
-bad_capture("R3 bad header hash", {R3: lambda d: d["data"]["images"][0].update(header_sha256="abc")})
+bad_capture("R3 omitted row", {R3: lambda d: d["data"]["images"].pop()},
+            match="R3 images must hold 18..18 entries")
+bad_capture("R3 old absent flag", {R3: lambda d: d["data"]["images"][0].update(absent=True)})
+bad_capture("R3 present image on a name missing from R2", {R3: lambda d: d["data"]["images"][R3_NULL].update(
+    image=fixtures.make_image("vendor_kernel_boot_a", 4))}, match="R3 presence differs from the R2 inventory")
+bad_capture("R3 null image on a name present in R2", {R3: lambda d: d["data"]["images"][R3_BOOT_A].update(
+    image=None)}, match="R3 presence differs from the R2 inventory")
+bad_capture("R3 image larger than its R2 partition", documents={
+    R2: operation_document(R2, data={**DATA[R2], "partitions": [
+        {**row, "size_bytes": 4096} if row["partition_name"] == "boot_a" else row
+        for row in DATA[R2]["partitions"]]})}, match="R3 image is larger than its R2 partition")
+bad_capture("R3 header version", {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"].update(version=9)})
+bad_capture("R3 page size", {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"].update(page_size=1234)})
+bad_capture("R3 os version as text", {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"].update(
+    os_version="16.0.0")})
+bad_capture("R3 bad header hash", {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"]["header"].update(
+    sha256="abc")})
+bad_capture("R3 operation without the read domain", {R3: lambda d: d.pop("read_domain")})
+bad_capture("R3 operation in a hardware domain", {R3: lambda d: d.update(read_domain="hardware")},
+            match="R3-boot-image-headers read domain differs")
 bad_capture("R4 half selection", {R4: lambda d: d["data"].update(selected_board_revision=None)})
 bad_capture("R4 dtb count", {R4: lambda d: d["data"].update(dtb_count=65)})
 bad_capture("R4 source", {R4: lambda d: d["data"].update(selection_source="adb")})
@@ -543,18 +562,46 @@ bad_capture("operation duplicate key", raw={R1: b'{"schema": 1, "schema": 1}\n'}
 bad_capture("operation NaN", raw={R1: b'{"schema": NaN}\n'})
 bad_capture("operation not JSON", raw={R1: b"not json\n"})
 good_raw = D.render_json(operation_document(R1, bytes_read=100))
+C.validate_operation(good_raw, READS[0], request_sha256, envs.identity)
+# The three budgets are separate and exact. A document one byte over max_output_bytes is
+# refused before it is parsed, whatever its fixture or hardware allowance.
+OUTPUT = READS[0]["max_output_bytes"]
+padded = good_raw + b" " * (OUTPUT - len(good_raw) + 1)
+assert len(padded) == OUTPUT + 1
 try:
-    C.validate_operation(
-        good_raw, {**READS[0], "max_bytes": len(good_raw) - 1}, request_sha256, envs.identity
-    )
+    C.validate_operation(padded, READS[0], request_sha256, envs.identity)
 except C.CollectError as error:
-    assert "byte bound" in str(error)
+    assert "output bound" in str(error), error
 else:
-    raise AssertionError("operation larger than its max_bytes was accepted")
-C.validate_operation(
-    good_raw, {**READS[0], "max_bytes": len(good_raw)}, request_sha256, envs.identity
-)
-ok("operation larger than its own max_bytes is rejected")
+    raise AssertionError("operation larger than max_output_bytes was accepted")
+for key in ("max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes"):
+    for delta in (1, -1):
+        row = {**READS[0], key: READS[0][key] + delta}
+        try:
+            C.validate_operation(good_raw, row, request_sha256, envs.identity)
+        except C.CollectError as error:
+            assert "request budgets differ from the policy's three bounds" in str(error), error
+        else:
+            raise AssertionError(f"{key} {delta:+d} was accepted: a request cannot move a bound")
+legacy = {key: value for key, value in READS[0].items() if not key.startswith("max_")}
+legacy["max_bytes"] = 64 * 1024
+try:
+    C.validate_operation(good_raw, legacy, request_sha256, envs.identity)
+except C.CollectError as error:
+    assert "request budgets differ" in str(error), error
+else:
+    raise AssertionError("a request row with only the legacy max_bytes was accepted")
+# bytes_read is fixture payload acquisition: it is bounded by the fixture bound alone.
+for bytes_read, accepted in ((1, True), (READS[0]["max_fixture_input_bytes"], True),
+                             (READS[0]["max_fixture_input_bytes"] + 1, False), (0, False)):
+    raw = D.render_json(operation_document(R1, bytes_read=bytes_read))
+    try:
+        C.validate_operation(raw, READS[0], request_sha256, envs.identity)
+    except C.CollectError:
+        assert not accepted, bytes_read
+    else:
+        assert accepted, bytes_read
+ok("output, fixture input and hardware bounds are separate, exact, and no request row moves them")
 bad_capture("manifest wrong request", req_sha="1" * 64)
 bad_capture("manifest extra field", manifest_edit=lambda m: m.update(extra=1))
 bad_capture("manifest live claim", manifest_edit=lambda m: m.update(live=True))
@@ -631,12 +678,16 @@ over = fresh("total-bound") / "capture"
 write_capture(over)
 for operation_id, row in zip(OPERATION_IDS, READS):
     target = over / f"operations/{operation_id}.json"
-    target.write_bytes(target.read_bytes() + b" " * (row["max_bytes"] - len(target.read_bytes())))
+    target.write_bytes(
+        target.read_bytes() + b" " * (row["max_output_bytes"] - len(target.read_bytes())))
 manifest = over / "capture.json"
 manifest.write_bytes(manifest.read_bytes() + b" " * (900 * 1024))
 total = sum(p.stat().st_size for p in over.rglob("*") if p.is_file())
 assert total > C.TOTAL_CAPTURE_BYTES, total
-assert sum(row["max_bytes"] for row in READS) <= C.TOTAL_CAPTURE_BYTES
+# The per-operation output ceilings (R2, R3, R5 and R7 at 1 MiB each) add up past 4 MiB, so the
+# total bound is a separate, binding limit: it is never implied by the ceilings.
+assert sum(row["max_output_bytes"] for row in READS) > C.TOTAL_CAPTURE_BYTES
+assert max(row["max_output_bytes"] for row in READS) <= C.MAX_FILE_BYTES == 1024 * 1024
 err = expect_fail("capture over the 4 MiB total",
                   ["collect", "--request", request, "--capture", over, "--out", work / "o6"],
                   work / "o6")
@@ -812,7 +863,7 @@ tampered["authority"]["hardware_read_authorized"] = True
 expect_fail("capture contract authority claim", ["show"], root=root)
 root = clone_root("contract-version")
 tampered = json.loads(capture_contract_bytes)
-tampered["pinned_versions"]["preflight"] = "0.3.0"
+tampered["pinned_versions"]["preflight"] = "0.2.1"
 (root / C.CAPTURE_CONTRACT_PATH).write_bytes(D.render_json(tampered))
 expect_fail("capture contract version pin changed", ["show"], root=root)
 root = clone_root("contract-noncanonical")
@@ -830,8 +881,8 @@ ok("capture contract tampering and a changed preflight contract fail closed")
 patched_tools = fresh("version-pin") / "tools"
 shutil.copytree(repo / "tools", patched_tools, ignore=shutil.ignore_patterns("__pycache__"))
 source = (patched_tools / "myron-preflight").read_text()
-assert 'VERSION = "0.2.1"' in source
-(patched_tools / "myron-preflight").write_text(source.replace('VERSION = "0.2.1"', 'VERSION = "0.2.0"', 1))
+assert 'VERSION = "0.3.0"' in source
+(patched_tools / "myron-preflight").write_text(source.replace('VERSION = "0.3.0"', 'VERSION = "0.2.1"', 1))
 saved_tool, saved_module = C.PREFLIGHT_TOOL, C._preflight
 C.PREFLIGHT_TOOL, C._preflight = patched_tools / "myron-preflight", None
 try:
@@ -869,7 +920,27 @@ contract_tamper("contract without the policy registry", lambda v: v.pop("policy"
 contract_tamper("contract without requested operations", lambda v: v.pop("requested_operations"))
 contract_tamper("contract operation removed", lambda v: v["requested_operations"].pop())
 contract_tamper("contract operation bound widened",
-                lambda v: v["requested_operations"][4].update(max_bytes=2 * 1024 * 1024))
+                lambda v: v["requested_operations"][4].update(max_output_bytes=2 * 1024 * 1024))
+contract_tamper("contract R3 hardware allowance widened",
+                lambda v: v["requested_operations"][2].update(max_hardware_read_bytes=1024 * 1024))
+contract_tamper("contract R3 fixture bound narrowed",
+                lambda v: v["requested_operations"][2].update(max_fixture_input_bytes=1024 * 1024))
+contract_tamper("contract legacy single bound restored",
+                lambda v: v["requested_operations"][2].update(max_bytes=65536))
+contract_tamper("contract operation schema back at 1",
+                lambda v: v["capture"].update(operation_schema=1))
+contract_tamper("contract envelope schema back at 1",
+                lambda v: v["policy"]["operation_envelope"].update(schema=1))
+contract_tamper("contract read domain widened",
+                lambda v: v["capture"].update(read_domain="hardware"))
+contract_tamper("contract R3 rule dropped",
+                lambda v: v["policy"]["operations"][R3]["rules"].pop())
+contract_tamper("contract R3 profile page size widened",
+                lambda v: v["policy"]["operations"][R3]["profile"]["page_sizes"].append(65536))
+contract_tamper("contract R3 budget widened in the policy",
+                lambda v: v["policy"]["operations"][R3]["budgets"].update(max_hardware_read_bytes=2**20))
+contract_tamper("contract capture schema back at v1",
+                lambda v: v.update(capture_schema="myron-capture-evidence-v1"))
 contract_tamper("contract operation emits widened",
                 lambda v: v["requested_operations"][0]["emits"].append("extra"))
 contract_tamper("contract forbidden operation dropped", lambda v: v["forbidden_operations"].pop())
@@ -978,7 +1049,12 @@ ok("underscore, hyphen, suffixed and boundary excluded names reject; lookalikes 
 REGISTRY = C.policy_registry()
 R3_HASHES = C.hash_scope(REGISTRY, "operation", R3)
 R7_HASHES = C.hash_scope(REGISTRY, "operation", R7)
-assert ("data", "images", "*", "header_sha256") in R3_HASHES
+IMAGE = ("data", "images", "*", "image")
+R3_NESTED_HASHES = frozenset({
+    IMAGE + ("sha256",), IMAGE + ("header", "sha256"), IMAGE + ("components", "*", "sha256"),
+    IMAGE + ("table", "sha256"),
+})
+assert {path for path in R3_HASHES if path[0] == "data"} == R3_NESTED_HASHES
 assert ("data", "notes_sha256") in R7_HASHES
 assert ("request_sha256",) in R3_HASHES
 assert C.hash_scope(REGISTRY, "manifest") == frozenset({
@@ -986,11 +1062,13 @@ assert C.hash_scope(REGISTRY, "manifest") == frozenset({
 })
 assert REGISTRY["exclusions"]["hash_scope"] == "declared-hash-fields-only"
 assert {path[-1] for operation in OPERATION_IDS for path in C.hash_scope(REGISTRY, "operation", operation)
-        if path[0] == "data"} == {"header_sha256", "notes_sha256"}
+        if path[0] == "data"} == {"sha256", "notes_sha256"}
 HEX = digest(b"x")
-# Real schema hash fields pass, in the real documents.
-C.reject_identifiers(operation_document(R3)["data"], "R3", frozenset({("images", "*", "header_sha256")}))
+# Real schema hash fields pass, in the real documents, at every declared nested location.
+C.reject_identifiers(operation_document(R3)["data"], "R3",
+                     frozenset(path[1:] for path in R3_NESTED_HASHES))
 C.reject_identifiers(operation_document(R3), R3, R3_HASHES)
+assert any(item["sha256"] for row in IMAGE_ROWS if row["image"] for item in row["image"]["components"])
 C.reject_identifiers(operation_document(R7), R7, R7_HASHES)
 C.reject_identifiers(json.loads(walk(capture)[1]["capture.json"]), "capture.json",
                      C.hash_scope(REGISTRY, "manifest"))
@@ -1004,15 +1082,57 @@ def hash_reject(name, value, paths):
     raise AssertionError(f"{name} was accepted")
 
 
+def image_with(**edits):
+    document = operation_document(R3)
+    document["data"]["images"][R3_BOOT_A]["image"].update(edits)
+    return document
+
+
 hash_reject("hash under an undeclared key", {"header_sha256": HEX}, frozenset())
 hash_reject("hash at a different location than declared", {"data": {"note": HEX}}, R3_HASHES)
 hash_reject("hash in a list under a hash field name", {"data": {"images": [HEX]}}, R3_HASHES)
 hash_reject("hash as a dictionary key", {HEX: 1}, R3_HASHES)
 hash_reject("hash beside an excluded name", {"android_id": HEX}, R3_HASHES)
 hash_reject("hash behind an excluded token run", {"note": "disk_guid_" + HEX}, R3_HASHES)
-hash_reject("hash one level too deep", {"data": {"images": [{"header_sha256": [HEX]}]}}, R3_HASHES)
+hash_reject("hash one level too deep", {"data": {"images": [{"image": {"sha256": [HEX]}}]}}, R3_HASHES)
 hash_reject("hash at the wrong depth of the declared name",
-            {"data": {"header_sha256": HEX}}, R3_HASHES)
+            {"data": {"sha256": HEX}}, R3_HASHES)
+hash_reject("image hash named at the row level", {"data": {"images": [{"sha256": HEX}]}}, R3_HASHES)
+hash_reject("hash under the old header_sha256 name",
+            {"data": {"images": [{"image": {"header_sha256": HEX}}]}}, R3_HASHES)
+hash_reject("hash where a nested field is not declared a hash",
+            image_with(format=HEX), R3_HASHES)
+hash_reject("hash in a component field that is not its sha256",
+            {"data": {"images": [{"image": {"components": [{"role": HEX}]}}]}}, R3_HASHES)
+hash_reject("hash in a coverage field", {"data": {"images": [{"image": {"coverage": {"kind": HEX}}}]}},
+            R3_HASHES)
+hash_reject("hash as the header offset", {"data": {"images": [{"image": {"header": {"offset": HEX}}}]}},
+            R3_HASHES)
+hash_reject("hash as a table role", {"data": {"images": [{"image": {"table": {"role": HEX}}}]}}, R3_HASHES)
+for label, edit in (
+    ("image sha256", lambda image: image.update(sha256=HEX)),
+    ("header sha256", lambda image: image["header"].update(sha256=HEX)),
+    ("component sha256", lambda image: image["components"][0].update(sha256=HEX)),
+    ("table sha256", lambda image: image["table"].update(sha256=HEX) if image["table"] else None),
+):
+    document = operation_document(R3)
+    edit(document["data"]["images"][R3_BOOT_A]["image"])
+    C.reject_identifiers(document, R3, R3_HASHES)  # a hash at a declared nested path passes
+bad_capture("identifier canary as a component role",
+            {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"]["components"][0].update(
+                role="serial")}, match="excluded identifier or payload field")
+bad_capture("MAC-shaped canary in an R3 coverage kind",
+            {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"]["coverage"].update(
+                kind="aa:bb:cc:dd:ee:ff")}, match="identifier-shaped value")
+bad_capture("hash-shaped canary as an R3 nested key",
+            {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"].update({digest(b"k"): 1})},
+            match="identifier-shaped value")
+bad_capture("raw_payload as a nested R3 key",
+            {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"]["header"].update(raw_payload="x")},
+            match="excluded identifier or payload field")
+bad_capture("long digit canary as an R3 table role",
+            {R3: lambda d: d["data"]["images"][R3_BOOT_A]["image"].update(
+                format="123456789012345")}, match="identifier-shaped value")
 hash_reject("hash in the manifest outside its declared fields",
             {"operations": [{"sha256": HEX, "id": HEX}]}, C.hash_scope(REGISTRY, "manifest"))
 bad_capture("64-hex string in a non-hash R7 location",
@@ -1116,7 +1236,9 @@ assert plan_a["forbidden_operations"] == request_document["forbidden_operations"
 assert plan_a["redaction"] == request_document["redaction"]
 assert plan_a["policy"]["exclusions"] == C.policy_registry()["exclusions"]
 for row, planned in zip(READS, plan_a["capture_tree"]["operations"]):
-    for key in ("purpose", "read_only", "max_bytes", "emits", "field_policy", "never_emits",
+    assert "max_bytes" not in planned
+    for key in ("purpose", "read_only", "max_output_bytes", "max_fixture_input_bytes",
+                "max_hardware_read_bytes", "emits", "field_policy", "never_emits",
                 "stop_conditions"):
         assert planned[key] == row[key], (row["id"], key)
     registry = C.policy_registry()["operations"][row["id"]]
@@ -1145,7 +1267,10 @@ plan_tamper("plan global exclusion dropped", lambda v: v["policy"]["exclusions"]
     "never_emits"].pop())
 plan_tamper("plan operation purpose", lambda v: v["capture_tree"]["operations"][0]["purpose"].append("x"))
 plan_tamper("plan operation read_only", lambda v: v["capture_tree"]["operations"][0].update(read_only=False))
-plan_tamper("plan operation bound", lambda v: v["capture_tree"]["operations"][4].update(max_bytes=1))
+for budget in ("max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes"):
+    plan_tamper(f"plan operation {budget}",
+                lambda v, budget=budget: v["capture_tree"]["operations"][2].update({budget: 1}))
+plan_tamper("plan legacy operation bound", lambda v: v["capture_tree"]["operations"][4].update(max_bytes=1))
 plan_tamper("plan operation emits", lambda v: v["capture_tree"]["operations"][4]["emits"].pop())
 plan_tamper("plan operation field policy", lambda v: v["capture_tree"]["operations"][6][
     "field_policy"]["bootconfig"].update(unknown_keys="accept"))
@@ -1164,8 +1289,13 @@ plan_tamper("plan row container", lambda v: v["capture_tree"]["operations"][1].u
 plan_tamper("plan row fields", lambda v: v["capture_tree"]["operations"][2]["row_fields"].pop())
 plan_tamper("plan implementation hash", lambda v: v["implementation"].update(sha256="0" * 64))
 plan_tamper("plan implementation dropped", lambda v: v.pop("implementation"))
-plan_tamper("plan R3 variant policy", lambda v: v["capture_tree"]["operations"][2]["policy"][
-    "fields"]["images"]["variants"]["cases"][1]["fields"]["header_version"].update(type="nullable"))
+plan_tamper("plan R3 nested policy", lambda v: v["capture_tree"]["operations"][2]["policy"][
+    "fields"]["images"]["row"]["image"]["of"]["fields"]["os_version"].update(type="int_enum"))
+plan_tamper("plan R3 profile", lambda v: v["capture_tree"]["operations"][2]["policy"][
+    "profile"]["layouts"][4].update(header_bytes=1632))
+plan_tamper("plan R3 rule dropped", lambda v: v["capture_tree"]["operations"][2]["policy"][
+    "rules"].pop())
+plan_tamper("plan operation envelope", lambda v: v["policy"]["operation_envelope"].update(schema=1))
 plan_tamper("plan R4 constraint dropped", lambda v: v["capture_tree"]["operations"][3]["policy"][
     "constraints"].pop())
 ok("plan carries the request policy and typed registry; each tamper is named and refused")
@@ -1174,28 +1304,56 @@ ok("plan carries the request policy and typed registry; each tamper is named and
 
 # 1. Null and branch semantics live in the serialized policy, read from the committed file.
 committed = json.loads((repo / C.CAPTURE_CONTRACT_PATH).read_text())
-images = committed["policy"]["operations"][R3]["fields"]["images"]
-cases = {case["when"]: case for case in images["variants"]["cases"]}
-absent_fields, present_fields = cases[True]["fields"], cases[False]["fields"]
-HEADER = ["header_version", "page_size", "os_version", "header_sha256"]
-assert images["variants"]["discriminator"] == "absent" and set(cases) == {True, False}
-assert set(images["row"]) == {"partition_name", "absent"}
-for name in HEADER:
-    assert absent_fields[name] == {"type": "null"}, name
-    assert present_fields[name]["type"] in ("int", "int_enum", "text", "hash"), name
-assert absent_fields["segment_count"] == {"type": "int", "min": 0, "max": 0}
-assert present_fields["segment_count"] == {"type": "int", "min": 1, "max": 8}
-for name in C.IMAGE_SEGMENT_LISTS:
-    assert absent_fields[name]["min"] == absent_fields[name]["max"] == 0
-    assert (present_fields[name]["min"], present_fields[name]["max"]) == (1, 8)
-for case in cases.values():
-    assert case["constraints"] == [{
-        "type": "list_lengths", "lists": ["component_sizes", "component_offsets"],
-        "count": "segment_count"}]
-assert set(absent_fields) == set(present_fields)
-assert committed["policy"]["operations"][R3]["container"]["row_fields"] == [
-    "partition_name", "absent", "header_version", "page_size", "os_version",
-    "component_sizes", "component_offsets", "segment_count", "header_sha256"]
+r3_policy = committed["policy"]["operations"][R3]
+images = r3_policy["fields"]["images"]
+assert images["type"] == "rows" and images["min"] == images["max"] == 18
+assert images["sorted_unique_by"] == "partition_name" and "variants" not in images
+assert set(images["row"]) == {"partition_name", "role", "image"}
+image_spec = images["row"]["image"]
+assert image_spec["type"] == "nullable" and image_spec["of"]["type"] == "object"
+image_fields = image_spec["of"]["fields"]
+assert set(image_fields) == {
+    "format", "version", "page_size", "os_version", "size_bytes", "sha256", "header",
+    "components", "table", "coverage"}
+HASH = {"type": "hash", "pattern": "[0-9a-f]{64}"}
+assert image_fields["os_version"] == {"type": "nullable", "of": {"type": "int", "min": 0, "max": 2**32 - 1}}
+assert image_fields["sha256"] == {"type": "nullable", "of": HASH}
+assert image_fields["header"]["type"] == "object"
+assert set(image_fields["header"]["fields"]) == {"offset", "size_bytes", "sha256"}
+assert image_fields["header"]["fields"]["sha256"] == HASH, "a header hash is never null"
+assert image_fields["header"]["fields"]["offset"] == {"type": "int", "min": 0, "max": 0}
+assert image_fields["table"]["type"] == "nullable" and image_fields["table"]["of"]["type"] == "object"
+assert image_fields["table"]["of"]["fields"]["sha256"] == HASH, "a table hash is the empty-bytes hash at size zero"
+component_spec = image_fields["components"]
+assert component_spec["type"] == "rows" and component_spec["sorted_unique_by"] == ["role", "index"]
+assert (component_spec["min"], component_spec["max"]) == (1, 256)
+assert component_spec["row"]["sha256"] == {"type": "nullable", "of": HASH}
+assert component_spec["row"]["ramdisk_type"] == {"type": "nullable", "of": {"type": "int", "min": 0, "max": 3}}
+coverage_fields = image_fields["coverage"]["fields"]
+assert coverage_fields["kind"] == {"type": "enum", "values": ["metadata-only", "full-image"]}
+assert coverage_fields["ranges"]["sorted_unique_by"] == "index" and coverage_fields["ranges"]["max"] == 32
+assert r3_policy["container"] == {
+    "rows_field": "images", "row_fields": ["partition_name", "role", "image"]}
+assert r3_policy["budgets"] == {
+    "max_output_bytes": 1048576, "max_fixture_input_bytes": 67108864, "max_hardware_read_bytes": 65536}
+assert r3_policy["rules"] == list(C.R3_RULES) and r3_policy["cross_rules"] == list(C.R3_CROSS_RULES)
+profile = r3_policy["profile"]
+assert (profile["row_count"], profile["max_image_bytes"], profile["max_vendor_fragments"],
+        profile["max_dt_entries"], profile["max_coverage_ranges"]) == (18, 16777216, 64, 256, 32)
+assert profile["page_sizes"] == [2048, 4096, 8192, 16384] and profile["suffixes"] == ["", "_a", "_b"]
+# The serialized profile is checked against the independent fixture tables, not the tool's own.
+assert {entry["role"]: (entry["format"], entry["versions"]) for entry in profile["partitions"]} == {
+    role: (fixtures.ROLE_FORMAT[role], fixtures.ROLE_VERSIONS[role]) for role in fixtures.ROLES}
+layouts = {(item["format"], item["version"]): item for item in profile["layouts"]}
+assert {key: item["header_bytes"] for key, item in layouts.items()} == fixtures.HEADER_BYTES
+assert {key: [slot["role"] for slot in item["slots"]] for key, item in layouts.items()} == {
+    key: list(roles) for key, roles in fixtures.SLOTS.items()}
+assert {key: item["fixed_page_size"] for key, item in layouts.items() if item["fixed_page_size"]} == fixtures.FIXED_PAGE
+assert {key: (item["table"]["role"], item["table"]["entry_bytes"]) for key, item in layouts.items()
+        if item["table"]} == fixtures.TABLES
+assert layouts[("android-vendor-boot", 4)]["table"]["min_entries"] == 0
+assert layouts[("android-dt-table", 0)]["table"]["min_entries"] == 1
+assert profile["init_boot_kernel_bytes"] == 0 and profile["fragment_role"] == "vendor_ramdisk_fragment"
 r4_policy = committed["policy"]["operations"][R4]
 for name in ("selected_board_id", "selected_board_revision"):
     assert r4_policy["fields"][name] == {"type": "nullable", "of": {
@@ -1206,60 +1364,489 @@ assert r4_policy["constraints"] == [{
     "type": "null_together", "fields": ["selected_board_id", "selected_board_revision"]}]
 assert committed["policy"]["operations"][R5]["reference_module_order"] == D.REFERENCE_MODULE_ORDER
 assert all("constraints" in row for row in committed["policy"]["operations"].values())
-ok("serialized policy states the absent/null forms, the required present forms and the board pairing")
+ok("serialized policy states the nested R3 forms, the nullable image, the profile and the board pairing")
 
 
-def r3_images(*rows):
-    document = operation_document(R3)
-    document["data"]["images"] = list(rows)
-    return D.render_json(document)
+R3_POLICY = C.policy_registry()["operations"][R3]
 
 
-def r3_accepts(row, name="boot_a"):
+def r3_doc_error(rows, spec=None, **overrides):
+    document = operation_document(R3, data={"images": rows}, **overrides)
     try:
-        C.validate_operation(r3_images({**image_row(name, False), **row}), READS[2],
-                             request_sha256, envs.identity)
+        C.validate_operation(D.render_json(document), spec or READS[2], request_sha256, envs.identity)
     except C.CollectError as error:
         return str(error)
     return None
 
 
-def r3_absent(row=None):
+def r3_edit_error(edit, base=None):
+    rows = fixtures.clone(base or IMAGE_ROWS)
+    edit(rows)
+    return r3_doc_error(rows)
+
+
+def pick(rows, name):
+    return next(row for row in rows if row["partition_name"] == name)["image"]
+
+
+def r3_must(label, edit, match, base=None):
+    error = r3_edit_error(edit, base)
+    assert error is not None and match in error, (label, error)
+
+
+def r3_accepted(label, edit=None, base=None):
+    error = r3_edit_error(edit or (lambda rows: None), base)
+    assert error is None, (label, error)
+
+
+make = fixtures.make_image
+as_rows = fixtures.image_rows
+
+# 1. Every supported format and version, in both coverage kinds, and every null image form.
+count = 0
+for role in fixtures.ROLES:
+    for version in fixtures.ROLE_VERSIONS[role]:
+        for kind in ("metadata-only", "full-image"):
+            for suffix in fixtures.SUFFIXES:
+                name = role + suffix
+                assert r3_doc_error(as_rows({name: make(name, version, kind)})) is None, (name, version, kind)
+                count += 1
+assert count == 16 * 2 * 3
+every_page = [2048, 4096, 8192, 16384]
+for role, version in (("boot", 0), ("boot", 1), ("boot", 2), ("recovery", 2), ("vendor_boot", 3),
+                      ("vendor_kernel_boot", 4), ("dtbo", 0)):
+    for page in every_page:
+        name = role + "_a"
+        assert r3_doc_error(as_rows({name: make(name, version, page=page)})) is None, (name, page)
+for role, version in (("boot", 3), ("boot", 4), ("init_boot", 4), ("recovery", 4)):
+    assert make(role + "_a", version, page=8192)["page_size"] == 4096  # fixed by the format
+assert r3_doc_error(as_rows({})) is None, "all eighteen images null is a well-formed claim"
+assert r3_doc_error(as_rows({name: make(name, fixtures.ROLE_VERSIONS[fixtures.role_of(name)][-1])
+                             for name in fixtures.NAMES})) is None, "all eighteen present"
+assert r3_doc_error(as_rows({name: make(name, fixtures.ROLE_VERSIONS[fixtures.role_of(name)][0], "full-image")
+                             for name in fixtures.NAMES})) is None, "all eighteen full-image"
+ok("every supported format/version, both coverage kinds, every suffix and the null forms are accepted")
+
+# 2. Role, format, version, page size and OS version matrices.
+r3_must("role differs from its name", lambda r: next(
+    row for row in r if row["partition_name"] == "boot_a").update(role="dtbo"),
+    "R3 role differs from its partition name")
+r3_must("boot image claims the vendor format",
+        lambda r: pick(r, "boot_a").update(format="android-vendor-boot"),
+        "format or version is outside its partition profile")
+r3_must("dtbo claims the boot format", lambda r: pick(r, "dtbo_a").update(format="android-boot"),
+        "format or version is outside its partition profile")
+r3_must("vendor boot version 2", lambda r: pick(r, "vendor_boot_a").update(version=2),
+        "format or version is outside its partition profile")
+r3_must("init_boot version 3", lambda r: pick(r, "init_boot_a").update(version=3),
+        "format or version is outside its partition profile")
+r3_must("dtbo version 1", lambda r: pick(r, "dtbo_a").update(version=1),
+        "format or version is outside its partition profile")
+r3_must("version 5", lambda r: pick(r, "boot_a").update(version=5), "outside 0..4")
+r3_must("unknown format", lambda r: pick(r, "boot_a").update(format="android-recovery"),
+        "is not an allowed value")
+r3_must("boot v4 page size is fixed", lambda r: pick(r, "boot_a").update(page_size=8192),
+        "page size is outside its format profile")
+r3_must("page size outside the profile", lambda r: pick(r, "boot_b").update(page_size=1234),
+        "is not an allowed value")
+r3_must("page size as text", lambda r: pick(r, "boot_b").update(page_size="4096"),
+        "is not an allowed value")
+r3_accepted("boot v2 header-field page size", lambda r: pick(r, "boot_b").update(page_size=16384))
+r3_must("boot os_version null", lambda r: pick(r, "boot_a").update(os_version=None), "os_version")
+r3_must("vendor os_version zero", lambda r: pick(r, "vendor_boot_a").update(os_version=0), "os_version")
+r3_must("dtbo os_version set", lambda r: pick(r, "dtbo_a").update(os_version=7), "os_version")
+r3_must("os_version text", lambda r: pick(r, "boot_a").update(os_version="0.0.0"),
+        "outside 0..4294967295")
+r3_must("os_version negative", lambda r: pick(r, "boot_a").update(os_version=-1), "outside 0..4294967295")
+r3_must("os_version past uint32", lambda r: pick(r, "boot_a").update(os_version=2**32),
+        "outside 0..4294967295")
+r3_must("os_version boolean", lambda r: pick(r, "boot_a").update(os_version=True), "outside 0..4294967295")
+r3_accepted("os_version literal zero is a value, not an absence",
+            lambda r: pick(r, "boot_a").update(os_version=0))
+r3_accepted("os_version maximum", lambda r: pick(r, "boot_a").update(os_version=2**32 - 1))
+assert fixtures.make_image("boot_a", 4, os_version=0)["os_version"] == 0
+ok("role, format, version, page size and OS version matrices accept the profile and reject the rest")
+
+# 3. Header region and table.
+r3_must("header offset", lambda r: pick(r, "boot_a")["header"].update(offset=1), "outside 0..0")
+r3_must("header size short", lambda r: pick(r, "boot_a")["header"].update(size_bytes=1583),
+        "R3 header region is not at offset 0 with its exact structure size")
+r3_must("header size of the wrong format", lambda r: pick(r, "boot_a")["header"].update(size_bytes=2128),
+        "exact structure size")
+r3_must("header hash null", lambda r: pick(r, "boot_a")["header"].update(sha256=None), "pattern")
+r3_must("header extra key", lambda r: pick(r, "boot_a")["header"].update(extra=1), "fields differ")
+r3_must("vendor v4 without a table", lambda r: pick(r, "vendor_boot_a").update(table=None),
+        "lacks the table its format requires")
+r3_must("boot image with a table", lambda r: pick(r, "boot_a").update(
+    table=pick(r, "vendor_boot_a")["table"]), "carries a table its format does not have")
+rows_v3 = as_rows({"vendor_boot_a": make("vendor_boot_a", 3), "vendor_boot_b": make("vendor_boot_b", 4)})
+r3_accepted("vendor v3 beside vendor v4", base=rows_v3)
+r3_must("vendor v3 with a table", lambda r: pick(r, "vendor_boot_a").update(
+    table=pick(r, "vendor_boot_b")["table"]), "carries a table its format does not have", base=rows_v3)
+r3_must("table role swapped", lambda r: pick(r, "vendor_boot_a")["table"].update(role="dt_entry_table"),
+        "table role or entry size differs from its profile")
+r3_must("table entry size", lambda r: pick(r, "vendor_boot_a")["table"].update(entry_size=32),
+        "table role or entry size differs from its profile")
+r3_must("table size not count times entry size",
+        lambda r: pick(r, "vendor_boot_a")["table"].update(size_bytes=217),
+        "table size is not entry count times entry size")
+r3_must("table hash null", lambda r: pick(r, "vendor_boot_a")["table"].update(sha256=None), "pattern")
+r3_must("dtbo without a table", lambda r: pick(r, "dtbo_a").update(table=None), "lacks the table")
+rows_dt0 = as_rows({"dtbo_a": make("dtbo_a", 0, entries=1)})
+r3_accepted("dtbo with exactly one entry", base=rows_dt0)
+r3_must("dtbo with zero entries", lambda r: pick(r, "dtbo_a")["table"].update(
+    entry_count=0, size_bytes=0, sha256=fixtures.EMPTY_SHA256), "table entry count is outside its profile",
+    base=rows_dt0)
+rows_v4_zero = as_rows({"vendor_boot_a": make("vendor_boot_a", 4, entries=0)})
+assert pick(rows_v4_zero, "vendor_boot_a")["table"]["size_bytes"] == 0
+r3_accepted("vendor v4 with zero ramdisk fragments and an empty-bytes table hash", base=rows_v4_zero)
+r3_must("empty table with a non-empty hash",
+        lambda r: pick(r, "vendor_boot_a")["table"].update(sha256=fixtures.digest("x")),
+        "empty table hash is not the SHA-256 of empty bytes", base=rows_v4_zero)
+r3_accepted("an empty table needs no positive coverage range", base=rows_v4_zero)
+rows_v4_max = as_rows({"vendor_boot_a": make("vendor_boot_a", 4, entries=64)})
+r3_accepted("vendor v4 with 64 fragments", base=rows_v4_max)
+r3_must("vendor v4 with 65 entries", lambda r: (
+    pick(r, "vendor_boot_a")["table"].update(entry_count=65, size_bytes=65 * 108)),
+    "table entry count is outside its profile", base=rows_v4_max)
+rows_dt_max = as_rows({"dtbo_a": make("dtbo_a", 0, entries=256)})
+r3_accepted("dtbo with 256 entries", base=rows_dt_max)
+r3_must("dtbo with 257 entries", lambda r: pick(r, "dtbo_a")["table"].update(entry_count=257),
+        "outside 0..256", base=rows_dt_max)
+ok("header region and table profiles are exact, including the empty and maximum tables")
+
+# 4. Component slots, ramdisk types and hashes.
+r3_must("component slot omitted", lambda r: pick(r, "boot_a")["components"].pop(0),
+        "components differ from the slots of the format version")
+r3_must("component slot added", lambda r: pick(r, "boot_a")["components"].append(
+    {**pick(r, "boot_a")["components"][0], "role": "second"}) or pick(r, "boot_a")["components"].sort(
+    key=lambda c: (c["role"], c["index"])), "components differ from the slots")
+r3_must("component of another format", lambda r: pick(r, "boot_a")["components"].__setitem__(
+    0, {**pick(r, "boot_a")["components"][0], "role": "dt_entry"}),
+    "components differ from the slots of the format version")
+r3_must("component index skipped", lambda r: pick(r, "dtbo_a")["components"][1].update(index=5),
+        "components differ from the slots")
+r3_must("component duplicate", lambda r: pick(r, "dtbo_a")["components"].__setitem__(
+    1, dict(pick(r, "dtbo_a")["components"][0])), "is not unique and sorted")
+r3_must("components unsorted", lambda r: pick(r, "boot_a")["components"].reverse(),
+        "is not unique and sorted")
+r3_must("component role unknown", lambda r: pick(r, "boot_a")["components"][0].update(role="vendor"),
+        "is not an allowed value")
+r3_must("component extra key", lambda r: pick(r, "boot_a")["components"][0].update(extra=1), "fields differ")
+r3_must("ramdisk_type on a kernel", lambda r: pick(r, "boot_a")["components"][0].update(ramdisk_type=1),
+        "ramdisk_type is set only on vendor ramdisk fragments")
+r3_must("fragment without a ramdisk_type", lambda r: pick(r, "vendor_boot_a")["components"][-1].update(
+    ramdisk_type=None), "ramdisk_type is set only")
+r3_must("ramdisk_type 4", lambda r: pick(r, "vendor_boot_a")["components"][-1].update(ramdisk_type=4),
+        "outside 0..3")
+for value in range(4):
+    r3_accepted(f"fragment ramdisk_type {value}", lambda r, v=value: next(
+        c for c in pick(r, "vendor_boot_a")["components"] if c["role"] == "vendor_ramdisk_fragment"
+    ).update(ramdisk_type=v))
+r3_must("fragment count differs from the table", lambda r: pick(r, "vendor_boot_a")["table"].update(
+    entry_count=3, size_bytes=324), "components differ from the slots")
+r3_must("dt entry count differs from the table", lambda r: pick(r, "dtbo_a")["table"].update(
+    entry_count=3, size_bytes=96), "components differ from the slots")
+r3_must("init_boot kernel is not zero", lambda r: next(
+    c for c in pick(r, "init_boot_a")["components"] if c["role"] == "kernel").update(size_bytes=4096),
+    "init_boot kernel size is not zero")
+r3_must("zero-size component with a hash", lambda r: next(
+    c for c in pick(r, "boot_a")["components"] if c["role"] == "boot_signature").update(
+    size_bytes=0, sha256=fixtures.digest("z")), "component sha256 is present only where")
+r3_must("component hash outside coverage", lambda r: pick(r, "boot_a")["components"][0].update(
+    sha256=fixtures.digest("k")), "component sha256 is present only where its whole extent is covered")
+r3_must("covered component without a hash", lambda r: next(
+    c for c in pick(r, "vendor_boot_a")["components"] if c["role"] == "dtb").update(sha256=None),
+    "component sha256 is present only where")
+r3_must("full-image component without a hash", lambda r: pick(r, "boot_b")["components"][0].update(
+    sha256=None), "component sha256 is present only where")
+ok("component slots, ramdisk types, the init_boot kernel and component hashes follow the profile")
+
+# 5. Extents: bounds, overlap, overflow.
+def move(rows, name, role, **edit):
+    next(c for c in pick(rows, name)["components"] if c["role"] == role).update(edit)
+
+
+r3_must("component runs past the image", lambda r: move(r, "boot_a", "ramdisk", offset=8192, size_bytes=2**24),
+        "R3 extent runs past the image")
+r3_must("component offset at the bound", lambda r: move(r, "boot_a", "ramdisk", offset=2**24),
+        "R3 extent runs past the image")
+r3_must("component over the 16 MiB bound", lambda r: move(r, "boot_a", "ramdisk", size_bytes=2**24 + 1),
+        "outside 0..16777216")
+r3_must("component offset beyond 2^32", lambda r: move(r, "boot_a", "ramdisk", offset=2**32),
+        "outside 0..16777216")
+r3_must("offset and size that would wrap 32 bits", lambda r: move(
+    r, "boot_a", "ramdisk", offset=2**24, size_bytes=2**24), "R3 extent runs past the image")
+r3_must("component overlaps the header", lambda r: move(r, "boot_a", "kernel", offset=1000),
+        "R3 extents overlap")
+r3_must("components overlap", lambda r: move(r, "boot_a", "ramdisk", offset=4096 + 100),
+        "R3 extents overlap")
+r3_must("table overlaps a component", lambda r: pick(r, "vendor_boot_a")["table"].update(offset=5000),
+        "R3 extents overlap")
+r3_must("table runs past the image", lambda r: pick(r, "vendor_boot_a")["table"].update(offset=2**24 - 8),
+        "R3 extent runs past the image")
+r3_must("empty component lies past the image", lambda r: move(
+    r, "boot_a", "boot_signature", size_bytes=0, offset=2**24), "R3 empty extent lies past the image")
+r3_must("image over 16 MiB", lambda r: pick(r, "boot_a").update(size_bytes=2**24 + 1),
+        "outside 32..16777216")
+r3_must("image smaller than its header", lambda r: pick(r, "boot_a").update(size_bytes=1000),
+        "R3 extent runs past the image")
+ok("extents are bounded by the image and the profile, disjoint, and cannot wrap 32 bits")
+
+# 6. Coverage: canonical ranges, header/table containment, kind and hash dependencies.
+def ranges_of(rows, name):
+    return pick(rows, name)["coverage"]["ranges"]
+
+
+def set_ranges(rows, name, ranges):
+    coverage = pick(rows, name)["coverage"]
+    coverage["ranges"] = [{"index": i, "offset": o, "size_bytes": s} for i, (o, s) in enumerate(ranges)]
+    coverage["covered_bytes"] = sum(s for _o, s in ranges)
+
+
+r3_must("ranges adjacent and not merged", lambda r: set_ranges(r, "boot_a", [(0, 1000), (1000, 584)]),
+        "adjacent and not merged")
+r3_must("ranges overlap", lambda r: set_ranges(r, "boot_a", [(0, 1600), (1000, 584)]),
+        "overlap or are not sorted")
+r3_must("ranges unsorted", lambda r: set_ranges(r, "boot_a", [(8192, 100), (0, 1584)]),
+        "overlap or are not sorted")
+r3_must("ranges indices not sequential", lambda r: ranges_of(r, "boot_a")[0].update(index=1),
+        "range indices are not sequential")
+r3_must("ranges indices duplicated", lambda r: set_ranges(r, "boot_a", [(0, 1584), (8192, 10)]) or
+        ranges_of(r, "boot_a")[1].update(index=0), "is not unique and sorted")
+r3_must("covered_bytes off by one", lambda r: pick(r, "boot_a")["coverage"].update(
+    covered_bytes=pick(r, "boot_a")["coverage"]["covered_bytes"] + 1), "exact sum of its ranges")
+r3_must("zero-size range", lambda r: set_ranges(r, "boot_a", [(0, 1584), (8192, 0)]), "outside 1..16777216")
+r3_must("range past the image", lambda r: set_ranges(
+    r, "boot_a", [(0, 1584), (pick(r, "boot_a")["size_bytes"] - 10, 20)]), "range runs past the image")
+r3_must("header not fully covered", lambda r: set_ranges(r, "boot_a", [(0, 1583)]),
+        "coverage does not reach the whole header")
+r3_must("header range starts late", lambda r: set_ranges(r, "boot_a", [(1, 1583)]),
+        "coverage does not reach the whole header")
+r3_must("table not fully covered", lambda r: set_ranges(r, "vendor_boot_a", [(0, 2128 + 100)]),
+        "coverage does not reach the whole table")
+r3_must("no ranges", lambda r: pick(r, "boot_a")["coverage"].update(ranges=[]), "must hold 1..32")
+r3_must("full-image coverage short", lambda r: set_ranges(r, "boot_b", [(0, pick(r, "boot_b")["size_bytes"] - 1)]),
+        "full-image coverage is not exactly the whole image")
+r3_must("full-image coverage in two ranges", lambda r: set_ranges(r, "boot_b", [(0, 4096), (8192, 4096)]),
+        "full-image coverage is not exactly the whole image")
+r3_must("metadata-only coverage of the whole image", lambda r: (
+    pick(r, "boot_a")["coverage"].update(kind="metadata-only"),
+    set_ranges(r, "boot_a", [(0, pick(r, "boot_a")["size_bytes"])])),
+    "leaves no unverified byte")
+r3_must("metadata-only image carrying an image hash", lambda r: pick(r, "boot_a").update(
+    sha256=fixtures.digest("i")), "image sha256 is required for full-image coverage and null otherwise")
+r3_must("full-image without an image hash", lambda r: pick(r, "boot_b").update(sha256=None),
+        "image sha256 is required for full-image coverage and null otherwise")
+r3_must("coverage kind switched without ranges", lambda r: pick(r, "boot_b")["coverage"].update(
+    kind="metadata-only"), "leaves no unverified byte")
+r3_must("coverage kind unknown", lambda r: pick(r, "boot_a")["coverage"].update(kind="partial"),
+        "is not an allowed value")
+r3_must("coverage extra key", lambda r: pick(r, "boot_a")["coverage"].update(extra=1), "fields differ")
+r3_must("range extra key", lambda r: ranges_of(r, "boot_a")[0].update(extra=1), "fields differ")
+partial = lambda r: (  # half of the ramdisk is covered: the component must stay unhashed
+    set_ranges(r, "boot_a", [(0, 1584), (12288, 2048)]))
+r3_accepted("a partly covered component stays unhashed", partial)
+r3_must("a partly covered component with a hash", lambda r: (
+    partial(r), move(r, "boot_a", "ramdisk", sha256=fixtures.digest("p"))),
+    "component sha256 is present only where its whole extent is covered")
+full_ramdisk = lambda r: set_ranges(r, "boot_a", [(0, 1584), (12288, 4096)])
+r3_must("a fully covered component without a hash", full_ramdisk, "component sha256 is present only where")
+r3_accepted("a fully covered component with a hash", lambda r: (
+    full_ramdisk(r), move(r, "boot_a", "ramdisk", sha256=fixtures.digest("r"))))
+r3_accepted("a coverage range spanning two components hashes both", lambda r: (
+    set_ranges(r, "boot_a", [(0, 1584), (8192, 8192)]),
+    move(r, "boot_a", "kernel", sha256=fixtures.digest("k")),
+    move(r, "boot_a", "ramdisk", sha256=fixtures.digest("r"))))
+max_ranges = as_rows({"dtbo_a": make("dtbo_a", 0, entries=256, component_bytes=512,
+                                      cover=[("dt_entry", i) for i in range(0, 62, 2)])})
+assert len(ranges_of(max_ranges, "dtbo_a")) == 32
+r3_accepted("exactly 32 coverage ranges", base=max_ranges)
+over_ranges = as_rows({"dtbo_a": make("dtbo_a", 0, entries=256, component_bytes=512,
+                                       cover=[("dt_entry", i) for i in range(0, 64, 2)])})
+assert len(ranges_of(over_ranges, "dtbo_a")) == 33
+assert "must hold 1..32" in r3_doc_error(over_ranges)
+ok("coverage ranges are canonical, contain header and table, and every hash exists exactly where covered")
+
+# 7. The three budgets: aggregate metadata coverage, full-image coverage, output.
+def padded_metadata(name, version, covered_total):
+    """A metadata-only image whose coverage totals exactly COVERED_TOTAL bytes."""
+    image = make(name, version)
+    base = image["coverage"]["covered_bytes"]
+    last = max(c["offset"] + c["size_bytes"] for c in image["components"])
+    start = last + 4096
+    image["size_bytes"] = start + (covered_total - base) + 4096
+    ranges = [(item["offset"], item["size_bytes"]) for item in image["coverage"]["ranges"]]
+    ranges.append((start, covered_total - base))
+    image["coverage"]["ranges"] = [{"index": i, "offset": o, "size_bytes": s} for i, (o, s) in enumerate(ranges)]
+    image["coverage"]["covered_bytes"] = covered_total
+    return image
+
+
+exact = as_rows({"boot_a": padded_metadata("boot_a", 4, 65536)})
+assert pick(exact, "boot_a")["coverage"]["covered_bytes"] == 65536
+r3_accepted("metadata coverage of exactly 65536 bytes", base=exact)
+over = as_rows({"boot_a": padded_metadata("boot_a", 4, 65537)})
+r3_must("metadata coverage of 65537 bytes", lambda r: None, "metadata coverage exceeds the hardware read budget", base=over)
+split = as_rows({"boot_a": padded_metadata("boot_a", 4, 32768), "boot_b": padded_metadata("boot_b", 4, 32768)})
+r3_accepted("two images totalling exactly 65536 metadata bytes", base=split)
+over_split = as_rows({"boot_a": padded_metadata("boot_a", 4, 32768), "boot_b": padded_metadata("boot_b", 4, 32769)})
+r3_must("two images totalling 65537 metadata bytes", lambda r: None,
+        "metadata coverage exceeds the hardware read budget", base=over_split)
+assert C.policy_registry()["operations"][R3]["budgets"]["max_hardware_read_bytes"] == 65536
+
+
+def full_sized(name, version):
+    image = make(name, version, "full-image")
+    image["size_bytes"] = 2**24
+    image["coverage"]["ranges"] = [{"index": 0, "offset": 0, "size_bytes": 2**24}]
+    image["coverage"]["covered_bytes"] = 2**24
+    return image
+
+
+four = as_rows({n: full_sized(n, 4) for n in ("boot_a", "boot_b", "recovery_a", "recovery_b")})
+r3_accepted("four 16 MiB full-image claims, exactly 64 MiB", base=four)
+five = as_rows({n: full_sized(n, 4) for n in ("boot_a", "boot_b", "recovery_a", "recovery_b", "init_boot_a")})
+r3_must("five 16 MiB full-image claims", lambda r: None,
+        "full-image coverage exceeds the fixture input budget", base=five)
+assert max(row["max_output_bytes"] for row in READS) == 2**20
+# The largest legitimate R3 document fits its output bound.
+biggest = as_rows({
+    **{n: make(n, 0, entries=256) for n in ("dtbo", "dtbo_a", "dtbo_b")},
+    **{n: make(n, 4, entries=64) for n in ("vendor_boot", "vendor_boot_a", "vendor_boot_b",
+                                           "vendor_kernel_boot", "vendor_kernel_boot_a",
+                                           "vendor_kernel_boot_b")},
+})
+size = len(D.render_json(operation_document(R3, data={"images": biggest})))
+assert size < READS[2]["max_output_bytes"], size
+oversize = fixtures.clone(biggest)
+raw = D.render_json(operation_document(R3, data={"images": oversize}))
+try:
+    C.validate_operation(raw + b" " * (READS[2]["max_output_bytes"] - len(raw) + 1), READS[2],
+                         request_sha256, envs.identity)
+except C.CollectError as error:
+    assert "output bound" in str(error)
+else:
+    raise AssertionError("an R3 document over max_output_bytes was accepted")
+ok("metadata coverage, full-image coverage and output stay inside their separate R3 bounds")
+
+# 8. Eighteen rows exactly, the null form and the previous R3 forms.
+r3_must("row omitted", lambda r: r.pop(), "must hold 18..18 entries")
+r3_must("nineteenth row", lambda r: r.append(dict(r[-1])), "must hold 18..18 entries")
+r3_must("row duplicated", lambda r: r.__setitem__(1, dict(r[0])), "is not unique and sorted")
+r3_must("rows unsorted", lambda r: r.reverse(), "is not unique and sorted")
+r3_must("two rows swapped", lambda r: r.__setitem__(slice(0, 2), [r[1], r[0]]), "is not unique and sorted")
+r3_must("unsupported name", lambda r: r[0].update(partition_name="vbmeta_a"), "does not match its pattern")
+r3_must("unsupported suffix", lambda r: r[0].update(partition_name="boot_c"), "does not match its pattern")
+r3_must("role unknown", lambda r: r[0].update(role="vbmeta"), "is not an allowed value")
+r3_must("role missing", lambda r: r[0].pop("role"), "fields differ")
+r3_must("image key missing", lambda r: r[0].pop("image"), "fields differ")
+r3_must("image empty object", lambda r: r[0].update(image={}), "fields differ")
+r3_must("image false", lambda r: r[0].update(image=False), "fields differ")
+r3_must("image as a list", lambda r: r[0].update(image=[]), "fields differ")
+r3_must("old absent flag row", lambda r: r[0].update(absent=True), "fields differ")
+OLD_ROW = {"partition_name": "boot_a", "absent": False, "header_version": 4, "page_size": 4096,
+           "os_version": "16.0.0", "component_sizes": [4096, 8192], "component_offsets": [4096, 8192],
+           "segment_count": 2, "header_sha256": None}
+r3_must("the old parallel-array row form", lambda r: r.__setitem__(0, dict(OLD_ROW)), "fields differ")
+r3_must("the old row form with its header hash",
+        lambda r: r.__setitem__(0, {**OLD_ROW, "header_sha256": fixtures.digest("old")}),
+        "identifier-shaped value")
+r3_must("old absent row", lambda r: r.__setitem__(0, {
+    "partition_name": "boot", "absent": True, "header_version": None, "page_size": None,
+    "os_version": None, "component_sizes": [], "component_offsets": [], "segment_count": 0,
+    "header_sha256": None}), "fields differ")
+assert "must hold 18..18 entries" in r3_doc_error([dict(OLD_ROW)])
+document = operation_document(R3)
+document["data"] = {"images": IMAGE_ROWS, "partitions": []}
+try:
+    C.validate_operation(D.render_json(document), READS[2], request_sha256, envs.identity)
+except C.CollectError as error:
+    assert "data fields differ" in str(error)
+else:
+    raise AssertionError("an extra data field was accepted")
+r3_must("nested unknown image key", lambda r: pick(r, "boot_a").update(extra=1), "fields differ")
+r3_must("nested unknown table key", lambda r: pick(r, "vendor_boot_a")["table"].update(extra=1), "fields differ")
+r3_must("nested over-deep value", lambda r: ranges_of(r, "boot_a")[0].update(index=[[[]]]), "nests too deeply")
+r3_accepted("an operation at the exact depth bound", lambda r: None)
+ok("exactly eighteen rows, the null form, the previous forms and nested unknown keys are refused")
+
+# The request's emits must be exactly the leaf paths of the typed structure, nested ones included.
+r3_raw = D.render_json(operation_document(R3))
+C.validate_operation(r3_raw, READS[2], request_sha256, envs.identity)
+for label, edit in (
+    ("a nested leaf dropped", lambda e: e.remove("image.header.sha256")),
+    ("an unknown nested leaf added", lambda e: e.append("image.header.extra")),
+    ("a nested leaf repeated", lambda e: e.append("image.header.sha256")),
+    ("a row leaf dropped", lambda e: e.remove("role")),
+    ("a nested row path flattened", lambda e: (e.remove("image.coverage.ranges.*.offset"),
+                                               e.append("image.coverage.ranges.offset"))),
+):
+    emits = list(READS[2]["emits"])
+    edit(emits)
     try:
-        C.validate_operation(r3_images({**image_row("boot_a", True), **(row or {})}), READS[2],
-                             request_sha256, envs.identity)
+        C.validate_operation(r3_raw, {**READS[2], "emits": emits}, request_sha256, envs.identity)
+    except C.CollectError as error:
+        assert "emitted fields differ from the policy registry" in str(error), (label, error)
+    else:
+        raise AssertionError(f"{label}: accepted")
+assert sorted(e.replace("-", "_") for e in READS[2]["emits"]) == C.field_paths(R3_POLICY, container_prefix=False)
+ok("emitted leaf paths must equal the typed structure's leaf paths, nested rows included")
+
+# 9. R3 against R2 (the collector itself enforces these, never the session).
+partitions = fixtures.partition_rows(IMAGE_ROWS, extra=[("pmos_root", 1 << 35)])
+C.check_r3_against_r2(IMAGE_ROWS, partitions, R3_POLICY)
+
+
+def cross_error(rows, parts):
+    try:
+        C.check_r3_against_r2(rows, parts, R3_POLICY)
     except C.CollectError as error:
         return str(error)
     return None
 
 
-def spec_for(case, name):
-    return cases[case]["fields"][name]
+exact_fit = [{**row, "size_bytes": pick(IMAGE_ROWS, "boot_a")["size_bytes"]} if row["partition_name"] == "boot_a"
+             else row for row in partitions]
+assert cross_error(IMAGE_ROWS, exact_fit) is None, "an image equal to its partition fits"
+too_small = [{**row, "size_bytes": pick(IMAGE_ROWS, "boot_a")["size_bytes"] - 1} if row["partition_name"] == "boot_a"
+             else row for row in partitions]
+assert "larger than its R2 partition" in cross_error(IMAGE_ROWS, too_small)
+assert "presence differs" in cross_error(IMAGE_ROWS, [row for row in partitions if row["partition_name"] != "dtbo_a"])
+assert "presence differs" in cross_error(IMAGE_ROWS, partitions + [{
+    "partition_name": "vendor_kernel_boot_a", "size_bytes": 1 << 20, "bootable_flag": False, "slot_suffix": "_a"}])
+nulls = as_rows({})
+assert cross_error(nulls, [{"partition_name": "pmos_root", "size_bytes": 1 << 35, "bootable_flag": False,
+                            "slot_suffix": ""}]) is None
+assert "presence differs" in cross_error(nulls, partitions)
+ok("R3 presence and capacity are enforced against R2 by the collector, in both directions")
 
-
-# The validator follows the policy: whatever the policy calls nullable accepts null and
-# whatever it calls required rejects null, for every header field in each branch.
-for name in present_fields:
-    nullable = spec_for(False, name)["type"] in ("null", "nullable")
-    assert not nullable, name
-    assert (r3_accepts({name: None}) is None) == nullable, name
-for name in absent_fields:
-    if absent_fields[name]["type"] == "null":
-        assert r3_absent() is None
-        assert r3_absent({name: image_row("boot_a", False)[name]}) is not None, name
-assert r3_absent() is None
-assert r3_absent({"segment_count": 1}) is not None
-assert r3_absent({"component_sizes": [1], "component_offsets": [1], "segment_count": 1}) is not None
-assert r3_absent({"segment_count": None}) is not None and r3_absent({"segment_count": False}) is not None
-assert r3_absent({"header_version": 0}) is not None
-assert r3_accepts({}) is None
-assert r3_accepts({"segment_count": 0, "component_sizes": [], "component_offsets": []}) is not None
-assert r3_accepts({"segment_count": 3}) is not None
-assert r3_accepts({"component_sizes": [4096], "segment_count": 2}) is not None
-assert r3_accepts({"header_sha256": None}) is not None
-assert r3_accepts({"absent": None}) is not None and r3_accepts({"absent": 0}) is not None
-assert r3_accepts({"absent": True}) is not None  # absent claim with a full header
-ok("R3 absent images carry exactly the null/empty form and present images keep every field required")
+# 10. A complete capture with every image present and every format passes end to end.
+every = as_rows({name: make(name, fixtures.ROLE_VERSIONS[fixtures.role_of(name)][-1],
+                            "full-image" if index % 2 else "metadata-only")
+                 for index, name in enumerate(fixtures.NAMES)})
+every_data = {**DATA[R2], "partitions": [
+    {"partition_name": row["partition_name"], "size_bytes": 96 << 20, "bootable_flag": False,
+     "slot_suffix": row["partition_name"][-2:] if row["partition_name"].endswith(("_a", "_b")) else ""}
+    for row in sorted(every + [{"partition_name": "pmos_root"}], key=lambda row: row["partition_name"])
+]}
+every_data["partitions"] = [
+    {**row, "size_bytes": 42949672960} if row["partition_name"] == "pmos_root" else row
+    for row in every_data["partitions"]]
+every_capture = fresh("every-image") / "capture"
+write_capture(every_capture, {
+    R2: operation_document(R2, data=every_data),
+    R3: operation_document(R3, data={"images": every}),
+})
+every_out = work / "every-image-out"
+expect_ok("collect", "--request", request, "--capture", every_capture, "--out", every_out)
+every_evidence = json.loads(walk(every_out)[1]["evidence.json"])
+assert every_evidence["operations"][2]["data"]["images"] == every
+assert every_evidence["operations"][2]["read_domain"] == "fixture"
+assert [every_evidence["operations"][2][key] for key in (
+    "max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes")] == [1048576, 67108864, 65536]
+expect_ok("verify-evidence", "--request", request, "--capture", every_capture, "--evidence", every_out)
+ok("a capture holding all eighteen images, every format and both coverage kinds collects and verifies")
 
 
 def r4_result(**fields):
@@ -1281,39 +1868,95 @@ assert r4_result(selected_board_id=True) is not None and r4_result(selected_boar
 assert r4_result(selected_board_id=None, selected_board_revision=3) is not None
 assert r4_result(dtb_count=None) is not None and r4_result(selection_source=None) is not None
 assert r4_result(dtbo_entry_count=None) is not None and r4_result(compatible_prefix=None) is not None
-ok("R4 accepts both board fields null or both integers, never one, and nothing else null")
+assert [name for name in dir(C) if name.startswith(("parse_", "derive_", "select_"))] == [], \
+    "the collector has no parser and no selection logic: R3 is schema only and R4 is unimplemented"
+assert set(C.policy_registry()["operations"][R4]["fields"]) == {
+    "dtb_count", "selected_board_id", "selected_board_revision", "dtbo_entry_count",
+    "compatible_prefix", "selection_source"}, "R4 is unchanged by the R3 migration"
+ok("R4 accepts both board fields null or both integers, never one, and nothing else null; no parser exists")
 
 # 2. Policy drift changes the validator and the derived contract together.
 
 
-saved_present = C.IMAGE_PRESENT["header_version"]
-assert r3_accepts({"header_version": None}) is not None
-C.IMAGE_PRESENT["header_version"] = C._nullable(saved_present)
+def consistency_drift(name, apply, restore):
+    """A drift that contradicts the registry's own bounds stops every command instead."""
+    apply()
+    try:
+        code, _out, err = invoke("show")
+        assert code != 0 and "policy registry is inconsistent" in err, (name, err)
+        try:
+            C.policy_registry()
+        except C.CollectError:
+            pass
+        else:
+            raise AssertionError(f"{name}: contradictory registry served")
+    finally:
+        restore()
+    code, _out, err = invoke("show")
+    assert code == 0, err
+    ok(f"{name} contradicts the registry and stops every command")
+
+
+saved_sha = C.R3_COMPONENT_ROW["sha256"]
+assert r3_doc_error(IMAGE_ROWS) is None
+C.R3_COMPONENT_ROW["sha256"] = C._hash()
 try:
-    assert r3_accepts({"header_version": None}) is None, "validator ignored the drifted policy"
+    assert r3_doc_error(IMAGE_ROWS) is not None, "validator ignored the drifted policy"
 finally:
-    C.IMAGE_PRESENT["header_version"] = saved_present
-drift("R3 present header made nullable",
-      lambda: C.IMAGE_PRESENT.__setitem__("header_version", C._nullable(saved_present)),
-      lambda: C.IMAGE_PRESENT.__setitem__("header_version", saved_present))
-assert r3_accepts({"header_version": None}) is not None
-saved_absent = C.IMAGE_ABSENT["os_version"]
-drift("R3 absent os_version made required",
-      lambda: C.IMAGE_ABSENT.__setitem__("os_version", C._text(C.OS_VERSION)),
-      lambda: C.IMAGE_ABSENT.__setitem__("os_version", saved_absent))
-saved_count = C.IMAGE_ABSENT["segment_count"]
-drift("R3 absent segment count widened",
-      lambda: C.IMAGE_ABSENT.__setitem__("segment_count", C._int(0, 1)),
-      lambda: C.IMAGE_ABSENT.__setitem__("segment_count", saved_count))
-saved_segments = C.IMAGE_PRESENT["segment_count"]
-drift("R3 present segment count widened",
-      lambda: C.IMAGE_PRESENT.__setitem__("segment_count", C._int(0, 8)),
-      lambda: C.IMAGE_PRESENT.__setitem__("segment_count", saved_segments))
-saved_constraints = list(C.IMAGE_VARIANTS["cases"][1]["constraints"])
-drift("R3 segment-count constraint dropped",
-      lambda: C.IMAGE_VARIANTS["cases"][1]["constraints"].clear(),
-      lambda: C.IMAGE_VARIANTS["cases"][1]["constraints"].extend(saved_constraints))
-assert r3_accepts({"segment_count": 3}) is not None
+    C.R3_COMPONENT_ROW["sha256"] = saved_sha
+drift("R3 component hash made always required",
+      lambda: C.R3_COMPONENT_ROW.__setitem__("sha256", C._hash()),
+      lambda: C.R3_COMPONENT_ROW.__setitem__("sha256", saved_sha))
+assert r3_doc_error(IMAGE_ROWS) is None
+saved_os = C.R3_IMAGE["fields"]["os_version"]
+C.R3_IMAGE["fields"]["os_version"] = C._int(0, 2**32 - 1)
+try:
+    assert r3_doc_error(as_rows({"dtbo_a": make("dtbo_a", 0)})) is not None, "validator ignored the drift"
+finally:
+    C.R3_IMAGE["fields"]["os_version"] = saved_os
+drift("R3 os_version made a plain integer",
+      lambda: C.R3_IMAGE["fields"].__setitem__("os_version", C._int(0, 2**32 - 1)),
+      lambda: C.R3_IMAGE["fields"].__setitem__("os_version", saved_os))
+saved_range = C.R3_RANGE_ROW["size_bytes"]
+drift("R3 zero-size coverage ranges admitted",
+      lambda: C.R3_RANGE_ROW.__setitem__("size_bytes", C._int(0, C.MAX_IMAGE_BYTES)),
+      lambda: C.R3_RANGE_ROW.__setitem__("size_bytes", saved_range))
+saved_header = C.R3_HEADER["fields"]["offset"]
+drift("R3 header offset widened",
+      lambda: C.R3_HEADER["fields"].__setitem__("offset", C._int(0, 4096)),
+      lambda: C.R3_HEADER["fields"].__setitem__("offset", saved_header))
+saved_sort = C.R3_COMPONENTS["sorted_unique_by"]
+drift("R3 component sort key changed",
+      lambda: C.R3_COMPONENTS.__setitem__("sorted_unique_by", ["index", "role"]),
+      lambda: C.R3_COMPONENTS.__setitem__("sorted_unique_by", saved_sort))
+saved_rule = C.R3_RULES["r3-coverage-budgets"]
+drift("R3 coverage budget rule dropped", lambda: C.R3_RULES.pop("r3-coverage-budgets"),
+      lambda: C.R3_RULES.__setitem__("r3-coverage-budgets", saved_rule))
+assert list(C.R3_RULES)[-1] == "r3-coverage-budgets"
+real_profile = C.r3_profile
+
+
+def drifted_profile():
+    value = real_profile()
+    value["layouts"][4]["header_bytes"] = 1632  # boot v4 claimed to share boot v0's header size
+    return value
+
+
+drift("R3 boot v4 header size", lambda: setattr(C, "r3_profile", drifted_profile),
+      lambda: setattr(C, "r3_profile", real_profile))
+real_budgets = P.R3_BUDGETS
+drift("R3 hardware budget widened in the preflight constants",
+      lambda: setattr(P, "R3_BUDGETS", (1048576, 67108864, 1048576)),
+      lambda: setattr(P, "R3_BUDGETS", real_budgets))
+saved_ranges_max = C.R3_COVERAGE["fields"]["ranges"]["max"]
+consistency_drift("R3 range count bound widened",
+                  lambda: C.R3_COVERAGE["fields"]["ranges"].__setitem__("max", 33),
+                  lambda: C.R3_COVERAGE["fields"]["ranges"].__setitem__("max", saved_ranges_max))
+consistency_drift("R3 profile image bound widened",
+                  lambda: setattr(C, "MAX_IMAGE_BYTES", 2**25),
+                  lambda: setattr(C, "MAX_IMAGE_BYTES", 2**24))
+consistency_drift("R3 profile page sizes widened", lambda: C.PAGE_SIZES.append(32768),
+                  lambda: C.PAGE_SIZES.pop())
 saved_dtb_constraints = list(C.DTB_CONSTRAINTS)
 drift("R4 board pairing dropped", lambda: C.DTB_CONSTRAINTS.clear(),
       lambda: C.DTB_CONSTRAINTS.extend(saved_dtb_constraints))
@@ -1343,25 +1986,73 @@ def inconsistent(name, mutate, match="policy registry is inconsistent"):
     ok(f"{name} is refused by the policy consistency check")
 
 
-def variant_cases(registry):
-    return registry["operations"][R3]["fields"]["images"]["variants"]["cases"]
+def image_fields_of(registry):
+    return registry["operations"][R3]["fields"]["images"]["row"]["image"]["of"]["fields"]
+
+
+def r3_op(registry):
+    return registry["operations"][R3]
 
 
 C.check_policy(C.policy_registry())
-inconsistent("variant field removed", lambda r: variant_cases(r)[0]["fields"].pop("page_size"))
-inconsistent("variant field renamed", lambda r: variant_cases(r)[1]["fields"].update(
-    extra=variant_cases(r)[1]["fields"].pop("os_version")))
-inconsistent("variant field shadows a base field", lambda r: variant_cases(r)[0]["fields"].update(
-    absent={"type": "null"}), match="disjoint")
-inconsistent("both variants selected by true", lambda r: variant_cases(r)[1].update(when=True))
-inconsistent("variant selector not a boolean", lambda r: r["operations"][R3]["fields"]["images"][
-    "row"].update(absent={"type": "int", "min": 0, "max": 1}))
-inconsistent("variant selector pinned", lambda r: r["operations"][R3]["fields"]["images"][
-    "row"].update(absent={"type": "bool", "const": False}))
-inconsistent("variant constraint names an unknown list", lambda r: variant_cases(r)[0][
-    "constraints"][0]["lists"].append("missing"))
-inconsistent("variant count not an integer", lambda r: variant_cases(r)[0]["fields"].update(
-    segment_count={"type": "null"}))
+inconsistent("object without fields", lambda r: r3_op(r)["fields"]["images"]["row"]["image"]["of"].update(
+    fields={}), match="object has no named fields")
+inconsistent("nested rows bounds reversed", lambda r: image_fields_of(r)["components"].update(min=9, max=1),
+             match="min above max")
+inconsistent("nested spec of an unknown type", lambda r: image_fields_of(r)["header"]["fields"].update(
+    offset={"type": "wildcard"}), match="unknown type")
+inconsistent("nullable of nullable in a nested object", lambda r: image_fields_of(r).update(
+    os_version={"type": "nullable", "of": {"type": "nullable", "of": {"type": "int", "min": 0, "max": 1}}}),
+    match="nests a null type")
+inconsistent("sort key names an unknown row field", lambda r: image_fields_of(r)["components"].update(
+    sorted_unique_by=["role", "missing"]), match="unknown or repeated row fields")
+inconsistent("sort key repeats a row field", lambda r: image_fields_of(r)["components"].update(
+    sorted_unique_by=["role", "role"]), match="unknown or repeated row fields")
+inconsistent("sort key is not a sortable scalar", lambda r: image_fields_of(r)["components"].update(
+    sorted_unique_by="sha256"), match="not a sortable scalar")
+inconsistent("nested rows without row fields", lambda r: image_fields_of(r)["components"].update(row={}),
+             match="rows have no row fields")
+deep_spec = {"type": "int", "min": 0, "max": 1}
+for _level in range(2000):
+    deep_spec = {"type": "object", "fields": {"x": deep_spec}}
+inconsistent("a spec nested 2000 levels deep", lambda r: r["operations"][R4]["fields"].update(
+    dtb_count=deep_spec), match="nests too deeply")
+inconsistent("R3 rule published without an implementation",
+             lambda r: r3_op(r)["rules"].append("r3-unchecked"), match="rules differ from the implemented")
+inconsistent("R3 rule listed twice", lambda r: r3_op(r)["rules"].append(r3_op(r)["rules"][0]),
+             match="rules differ from the implemented")
+inconsistent("R3 implemented rule left out", lambda r: r3_op(r)["rules"].pop(),
+             match="rules differ from the implemented")
+inconsistent("R3 cross rule dropped", lambda r: r3_op(r)["cross_rules"].pop(),
+             match="cross rules differ from the implemented")
+inconsistent("R3 profile row count", lambda r: r3_op(r)["profile"].update(row_count=19),
+             match="not unique or miscounted")
+inconsistent("R3 profile page sizes", lambda r: r3_op(r)["profile"]["page_sizes"].append(65536),
+             match="page sizes differ from the profile")
+inconsistent("R3 profile range bound", lambda r: r3_op(r)["profile"].update(max_coverage_ranges=33),
+             match="coverage range bound differs")
+inconsistent("R3 profile image bound", lambda r: r3_op(r)["profile"].update(max_image_bytes=2**25),
+             match="image size bound differs")
+inconsistent("R3 profile layout repeated", lambda r: r3_op(r)["profile"]["layouts"].append(
+    dict(r3_op(r)["profile"]["layouts"][0])), match="repeated or unbounded")
+inconsistent("R3 profile counted slot without a table", lambda r: r3_op(r)["profile"]["layouts"][7].update(
+    table=None), match="disagree about counted slots")
+inconsistent("R3 profile partition names an unknown version", lambda r: r3_op(r)["profile"][
+    "partitions"][0]["versions"].append(9), match="unknown format version")
+inconsistent("R3 profile empty-bytes hash", lambda r: r3_op(r)["profile"].update(
+    empty_bytes_sha256="0" * 64), match="empty-bytes hash")
+inconsistent("R3 image spec missing its coverage object",
+             lambda r: image_fields_of(r).pop("coverage"), match="R3 policy is not the reviewed shape")
+inconsistent("R3 profile table bound", lambda r: r3_op(r)["profile"]["layouts"][7]["table"].update(
+    max_entries=300), match="table bounds are inconsistent")
+inconsistent("legacy single budget", lambda r: r3_op(r).update(budgets={"max_bytes": 65536}),
+             match="budgets differ from the three separate bounds")
+inconsistent("budget not positive", lambda r: r3_op(r)["budgets"].update(max_output_bytes=0),
+             match="budgets are not positive integers")
+inconsistent("operation envelope schema", lambda r: r["operation_envelope"].update(schema=1),
+             match="operation envelope differs")
+inconsistent("operation envelope keys", lambda r: r["operation_envelope"]["keys"].remove("read_domain"),
+             match="operation envelope differs")
 inconsistent("pairing over a non-nullable field", lambda r: r["operations"][R4]["fields"].update(
     selected_board_id={"type": "int", "min": 0, "max": 1}))
 inconsistent("pairing over an unknown field", lambda r: r["operations"][R4]["constraints"][0][
@@ -1467,7 +2158,19 @@ SOURCE_EDITS = {
     "a dropped slot cross-check": lambda t: t.replace(
         'raise CollectError("R7 slot disagrees with R1")', "pass", 1),
     "a loosened presence cross-check": lambda t: t.replace(
-        "(image[\"partition_name\"] in r2) == image[\"absent\"]", "False", 1),
+        'if (row["partition_name"] in inventory) != (row["image"] is not None):', "if False:", 1),
+    "a dropped R3 header coverage check": lambda t: t.replace(
+        'raise CollectError("R3 coverage does not reach the whole header")', "pass", 1),
+    "a loosened hash-iff-covered rule": lambda t: t.replace(
+        'if (item["sha256"] is not None) != reached:', "if False:", 1),
+    "a loosened metadata coverage budget": lambda t: t.replace(
+        'if metadata > budgets["max_hardware_read_bytes"]:', "if False:", 1),
+    "a skipped adjacent-range merge rule": lambda t: t.replace(
+        'if item["offset"] == previous_end:', "if False:", 1),
+    "an operation schema that also admits 1": lambda t: t.replace(
+        'document["schema"] != OPERATION_SCHEMA', 'document["schema"] not in (1, 2)', 1),
+    "a request budget comparison left out": lambda t: t.replace(
+        'if budgets != policy["budgets"] or "max_bytes" in spec:', "if False:", 1),
     "a weakened order recomputation": lambda t: t.replace("] == declared", "] != []", 1),
     "a skipped R7 unknown-key policy check": lambda t: t.replace(
         'raise CollectError("R7 policy no longer rejects unknown keys")', "pass", 1),
@@ -1636,7 +2339,7 @@ def refused_before_render(label, call, levels):
     assert not renders, f"{label}: the renderer ran on a {levels}-deep document"
 
 
-big_spec = {**READS[0], "max_bytes": 1024 * 1024}
+big_spec = READS[0]  # the depth bound is checked right after the output bound, before any render
 for levels in (C.MAX_DEPTH + 1, C.PLAN_MAX_DEPTH + 1, 800):
     raw = deep(levels)
     assert len(raw) < 1024 * 1024

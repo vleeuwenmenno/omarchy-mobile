@@ -162,23 +162,23 @@ capture or restore, clears no blocker and authorizes nothing
 ([SNAPSHOT-GATE.md](SNAPSHOT-GATE.md)).
 
 Phase 2.10 (laptop-only, mechanism done):
-`device/myron/preflight-contract.json` and `tools/myron-preflight` 0.2.1 bind a
-re-verified kit and snapshot into a refusal-only hardware-read approval
-request. The request maps all seven open blockers to their real evidence
-producer and declares seven bounded, redacted future read operations, but its
-execution and collected-evidence lists are empty and every authority flag is
-false. It contacts no phone and is not approval
+`device/myron/preflight-contract.json` and `tools/myron-preflight` (0.3.0 since
+Phase 2.15A) bind a re-verified kit and snapshot into a refusal-only
+hardware-read approval request. The request maps all seven open blockers to
+their real evidence producer and declares seven bounded, redacted future read
+operations, but its execution and collected-evidence lists are empty and every
+authority flag is false. It contacts no phone and is not approval
 ([PREFLIGHT-GATE.md](PREFLIGHT-GATE.md)).
 
 Phase 2.12 (laptop-only, mechanism done): `device/myron/capture-contract.json`
-and `tools/myron-collect` 0.1.0 validate a bounded **pre-captured fixture**
+and `tools/myron-collect` (0.2.0 since Phase 2.15A) validate a bounded **pre-captured fixture**
 tree against one preflight request and record structure-only evidence. This is
 fixture evidence, not live evidence and not approval; it has no live transport,
 clears no blocker and sets no authority flag
 ([CAPTURE-GATE.md](CAPTURE-GATE.md)).
 
 Phase 2.13 (laptop-only, rehearsal done): `device/myron/session-contract.json`
-and `tools/myron-session` 0.1.0 adapt a fixed set of **synthetic** input
+and `tools/myron-session` (0.2.0 since Phase 2.15A) adapt a fixed set of **synthetic** input
 projections into the exact R1-R7 capture fixture and prove the unchanged
 collector accepts it. This is not acquisition, a live transport, hardware
 evidence, authorization, blocker closure or device-format qualification; no GPT,
@@ -186,18 +186,29 @@ Android boot-image or device-tree parser exists
 ([SESSION-GATE.md](SESSION-GATE.md)).
 
 Phase 2.14 (laptop-only, synthetic parser done): `device/myron/bootchain-contract.json`
-and `tools/myron-bootchain` 0.1.0 parse one **synthetic** GPT (revision 1.0,
-92-byte headers, 128 entries of 128 bytes, primary and backup copies) byte for
-byte into the R2 operation fragment the unchanged collector accepts. This is
-synthetic binary parser qualification only: no captured provenance, live
-transport, hardware evidence, authorization or blocker closure. R3 (boot image
-headers) and R4 (selection) are **not** implemented and stay required successor
-gates: the R3 schema migration (format-specific Android boot v0-v4, vendor boot
-v3/v4 and DTBO; nullable or not-applicable OS-version semantics; component
-roles, hash coverage and profile limits) and the R4 selection-source
-qualification (a concrete selected-index source, an actual Myron witness and
-contract cross-checks; parsing a DTBO or FDT does not prove selection)
-([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
+and `tools/myron-bootchain` (0.2.0 since Phase 2.15A) parse one **synthetic**
+GPT (revision 1.0, 92-byte headers, 128 entries of 128 bytes, primary and backup
+copies) byte for byte into the R2 operation fragment the unchanged collector
+accepts. This is synthetic binary parser qualification only: no captured
+provenance, live transport, hardware evidence, authorization or blocker closure.
+R3 (boot image headers) binary parsing and R4 (selection) are **not**
+implemented and stay required successor gates: the R3 binary parsers
+(`r3-binary-image-parsers`; the schema they fill exists since Phase 2.15A) and
+the R4 selection-source qualification (a concrete selected-index source, an
+actual Myron witness and contract cross-checks; parsing a DTBO or FDT does not
+prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
+
+Phase 2.15A (laptop-only, schema done): the preflight (0.3.0), collector
+(0.2.0), session (0.2.0) and bootchain (0.2.0) tools migrate to one R3
+generation that can represent Android boot v0-v4, vendor boot v3/v4 and DT
+table v0 images: raw OS version versus zero versus not applicable, typed payload
+components, exact header and table hash coverage, and metadata-only versus
+full-image evidence as different claims. Every operation envelope moves to
+schema 2 with `read_domain: "fixture"` and the old `max_bytes` splits into
+three separate budgets; schema 1 and hybrid captures are refused, with no
+adapters. **Phase A has no parser**: every R3 summary is a synthetic claim, all
+authority stays false and all seven blockers stay open
+([R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)).
 
 Phase 2.11 (laptop-only, mechanism done): kernel-contract and deployment tool
 0.4.0 add synthetic coverage for standard AArch64/GKI module layouts so real
@@ -345,8 +356,9 @@ Offline refusal tooling is now complete through the preflight request, and the
 fixture collector (Phase 2.12) can check the shape of pre-captured evidence; the
 synthetic adapter rehearsal (Phase 2.13) shows synthetic projections adapt into that
 fixture, and the synthetic GPT parser (Phase 2.14) parses one synthetic GPT into R2
-only (the R3 schema migration and the R4 selection-source qualification are the
-required successor gates). Next,
+only, and the R3 schema migration (Phase 2.15A) can represent R3 image summaries
+without parsing any (the R3 binary parsers and the R4 selection-source
+qualification are the required successor gates). Next,
 assemble a **real** kit and snapshot candidate from the owner-supplied qualified
 archive, runtime tree and symvers pair, then generate and independently review
 its preflight request SHA-256. That work stays offline. The following boundary

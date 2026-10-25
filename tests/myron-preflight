@@ -21,8 +21,8 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-hardware-read-preflight-contract"
-assert value["format_version"] == "0.2.1"
-assert value["capture_schema"] == "myron-capture-evidence-v1"
+assert value["format_version"] == "0.3.0"
+assert value["capture_schema"] == "myron-capture-evidence-v2"
 assert len(value["blockers"]) == 7
 assert value["request"] == {
     "accepts_real_evidence": False,
@@ -186,8 +186,18 @@ assert [row["id"] for row in request["requested_reads"]] == [
     "R5-module-load-order", "R6-storage-and-mount-model",
     "R7-kernel-identity-revalidation",
 ]
-assert all(row["read_only"] is True and row["max_bytes"] <= 1024 * 1024
-           for row in request["requested_reads"])
+BUDGETS = ("max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes")
+assert all(row["read_only"] is True and "max_bytes" not in row for row in request["requested_reads"])
+# The three budgets are separate bounds. Unchanged operations keep their one ceiling in each;
+# R3 alone differs, and its hardware allowance stays the 64 KiB aggregate metadata coverage.
+ceilings = [64 * 1024, 1024 * 1024, None, 64 * 1024, 1024 * 1024, 64 * 1024, 1024 * 1024]
+for row, ceiling in zip(request["requested_reads"], ceilings):
+    if ceiling is not None:
+        assert [row[key] for key in BUDGETS] == [ceiling] * 3, row["id"]
+r3_row = request["requested_reads"][2]
+assert [r3_row[key] for key in BUDGETS] == [1048576, 67108864, 65536]
+assert r3_row["emits"] == P.R3_EMITS and r3_row["field_policy"] == {}
+assert all(row["max_hardware_read_bytes"] <= 1024 * 1024 for row in request["requested_reads"])
 assert all(row["never_emits"] == P.NEVER_EMITS for row in request["requested_reads"])
 r7 = request["requested_reads"][-1]
 assert r7["targets"] == [
@@ -337,7 +347,14 @@ tampered_request("collected evidence", lambda v: v["execution"]["evidence_collec
 tampered_request("removed blocker", lambda v: v["status"]["blockers"].pop())
 tampered_request("reordered blocker", lambda v: v["status"]["blockers"].reverse())
 tampered_request("cleared blocker", lambda v: v["evidence"][0]["closure"][0].update(blocker_cleared=True))
-tampered_request("unbounded read", lambda v: v["requested_reads"][0].update(max_bytes=2**31))
+tampered_request("legacy single read bound", lambda v: v["requested_reads"][0].update(max_bytes=64 * 1024))
+tampered_request("unbounded output", lambda v: v["requested_reads"][0].update(max_output_bytes=2**31))
+tampered_request("unbounded fixture input",
+                 lambda v: v["requested_reads"][2].update(max_fixture_input_bytes=2**31))
+tampered_request("widened R3 hardware allowance",
+                 lambda v: v["requested_reads"][2].update(max_hardware_read_bytes=1024 * 1024))
+tampered_request("dropped budget", lambda v: v["requested_reads"][0].pop("max_hardware_read_bytes"))
+tampered_request("widened R3 emits", lambda v: v["requested_reads"][2]["emits"].append("raw-payload"))
 tampered_request("identifier emission", lambda v: v["requested_reads"][0]["never_emits"].remove("serial"))
 tampered_request(
     "widened R7 command-line allowlist",
@@ -462,11 +479,11 @@ finally:
     unsafe_parent.chmod(0o700)
 ok("changed inputs and unsafe publication paths are rejected")
 
-# No 0.2.1 option can submit evidence or authorize a read.
+# No 0.3.0 option can submit evidence or authorize a read.
 code, out, err = invoke("assess", *common_args(), "--evidence", work / "evidence",
                         "--out", work / "never")
 assert code != 0 and not os.path.lexists(work / "never")
-ok("real evidence input is unavailable in 0.2.1")
+ok("real evidence input is unavailable in 0.3.0")
 
 # Process-spawn primitives remain unused even if present in the interpreter.
 def boom(*args, **kwargs):

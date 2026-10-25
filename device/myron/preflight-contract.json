@@ -19,7 +19,7 @@
     "composed-kit-not-hardware-qualified",
     "no-independent-deployment-review-or-authorization"
   ],
-  "capture_schema": "myron-capture-evidence-v1",
+  "capture_schema": "myron-capture-evidence-v2",
   "components": {
     "deployment_contract": {
       "path": "device/myron/deployment-contract.json",
@@ -30,7 +30,7 @@
       "sha256": "4dc53614992922b50cbfe7b59bfc10c473088c9d98058a9abec0933d345257ea"
     }
   },
-  "format_version": "0.2.1",
+  "format_version": "0.3.0",
   "kind": "myron-hardware-read-preflight-contract",
   "request": {
     "accepts_real_evidence": false,

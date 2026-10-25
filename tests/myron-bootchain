@@ -39,9 +39,9 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import hashlib, json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-synthetic-bootchain-contract"
-assert value["format_version"] == "0.1.0"
+assert value["format_version"] == "0.2.0"
 assert value["pinned_versions"] == {
-    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0",
+    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0",
 }
 assert value["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert value["dependencies"]["byte_pinned"] is False
@@ -265,7 +265,9 @@ READS = request_document["requested_reads"]
 OPERATION_IDS = [row["id"] for row in READS]
 R1, R2, R3, R4, R5, R6, R7 = OPERATION_IDS
 R2_ROW = READS[1]
-assert R2 == B.R2_ID and R2_ROW["max_bytes"] == 1024 * 1024
+assert R2 == B.R2_ID and "max_bytes" not in R2_ROW
+assert [R2_ROW[key] for key in ("max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes")] == [
+    1024 * 1024] * 3
 
 # --- an independent GPT encoder (never calls a parser helper) ------------------------------
 
@@ -471,7 +473,7 @@ assert contract["bound_contracts"]["deployment_contract"]["sha256"] == contracts
 assert contract["bound_contracts"]["kernel_reference"]["sha256"] == contracts.reference_sha256
 assert contract["bound_contracts"]["snapshot_contract"]["sha256"] == snapshot_sha
 assert contract["pinned_versions"] == {
-    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0"}
+    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0"}
 assert contract["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert contract["dependencies"]["byte_pinned"] is False and "not pinned" in contract["dependencies"]["note"]
 assert contract["implementation"] == B.implementation_binding()
@@ -510,7 +512,11 @@ assert contract["output"]["closure"]["directories"] == ["operations"]
 assert contract["output"]["closure"]["checksums"]["parse_json_binds_checksums"] is False
 assert contract["output"]["accounting"]["meaning"] == "fixture-payload-accounting-not-device-io"
 assert contract["output"]["accounting"]["excludes"] == [
-    "reads.json", "manifest-validation-rereads", "verification-reruns"]
+    "reads.json", "manifest-validation-rereads", "verification-reruns", "hardware-bytes"]
+assert contract["output"]["accounting"]["read_domain"] == "fixture"
+assert contract["output"]["accounting"]["hardware_transport"] == "none"
+assert contract["output"]["accounting"]["future_hardware_accounting"] == [
+    "actual-returned-bytes", "rereads-counted-separately", "overreads-counted-separately"]
 assert contract["output"]["accounting"]["max"] == 41984
 assert contract["capture"]["unchanged_for_collector"] is True
 assert contract["capture"]["complete_capture"] is False and contract["capture"]["produces"] == [R2]
@@ -525,10 +531,10 @@ assert [row["claim"] for row in contract["coverage"]["unresolved_claims"]] == [
     "geometry-provenance-not-established", "physical-acquisition-and-freshness-not-established",
     "complete-device-disk-inventory-not-established", "protective-mbr-not-parsed",
     "android-slot-semantics-not-established", "bootability-not-established",
-    "r3-format-schema-successor-required", "r4-selection-provenance-successor-required"]
+    "r3-binary-parser-successor-required", "r4-selection-provenance-successor-required"]
 assert any("does NOT prove Android slot priority" in t for t in contract["coverage"]["semantic_limits"])
 assert [(row["id"], row["state"], row["successor_gate"]) for row in contract["deferred"]] == [
-    (R3, "not-implemented", "r3-boot-image-schema-migration"),
+    (R3, "not-implemented", "r3-binary-image-parsers"),
     (R4, "not-implemented", "r4-selection-source-qualification")]
 assert contract["qualification"]["captured_provenance"] is False
 assert contract["qualification"]["implemented_operations"] == [R2]
@@ -559,7 +565,8 @@ contract_tamper("contract capture hash", lambda v: v["components"]["capture_cont
 contract_tamper("contract preflight hash", lambda v: v["components"]["preflight_contract"].update(sha256="0" * 64))
 contract_tamper("contract bound deployment hash", lambda v: v["bound_contracts"]["deployment_contract"].update(sha256="0" * 64))
 contract_tamper("contract bound kernel hash", lambda v: v["bound_contracts"]["kernel_reference"].update(sha256="0" * 64))
-contract_tamper("contract version pin", lambda v: v["pinned_versions"].update(collector="0.2.0"))
+contract_tamper("contract version pin", lambda v: v["pinned_versions"].update(collector="0.1.0"))
+contract_tamper("contract preflight version pin", lambda v: v["pinned_versions"].update(preflight="0.2.1"))
 contract_tamper("contract dependencies claim byte pin", lambda v: v["dependencies"].update(byte_pinned=True))
 contract_tamper("contract implementation hash", lambda v: v["implementation"].update(sha256="0" * 64))
 contract_tamper("contract implementation dropped", lambda v: v.pop("implementation"))
@@ -680,7 +687,9 @@ _, plan_text_b = expect_ok("plan", "--request", request)
 assert plan_text == plan_text_b and plan_text.encode("ascii") == D.render_json(plan_a)
 assert plan_a["kind"] == "myron-synthetic-gpt-parse-plan"
 assert plan_a["request_sha256"] == request_sha256 and plan_a["bootchain_contract_sha256"] == BC
-assert plan_a["request_binding"]["operation"] == R2 and plan_a["request_binding"]["max_bytes"] == 1024 * 1024
+assert plan_a["request_binding"]["operation"] == R2 and "max_bytes" not in plan_a["request_binding"]
+assert [plan_a["request_binding"][key] for key in (
+    "max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes")] == [1024 * 1024] * 3
 assert plan_a["supported_profile"] == contract["profile"] and plan_a["input_closure"]["total_max_bytes"] == 50176
 assert plan_a["synthetic"] is True and plan_a["live"] is False and plan_a["executes"] is False
 assert plan_a["remote_commands"] == [] and plan_a["blockers"] == D.BLOCKERS
@@ -740,10 +749,10 @@ assert all(e.mode == 0o755 for e in entries if e.kind == "dir")
 OP = data[f"operations/{R2}.json"]
 operation = json.loads(OP)
 assert operation == {
-    "schema": 1, "kind": "myron-precaptured-operation", "id": R2, "request_sha256": request_sha256,
-    "transport": "external-precaptured-fixture", "read_only": True, "bytes_read": BYTES_READ,
-    "data": EXPECTED_DATA}
-assert OP == jbytes(operation) and len(OP) <= R2_ROW["max_bytes"]
+    "schema": 2, "kind": "myron-precaptured-operation", "id": R2, "request_sha256": request_sha256,
+    "transport": "external-precaptured-fixture", "read_domain": "fixture", "read_only": True,
+    "bytes_read": BYTES_READ, "data": EXPECTED_DATA}
+assert OP == jbytes(operation) and len(OP) <= R2_ROW["max_output_bytes"]
 assert [row["partition_name"] for row in operation["data"]["partitions"]] == sorted(
     row["partition_name"] for row in operation["data"]["partitions"])
 sums_expected = "".join(f"{digest(data[p])}  {p}\n" for p in sorted(
@@ -759,7 +768,7 @@ assert set(parse_doc) == {
     "complete_capture", "inputs", "operation", "accounting", "coverage", "semantic_limits",
     "unresolved_claims", "deferred", "qualification", "limitations", "non_goals", "blockers",
     "authority"}
-assert parse_doc["kind"] == "myron-synthetic-gpt-parse" and parse_doc["format_version"] == "0.1.0"
+assert parse_doc["kind"] == "myron-synthetic-gpt-parse" and parse_doc["format_version"] == "0.2.0"
 assert parse_doc["profile"] == "gpt-v1-128x128-primary-backup"
 assert parse_doc["inventory_scope"] == "one-synthetic-gpt"
 assert parse_doc["evidence_level"] == "synthetic-binary-parser-only"
@@ -782,9 +791,14 @@ assert parse_doc["inputs"] == [
         "gpt-primary-header.bin": "gpt-primary-header", "reads.json": "manifest"}.items())]
 assert parse_doc["operation"] == {
     "id": R2, "path": f"operations/{R2}.json", "bytes": len(OP), "sha256": digest(OP),
-    "bytes_read": BYTES_READ, "max_bytes": 1024 * 1024, "partition_count": 7}
+    "bytes_read": BYTES_READ, "max_output_bytes": 1024 * 1024, "max_fixture_input_bytes": 1024 * 1024,
+    "max_hardware_read_bytes": 1024 * 1024, "partition_count": 7}
 assert parse_doc["accounting"]["meaning"] == "fixture-payload-accounting-not-device-io"
-assert parse_doc["accounting"]["excludes"] == ["reads.json", "manifest-validation-rereads", "verification-reruns"]
+assert parse_doc["accounting"]["read_domain"] == "fixture" and parse_doc["accounting"]["hardware_transport"] == "none"
+assert parse_doc["accounting"]["future_hardware_accounting"] == [
+    "actual-returned-bytes", "rereads-counted-separately", "overreads-counted-separately"]
+assert parse_doc["accounting"]["excludes"] == [
+    "reads.json", "manifest-validation-rereads", "verification-reruns", "hardware-bytes"]
 assert parse_doc["accounting"]["total_fixture_payload_bytes"] == BYTES_READ + len(
     (reads / "reads.json").read_bytes())
 assert parse_doc["authority"] == {flag: False for flag in P.AUTHORITY_FLAGS}
@@ -893,27 +907,26 @@ MODULES = [("pwrseq_core", ""), ("bluetooth", ""), ("extra_mod", "O"), ("btbcm",
            ("btqca", ""), ("hci_uart", ""), ("rfkill", ""), ("rmnet", "")]
 
 
-def header_row(name, absent):
-    if absent:
-        return {"partition_name": name, "absent": True, "header_version": None, "page_size": None,
-                "os_version": None, "component_sizes": [], "component_offsets": [],
-                "segment_count": 0, "header_sha256": None}
-    return {"partition_name": name, "absent": False, "header_version": 4, "page_size": 4096,
-            "os_version": "16.0.0", "component_sizes": [4096, 8192],
-            "component_offsets": [4096, 8192], "segment_count": 2, "header_sha256": digest(name.encode())}
-
-
+fixtures = load("myron_r3_fixtures", repo / "tests/myron-fixtures/r3.py")
 IMAGE_LIKE = re.compile(r"(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?")
 
 
-def other_data(r3_absent=("vendor_kernel_boot_a",), root_name="pmos_root", r2_names=None):
+def r3_rows(r2_names=None, absent=(), extra=()):
+    """The migrated R3: eighteen rows, an image for every supported name R2 lists, null for the
+    rest. ABSENT names an R2 image to leave null, EXTRA an image to claim where R2 lacks it."""
     r2_names = r2_names or [row["partition_name"] for row in EXPECTED_DATA["partitions"]]
-    images = sorted({n for n in r2_names if IMAGE_LIKE.fullmatch(n)} | set(r3_absent))
+    present = ({n for n in r2_names if IMAGE_LIKE.fullmatch(n)} - set(absent)) | set(extra)
+    return fixtures.image_rows({
+        name: fixtures.make_image(name, fixtures.ROLE_VERSIONS[fixtures.role_of(name)][-1])
+        for name in present})
+
+
+def other_data(r3_value=None, root_name="pmos_root", r2_names=None):
     return {
         R1: {"codename": identity["device.codename"], "soc": identity["device.soc"],
              "compatible_prefix": identity["device.compatible"], "current_slot": "a",
              "slot_suffix": "_a", "verified_boot_state": "orange", "sources_agree": True},
-        R3: {"images": [header_row(n, n in r3_absent) for n in images]},
+        R3: {"images": r3_value if r3_value is not None else r3_rows(r2_names)},
         R4: {"dtb_count": 2, "selected_board_id": 7, "selected_board_revision": 1,
              "dtbo_entry_count": 3, "compatible_prefix": identity["device.compatible"],
              "selection_source": "bootconfig"},
@@ -931,14 +944,11 @@ def other_data(r3_absent=("vendor_kernel_boot_a",), root_name="pmos_root", r2_na
 
 
 def r3_complete(r2_names, rows):
-    """Phase 2.13's stronger R3 profile: every inventoried boot image has a present row, and an
-    absent row is only accepted where R2 lacks the partition."""
-    listed = {row["partition_name"]: row["absent"] for row in rows}
-    if any(name in listed and listed[name] for name in r2_names):
+    """The migrated R3 completeness this test expects of the collector itself: exactly the
+    eighteen supported names, an image where R2 lists the name and null where it does not."""
+    if [row["partition_name"] for row in rows] != fixtures.NAMES:
         return False
-    if any(name in r2_names and name not in listed for name in r2_names if IMAGE_LIKE.fullmatch(name)):
-        return False
-    return not any(not absent and name not in r2_names for name, absent in listed.items())
+    return all((row["partition_name"] in r2_names) == (row["image"] is not None) for row in rows)
 
 
 def write_capture(base, r2_bytes, others, extra_manifest=None):
@@ -948,9 +958,9 @@ def write_capture(base, r2_bytes, others, extra_manifest=None):
     files = {f"operations/{R2}.json": r2_bytes}
     for operation_id, value in others.items():
         files[f"operations/{operation_id}.json"] = jbytes({
-            "schema": 1, "kind": "myron-precaptured-operation", "id": operation_id,
+            "schema": 2, "kind": "myron-precaptured-operation", "id": operation_id,
             "request_sha256": request_sha256, "transport": "external-precaptured-fixture",
-            "read_only": True, "bytes_read": 4096, "data": value})
+            "read_domain": "fixture", "read_only": True, "bytes_read": 4096, "data": value})
     manifest = {
         "schema": 1, "kind": "myron-precaptured-fixture", "format_version": C.VERSION,
         "contract_sha256": digest(capture_contract_bytes), "request_sha256": request_sha256,
@@ -1014,32 +1024,38 @@ def rejected_capture(label, r2_bytes, others, match, extra_manifest=None):
 
 # Contradictory R3 presence and an R6 root outside the inventory must reject, in the composed fixture.
 for name in ("boot_b", "boot_a"):
-    others = other_data()
-    rows = others[R3]["images"]
-    for index, row in enumerate(rows):
-        if row["partition_name"] == name:
-            rows[index] = header_row(name, True)
-    assert not r3_complete(names_present, rows)
-    rejected_capture(f"R3 marking the inventoried {name} absent", OP, others, "R3 presence differs from the R2 inventory")
-others = other_data()
-others[R3]["images"] = sorted(others[R3]["images"] + [header_row("vendor_kernel_boot_b", False)],
-                              key=lambda row: row["partition_name"])
+    others = other_data(r3_rows(absent=(name,)))
+    assert not r3_complete(names_present, others[R3]["images"])
+    rejected_capture(f"R3 marking the inventoried {name} null", OP, others, "R3 presence differs from the R2 inventory")
+others = other_data(r3_rows(extra=("vendor_kernel_boot_b",)))
 assert not r3_complete(names_present, others[R3]["images"])
 rejected_capture("R3 listing a present image R2 lacks", OP, others, "R3 presence differs from the R2 inventory")
+# R3 capacity against the generated R2: an image cannot exceed its inventoried partition.
+others = other_data()
+boot_row = next(row for row in others[R3]["images"] if row["partition_name"] == "init_boot_a")
+boot_row["image"]["size_bytes"] = 2**24  # init_boot_a is 8 MiB in the generated GPT
+rejected_capture("R3 image larger than its generated R2 partition", OP, others, "R3 image is larger than its R2 partition")
 for root_name in ("userdata", "boot_c"):
     rejected_capture(f"R6 root {root_name} outside the R2 inventory", OP, other_data(root_name=root_name),
                      "R6 root partition is not in the R2 inventory")
-# the stronger completeness profile: a missing image row is flagged by the profile even though a
-# row-less R3 passes the collector's own checks
+# completeness is the collector's own rule now: a missing row is rejected outright, no profile
+# outside the collector is needed
 others = other_data()
 others[R3]["images"] = [row for row in others[R3]["images"] if row["partition_name"] != "boot_b"]
 assert not r3_complete(names_present, others[R3]["images"])
-ok("the composed fixture satisfies the stronger R3 completeness profile; contradictions are detected")
+rejected_capture("R3 missing a row", OP, others, "R3 images must hold 18..18 entries")
+others = other_data()
+others[R3]["images"] = [{"partition_name": "boot_a", "absent": False}]
+rejected_capture("R3 in the previous row form", OP, others, "R3 images must hold 18..18 entries")
+ok("the composed fixture is a complete migrated R3; contradictions are rejected by the collector itself")
 # a tampered or foreign R2 fragment is rejected by the unchanged collector
 for label, mutate in (
     ("R2 with a wrong request binding", lambda v: v.update(request_sha256="0" * 64)),
     ("R2 with bytes_read zero", lambda v: v.update(bytes_read=0)),
-    ("R2 with bytes_read past its bound", lambda v: v.update(bytes_read=1024 * 1024 + 1)),
+    ("R2 with bytes_read past its fixture input bound", lambda v: v.update(bytes_read=1024 * 1024 + 1)),
+    ("R2 at the previous schema 1", lambda v: v.update(schema=1)),
+    ("R2 without its read domain", lambda v: v.pop("read_domain")),
+    ("R2 in a hardware read domain", lambda v: v.update(read_domain="hardware")),
     ("R2 with a wrong transport", lambda v: v.update(transport="synthetic-binary-gpt-fixture")),
     ("R2 with an unsorted inventory", lambda v: v["data"]["partitions"].reverse()),
     ("R2 with a wrong recovery flag", lambda v: v["data"].update(recovery_present=False)),
@@ -2358,7 +2374,8 @@ assert not [p for p in tracked if re.search(r"(^|/)gpt[-_].*\.bin$|(^|/)geometry
 assert (repo / "tools/myron-bootchain").exists() and "tests/myron-bootchain" in (repo / "tests/all").read_text()
 assert sum(1 for line in (repo / "tests/all").read_text().splitlines() if "tests/myron-bootchain" in line) == 1
 plan_all = json.dumps(plan_a)
-assert "R3 and R4 are not implemented" in plan_all and "r3-boot-image-schema-migration" in plan_all
+assert "R3 binary parsing and R4 selection are not implemented" in plan_all
+assert "r3-binary-image-parsers" in plan_all and "r3-boot-image-schema-migration" not in plan_all
 assert "r4-selection-source-qualification" in plan_all
 ok("existing contracts and tools are untouched, R3 and R4 are recorded successor gates, no raw fixture is committed")
 
@@ -2619,9 +2636,9 @@ def version_pin(label, tool, old, new, expect):
 
 
 version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
-            'VERSION = "0.1.0"', 'VERSION = "0.1.1"', "(code dependency-version)")
+            'VERSION = "0.2.0"', 'VERSION = "0.2.1"', "(code dependency-version)")
 version_pin("a preflight at another version", "tools/myron-preflight",
-            'VERSION = "0.2.1"', 'VERSION = "0.2.0"', "(code dependency-rejected)")
+            'VERSION = "0.3.0"', 'VERSION = "0.2.1"', "(code dependency-rejected)")
 ok("dependency version pins are enforced")
 
 # Dependency acquisition is fully protected. Every case runs in a fresh process, so no import
@@ -2740,9 +2757,9 @@ VERSION_LINE = "bootchain dependencies are not the pinned versions (code depende
 base = startup_copy("hostile-version")
 target = base / "tools/lib/myron-collect-impl.py"
 text = target.read_text()
-assert 'VERSION = "0.1.0"' in text
-target.write_text(text.replace('VERSION = "0.1.0"', f'VERSION = "{CANARY}\\nERROR: injected\\x1b[31m"', 1))
-startup_refusal("hostile version", base, expected=f"ERROR: {VERSION_LINE}\n", leaks=("injected", "\x1b", "0.1.0", "0.2.1"))
+assert 'VERSION = "0.2.0"' in text
+target.write_text(text.replace('VERSION = "0.2.0"', f'VERSION = "{CANARY}\\nERROR: injected\\x1b[31m"', 1))
+startup_refusal("hostile version", base, expected=f"ERROR: {VERSION_LINE}\n", leaks=("injected", "\x1b", "0.2.0", "0.3.0"))
 
 # An unexpected ValueError at runtime is one fixed line; the text never leaves.
 def raiser(error):

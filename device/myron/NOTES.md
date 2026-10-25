@@ -75,8 +75,8 @@ blockers, copies no payload bytes and performs no capture, restore or deploy.
 See [SNAPSHOT-GATE.md](../../docs/myron/SNAPSHOT-GATE.md).
 
 Phase 2.10 adds `device/myron/preflight-contract.json` and
-`tools/myron-preflight` 0.2.1 (0.2.0 plus a request depth bound checked before
-rendering). It re-verifies a kit and snapshot and produces a
+`tools/myron-preflight` (0.2.1 added a request depth bound checked before
+rendering; 0.3.0 is Phase 2.15A below). It re-verifies a kit and snapshot and produces a
 five-file, metadata-only hardware-read approval request. Seven declarative read
 IDs carry strict byte bounds, emitted-field allowlists, identifier/private-byte
 redaction and stop conditions. The execution and evidence lists remain empty,
@@ -86,7 +86,7 @@ separate read-only session, not permission for that session or for deployment.
 See [PREFLIGHT-GATE.md](../../docs/myron/PREFLIGHT-GATE.md).
 
 Phase 2.12 adds `device/myron/capture-contract.json` and `tools/myron-collect`
-0.1.0 (a minimal trusted loader for `tools/lib/myron-collect-impl.py`, whose
+(0.1.0 at that phase; a minimal trusted loader for `tools/lib/myron-collect-impl.py`, whose
 captured bytes the contract pins). The collector validates a local, trusted,
 **pre-captured fixture** tree
 (`capture.json` plus `operations/R1`..`R7` JSON) against one preflight request
@@ -96,7 +96,7 @@ contacts no phone. All seven blockers stay missing and every authority flag
 stays false. See [CAPTURE-GATE.md](../../docs/myron/CAPTURE-GATE.md).
 
 Phase 2.13 adds `device/myron/session-contract.json` and `tools/myron-session`
-0.1.0 (a minimal trusted loader for `tools/lib/myron-session-impl.py`, whose
+(0.1.0 at that phase; a minimal trusted loader for `tools/lib/myron-session-impl.py`, whose
 captured bytes the contract pins). It adapts a flat tree of **synthetic**
 projections into the exact R1-R7 capture fixture, checks it with the unchanged
 collector and writes a rehearsal artifact that the collector's own `collect`
@@ -106,7 +106,7 @@ or device-tree parser. The collector and preflight are trusted version-pinned
 imports, not byte-pinned. See [SESSION-GATE.md](../../docs/myron/SESSION-GATE.md).
 
 Phase 2.14 adds `device/myron/bootchain-contract.json` and `tools/myron-bootchain`
-0.1.0 (a minimal trusted loader for `tools/lib/myron-bootchain-impl.py`, whose
+(0.1.0 at that phase; a minimal trusted loader for `tools/lib/myron-bootchain-impl.py`, whose
 captured bytes the contract pins). It parses one **synthetic** GPT (revision 1.0,
 128 entries of 128 bytes, primary and backup copies, sectors of 512 or 4096
 bytes) into the R2 operation fragment and checks it with the unchanged
@@ -114,9 +114,24 @@ collector. It is synthetic binary parser qualification only: sector size and
 disk length are explicit synthetic claims, `bootable_flag` is the literal GPT
 attributes bit 2 (`legacy-bios-bootable-bit`, no Android priority, success,
 active-slot, bootability or recovery claim), and nothing is acquired from a
-phone. R3 and R4 are not implemented: the R3 schema migration and the R4
-selection-source qualification are required successor gates. See
+phone. R3 binary parsing and R4 are not implemented: the R3 binary parsers and
+the R4 selection-source qualification are required successor gates. See
 [BOOTCHAIN-GATE.md](../../docs/myron/BOOTCHAIN-GATE.md).
+
+Phase 2.15A moves the preflight to 0.3.0 (capture schema
+`myron-capture-evidence-v2`, three separate budgets per read), the collector to
+0.2.0, the session to 0.2.0 and the bootchain to 0.2.0 (still GPT to R2 only).
+Every R1-R7 operation envelope is now integer `schema` 2 with
+`read_domain: "fixture"`; schema 1 and mixed captures are refused with no
+adapters. R3 becomes 18 typed image rows that can represent Android boot v0-v4,
+vendor boot v3/v4 and DT table v0 images (raw OS version, 0 or not applicable;
+typed components; exact header and table hash coverage; metadata-only versus
+full-image coverage as different claims). There is **no parser**: every R3
+summary and every hash and coverage value is a synthetic claim
+(`unverified-source-claim` in the session), schema support does not authorize a
+hardware read, and R4 stays unimplemented. Authority stays all false, the seven
+blockers stay missing, `BOOT_IMAGES` and `UFS_RW` stay empty. See
+[R3-SCHEMA-GATE.md](../../docs/myron/R3-SCHEMA-GATE.md).
 
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not

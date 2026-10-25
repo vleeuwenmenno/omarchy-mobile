@@ -2,10 +2,14 @@
 # Myron synthetic GPT-to-R2 parser (Phase 2.14)
 
 Status (2026-10-25): offline, deterministic, **synthetic binary parser
-qualification**. `tools/myron-bootchain` 0.1.0 proves one thing: one narrow GPT
+qualification**. `tools/myron-bootchain` 0.2.0 proves one thing: one narrow GPT
 profile, supplied as synthetic bytes, parses byte for byte into the exact R2
-operation (`R2-gpt-and-recovery-inventory`) that `tools/myron-collect` 0.1.0
-already consumes, and the collector accepts the result unchanged.
+operation (`R2-gpt-and-recovery-inventory`) that `tools/myron-collect` 0.2.0
+already consumes, and the collector accepts the result unchanged. Version 0.2.0
+(Phase 2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) only moves the R2 envelope
+to schema 2 with `read_domain: "fixture"`, splits the old `max_bytes` into the
+three request budgets and re-pins the collector 0.2.0 and preflight 0.3.0. It is
+still GPT to R2 only: R3 binary parsing and R4 selection stay successor gates.
 
 It is **not** real captured provenance, **not** a live transport, **not**
 hardware evidence, **not** authorization, **not** blocker closure, and **not**
@@ -33,13 +37,15 @@ and the current R4 row cannot prove a selection. This phase therefore parses R2
 only. R3 and R4 stay in the final scope; each is a **required successor gate**
 and nothing here implements or claims either.
 
-- **R3 schema migration** (`r3-boot-image-schema-migration`). Boot images are
-  format-specific: Android boot v0-v4, vendor boot v3 and v4, and DTBO are
-  distinct formats. The current R3 row needs nullable or not-applicable OS-version
-  semantics (vendor boot and DTBO carry no OS version of their own), component
-  roles, hash coverage and profile limits before a parser can fill it honestly.
-  That is a collector and preflight contract change, so it needs its own phase,
-  contract versions and review.
+- **R3 schema migration** (`r3-boot-image-schema-migration`, done in Phase
+  2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)). Boot images are
+  format-specific: Android boot v0-v4, vendor boot v3 and v4, and DT table
+  images are distinct formats. The collector and preflight now carry R3 rows
+  that represent them (raw OS version, 0 or not applicable, typed components,
+  exact header and table hash coverage, metadata-only versus full-image
+  coverage). That is schema only; the **R3 binary parsers**
+  (`r3-binary-image-parsers`) that would fill those rows from image bytes are the
+  remaining successor gate, and this tool still has none.
 - **R4 selection-source qualification** (`r4-selection-source-qualification`).
   There is no concrete selected-index source. Parsing a DTBO or a device-tree
   blob does not prove which entry the bootloader selects. R4 needs an actual
@@ -191,8 +197,11 @@ no occupied entry is refused as unsupported.
 | `bootable_flag` | the literal GPT attributes **bit 2** |
 
 Rows are emitted sorted by `partition_name`. The operation document uses the
-collector's envelope (`schema`, `kind`, `id`, `request_sha256`, `transport`,
-`read_only`, `bytes_read`, `data`) and is checked by the unchanged collector's
+collector's envelope (`schema` 2, `kind`, `id`, `request_sha256`, `transport`,
+`read_domain` `fixture`, `read_only`, `bytes_read`, `data`). `bytes_read` is the
+fixture payload only; no hardware transport exists, and a future one must count
+the actual returned bytes, rereads and overreads separately (the accounting
+policy states it). The document is checked by the unchanged collector's
 `validate_operation` before anything is published, and again on the bytes found
 in the built tree.
 
@@ -234,16 +243,18 @@ canonical lines; `parse.json` binds the operation's bytes and hash but not
 
 **Unresolved:** geometry provenance, physical acquisition and freshness, the
 complete device and disk inventory (one GPT only), the protective MBR (not
-parsed), Android slot semantics, bootability, the R3 format and schema, and R4
-selection provenance.
+parsed), Android slot semantics, bootability, the R3 binary parsers
+(`r3-binary-parser-successor-required`), and R4 selection provenance.
 
 The standalone parse is an **operation fragment**, never a complete capture. The
 tool produces no R1 or R3-R7 operation. `tests/myron-bootchain` composes the
 generated R2 into a complete synthetic R1-R7 fixture, built by independent test
 logic, and runs the unchanged collector's `read_capture`, `collect` and
-`verify-evidence` on it, including the Phase 2.13 stronger R3 completeness rule
-(every inventoried boot image has a present R3 row), a contradictory R3 presence
-and an R6 root outside the inventory, both of which the collector rejects.
+`verify-evidence` on it. The R3 in that fixture is the migrated, synthetic
+18-row R3, and the collector itself enforces its completeness against the
+generated R2 (an image exactly where R2 lists the name, no image larger than its
+partition); a contradictory R3 presence, an oversize image, a missing row and an
+R6 root outside the inventory are all rejected by the collector.
 
 `verify-parse` regathers the input, recomputes the expected artifact and compares
 the closure, modes, bytes and hashes exactly: a forged operation with a
@@ -252,10 +263,10 @@ semantics differ from the recomputation.
 
 ## Bootchain contract
 
-`device/myron/bootchain-contract.json` (0.1.0) is derived and canonical; the
+`device/myron/bootchain-contract.json` (0.2.0) is derived and canonical; the
 tool refuses any other bytes. It binds:
 
-- the preflight contract (0.2.1) and the capture contract (collector 0.1.0)
+- the preflight contract (0.3.0) and the capture contract (collector 0.2.0)
   hashes, and the deployment, snapshot and kernel-reference hashes they carry;
 - the bootchain implementation digest: `tools/myron-bootchain` is a minimal loader
   (the same pattern as `myron-collect` and `myron-session`) that reads
@@ -341,7 +352,7 @@ Residuals, as in Phase 2.13:
   compile or implementation-import failure as one fixed `loader-rejected` line.
 - `bootable_flag` is a bit, not a bootability claim.
 - The dependency imports are version-pinned, not byte-pinned.
-- R3 and R4 are not implemented.
+- R3 binary parsing and R4 selection are not implemented.
 
 ## Later producer (not part of this phase)
 

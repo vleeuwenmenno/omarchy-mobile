@@ -140,6 +140,11 @@ artifact-structure-only evidence. It is fixture evidence only: not live
 evidence, not approval, no live transport, and it clears no blocker. All seven
 blockers stay missing and every authority flag stays false
 ([CAPTURE-GATE](myron/CAPTURE-GATE.md)).
+Phase 2.15A (preflight 0.3.0, collector, session and bootchain 0.2.0) migrates
+R3 to a schema that can represent Android boot, vendor boot and DT table images
+and moves every operation envelope to schema 2; it has no image parser, every R3
+value is a synthetic claim, and it changes no authority
+([R3-SCHEMA-GATE](myron/R3-SCHEMA-GATE.md)).
 
 ### 3.2 Keys to add later
 
