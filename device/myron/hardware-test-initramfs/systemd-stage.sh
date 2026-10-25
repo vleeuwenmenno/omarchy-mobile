@@ -73,6 +73,11 @@ valid_rootfs_identity \
 	/hostroot/var/lib/myron-modules/systemd-core/installed.sha256 ||
 	fail_boot pmos-root-identity-invalid
 
+state=/hostroot/var/lib/omarchy-mobile
+if [ -f "$state/hardware-test.armed" ] && [ ! -f "$state/hardware-test.disarm" ]; then
+	fail_boot previous-test-rebooted-before-disarm
+fi
+
 payload=/hostroot/home/menno/myron-omarchy-hardware-test-20261025.img
 [ "$(/bin/stat -c %s "$payload" 2>/dev/null)" = @PAYLOAD_SIZE@ ] ||
 	fail_boot omarchy-payload-size-mismatch
@@ -99,7 +104,6 @@ payload_loop=$(/bin/losetup -f 2>/dev/null)
 	/newroot/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned ||
 	fail_boot omarchy-unsigned-marker-missing
 
-state=/hostroot/var/lib/omarchy-mobile
 /bin/mkdir -p "$state" /hostroot/var/log /newroot/dev /newroot/proc /newroot/sys \
 	/newroot/run /newroot/mnt/logfs /newroot/lib /newroot/tmp
 /bin/rm -f "$state/hardware-test.disarm"

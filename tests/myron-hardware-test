@@ -99,6 +99,8 @@ grep -Fq 'functions/acm.usb0' "$initramfs/systemd-stage.sh" ||
 grep -Fq 'Before=sysinit.target' \
   "$overlay/usr/lib/systemd/system/myron-hardware-watchdog.service" ||
   fail 'rollback watchdog does not start before sysinit'
+grep -Fq 'fail_boot previous-test-rebooted-before-disarm' "$initramfs/systemd-stage.sh" ||
+  fail 'initramfs does not restore after an unexpected armed test reboot'
 grep -Fq 'enable myron-hardware-watchdog.service' "$compose" ||
   fail 'rollback watchdog is not enabled in the payload'
 grep -Fq 'mask ModemManager.service systemd-firstboot.service' "$compose" ||

@@ -163,7 +163,10 @@ and GNSS fixes was:
 This pair is evidence, not the reproducible successor: rebuild both artifacts
 after the committed live fixes before another boot. The initramfs watchdog
 remains 900 seconds, writes only `init_boot_a`, checks both candidate and
-rollback hashes, and never references a slot-B partition.
+rollback hashes, and never references a slot-B partition. Its successor also
+detects a second candidate boot with an armed test and no disarm marker; that
+path restores postmarketOS immediately instead of consuming slot retry counts
+after a hard reset.
 
 ## Next attended sequence
 
