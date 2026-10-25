@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: MIT
-"""Parse synthetic bytes into the exact Myron R2 and R3 operation fragments.
+"""Parse synthetic bytes into the exact Myron R2, R3 and R4 operation fragments.
 
-Offline and synthetic only. Two independent command families share one trust root.
+Offline and synthetic only. Three independent command families share one trust root.
 `parse` reads a fixed closure of six flat files (a manifest, an explicit geometry claim and
 the primary and backup GPT headers and entry tables) into the R2 operation. `parse-images`
 reads one flat directory of synthetic Android boot (v0-v4), vendor_boot (v3, v4) and DT table
-(v0) images, bound to a validated R2 operation, into the metadata-only R3 operation. Both
-fragments are validated by the unchanged tools/myron-collect. Nothing here reads a phone or
-a block device, acquires evidence, authorizes anything or clears a blocker. R4 (selection)
-is not implemented: it is a recorded successor gate.
+(v0) images, bound to a validated R2 operation, into the metadata-only R3 operation.
+`parse-selection` reparses the same exact R3 fixture bytes, counts the flattened device tree
+blobs of one fixed base partition and the entries of one DT table, checks a synthetic index
+witness for membership and binding only, and emits an R4 operation whose selected board id,
+revision and selection source are always null. All fragments are validated by the unchanged
+tools/myron-collect. Nothing here reads a phone or a block device, acquires evidence,
+authorizes anything or clears a blocker. Which board a real device selects is not
+established: that is the recorded hardware-witness successor gate.
 
 This file is not run directly. tools/myron-bootchain captures its bytes once and
 executes them in its own namespace (so `__file__` is the loader's), and passes
@@ -28,11 +32,11 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 REPO = Path(__file__).resolve().parent.parent
 COLLECT_TOOL = REPO / "tools/myron-collect"
 PINNED_VERSIONS = {
-    "collector": "0.2.0", "preflight": "0.3.0", "snapshot": "0.2.0", "deployment": "0.4.0",
+    "collector": "0.3.0", "preflight": "0.4.0", "snapshot": "0.2.0", "deployment": "0.4.0",
 }
 BOOTCHAIN_CONTRACT_PATH = "device/myron/bootchain-contract.json"
 IMPLEMENTATION_PATH = "tools/lib/myron-bootchain-impl.py"
@@ -133,14 +137,22 @@ UNRESOLVED = [
     "r3-acquisition-provenance-not-established",
     "r3-image-freshness-not-established",
     "r3-hardware-transport-not-established",
-    "r4-selection-provenance-successor-required",
+    "r4-selection-provenance-not-established",
+    "r4-selection-source-semantics-not-established",
+    "r4-actual-myron-witness-not-established",
+    "r4-selection-freshness-not-established",
+    "r4-multi-overlay-ordering-not-established",
 ]
 DEFERRED = [
     {
-        "id": R4_ID, "state": "not-implemented", "successor_gate": "r4-selection-source-qualification",
+        "id": R4_ID, "state": "hardware-witness-required",
+        "successor_gate": "r4-selection-source-qualification",
         "requires": [
             "a concrete selected-index source: parsing a DTBO or FDT does not prove selection",
             "an actual Myron witness and contract cross-checks",
+            "captured provenance and freshness of the witness and of the images it indexes",
+            "a qualified source semantics: which partition, format and field names the live selection",
+            "an ordering model for more than one overlay: this synthetic gate binds one base and one overlay index",
         ],
     },
 ]
@@ -152,7 +164,7 @@ LIMITATIONS = [
     "header bytes after the 92-byte header must be zero: a profile restriction, not universal GPT validity",
     "a partition name fills at most 35 UTF-16 units and must be NUL terminated (a profile restriction)",
     "bootable_flag is legacy-bios-bootable-bit and proves no Android priority, success, active slot, bootability or recovery viability",
-    "R4 selection is not implemented: it is a recorded successor gate. The GPT parse produces only the R2 operation fragment and the image parse produces only the R3 operation fragment: neither is a capture",
+    "the GPT parse produces only the R2 operation fragment, the image parse only the R3 operation fragment and the selection parse only an R4 fragment with a null selection triple: none is a capture, and which board a real device selects stays a recorded hardware-witness successor gate",
     "bytes_read is fixture payload accounting only: it counts consumed fixture bytes and is no device I/O",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the bootchain contract pins the bootchain implementation bytes; the collector implementation is bound only through the capture contract",
@@ -166,7 +178,7 @@ NON_GOALS = [
     "hardware evidence or captured provenance",
     "authorization of any read, deployment or boot",
     "closing any blocker",
-    "R4 DTB or DTBO selection, hardware acquisition of images, or any complete R1-R7 capture",
+    "an actual R4 DTB or DTBO selection, a selected board id, revision or source, hardware acquisition of images, or any complete R1-R7 capture",
     "Android slot, priority, success or recovery qualification",
 ]
 SAFETY = [
@@ -515,6 +527,7 @@ def expected_bootchain_contract(env) -> dict:
     c = collect()
     check_registry_consistency(c)
     check_image_registry_consistency(c)
+    check_selection_registry_consistency(c)
     p = c.preflight()
     d = p.deploy()
     preflight_value = d.strict_json(env.preflight_bytes, "preflight contract")
@@ -575,6 +588,7 @@ def expected_bootchain_contract(env) -> dict:
         },
         "profile": profile_contract(),
         "image_parser": image_parser_contract(),
+        "selection_parser": selection_parser_contract(),
         "input": input_contract(),
         "output": {
             "kind": PARSE_KIND,
@@ -605,8 +619,17 @@ def qualification() -> dict:
         "binary_parser": "synthetic-fixtures-only",
         "captured_provenance": False,
         "hardware_qualified": False,
-        "implemented_operations": [R2_ID, R3_ID],
-        "command_scope": {"parse": [R2_ID], "parse-images": [R3_ID]},
+        "implemented_operations": [R2_ID, R3_ID, R4_ID],
+        "command_scope": {
+            "parse": [R2_ID], "parse-images": [R3_ID], "parse-selection": [R4_ID],
+        },
+        "r4_capability": {
+            "counts_from_synthetic_bytes": True,
+            "synthetic_index_binding": True,
+            "selected_board_fields_produced": False,
+            "captured_provenance": False,
+            "hardware_qualified": False,
+        },
         "deferred_operations": [
             {"id": row["id"], "state": row["state"], "successor_gate": row["successor_gate"]}
             for row in DEFERRED
@@ -2510,9 +2533,9 @@ def image_parse_document(env: Environment, inputs: ImageInputs, result: dict, op
     }
 
 
-def image_parse_spec(env: Environment, inputs: ImageInputs) -> list:
+def image_parse_spec(env: Environment, inputs: ImageInputs, result: dict | None = None) -> list:
     d = deploy()
-    result = image_result(inputs)
+    result = image_result(inputs) if result is None else result
     operation = d.render_json(operation_document(inputs.request_sha256, result, R3_ID))
     validate_r3_operation(env, inputs.request, inputs.request_sha256, operation, inputs.inventory.partitions)
     files = {
@@ -2674,6 +2697,1315 @@ def command_verify_images(env: Environment, args) -> dict:
     return image_result_summary("verified", inputs, spec)
 
 
+# --- R4 synthetic selection mechanism (selection parser contract 1.0.0) -------------------
+# The same exact R3 image fixture bytes that the R3 parser admitted are reparsed here: the
+# flattened device tree (FDT) blobs of one fixed base partition's dtb component are counted and
+# validated, and the entries of one DT table are counted. A synthetic witness holds either no
+# claim or one (dtb index, DT table entry index) pair; the pair is checked for membership in the
+# parsed sets and for binding only. The R4 operation this emits ALWAYS carries a null selected
+# board id, a null selected board revision and a null selection source: nothing here can
+# establish which board a real device selects, from where, or how fresh that is. Which source
+# and semantics a real Myron uses is the recorded hardware-witness successor gate
+# (r4-selection-source-qualification).
+#
+# Accounting (per complete gather; verification and publication re-gather separately):
+#   S = complete R3 fixture bytes (images.json plus every present image) + selection.json
+#       + witness.json: the R4 operation's bytes_read
+#   M = per image, the union of the reused R3 metadata coverage and (for the one base image)
+#       the complete parsed base-DTB component range, overlap counted once, summed
+#   O = canonical serialized R4 operation bytes, newline included
+# The request tree, the R2 inventory and the R3 parse artifact are dependency reads, reported
+# separately and never part of S.
+
+SELECTION_PARSER_VERSION = "1.0.0"
+SELECTION_KIND = "myron-synthetic-r4-selection"
+WITNESS_KIND = "myron-synthetic-r4-witness"
+SELECTION_PLAN_KIND = "myron-synthetic-r4-selection-parse-plan"
+SELECTION_PARSE_KIND = "myron-synthetic-r4-selection-parse"
+SELECTION_PROFILE = "r4-synthetic-fdt-v17-dt-table-v0-index-membership-only"
+SELECTION_TRANSPORT = "synthetic-binary-selection-fixture"
+SELECTION_EVIDENCE_LEVEL = "synthetic-binary-selection-count-and-index-membership-only"
+SELECTION_PARSE_STATUS = "synthetic-r4-parse-recorded"
+SELECTION_ACCOUNTING_SCOPE = "one-admitted-fixture-snapshot"
+SELECTION_MANIFEST_PATH = "selection.json"
+WITNESS_PATH = "witness.json"
+SELECTION_CLOSURE = sorted([SELECTION_MANIFEST_PATH, WITNESS_PATH])
+SELECTION_LISTING_MAX = len(SELECTION_CLOSURE) + 1  # the closure and one entry past it
+SELECTION_MANIFEST_MAX_BYTES = 8192
+WITNESS_MAX_BYTES = 4096
+SELECTION_OPERATION_PATH = f"operations/{R4_ID}.json"
+SELECTION_OUTPUT_FILES = sorted(["SHA256SUMS", "parse.json", SELECTION_OPERATION_PATH])
+SELECTION_MAX_FIXTURE_INPUT_BYTES = MAX_FIXTURE_INPUT_BYTES + SELECTION_MANIFEST_MAX_BYTES + WITNESS_MAX_BYTES
+SELECTION_MAX_REPRESENTED_METADATA_BYTES = 65536  # M: the collector's max_hardware_read_bytes for R4
+SELECTION_MAX_OPERATION_BYTES = 65536  # O: the collector's max_output_bytes for R4
+SELECTION_MAX_PARSE_BYTES = 131072
+SELECTION_MAX_SUMS_BYTES = 1024
+SELECTION_MAX_OUTPUT_BYTES = SELECTION_MAX_PARSE_BYTES + SELECTION_MAX_OPERATION_BYTES + SELECTION_MAX_SUMS_BYTES
+BASE_ROLES = ("boot", "recovery", "vendor_boot", "vendor_kernel_boot")
+BASE_SOURCES = sorted(role + suffix for role in BASE_ROLES for suffix in IMAGE_SUFFIXES)
+DTBO_SOURCES = sorted("dtbo" + suffix for suffix in IMAGE_SUFFIXES)
+FDT_MAGIC = 0xD00DFEED
+FDT_HEADER = 40
+FDT_VERSION = 17
+FDT_LAST_COMP_VERSION = 16
+FDT_BEGIN_NODE, FDT_END_NODE, FDT_PROP, FDT_NOP, FDT_END = 1, 2, 3, 4, 9
+MAX_FDT_BLOBS = 64
+MAX_FDT_DEPTH = 64
+MAX_FDT_NODES = 4096
+MAX_FDT_PROPERTIES = 8192
+MAX_FDT_NAME_BYTES = 128
+MAX_COMPATIBLE_TOKENS = 16
+MAX_COMPATIBLE_TOKEN_BYTES = 64
+MAX_WITNESS_DTB_INDEX = MAX_FDT_BLOBS - 1
+MAX_WITNESS_DTBO_INDEX = MAX_DT_ENTRIES - 1
+DT_ENTRY_ID_OFFSET, DT_ENTRY_REVISION_OFFSET = 8, 12
+FDT_NODE_NAME_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789,._+-@")
+FDT_PROPERTY_NAME_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789,._+*#?-")
+SELECTION_CODES = {
+    "selection-input-rejected": "the selection fixture, an input path or a dependency artifact failed safe admission",
+    "selection-binding-mismatch": "the selection fixture, witness or R3 parse disagrees with its bindings or the exact R3 fixture",
+    "selection-unstable": "an input changed while it was admitted or read",
+    "selection-corrupt": "the device tree or DT table bytes are internally inconsistent",
+    "selection-unsupported": "the bytes may be valid but lie outside the supported selection profile",
+    "selection-budget": "a count, size or accounting bound was exceeded",
+    "selection-witness-rejected": "the witness is malformed or its claim is not a member of the parsed sets",
+    "selection-operation-rejected": "the collector or this parser refused the produced R4 operation",
+    "publish-rejected": "the output could not be published safely",
+}
+SELECTION_NOT_PRODUCED = [
+    "R1-identity-and-slot", R2_ID, R3_ID, "R5-module-load-order", "R6-storage-and-mount-model",
+    "R7-kernel-identity-revalidation",
+]
+SELECTION_SAFETY = IMAGE_SAFETY + ["exact-r3-fixture-reparse", "witness-hashed-one-way"]
+SELECTION_NOT_ESTABLISHED = [
+    "actual-selected-board-id", "actual-selected-board-revision", "actual-selection-source",
+    "selection-provenance", "selection-freshness", "selection-source-semantics",
+    "board-semantics", "multi-overlay-ordering",
+]
+SELECTION_SEMANTIC_LIMITS = [
+    "dtb_count and dtbo_entry_count are counts parsed from the admitted synthetic bytes: FDT blobs in the one chosen base partition's dtb component and entries of the one chosen DT table",
+    "selected_board_id, selected_board_revision and selection_source are always null: no actual selection, source, provenance or freshness is established",
+    "the witness indexes are unverified synthetic claims: membership is a computed check that the claimed indexes lie inside the parsed sets and that the claimed base candidate carries the exact contract compatible token",
+    "a decoded DT table entry id and revision appear only in the parse sidecar as the claimed entry's raw big-endian words: never an operation field and never a selected board",
+    "no selection is inferred from an id, a singleton, the highest revision or entry 0; duplicate ids and revisions are valid",
+    "DT table custom words are opaque and a DTBO payload is never parsed as a device tree",
+    "the root compatible check matches one exact token and implies no board, SoC variant or boot behavior",
+    "one base source and one overlay index only: no multi-overlay ordering, no live merged tree and no complete-device claim",
+    "bootconfig is not parsed: an extra bootconfig.txt is refused and no androidboot key or board semantics are interpreted",
+    "the matching slot suffix of the two source partitions is a synthetic profile restriction, not an active-slot claim",
+]
+SELECTION_LIMITATIONS = [
+    "synthetic binary parser qualification only: the fixture bytes were never read from a phone or a block device and carry no captured provenance",
+    "the mechanism establishes counts and index membership only: it never produces a selected board id, revision or selection source, and closes no hardware-witness gate",
+    "hardware discovery may reveal another source or format: this is the final planned synthetic gate, not guaranteed final parser work",
+    "one base DTB partition (boot, recovery, vendor_boot or vendor_kernel_boot, with a boot v2 or a vendor_boot dtb component) and one dtbo partition with the same slot suffix; no active-slot claim",
+    "FDT v17 with last_comp_version 16 only, at most 64 tightly concatenated blobs, depth 64, 4096 nodes, 8192 properties, 128-byte names and a 1..16 token root compatible list; other valid variants are refused as unsupported, numeric overruns as budget, malformed bytes as corrupt",
+    "an empty dtb component and a dtb component without a root compatible are refused as unsupported: the parser never invents a candidate",
+    "DT table v0 with the R3 layout rules; a table with more than 256 entries is refused by the shared R3 admission under its image-budget code before any R4 code runs",
+    "the R3 fixture is reparsed and the R3 artifact recomputed from the exact admitted buffers; the R3 artifact's metadata hashes alone would not bind the payload and are never trusted without that recomputation",
+    "operation bytes_read is S and is fixture payload accounting, no device I/O; the request, R2 inventory and R3 artifact dependency reads are reported separately",
+    "each complete gather admits at most 64 MiB plus 12 KiB (S): parse-selection gathers three times (admission, temporary and published verification) and verify-selection twice, so total invocation I/O exceeds S",
+    "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot and not writer exclusion; a later verify against a changed source rejects",
+    "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
+    "publication is durable only if the output parent's fsync succeeds; a failure there removes the just-published output by identity on a best-effort basis",
+]
+
+
+class SelectionError(BootchainError):
+    """A fixed-category refusal. The reason is a literal written in this file, never input."""
+
+    def __init__(self, code: str, reason: str):
+        super().__init__(reason)
+        self.code = code
+
+    def __str__(self) -> str:
+        return f"{self.args[0]} (code {self.code})"
+
+
+def selection_input_error(reason: str) -> SelectionError:
+    return SelectionError("selection-input-rejected", reason)
+
+
+def selection_unstable(reason: str) -> SelectionError:
+    return SelectionError("selection-unstable", reason)
+
+
+def selection_binding(reason: str) -> SelectionError:
+    return SelectionError("selection-binding-mismatch", reason)
+
+
+def selection_corrupt(reason: str) -> SelectionError:
+    return SelectionError("selection-corrupt", reason)
+
+
+def selection_unsupported(reason: str) -> SelectionError:
+    return SelectionError("selection-unsupported", reason)
+
+
+def selection_budget(reason: str) -> SelectionError:
+    return SelectionError("selection-budget", reason)
+
+
+def selection_witness_rejected(reason: str) -> SelectionError:
+    return SelectionError("selection-witness-rejected", reason)
+
+
+def selection_operation_rejected(reason: str) -> SelectionError:
+    return SelectionError("selection-operation-rejected", reason)
+
+
+def suffix_of(name: str) -> str:
+    return name[-2:] if name.endswith(("_a", "_b")) else ""
+
+
+# --- flattened device tree -------------------------------------------------------------
+
+
+def fdt_u32(data: bytes, offset: int, end: int) -> int:
+    if offset < 0 or offset + 4 > end:
+        raise selection_corrupt("a device tree field lies outside its block")
+    return int.from_bytes(data[offset:offset + 4], "big")
+
+
+def fdt_padded(length: int) -> int:
+    return (length + 3) // 4 * 4
+
+
+def fdt_node_name_ok(name: bytes) -> bool:
+    return (bool(name) and name[0] != ord("@") and name[-1] != ord("@") and name.count(b"@") <= 1
+            and all(byte in FDT_NODE_NAME_BYTES for byte in name))
+
+
+def fdt_property_name_ok(name: bytes) -> bool:
+    return bool(name) and all(byte in FDT_PROPERTY_NAME_BYTES for byte in name)
+
+
+def compatible_tokens(raw: bytes) -> list[bytes]:
+    """A root compatible property is a NUL-terminated stringlist of 1..16 printable ASCII tokens of
+    1..64 bytes. Malformed shapes are corrupt; the numeric limits are budget refusals."""
+    if not raw or raw[-1] != 0:
+        raise selection_corrupt("the root compatible is not a NUL-terminated string list")
+    tokens = raw[:-1].split(b"\0")
+    if len(tokens) > MAX_COMPATIBLE_TOKENS:
+        raise selection_budget("the root compatible holds more tokens than the profile allows")
+    for token in tokens:
+        if not token:
+            raise selection_corrupt("the root compatible holds an empty token")
+        if len(token) > MAX_COMPATIBLE_TOKEN_BYTES:
+            raise selection_budget("a root compatible token is longer than the profile allows")
+        if not all(0x20 <= byte <= 0x7E for byte in token):
+            raise selection_corrupt("a root compatible token is not printable ASCII")
+    return tokens
+
+
+def parse_fdt_blob(component: bytes, base: int) -> dict:
+    """One v17 blob that starts exactly at BASE. Every offset in its header is blob-relative."""
+    available = len(component) - base
+    if available < FDT_HEADER:
+        raise selection_corrupt("a device tree blob is shorter than its header")
+    end = len(component)
+    (magic, total, off_struct, off_strings, off_reserve, version, last_comp, _cpu, size_strings,
+     size_struct) = (fdt_u32(component, base + 4 * index, end) for index in range(10))
+    if magic != FDT_MAGIC:
+        raise selection_corrupt("a device tree blob magic differs")
+    if total < FDT_HEADER or total > available:
+        raise selection_corrupt("a device tree blob total size does not fit its component")
+    if last_comp > version:
+        raise selection_corrupt("a device tree blob last_comp_version exceeds its version")
+    if version != FDT_VERSION or last_comp != FDT_LAST_COMP_VERSION:
+        raise selection_unsupported("a device tree blob version lies outside the supported profile")
+    if off_struct % 4 or size_struct % 4 or off_reserve % 8:
+        raise selection_corrupt("a device tree block is misaligned")
+    if off_struct < FDT_HEADER or off_strings < FDT_HEADER or off_reserve < FDT_HEADER:
+        raise selection_corrupt("a device tree block overlaps the header")
+    if off_struct + size_struct > total or off_strings + size_strings > total:
+        raise selection_corrupt("a device tree block runs past the blob")
+    if size_struct < 16:
+        raise selection_corrupt("the structure block is too short for a root node")
+    position = off_reserve
+    reservations = []
+    while True:
+        if position + 16 > total:
+            raise selection_corrupt("the reserve map has no terminator within the blob")
+        address = int.from_bytes(component[base + position:base + position + 8], "big")
+        size = int.from_bytes(component[base + position + 8:base + position + 16], "big")
+        if address == 0 and size == 0:
+            break
+        if size:
+            reserved_end = address + size
+            if reserved_end > 1 << 64:
+                raise selection_corrupt("a memory reservation runs past the address space")
+            reservations.append((address, reserved_end))
+        position += 16
+    reservations.sort()
+    for previous, current in zip(reservations, reservations[1:]):
+        if current[0] < previous[1]:
+            raise selection_corrupt("memory reservations overlap")
+    blocks = [(0, FDT_HEADER), (off_reserve, position + 16), (off_struct, off_struct + size_struct)]
+    if size_strings:
+        blocks.append((off_strings, off_strings + size_strings))
+    blocks.sort()
+    cursor = 0
+    for start, stop in blocks:
+        if start < cursor:
+            raise selection_corrupt("device tree blocks overlap")
+        if any(component[base + cursor:base + start]):
+            raise selection_corrupt("a device tree gap holds nonzero bytes")
+        cursor = stop
+    if cursor > total or any(component[base + cursor:base + total]):
+        raise selection_corrupt("a device tree blob has nonzero bytes after its last block")
+    strings_start, strings_end = base + off_strings, base + off_strings + size_strings
+    pointer, stop = base + off_struct, base + off_struct + size_struct
+    depth = nodes = properties = deepest = 0
+    child_sections = []
+    property_names = []
+    child_names = []
+    saw_root = False
+    root_compatible = None
+    while True:
+        if pointer + 4 > stop:
+            raise selection_corrupt("the structure block ends without FDT_END")
+        token = fdt_u32(component, pointer, stop)
+        pointer += 4
+        if token == FDT_BEGIN_NODE:
+            if depth == 0 and saw_root:
+                raise selection_corrupt("the structure block holds a second root node")
+            nul = component.find(b"\0", pointer, stop)
+            if nul < 0:
+                raise selection_corrupt("a node name has no terminator inside the structure block")
+            name = component[pointer:nul]
+            if len(name) > MAX_FDT_NAME_BYTES:
+                raise selection_budget("a node name is longer than the profile allows")
+            if depth == 0 and name:
+                raise selection_corrupt("the root node name is not empty")
+            if depth > 0 and not fdt_node_name_ok(name):
+                raise selection_corrupt("a node name is empty or holds an unsupported byte")
+            if depth:
+                if name in child_names[-1]:
+                    raise selection_corrupt("a node repeats a sibling name")
+                child_names[-1].add(name)
+                child_sections[-1] = True
+            following = pointer + fdt_padded(len(name) + 1)
+            if following > stop or any(component[nul + 1:following]):
+                raise selection_corrupt("a node name padding is not zero or runs past the structure block")
+            pointer = following
+            saw_root = True
+            depth += 1
+            child_sections.append(False)
+            property_names.append(set())
+            child_names.append(set())
+            nodes += 1
+            deepest = max(deepest, depth)
+            if nodes > MAX_FDT_NODES:
+                raise selection_budget("the blob holds more nodes than the profile allows")
+            if depth > MAX_FDT_DEPTH:
+                raise selection_budget("the blob nests deeper than the profile allows")
+        elif token == FDT_END_NODE:
+            if depth == 0:
+                raise selection_corrupt("the structure block closes a node it never opened")
+            depth -= 1
+            child_sections.pop()
+            property_names.pop()
+            child_names.pop()
+        elif token == FDT_PROP:
+            if depth == 0:
+                raise selection_corrupt("the structure block holds a property outside a node")
+            if child_sections[-1]:
+                raise selection_corrupt("a node property appears after its child nodes")
+            if pointer + 8 > stop:
+                raise selection_corrupt("a property header runs past the structure block")
+            length, name_offset = fdt_u32(component, pointer, stop), fdt_u32(component, pointer + 4, stop)
+            pointer += 8
+            if length > stop - pointer:
+                raise selection_corrupt("a property value runs past the structure block")
+            data_start = pointer
+            following = pointer + fdt_padded(length)
+            if following > stop or any(component[data_start + length:following]):
+                raise selection_corrupt("a property padding is not zero or runs past the structure block")
+            pointer = following
+            properties += 1
+            if properties > MAX_FDT_PROPERTIES:
+                raise selection_budget("the blob holds more properties than the profile allows")
+            if name_offset >= size_strings:
+                raise selection_corrupt("a property name lies outside the strings block")
+            nul = component.find(b"\0", strings_start + name_offset, strings_end)
+            if nul < 0:
+                raise selection_corrupt("a property name has no terminator inside the strings block")
+            property_name = component[strings_start + name_offset:nul]
+            if len(property_name) > MAX_FDT_NAME_BYTES:
+                raise selection_budget("a property name is longer than the profile allows")
+            if not fdt_property_name_ok(property_name):
+                raise selection_corrupt("a property name is empty or holds an unsupported byte")
+            if property_name in property_names[-1]:
+                raise selection_corrupt("a node repeats a property name")
+            property_names[-1].add(property_name)
+            if depth == 1 and property_name == b"compatible":
+                if root_compatible is not None:
+                    raise selection_corrupt("the root node repeats its compatible property")
+                root_compatible = component[data_start:data_start + length]
+        elif token == FDT_NOP:
+            continue
+        elif token == FDT_END:
+            if depth != 0 or not saw_root:
+                raise selection_corrupt("the structure block ends unbalanced or without a root node")
+            break
+        else:
+            raise selection_corrupt("the structure block holds an unknown token")
+    if pointer != stop:
+        raise selection_corrupt("the structure block holds bytes after FDT_END")
+    if root_compatible is None:
+        raise selection_unsupported("a device tree blob has no root compatible property")
+    return {
+        "bytes": total, "nodes": nodes, "properties": properties, "max_depth": deepest,
+        "compatible": compatible_tokens(root_compatible),
+    }
+
+
+def parse_fdt_component(component: bytes) -> list[dict]:
+    """Exactly one blob or tightly concatenated blobs covering the whole component: no scan for a
+    magic, no gap between blobs and no trailing byte."""
+    blobs, position = [], 0
+    while position < len(component):
+        if len(blobs) >= MAX_FDT_BLOBS:
+            raise selection_budget("the dtb component holds more blobs than the profile allows")
+        blob = parse_fdt_blob(component, position)
+        blob["offset"] = position
+        blobs.append(blob)
+        position += blob["bytes"]
+    if not blobs:
+        raise selection_unsupported("an empty dtb component carries no device tree blob")
+    return blobs
+
+
+# --- selection manifest and witness ----------------------------------------------------
+
+
+def selection_manifest_schema() -> dict:
+    c = collect()
+    return {
+        "fields": {
+            "schema": c._int(1, 1), "kind": c._enum([SELECTION_KIND]), "format_version": c._int(1, 1),
+            "bootchain_contract_sha256": c._hash(), "request_sha256": c._hash(),
+            "inventory_sha256": c._hash(), "r3_parse_sha256": c._hash(),
+            "r3_operation_sha256": c._hash(), "images_sha256": c._hash(),
+            "base_source_partition": c._enum(BASE_SOURCES), "dtbo_source_partition": c._enum(DTBO_SOURCES),
+            "witness_bytes": c._int(1, WITNESS_MAX_BYTES), "witness_sha256": c._hash(),
+            "synthetic": c._bool(True),
+        },
+    }
+
+
+def witness_schema() -> dict:
+    c = collect()
+    return {
+        "fields": {
+            "schema": c._int(1, 1), "kind": c._enum([WITNESS_KIND]), "format_version": c._int(1, 1),
+            "request_sha256": c._hash(), "r3_operation_sha256": c._hash(),
+            "base_source_partition": c._enum(BASE_SOURCES), "dtbo_source_partition": c._enum(DTBO_SOURCES),
+            "synthetic": c._bool(True),
+            "claim": c._nullable(c._object({
+                "dtb_index": c._int(0, MAX_WITNESS_DTB_INDEX),
+                "dtbo_entry_index": c._int(0, MAX_WITNESS_DTBO_INDEX),
+            })),
+        },
+    }
+
+
+def check_selection_scope(base: str, dtbo: str) -> None:
+    if suffix_of(base) != suffix_of(dtbo):
+        raise selection_unsupported("the base and dtbo source partitions do not share one slot suffix")
+
+
+def parse_selection_manifest(raw: bytes) -> dict:
+    schema = selection_manifest_schema()
+    try:
+        document = parse_json(raw, "selection.json")
+        values = check_fields(document, schema["fields"], "selection.json")
+    except (BootchainError, *admission_errors(), RecursionError, KeyError, TypeError):
+        raise selection_input_error("selection.json is not the exact canonical manifest") from None
+    check_selection_scope(values["base_source_partition"], values["dtbo_source_partition"])
+    return values
+
+
+def parse_witness(raw: bytes) -> dict:
+    schema = witness_schema()
+    try:
+        document = parse_json(raw, "witness.json")
+        values = check_fields(document, schema["fields"], "witness.json")
+    except (BootchainError, *admission_errors(), RecursionError, KeyError, TypeError):
+        raise selection_witness_rejected("witness.json is not the exact canonical witness") from None
+    check_selection_scope(values["base_source_partition"], values["dtbo_source_partition"])
+    return values
+
+
+# --- the selection fixture directory (selection.json and witness.json only) ------------
+
+
+class SelectionFixture:
+    def __init__(self, manifest_bytes, witness_bytes, directory_ids):
+        self.manifest_bytes = manifest_bytes
+        self.witness_bytes = witness_bytes
+        self.directory_ids = directory_ids
+        self.manifest_sha256 = sha256_hex(manifest_bytes)
+        self.witness_sha256 = sha256_hex(witness_bytes)
+
+
+def list_selection_names(descriptor: int) -> list[str]:
+    names = []
+    try:
+        with os.scandir(descriptor) as children:
+            for child in children:
+                names.append(child.name)
+                if len(names) > SELECTION_LISTING_MAX:
+                    raise selection_input_error("the selection fixture holds too many entries")
+    except OSError:
+        raise selection_input_error("the selection fixture cannot be listed") from None
+    return names
+
+
+def check_selection_closure(names: list, error) -> None:
+    if sorted(names) != SELECTION_CLOSURE:
+        raise error("the selection fixture differs from its exact closure")
+
+
+def pin_selection_file(directory: int, name: str, root, root_mount: int, low: int, high: int) -> Held:
+    """Pin one closure file and judge all of its metadata; no payload byte is read here."""
+    d = deploy()
+    try:
+        pinned, descriptor, opened = d.open_pinned_regular_at(directory, name, "selection fixture file")
+    except (*d.handled_errors(), OSError):
+        raise selection_input_error("a selection fixture file cannot be opened safely") from None
+    item = Held(name, pinned, descriptor, opened)
+    try:
+        if opened.st_nlink != 1:
+            raise selection_input_error("a selection fixture file has additional hard links")
+        if d.untrusted_owner_or_mode(opened):
+            raise selection_input_error("a selection fixture file is writable or controlled by another user")
+        if opened.st_mode & 0o111:
+            raise selection_input_error("a selection fixture file is executable")
+        if opened.st_dev != root.st_dev:
+            raise selection_input_error("a selection fixture file crosses a device boundary")
+        try:
+            mount = d.kernel().mount_id_for_fd(pinned, "selection fixture file")
+        except (*d.handled_errors(), OSError):
+            raise selection_input_error("a selection fixture file mount cannot be determined") from None
+        if mount != root_mount:
+            raise selection_input_error("a selection fixture file crosses a mount point")
+        if not low <= opened.st_size <= high:
+            raise selection_input_error("a selection fixture file is outside its byte bounds")
+    except BaseException:
+        release([item])
+        raise
+    return item
+
+
+def settle_selection(directory: int, held: list, root_before: tuple) -> None:
+    """The same repeated best-effort passes as the other gathers: detection only, never a claim of
+    atomicity or writer exclusion."""
+    d = deploy()
+
+    def directory_unchanged() -> None:
+        check_selection_closure(list_selection_names(directory), selection_unstable)
+        if d.fingerprint(os.fstat(directory)) != root_before:
+            raise selection_unstable("the selection fixture directory changed")
+
+    def files_unchanged() -> None:
+        for item in held:
+            pinned = d.fingerprint(item.opened)
+            if d.fingerprint(os.fstat(item.descriptor)) != pinned:
+                raise selection_unstable("a selection fixture file changed")
+            try:
+                current = os.stat(item.name, dir_fd=directory, follow_symlinks=False)
+            except OSError:
+                raise selection_unstable("a selection fixture file was removed") from None
+            if d.fingerprint(current) != pinned:
+                raise selection_unstable("a selection fixture file was replaced")
+
+    directory_unchanged()
+    files_unchanged()
+    directory_unchanged()
+    files_unchanged()
+    directory_unchanged()
+
+
+def read_selection_pinned(item: Held) -> bytes:
+    d = deploy()
+    pinned = d.fingerprint(item.opened)
+    if d.fingerprint(os.fstat(item.descriptor)) != pinned:
+        raise selection_unstable("a selection fixture file changed before being read")
+    chunks, remaining = [], item.opened.st_size
+    while remaining:
+        block = os.read(item.descriptor, min(1024 * 1024, remaining))
+        if not block:
+            raise selection_unstable("a selection fixture file changed size while being read")
+        chunks.append(block)
+        remaining -= len(block)
+    if os.read(item.descriptor, 1):
+        raise selection_unstable("a selection fixture file grew while being read")
+    if d.fingerprint(os.fstat(item.descriptor)) != pinned:
+        raise selection_unstable("a selection fixture file changed while being read")
+    return b"".join(chunks)
+
+
+def read_selection_fixture(path: str, r3_bytes: int) -> SelectionFixture:
+    """Admit the exact two-file closure from the listing before any payload read, pin and judge
+    both files' metadata (including the S bound, computed from the R3 fixture bytes and the two
+    sizes), and only then read each file once from its pinned descriptor."""
+    d = deploy()
+    try:
+        descriptor, identity = d.open_trusted_artifact(path, "selection fixture")
+    except (*d.handled_errors(), OSError):
+        raise selection_input_error("the selection fixture directory failed safe admission") from None
+    held = []
+    try:
+        root = os.fstat(descriptor)
+        if d.untrusted_owner_or_mode(root):
+            raise selection_input_error("the selection fixture directory is writable or controlled by another user")
+        try:
+            root_mount = d.kernel().mount_id_for_fd(descriptor, "selection fixture root")
+        except (*d.handled_errors(), OSError):
+            raise selection_input_error("the selection fixture mount cannot be determined") from None
+        root_before = d.fingerprint(root)
+        check_selection_closure(list_selection_names(descriptor), selection_input_error)
+        bounds = {SELECTION_MANIFEST_PATH: SELECTION_MANIFEST_MAX_BYTES, WITNESS_PATH: WITNESS_MAX_BYTES}
+        for name in SELECTION_CLOSURE:
+            held.append(pin_selection_file(descriptor, name, root, root_mount, 1, bounds[name]))
+        if r3_bytes + sum(item.opened.st_size for item in held) > SELECTION_MAX_FIXTURE_INPUT_BYTES:
+            raise selection_budget("the admitted selection input exceeds the per-gather input bound")
+        settle_selection(descriptor, held, root_before)
+        data = {item.name: read_selection_pinned(item) for item in held}
+        settle_selection(descriptor, held, root_before)
+    finally:
+        release(held)
+        os.close(descriptor)
+    try:
+        d.recheck_trusted_artifact(path, identity, "selection fixture")
+    except (*d.handled_errors(), OSError):
+        raise selection_unstable("the selection fixture directory changed") from None
+    return SelectionFixture(data[SELECTION_MANIFEST_PATH], data[WITNESS_PATH], frozenset({(root.st_dev, root.st_ino)}))
+
+
+# --- inputs ----------------------------------------------------------------------------
+
+
+class SelectionInputs:
+    def __init__(self, image_inputs, r3_result, r3_spec, r3_parse_sha256, r3_operation_sha256,
+                 r3_artifact_bytes, r3_directory_ids, fixture, manifest, witness):
+        self.image_inputs = image_inputs
+        self.request = image_inputs.request
+        self.request_sha256 = image_inputs.request_sha256
+        self.request_ids = image_inputs.request_ids
+        self.inventory = image_inputs.inventory
+        self.images = image_inputs.fixture
+        self.r3_result = r3_result
+        self.r3_spec = r3_spec
+        self.r3_parse_sha256 = r3_parse_sha256
+        self.r3_operation_sha256 = r3_operation_sha256
+        self.r3_artifact_bytes = r3_artifact_bytes
+        self.r3_directory_ids = r3_directory_ids
+        self.fixture = fixture
+        self.manifest = manifest
+        self.witness = witness
+
+
+def selection_request_row(request: dict) -> dict:
+    return next(row for row in request["requested_reads"] if row["id"] == R4_ID)
+
+
+def selection_paths(args) -> list:
+    return [args.request, args.inventory, args.images, args.r3_parse, args.selection]
+
+
+def check_selection_paths(args, extra=()) -> None:
+    d = deploy()
+    paths = selection_paths(args)
+    for index, first in enumerate(paths):
+        for second in paths[index + 1:]:
+            if d.paths_overlap(first, second):
+                raise selection_input_error("an input path overlaps another input")
+    for output in extra:
+        if any(d.paths_overlap(output, path) for path in paths):
+            raise selection_input_error("the output path overlaps an input")
+
+
+def admit_r3_parse(args, env: Environment, image_inputs: ImageInputs, r3_result: dict) -> tuple:
+    """The R3 artifact is never trusted by its hashes: it is recomputed from the exact admitted image
+    buffers and the admitted tree must equal that recomputation entry for entry and byte for byte."""
+    d = deploy()
+    r3_spec = image_parse_spec(env, image_inputs, r3_result)
+    try:
+        descriptor, identity = d.open_trusted_artifact(args.r3_parse, "R3 parse")
+    except (*d.handled_errors(), OSError):
+        raise selection_input_error("the R3 parse failed safe admission") from None
+    try:
+        tree = walk_output(descriptor, "R3 parse", keep_data=True, trusted_ownership=True)
+    except BootchainError:
+        raise selection_input_error("the R3 parse tree failed safe inspection") from None
+    finally:
+        os.close(descriptor)
+    try:
+        diff_output(tree.entries, d.spec_entries(r3_spec), "R3 parse")
+    except BootchainError:
+        raise selection_binding("the R3 parse differs from the artifact recomputed from the exact R3 fixture") from None
+    try:
+        d.recheck_trusted_artifact(args.r3_parse, identity, "R3 parse")
+    except (*d.handled_errors(), OSError):
+        raise selection_unstable("the R3 parse changed while it was admitted") from None
+    return r3_spec, tree
+
+
+def bind_selection(env: Environment, inputs: SelectionInputs) -> None:
+    manifest, witness, fixture = inputs.manifest, inputs.witness, inputs.fixture
+    if manifest["bootchain_contract_sha256"] != env.contract_sha256 or (
+        manifest["request_sha256"] != inputs.request_sha256
+        or manifest["inventory_sha256"] != inputs.inventory.sha256
+        or manifest["images_sha256"] != inputs.images.sha256
+        or manifest["r3_parse_sha256"] != inputs.r3_parse_sha256
+        or manifest["r3_operation_sha256"] != inputs.r3_operation_sha256
+    ):
+        raise selection_binding("selection.json bindings differ from the contract, request, inventory, images or R3 parse")
+    if manifest["witness_bytes"] != len(fixture.witness_bytes) or manifest["witness_sha256"] != fixture.witness_sha256:
+        raise selection_binding("selection.json witness size or hash differs from witness.json")
+    if witness["request_sha256"] != inputs.request_sha256 or (
+        witness["r3_operation_sha256"] != inputs.r3_operation_sha256
+        or witness["base_source_partition"] != manifest["base_source_partition"]
+        or witness["dtbo_source_partition"] != manifest["dtbo_source_partition"]
+    ):
+        raise selection_binding("witness.json bindings differ from the request, R3 operation or scope")
+    for name in (manifest["base_source_partition"], manifest["dtbo_source_partition"]):
+        if name not in inputs.images.files:
+            raise selection_binding("a selection source partition is absent from the bound R3 fixture")
+
+
+def gather_selection(args, env: Environment) -> SelectionInputs:
+    check_selection_paths(args)
+    image_inputs = gather_images(args, env)
+    r3_result = image_result(image_inputs)
+    r3_spec, tree = admit_r3_parse(args, env, image_inputs, r3_result)
+    fixture = read_selection_fixture(args.selection, r3_result["bytes_read"])
+    manifest = parse_selection_manifest(fixture.manifest_bytes)
+    witness = parse_witness(fixture.witness_bytes)
+    r3_files = {path: data for path, _kind, _mode, data in r3_spec if data is not None}
+    inputs = SelectionInputs(
+        image_inputs, r3_result, r3_spec,
+        sha256_hex(r3_files["SHA256SUMS"]), sha256_hex(r3_files[IMAGE_OPERATION_PATH]),
+        sum(len(data) for data in r3_files.values()), tree.directory_ids, fixture, manifest, witness,
+    )
+    bind_selection(env, inputs)
+    others = [inputs.request_ids, image_inputs.fixture.directory_ids, tree.directory_ids,
+              fixture.directory_ids, frozenset({image_inputs.inventory.handle.parent_identity})]
+    for index, first in enumerate(others):
+        if any(first & second for second in others[index + 1:]):
+            raise selection_input_error("an input aliases another input tree")
+    return inputs
+
+
+# --- the selection facts ----------------------------------------------------------------
+
+
+def dtb_component(name: str, data: bytes) -> tuple[int, int]:
+    found = parse_layout(name, data)
+    for role, _index, offset, size, _type in found["components"]:
+        if role == "dtb":
+            if not size:
+                raise selection_unsupported("the base partition's dtb component is empty")
+            return offset, size
+    raise selection_unsupported("the base partition's format carries no dtb component")
+
+
+def selection_result(env: Environment, inputs: SelectionInputs) -> dict:
+    manifest, witness = inputs.manifest, inputs.witness
+    base, dtbo = manifest["base_source_partition"], manifest["dtbo_source_partition"]
+    files = inputs.images.files
+    offset, size = dtb_component(base, files[base])
+    blobs = parse_fdt_component(files[base][offset:offset + size])
+    token = env.identity["device.compatible"].encode("ascii")
+    for blob in blobs:
+        blob["has_profile_token"] = token in blob["compatible"]
+    table = parse_layout(dtbo, files[dtbo])["table"]
+    claim = witness["claim"]
+    membership = {"claim_present": claim is not None, "dtb_index": None, "dtbo_entry_index": None,
+                  "base_candidate_has_contract_token": None, "decoded_table_entry": None}
+    if claim is not None:
+        dtb_index, entry_index = claim["dtb_index"], claim["dtbo_entry_index"]
+        if dtb_index >= len(blobs):
+            raise selection_witness_rejected("the witness dtb index is not a member of the parsed blobs")
+        if entry_index >= table["count"]:
+            raise selection_witness_rejected("the witness dtbo entry index is not a member of the parsed table")
+        if not blobs[dtb_index]["has_profile_token"]:
+            raise selection_witness_rejected("the claimed base candidate does not carry the contract compatible token")
+        entry = table["offset"] + entry_index * table["entry_size"]
+        membership.update({
+            "dtb_index": dtb_index, "dtbo_entry_index": entry_index,
+            "base_candidate_has_contract_token": True,
+            "decoded_table_entry": {
+                "id": be32(files[dtbo], entry + DT_ENTRY_ID_OFFSET),
+                "revision": be32(files[dtbo], entry + DT_ENTRY_REVISION_OFFSET),
+            },
+        })
+    represented = 0
+    for row in inputs.r3_result["data"]["images"]:
+        image = row["image"]
+        if image is None:
+            continue
+        extents = [(item["offset"], item["size_bytes"]) for item in image["coverage"]["ranges"]]
+        if row["partition_name"] == base:
+            extents.append((offset, size))
+        represented += sum(length for _start, length in merge_ranges(extents))
+    if represented > SELECTION_MAX_REPRESENTED_METADATA_BYTES:
+        raise selection_budget("represented metadata coverage exceeds its bound")
+    payload = inputs.r3_result["bytes_read"] + len(inputs.fixture.manifest_bytes) + len(inputs.fixture.witness_bytes)
+    if payload > SELECTION_MAX_FIXTURE_INPUT_BYTES:
+        raise selection_budget("the admitted selection input exceeds the per-gather input bound")
+    return {
+        "base": base, "dtbo": dtbo, "dtb_offset": offset, "dtb_bytes": size, "blobs": blobs,
+        "dtbo_entry_count": table["count"], "membership": membership,
+        "represented_metadata_bytes": represented, "bytes_read": payload,
+        "data": {
+            "dtb_count": len(blobs), "selected_board_id": None, "selected_board_revision": None,
+            "dtbo_entry_count": table["count"],
+            "compatible_prefix": env.identity["device.compatible"], "selection_source": None,
+        },
+    }
+
+
+def validate_selection_operation(env: Environment, request: dict, request_sha256: str, raw: bytes) -> dict:
+    """The unchanged collector validates the R4 fragment; this parser additionally refuses any
+    operation whose selection triple is not null, whatever the collector would accept."""
+    c, d = collect(), deploy()
+    if len(raw) > SELECTION_MAX_OPERATION_BYTES:
+        raise selection_budget("the R4 operation exceeds the selection parser's output bound")
+    try:
+        document, _outcome = c.validate_operation(raw, selection_request_row(request), request_sha256, env.identity)
+    except (BootchainError, c.CollectError, *d.handled_errors(), RecursionError):
+        raise selection_operation_rejected("the collector refused the R4 operation") from None
+    data = document["data"]
+    if any(data[name] is not None for name in ("selected_board_id", "selected_board_revision", "selection_source")):
+        raise selection_operation_rejected("the R4 operation carries a selection this parser never produces")
+    return document
+
+
+def selection_input_rows(inputs: SelectionInputs) -> list[dict]:
+    fixture = inputs.fixture
+    return [
+        {"path": SELECTION_MANIFEST_PATH, "role": "selection-manifest", "bytes": len(fixture.manifest_bytes),
+         "sha256": fixture.manifest_sha256},
+        {"path": WITNESS_PATH, "role": "synthetic-witness", "bytes": len(fixture.witness_bytes),
+         "sha256": fixture.witness_sha256},
+    ]
+
+
+def selection_accounting_policy() -> dict:
+    return {
+        "scope": SELECTION_ACCOUNTING_SCOPE,
+        "S": "complete R3 fixture bytes (images.json plus every present image) plus selection.json plus witness.json: operation bytes_read, fixture_payload_bytes and fixture_payload_read_bytes",
+        "M": "per image the union of the reused R3 metadata coverage and, for the one base image, the complete parsed base-DTB component range, overlap counted once, summed: represented_metadata_bytes, no hardware read",
+        "O": "canonical serialized R4 operation bytes including newline and whitespace",
+        "bounds": {
+            "S_max_bytes_per_gather": SELECTION_MAX_FIXTURE_INPUT_BYTES,
+            "image_max_bytes": MAX_IMAGE_BYTES,
+            "M_max_bytes": SELECTION_MAX_REPRESENTED_METADATA_BYTES,
+            "O_max_bytes": SELECTION_MAX_OPERATION_BYTES,
+            "hardware_read_max_bytes": SELECTION_MAX_REPRESENTED_METADATA_BYTES,
+            "parse_json_max_bytes": SELECTION_MAX_PARSE_BYTES,
+            "sha256sums_max_bytes": SELECTION_MAX_SUMS_BYTES,
+            "output_total_max_bytes": SELECTION_MAX_OUTPUT_BYTES,
+        },
+        "bound_sources": {
+            "S": "collector R4 max_fixture_input_bytes",
+            "M": "collector R4 max_hardware_read_bytes",
+            "O": "collector R4 max_output_bytes",
+        },
+        "dependency_reads": "the request tree, the R2 inventory and the R3 parse artifact are dependency reads reported separately and never counted in S",
+        "hardware_bytes_read": 0,
+        "hardware_transport": "none",
+        "rereads": "parse-selection gathers three times and verify-selection twice: each gather is bounded by S separately",
+    }
+
+
+def selection_accounting(inputs: SelectionInputs, result: dict, operation: bytes) -> dict:
+    return {
+        "scope": SELECTION_ACCOUNTING_SCOPE,
+        "fixture_payload_bytes": result["bytes_read"],
+        "fixture_payload_read_bytes": result["bytes_read"],
+        "r3_fixture_bytes": inputs.r3_result["bytes_read"],
+        "selection_input_bytes": len(inputs.fixture.manifest_bytes) + len(inputs.fixture.witness_bytes),
+        "represented_metadata_bytes": result["represented_metadata_bytes"],
+        "operation_output_bytes": len(operation),
+        "dependency_reads": {
+            "counted_in_S": False,
+            "r2_inventory_bytes": len(inputs.inventory.raw),
+            "r3_parse_artifact_bytes": inputs.r3_artifact_bytes,
+            "request_tree": "read by the shared request reader: bytes not accounted here",
+        },
+        "hardware_bytes_read": 0,
+        "hardware_transport": "none",
+        "definitions": selection_accounting_policy(),
+    }
+
+
+def selection_classification() -> list[dict]:
+    rows = [
+        ("dtb_count", "parsed-bytes", "fdt-blob-count-of-the-base-dtb-component"),
+        ("dtbo_entry_count", "parsed-bytes", "dt-table-entry-count-of-the-dtbo-image"),
+        ("witness.dtb_index", "unverified-synthetic-witness-claim", "witness.json"),
+        ("witness.dtbo_entry_index", "unverified-synthetic-witness-claim", "witness.json"),
+        ("membership", "computed-membership-result", "claimed-indexes-inside-parsed-sets-and-exact-compatible-token"),
+        ("decoded_table_entry", "parse-sidecar-only-raw-words", "dt-table-entry-offsets-8-and-12-big-endian"),
+        ("compatible_prefix", "contract-constant", "capture-contract-identity-device.compatible"),
+    ]
+    rows += [(item, "not-established", "no-source-in-this-gate") for item in (
+        "selected_board_id", "selected_board_revision", "selection_source",
+        "selection_provenance", "selection_freshness", "board_semantics")]
+    return [{"item": item, "class": klass, "source": source} for item, klass, source in rows]
+
+
+def selection_parse_document(env: Environment, inputs: SelectionInputs, result: dict, operation: bytes) -> dict:
+    row = selection_request_row(inputs.request)
+    membership = result["membership"]
+    return {
+        "schema": 1,
+        "kind": SELECTION_PARSE_KIND,
+        "format_version": VERSION,
+        "selection_parser_version": SELECTION_PARSER_VERSION,
+        "bootchain_contract_sha256": env.contract_sha256,
+        "capture_contract_sha256": env.collector.contract_sha256,
+        "preflight_contract_sha256": env.collector.preflight_sha256,
+        "request_sha256": inputs.request_sha256,
+        "inventory_sha256": inputs.inventory.sha256,
+        "images_sha256": inputs.images.sha256,
+        "r3_parse_sha256": inputs.r3_parse_sha256,
+        "r3_operation_sha256": inputs.r3_operation_sha256,
+        "selection_sha256": inputs.fixture.manifest_sha256,
+        "witness_sha256": inputs.fixture.witness_sha256,
+        "implementation": implementation_binding(),
+        "dependencies": {
+            "trust": DEPENDENCY_TRUST, "byte_pinned": False, "pinned_versions": dict(PINNED_VERSIONS),
+        },
+        "profile": SELECTION_PROFILE,
+        "provenance": {
+            "kind": "synthetic-parser-provenance", "captured": False, "hardware_qualified": False,
+            "collector_labels_are_not_provenance": True,
+        },
+        "transport": SELECTION_TRANSPORT,
+        "evidence_level": SELECTION_EVIDENCE_LEVEL,
+        "status": SELECTION_PARSE_STATUS,
+        "synthetic": True,
+        "live": False,
+        "executes": False,
+        "kit_snapshot_reverified": False,
+        "remote_commands": [],
+        "human_approval_required": True,
+        "complete_capture": False,
+        "inputs": selection_input_rows(inputs),
+        "scope": {
+            "base_source_partition": result["base"], "dtbo_source_partition": result["dtbo"],
+            "slot_suffix_match": "synthetic-profile-restriction-not-an-active-slot-claim",
+        },
+        "parsed": {
+            "dtb_component": {"offset": result["dtb_offset"], "bytes": result["dtb_bytes"]},
+            "dtb_count": len(result["blobs"]),
+            "dtb_blobs": [
+                {"index": index, "offset": blob["offset"], "bytes": blob["bytes"], "version": FDT_VERSION,
+                 "node_count": blob["nodes"], "property_count": blob["properties"],
+                 "max_depth": blob["max_depth"], "compatible_token_count": len(blob["compatible"]),
+                 "has_contract_token": blob["has_profile_token"]}
+                for index, blob in enumerate(result["blobs"])
+            ],
+            "dtbo_entry_count": result["dtbo_entry_count"],
+        },
+        "witness": {
+            "classification": "unverified-synthetic-witness-claim",
+            "claim_present": membership["claim_present"],
+            "dtb_index": membership["dtb_index"],
+            "dtbo_entry_index": membership["dtbo_entry_index"],
+        },
+        "membership": {
+            "computed": True,
+            "result": "claimed-indexes-are-members" if membership["claim_present"] else "no-claim",
+            "base_candidate_has_contract_token": membership["base_candidate_has_contract_token"],
+            "decoded_table_entry": None if membership["decoded_table_entry"] is None else {
+                **membership["decoded_table_entry"],
+                "encoding": "dt-table-entry-offsets-8-and-12-big-endian",
+                "scope": "parse-sidecar-only",
+            },
+            "promoted_to_selection": False,
+        },
+        "classification": selection_classification(),
+        "not_established": list(SELECTION_NOT_ESTABLISHED),
+        "operation": {
+            "id": R4_ID,
+            "path": SELECTION_OPERATION_PATH,
+            "bytes": len(operation),
+            "sha256": sha256_hex(operation),
+            "bytes_read": result["bytes_read"],
+            **{key: row[key] for key in collect().BUDGET_KEYS},
+            "dtb_count": result["data"]["dtb_count"],
+            "dtbo_entry_count": result["data"]["dtbo_entry_count"],
+            "selected_board_id": None,
+            "selected_board_revision": None,
+            "selection_source": None,
+            "compatible_prefix": result["data"]["compatible_prefix"],
+            "collector_transport": collect().TRANSPORT,
+            "read_domain": collect().READ_DOMAIN,
+        },
+        "accounting": selection_accounting(inputs, result, operation),
+        "semantic_limits": list(SELECTION_SEMANTIC_LIMITS),
+        "unresolved_claims": unresolved_claims(),
+        "deferred": deferred_rows(),
+        "qualification": qualification(),
+        "limitations": list(SELECTION_LIMITATIONS),
+        "non_goals": list(NON_GOALS),
+        "blockers": blocker_rows(),
+        "authority": authority(),
+    }
+
+
+def check_selection_output_bounds(files: dict) -> None:
+    if (len(files["parse.json"]) > SELECTION_MAX_PARSE_BYTES or len(files["SHA256SUMS"]) > SELECTION_MAX_SUMS_BYTES
+            or len(files[SELECTION_OPERATION_PATH]) > SELECTION_MAX_OPERATION_BYTES
+            or sum(len(data) for data in files.values()) > SELECTION_MAX_OUTPUT_BYTES):
+        raise selection_budget("the selection parse output exceeds its byte bounds")
+
+
+def selection_parse_spec(env: Environment, inputs: SelectionInputs) -> list:
+    d = deploy()
+    result = selection_result(env, inputs)
+    operation = d.render_json(operation_document(inputs.request_sha256, result, R4_ID))
+    validate_selection_operation(env, inputs.request, inputs.request_sha256, operation)
+    files = {
+        "parse.json": d.render_json(selection_parse_document(env, inputs, result, operation)),
+        SELECTION_OPERATION_PATH: operation,
+    }
+    files["SHA256SUMS"] = sums_of(files)
+    if sorted(files) != SELECTION_OUTPUT_FILES:
+        raise selection_operation_rejected("the selection parse output closure differs from the contract")
+    check_selection_output_bounds(files)
+    spec = [("operations", "dir", 0o755, None)]
+    spec += [(path, "file", 0o644, data) for path, data in files.items()]
+    spec.sort(key=lambda item: item[0].encode("utf-8"))
+    return spec
+
+
+def selection_result_summary(status: str, inputs: SelectionInputs, spec: list) -> dict:
+    d = deploy()
+    operation = spec_file(spec, SELECTION_OPERATION_PATH)
+    document = json.loads(operation)
+    parse = json.loads(spec_file(spec, "parse.json"))
+    accounting = parse["accounting"]
+    return {
+        "status": status,
+        "evidence_level": SELECTION_EVIDENCE_LEVEL,
+        "profile": SELECTION_PROFILE,
+        "operation": R4_ID,
+        "parse_sha256": d.sha256_bytes(spec_file(spec, "SHA256SUMS")),
+        "operation_sha256": d.sha256_bytes(operation),
+        "request_sha256": inputs.request_sha256,
+        "inventory_sha256": inputs.inventory.sha256,
+        "images_sha256": inputs.images.sha256,
+        "r3_parse_sha256": inputs.r3_parse_sha256,
+        "selection_sha256": inputs.fixture.manifest_sha256,
+        "witness_sha256": inputs.fixture.witness_sha256,
+        "bytes_read": document["bytes_read"],
+        "represented_metadata_bytes": accounting["represented_metadata_bytes"],
+        "operation_output_bytes": accounting["operation_output_bytes"],
+        "hardware_bytes_read": 0,
+        "dtb_count": document["data"]["dtb_count"],
+        "dtbo_entry_count": document["data"]["dtbo_entry_count"],
+        "selected_board_id": None,
+        "selected_board_revision": None,
+        "selection_source": None,
+        "blocker_count": len(d.BLOCKERS),
+        "synthetic": True,
+        "live": False,
+        "executes": False,
+        "kit_snapshot_reverified": False,
+        "complete_capture": False,
+        **authority(),
+    }
+
+
+# --- contract ----------------------------------------------------------------------------
+
+
+def check_selection_registry_consistency(c) -> None:
+    """These constants are exactly the collector's R4 fields, null rule and budgets."""
+    registry = c.policy_registry()["operations"][R4_ID]
+    fields = registry["fields"]
+    triple = ["selected_board_id", "selected_board_revision", "selection_source"]
+    if set(fields) != {"dtb_count", "dtbo_entry_count", "compatible_prefix", *triple}:
+        raise BootchainError("selection parser fields differ from the collector's")
+    if fields["dtb_count"] != c._int(0, MAX_FDT_BLOBS) or fields["dtbo_entry_count"] != c._int(0, MAX_DT_ENTRIES):
+        raise BootchainError("selection parser counts differ from the collector's")
+    if fields["selection_source"] != c._nullable(c._enum(["bootconfig", "device-tree", "dtbo-header"])) or (
+        fields["selected_board_id"] != c._nullable(c._int(0, 2**32 - 1))
+        or fields["selected_board_revision"] != c._nullable(c._int(0, 2**32 - 1))
+    ):
+        raise BootchainError("selection parser nullable fields differ from the collector's")
+    if registry["constraints"] != [c._null_together(*triple)]:
+        raise BootchainError("selection parser null rule differs from the collector's")
+    budgets = registry["budgets"]
+    if budgets["max_fixture_input_bytes"] != SELECTION_MAX_FIXTURE_INPUT_BYTES or (
+        budgets["max_hardware_read_bytes"] != SELECTION_MAX_REPRESENTED_METADATA_BYTES
+        or budgets["max_output_bytes"] != SELECTION_MAX_OPERATION_BYTES
+    ):
+        raise BootchainError("selection parser budgets differ from the collector's")
+    if MAX_FDT_BLOBS != 64 or MAX_WITNESS_DTBO_INDEX != 255:
+        raise BootchainError("selection parser index bounds are inconsistent")
+
+
+def selection_parser_contract() -> dict:
+    c = collect()
+    return {
+        "version": SELECTION_PARSER_VERSION,
+        "independently_versioned": True,
+        "profile": SELECTION_PROFILE,
+        "operation": R4_ID,
+        "commands": ["plan-selection", "parse-selection", "verify-selection"],
+        "kinds": {"manifest": SELECTION_KIND, "witness": WITNESS_KIND, "plan": SELECTION_PLAN_KIND,
+                  "parse": SELECTION_PARSE_KIND},
+        "transport": SELECTION_TRANSPORT,
+        "evidence_level": SELECTION_EVIDENCE_LEVEL,
+        "status": SELECTION_PARSE_STATUS,
+        "synthetic": True,
+        "live": False,
+        "executes": False,
+        "capture": {
+            "operation_kind": c.OPERATION_KIND,
+            "transport": c.TRANSPORT,
+            "read_domain": c.READ_DOMAIN,
+            "operation_schema": c.OPERATION_SCHEMA,
+            "collector_transport_label_is_not_provenance": True,
+            "validated_by": ["validate_operation", "null-selection-triple"],
+            "produces": [R4_ID],
+            "does_not_produce": list(SELECTION_NOT_PRODUCED),
+            "selection_triple": "always-null",
+            "complete_capture": False,
+        },
+        "binding": {
+            "original_r3_fixture": "the exact image fixture bytes the R3 parser admitted: no detached dtb or dtbo copy",
+            "r3_artifact": "recomputed from the exact admitted image buffers and compared entry for entry and byte for byte with --r3-parse",
+            "r3_metadata_hashes_alone": "insufficient: they do not bind the payload",
+            "binds": ["bootchain_contract_sha256", "request_sha256", "inventory_sha256", "r3_parse_sha256",
+                      "r3_operation_sha256", "images_sha256", "base_source_partition",
+                      "dtbo_source_partition", "witness_bytes", "witness_sha256"],
+            "witness_hashed_one_way": "selection.json hashes witness.json; the witness never hashes the manifest",
+        },
+        "input": {
+            "layout": "flat",
+            "closure": list(SELECTION_CLOSURE),
+            "closure_checked_before_payload_read": True,
+            "extra_entries": "reject",
+            "bootconfig_txt": "rejected as an extra file: bootconfig is not parsed",
+            "entries_max": SELECTION_LISTING_MAX,
+            "files": [
+                {"path": SELECTION_MANIFEST_PATH, "min_bytes": 1, "max_bytes": SELECTION_MANIFEST_MAX_BYTES,
+                 "role": "selection-manifest"},
+                {"path": WITNESS_PATH, "min_bytes": 1, "max_bytes": WITNESS_MAX_BYTES, "role": "synthetic-witness"},
+            ],
+            "json": "strict canonical ASCII; duplicate keys, floats, booleans for integers rejected",
+            "schemas": {SELECTION_MANIFEST_PATH: selection_manifest_schema(), WITNESS_PATH: witness_schema()},
+            "scope": {
+                "base_source_partitions": list(BASE_SOURCES),
+                "dtbo_source_partitions": list(DTBO_SOURCES),
+                "slot_suffix": "the two source partitions must share one suffix: a synthetic profile restriction, no active-slot claim",
+                "init_boot": "never a base source: it carries no dtb",
+            },
+            "witness": {
+                "claim": "null or exactly dtb_index 0..63 and dtbo_entry_index 0..255",
+                "meaning": "synthetic unverified claim: membership and binding only",
+                "binds": ["request_sha256", "r3_operation_sha256", "base_source_partition",
+                          "dtbo_source_partition"],
+            },
+            "safety": list(SELECTION_SAFETY),
+            "configurable": "nothing: caller paths, offsets, parser names, algorithms and limits are fixed here",
+            "snapshot_claim": "descriptor-read snapshot only: not atomic, no writer exclusion",
+        },
+        "formats": {
+            "dt_table": {
+                "layout": "the R3 DT table v0 layout rules, reused",
+                "entry_words": {"id": {"offset": DT_ENTRY_ID_OFFSET, "bytes": 4, "endian": "big"},
+                                "revision": {"offset": DT_ENTRY_REVISION_OFFSET, "bytes": 4, "endian": "big"}},
+                "decoded": "only for the sidecar's claimed entry; duplicates allowed; custom words opaque; payload never parsed",
+                "never_infers_selection_by": ["id", "singleton", "highest-revision", "entry-0"],
+                "entries": {"min": 1, "max": MAX_DT_ENTRIES},
+            },
+            "fdt": {
+                "version": FDT_VERSION, "last_comp_version": FDT_LAST_COMP_VERSION, "endian": "big",
+                "header_bytes": FDT_HEADER,
+                "component": "the exact R3 dtb component: one blob or tightly concatenated blobs, no scan, no gap, no trailing byte",
+                "validated": ["magic", "header", "block extents and alignment", "reserve map terminator",
+                              "structure tokens", "balanced iterative traversal", "string references",
+                              "single FDT_END", "zero gaps and slack", "exact component consumption"],
+                "root_compatible": "root node only; duplicate root compatible is corrupt; missing is unsupported",
+                "match": "exact token equality with the contract compatible",
+                "limits": {"blobs": MAX_FDT_BLOBS, "depth": MAX_FDT_DEPTH, "nodes": MAX_FDT_NODES,
+                           "properties_per_blob": MAX_FDT_PROPERTIES, "name_bytes": MAX_FDT_NAME_BYTES,
+                           "compatible_tokens": [1, MAX_COMPATIBLE_TOKENS],
+                           "compatible_token_bytes": [1, MAX_COMPATIBLE_TOKEN_BYTES]},
+                "classification": "malformed is corrupt, valid but outside the profile is unsupported, numeric overruns are budget",
+                "empty_component": "unsupported",
+            },
+        },
+        "membership": {
+            "claim_null": "no membership check; counts only",
+            "claim_set": ["both indexes inside the parsed counts",
+                          "the chosen base candidate carries the exact contract compatible token",
+                          "the selected table entry id and revision are decoded into the sidecar only"],
+            "promotion": "never: a membership result and a decoded entry do not become selected_board_* fields",
+        },
+        "operation": {
+            "dtb_count": "parsed blob count",
+            "dtbo_entry_count": "parsed DT table entry count",
+            "compatible_prefix": "the capture contract's device.compatible constant",
+            "selected_board_id": None,
+            "selected_board_revision": None,
+            "selection_source": None,
+        },
+        "accounting": selection_accounting_policy(),
+        "diagnostics": {
+            "codes": dict(SELECTION_CODES),
+            "shared": "the shared request, R2 inventory and R3 image admission keep their documented request-rejected and image-* codes",
+            "value_free": "fixed categories only: untrusted paths, names, bytes, sizes, hashes, board ids, compatible strings and exception text are never echoed",
+        },
+        "output": {
+            "kind": SELECTION_PARSE_KIND,
+            "directories": ["operations"],
+            "files": list(SELECTION_OUTPUT_FILES),
+            "extra_entries": "reject",
+            "binary_copies": False,
+            "witness_copies": False,
+            "modes": {"directories": "0755", "files": "0644"},
+            "max_bytes": {"parse.json": SELECTION_MAX_PARSE_BYTES, SELECTION_OPERATION_PATH: SELECTION_MAX_OPERATION_BYTES,
+                          "SHA256SUMS": SELECTION_MAX_SUMS_BYTES, "total": SELECTION_MAX_OUTPUT_BYTES},
+            "checksums": {"path": "SHA256SUMS", "covers": ["parse.json", SELECTION_OPERATION_PATH],
+                          "sorted": "canonical-byte-order-of-path"},
+            "deterministic": True,
+            "published": "atomic-no-replace",
+            "verification": "recompute-from-request-inventory-images-r3-parse-and-selection-byte-for-byte",
+        },
+        "capability": dict(qualification()["r4_capability"]),
+        "not_established": list(SELECTION_NOT_ESTABLISHED),
+        "semantic_limits": list(SELECTION_SEMANTIC_LIMITS),
+        "limitations": list(SELECTION_LIMITATIONS),
+    }
+
+
+def selection_plan_document(env: Environment, request: dict, request_sha256: str, inventory: Inventory) -> dict:
+    d = deploy()
+    row = selection_request_row(request)
+    expected = [name for name in IMAGE_NAMES if name in inventory.sizes]
+    return {
+        "schema": 1,
+        "kind": SELECTION_PLAN_KIND,
+        "format_version": VERSION,
+        "selection_parser_version": SELECTION_PARSER_VERSION,
+        "bootchain_contract_sha256": env.contract_sha256,
+        "request_sha256": request_sha256,
+        "inventory_sha256": inventory.sha256,
+        "request_binding": {
+            "operation": R4_ID,
+            **{key: row[key] for key in collect().BUDGET_KEYS},
+            "emits": list(row["emits"]),
+            "never_emits": list(row["never_emits"]),
+            "request_sha256_is": "sha256-of-the-verified-request-SHA256SUMS-bytes",
+        },
+        "expected_inputs": {
+            "r3_images": {"present": expected, "absent": [n for n in IMAGE_NAMES if n not in inventory.sizes]},
+            "selection_fixture": list(SELECTION_CLOSURE),
+            "r3_parse": list(IMAGE_OUTPUT_FILES),
+            "note": "the selection fixture holds exactly selection.json and witness.json; the R3 parse is recomputed from the exact R3 image fixture",
+        },
+        "transport": SELECTION_TRANSPORT,
+        "evidence_level": SELECTION_EVIDENCE_LEVEL,
+        "implementation": implementation_binding(),
+        "synthetic": True,
+        "live": False,
+        "executes": False,
+        "kit_snapshot_reverified": False,
+        "remote_commands": [],
+        "complete_capture": False,
+        "selection_parser": selection_parser_contract(),
+        "output_closure": selection_parser_contract()["output"],
+        "qualification": qualification(),
+        "unresolved_claims": unresolved_claims(),
+        "deferred": deferred_rows(),
+        "non_goals": list(NON_GOALS),
+        "human_approval_required": True,
+        "blockers": list(d.BLOCKERS),
+        "authority": authority(),
+    }
+
+
+def revalidate_selection_tree(tree, env: Environment, inputs: SelectionInputs) -> None:
+    validate_selection_operation(env, inputs.request, inputs.request_sha256, tree.data[SELECTION_OPERATION_PATH])
+
+
+# --- commands ----------------------------------------------------------------------------
+
+
+def command_plan_selection(env: Environment, args) -> dict:
+    request, request_sha256, _ids, inventory = gather_inventory(args, env)
+    try:
+        recheck_inventory(args.inventory, inventory)
+    finally:
+        os.close(inventory.handle.pinned)
+    return selection_plan_document(env, request, request_sha256, inventory)
+
+
+def command_parse_selection(env: Environment, args) -> dict:
+    d = deploy()
+    check_selection_paths(args, extra=(args.out,))
+    inputs = gather_selection(args, env)
+    spec = selection_parse_spec(env, inputs)
+    expected = d.spec_entries(spec)
+    protected = selection_paths(args)
+    protected_ids = frozenset(inputs.request_ids | inputs.images.directory_ids | inputs.r3_directory_ids
+                              | inputs.fixture.directory_ids)
+
+    def verify_built(_temporary_path: str, descriptor: int) -> None:
+        again = gather_selection(args, env)
+        if selection_parse_spec(env, again) != spec:
+            raise selection_unstable("the request, inventory, images, R3 parse or selection changed during the parse")
+        tree = walk_output(descriptor, "parse", keep_data=True)
+        diff_output(tree.entries, expected, "parse")
+        revalidate_selection_tree(tree, env, again)
+
+    try:
+        d.publish(args.out, protected, protected_ids, spec, verify_built)
+    except d.handled_errors():
+        raise SelectionError("publish-rejected", "the selection parse could not be published safely") from None
+    return selection_result_summary("parsed", inputs, spec)
+
+
+def command_verify_selection(env: Environment, args) -> dict:
+    d = deploy()
+    check_selection_paths(args, extra=(args.parse,))
+    inputs = gather_selection(args, env)
+    spec = selection_parse_spec(env, inputs)
+    try:
+        descriptor, identity = d.open_trusted_artifact(args.parse, "parse")
+    except (*d.handled_errors(), OSError):
+        raise selection_input_error("the parse artifact failed safe admission") from None
+    try:
+        tree = walk_output(descriptor, "parse", keep_data=True, trusted_ownership=True)
+    finally:
+        os.close(descriptor)
+    diff_output(tree.entries, d.spec_entries(spec), "parse")
+    if tree.directory_ids & (inputs.request_ids | inputs.images.directory_ids | inputs.r3_directory_ids
+                             | inputs.fixture.directory_ids):
+        raise selection_input_error("the parse aliases an input tree")
+    revalidate_selection_tree(tree, env, inputs)
+    try:
+        d.recheck_trusted_artifact(args.parse, identity, "parse")
+    except (*d.handled_errors(), OSError):
+        raise selection_unstable("the parse artifact changed during verification") from None
+    again = gather_selection(args, env)
+    if selection_parse_spec(env, again) != spec:
+        raise selection_unstable("the request, inventory, images, R3 parse or selection changed during verification")
+    return selection_result_summary("verified", inputs, spec)
+
+
 class UsageError(BootchainError):
     """The command line is not one of the fixed commands; the text never carries the arguments."""
 
@@ -2716,6 +4048,24 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--images", required=True)
     parse_images.add_argument("--out", required=True)
     verify_images.add_argument("--parse", required=True)
+    plan_selection = commands.add_parser(
+        "plan-selection", help="print the value-free offline R4 selection parse plan"
+    )
+    plan_selection.add_argument("--request", required=True)
+    plan_selection.add_argument("--inventory", required=True)
+    parse_selection = commands.add_parser(
+        "parse-selection",
+        help="count device tree blobs and DT table entries and bind a synthetic index witness into an R4 fragment",
+    )
+    verify_selection = commands.add_parser("verify-selection", help="recompute an R4 selection parse artifact")
+    for command in (parse_selection, verify_selection):
+        command.add_argument("--request", required=True)
+        command.add_argument("--inventory", required=True)
+        command.add_argument("--images", required=True)
+        command.add_argument("--r3-parse", required=True, dest="r3_parse")
+        command.add_argument("--selection", required=True)
+    parse_selection.add_argument("--out", required=True)
+    verify_selection.add_argument("--parse", required=True)
     return parser
 
 
@@ -2776,6 +4126,12 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
                 result = command_parse_images(env, args)
             elif args.command == "verify-images":
                 result = command_verify_images(env, args)
+            elif args.command == "plan-selection":
+                result = command_plan_selection(env, args)
+            elif args.command == "parse-selection":
+                result = command_parse_selection(env, args)
+            elif args.command == "verify-selection":
+                result = command_verify_selection(env, args)
             else:
                 result = command_verify_parse(env, args)
     except runtime_errors as error:

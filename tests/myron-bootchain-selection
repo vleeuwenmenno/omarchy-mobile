@@ -1,0 +1,1522 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the Myron synthetic R4 selection mechanism (Phase 2.15C): flattened device
+# tree (FDT) blob counts, DT table entry counts, a synthetic index witness checked for membership
+# and binding only, and an R4 operation whose selected board id, revision and selection source
+# are always null. Everything here is synthetic: no phone, no network, no process, no block
+# device, no real firmware. The image and device tree bytes are generated at runtime by
+# tests/myron-fixtures/boot_images.py and tests/myron-fixtures/selection.py, independently of
+# the parser, and exist only in a temporary directory: no binary fixture is committed.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+python3 -m py_compile tools/myron-bootchain tools/lib/myron-bootchain-impl.py tests/myron-fixtures/boot_images.py \
+  tests/myron-fixtures/selection.py || fail "tool and fixture builders parse"
+bash -n tests/myron-bootchain-selection || fail "runner parses"
+grep -q 'synthetic-binary-selection-fixture' tools/lib/myron-bootchain-impl.py || fail "tool lacks the synthetic selection transport"
+[[ $(wc -l < tools/myron-bootchain) -le 90 ]] || fail "the trusted loader grew past 90 lines"
+grep -q 'tests/myron-bootchain-selection' tests/all || fail "tests/all does not run this test"
+pass "tool and builders parse, the loader stayed small, tests/all runs this test"
+
+tools/myron-bootchain derive-contract > "$tmp/derived.json" || fail "derive-contract failed"
+cmp -s "$tmp/derived.json" device/myron/bootchain-contract.json \
+  || fail "committed bootchain contract differs from derive-contract (regenerate it, see docs/myron/R4-SELECTION-GATE.md)"
+tools/myron-bootchain show | cmp -s - "$tmp/derived.json" || fail "show differs from derive-contract"
+pass "derive-contract output equals the committed 0.4.0 bootchain contract byte for byte"
+
+mkdir "$tmp/fixture"
+MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
+  || { cat "$tmp/snapshot-suite.log" >&2; fail "snapshot fixture export"; }
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(repo / "tests/myron-fixtures"))
+import boot_images as F  # noqa: E402
+import selection as S  # noqa: E402
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+B = load("bootchain_tool_selection_test", repo / "tools/myron-bootchain")
+C = B.collect()
+P = C.preflight()
+D = P.deploy()
+K = D.kernel()
+paths = {key: Path(value) for key, value in json.loads((work / "fixture/paths.json").read_text()).items()}
+contracts_root = paths["contracts_root"]
+contracts = D.load_contracts(contracts_root)
+_, _, snapshot_sha = P.snapshot().load_snapshot_contract(contracts_root, contracts)
+preflight_bytes = D.render_json(P.expected_preflight_contract(contracts, snapshot_sha))
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).parent.mkdir(parents=True, exist_ok=True)
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes)
+capture_contract_bytes = D.render_json(C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts))
+(contracts_root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes)
+collector_env = C.load_environment(contracts_root)
+bootchain_contract = B.expected_bootchain_contract(collector_env)
+bootchain_contract_bytes = D.render_json(bootchain_contract)
+(contracts_root / B.BOOTCHAIN_CONTRACT_PATH).write_bytes(bootchain_contract_bytes)
+env = B.load_environment(contracts_root)
+BC = env.contract_sha256
+assert BC == hashlib.sha256(bootchain_contract_bytes).hexdigest()
+CANARY = "canaryq7k2"
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def jbytes(value):
+    return D.render_json(value)
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+counter = [0]
+
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{name}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+def invoke(*arguments, root=None):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = B.main([str(value) for value in arguments], contracts_root=root or contracts_root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def expect_ok(*arguments):
+    code, out, err = invoke(*arguments)
+    assert code == 0, (arguments[0], err)
+    return json.loads(out), out
+
+
+def expect_fail(name, arguments, code_name=None, outputs=(), absent=(CANARY,)):
+    code, out, err = invoke(*arguments)
+    assert code != 0, f"{name}: accepted\n{out}"
+    assert out == "", f"{name}: stdout is not empty"
+    assert err.count("\n") == 1 and err.startswith("ERROR: "), f"{name}: not one line: {err!r}"
+    if code_name is not None:
+        assert err.rstrip().endswith(f"(code {code_name})"), f"{name}: expected {code_name}, got {err!r}"
+    for text in absent:
+        assert text not in err, f"{name}: diagnostics echo {text!r}: {err}"
+    for output in outputs:
+        assert not os.path.lexists(output), f"{name}: left output {output}"
+    ok(f"{name} is rejected as {code_name or 'a fixed refusal'}")
+    return err
+
+
+def with_patch(owner, attribute, replacement, run):
+    original = getattr(owner, attribute)
+    setattr(owner, attribute, replacement(original))
+    try:
+        return run()
+    finally:
+        setattr(owner, attribute, original)
+
+
+def set_constant(name, value, run):
+    original = getattr(B, name)
+    setattr(B, name, value)
+    try:
+        return run()
+    finally:
+        setattr(B, name, original)
+
+
+# A real preflight request, built by the pinned preflight tool, is the only request input.
+request = work / "request"
+with contextlib.redirect_stdout(io.StringIO()):
+    code = P.main(
+        ["assess", "--kit", str(paths["kit"]), "--snapshot", str(paths["snapshot"]),
+         "--rootfs-stage", str(paths["rootfs"]), "--rootfs-manifest", str(paths["manifest"]),
+         "--assets", str(paths["archive"]), "--runtime-assets", "none",
+         "--vmlinux-symvers", "none", "--module-symvers", "none", "--out", str(request)],
+        contracts_root=contracts_root)
+assert code == 0
+request_sha256 = digest((request / "SHA256SUMS").read_bytes())
+READS = json.loads((request / "request.json").read_text())["requested_reads"]
+R1, R2, R3, R4, R5, R6, R7 = [row["id"] for row in READS]
+R3_ROW, R4_ROW = READS[2], READS[3]
+assert R4 == B.R4_ID and R3 == B.R3_ID and R2 == B.R2_ID
+BUDGET_KEYS = ("max_output_bytes", "max_fixture_input_bytes", "max_hardware_read_bytes")
+assert [R4_ROW[key] for key in BUDGET_KEYS] == [65536, 67121152, 65536]
+assert [R3_ROW[key] for key in BUDGET_KEYS] == [1048576, 67108864, 65536], "R3 limits are unchanged"
+NAMES = sorted(r + s for r in ("boot", "init_boot", "vendor_boot", "vendor_kernel_boot", "dtbo", "recovery")
+               for s in ("", "_a", "_b"))
+assert NAMES == B.IMAGE_NAMES and len(NAMES) == 18
+TRIPLE = ("selected_board_id", "selected_board_revision", "selection_source")
+
+
+def role_of(name):
+    return name[:-2] if name.endswith(("_a", "_b")) else name
+
+
+# --- the contract -------------------------------------------------------------------------
+
+contract = json.loads(bootchain_contract_bytes)
+assert contract["format_version"] == "0.4.0"
+assert contract["pinned_versions"] == {"collector": "0.3.0", "deployment": "0.4.0", "preflight": "0.4.0",
+                                       "snapshot": "0.2.0"}
+assert P.VERSION == "0.4.0" and C.VERSION == "0.3.0" and B.VERSION == "0.4.0"
+assert P.CAPTURE_SCHEMA == "myron-capture-evidence-v3" and C.OPERATION_SCHEMA == 3
+parser = contract["selection_parser"]
+assert parser["version"] == "1.0.0" and parser["independently_versioned"] is True
+assert contract["image_parser"]["version"] == "1.0.0" and parser["profile"] == B.SELECTION_PROFILE
+assert parser["commands"] == ["plan-selection", "parse-selection", "verify-selection"]
+assert parser["capture"]["produces"] == [R4] and parser["capture"]["selection_triple"] == "always-null"
+assert {R1, R2, R3, R5, R6, R7} == set(parser["capture"]["does_not_produce"]) and R4 not in parser["capture"]["does_not_produce"]
+assert contract["capture"]["produces"] == [R2] and R4 in contract["capture"]["does_not_produce"]
+assert contract["image_parser"]["capture"]["produces"] == [R3] and R4 in contract["image_parser"]["capture"]["does_not_produce"]
+qualification = contract["qualification"]
+assert qualification["implemented_operations"] == [R2, R3, R4]
+assert qualification["command_scope"] == {"parse": [R2], "parse-images": [R3], "parse-selection": [R4]}
+assert qualification["r4_capability"] == {
+    "counts_from_synthetic_bytes": True, "synthetic_index_binding": True,
+    "selected_board_fields_produced": False, "captured_provenance": False, "hardware_qualified": False}
+assert parser["capability"] == qualification["r4_capability"]
+assert qualification["captured_provenance"] is False and qualification["hardware_qualified"] is False
+assert [(row["id"], row["state"], row["successor_gate"]) for row in contract["deferred"]] == [
+    (R4, "hardware-witness-required", "r4-selection-source-qualification")]
+claims = [row["claim"] for row in contract["coverage"]["unresolved_claims"]]
+assert {"r4-selection-provenance-not-established", "r4-selection-source-semantics-not-established",
+        "r4-actual-myron-witness-not-established", "r4-selection-freshness-not-established",
+        "r4-multi-overlay-ordering-not-established"} <= set(claims)
+assert "r4-selection-provenance-successor-required" not in claims
+assert len(contract["blockers"]) == 7
+assert len(contract["authority"]) == 9 and all(v is False for v in contract["authority"].values())
+assert contract["remote_commands"] == [] and contract["live"] is False and contract["capture"]["complete_capture"] is False
+assert parser["operation"] == {"dtb_count": "parsed blob count", "dtbo_entry_count": "parsed DT table entry count",
+                               "compatible_prefix": "the capture contract's device.compatible constant",
+                               "selected_board_id": None, "selected_board_revision": None, "selection_source": None}
+accounting = parser["accounting"]
+assert accounting["bounds"] == {
+    "S_max_bytes_per_gather": 67121152, "image_max_bytes": 16777216, "M_max_bytes": 65536, "O_max_bytes": 65536,
+    "hardware_read_max_bytes": 65536, "parse_json_max_bytes": 131072, "sha256sums_max_bytes": 1024,
+    "output_total_max_bytes": 197632}
+assert accounting["hardware_bytes_read"] == 0 and accounting["hardware_transport"] == "none"
+assert sorted(parser["diagnostics"]["codes"]) == sorted([
+    "selection-input-rejected", "selection-binding-mismatch", "selection-unstable", "selection-corrupt",
+    "selection-unsupported", "selection-budget", "selection-witness-rejected", "selection-operation-rejected",
+    "publish-rejected"])
+assert parser["input"]["closure"] == ["selection.json", "witness.json"]
+assert parser["output"]["files"] == sorted(["SHA256SUMS", "parse.json", f"operations/{R4}.json"])
+assert parser["output"]["binary_copies"] is False and parser["output"]["witness_copies"] is False
+assert parser["formats"]["fdt"]["limits"] == {
+    "blobs": 64, "depth": 64, "nodes": 4096, "properties_per_blob": 8192, "name_bytes": 128,
+    "compatible_tokens": [1, 16], "compatible_token_bytes": [1, 64]}
+assert parser["formats"]["dt_table"]["never_infers_selection_by"] == ["id", "singleton", "highest-revision", "entry-0"]
+assert any("bootconfig is not parsed" in text for text in parser["semantic_limits"])
+assert parser["binding"]["r3_metadata_hashes_alone"].startswith("insufficient")
+assert B.PINNED_VERSIONS == contract["pinned_versions"]
+r4_policy = C.policy_registry()["operations"][R4]
+assert r4_policy["budgets"] == {"max_output_bytes": 65536, "max_fixture_input_bytes": 67121152,
+                                "max_hardware_read_bytes": 65536}
+for name in ("capture", "preflight", "deployment", "snapshot", "session", "stage", "kernel"):
+    assert "bootchain" not in (repo / f"device/myron/{name}-contract.json").read_text(), "pins are one-way"
+ok("the 0.4.0 contract binds the independent selection-parser contract, the three command scopes, the R4 capability, the hardware-witness deferral, nine false authorities and seven missing blockers")
+
+# --- scenarios ---------------------------------------------------------------------------------
+
+
+def r2_operation(partitions, req_sha=None, schema=None):
+    rows = [{"partition_name": name, "size_bytes": size, "bootable_flag": False,
+             "slot_suffix": name[-2:] if name.endswith(("_a", "_b")) else ""}
+            for name, size in sorted(partitions.items())]
+    return jbytes({
+        "schema": C.OPERATION_SCHEMA if schema is None else schema, "kind": C.OPERATION_KIND, "id": R2,
+        "request_sha256": req_sha or request_sha256, "transport": C.TRANSPORT,
+        "read_domain": C.READ_DOMAIN, "read_only": True, "bytes_read": 4096,
+        "data": {"partitions": rows, "recovery_present": any(role_of(n) == "recovery" for n in partitions)},
+    })
+
+
+def dtbo_image(entries, page=2048):
+    """(bytes, meta) for a DT table image the independent builder placed."""
+    data = S.dtbo(entries, page=page)
+    cursor, components = 32 + 32 * len(entries), []
+    for index, item in enumerate(entries):
+        components.append(F.component("dt_entry", index, cursor, len(item["payload"])))
+        cursor += len(item["payload"])
+    meta = {"format": "android-dt-table", "version": 0, "page_size": page, "os_version": None, "header": 32,
+            "table": {"role": "dt_entry_table", "offset": 32, "size": 32 * len(entries), "entry_size": 32,
+                      "count": len(entries)},
+            "components": components}
+    return data, meta
+
+
+def vendor_image(dtb, version=4):
+    if version == 4:
+        return F.vendor(4, fragments=[F.fragment("v0", 600, 1)], dtb=dtb, bootconfig=F.blob("vb", 40))
+    return F.vendor(3, page=2048, ramdisk=F.blob("vr", 700), dtb=dtb)
+
+
+def entries_of(count, base=1):
+    return [S.entry(F.blob(f"d{i}", 24 + i % 5), base + i, 100 + i, (i, 2 * i, 3 * i, 4 * i)) for i in range(count)]
+
+
+DEFAULT_DTB = S.fdt(compatible=(b"other,board",)) + S.fdt(compatible=(b"vendor,x", S.COMPATIBLE)) + S.fdt()
+DEFAULT_ENTRIES = [S.entry(F.blob("e0", 40), 7, 3), S.entry(F.blob("e1", 41), 7, 3), S.entry(F.blob("e2", 42), 9, 1),
+                   S.entry(b"not a device tree at all", 0, 0, (0xFFFFFFFF, 1, 2, 3))]
+
+
+def standard_images(dtb=DEFAULT_DTB, entries=DEFAULT_ENTRIES):
+    return {
+        "vendor_boot_a": vendor_image(dtb),
+        "dtbo_a": dtbo_image(entries),
+        "boot_a": F.boot_modern(4, kernel=F.blob("k4", 5000), ramdisk=F.blob("r4", 700), signature=F.blob("s4", 64)),
+        "recovery_a": F.boot_legacy(2, kernel=F.blob("kr", 1000), dtb=S.fdt(), page=2048),
+    }
+
+
+class Scenario:
+    pass
+
+
+def make(images, label="scn", *, base="vendor_boot_a", dtbo="dtbo_a", claim=None, capacity=None,
+         witness_edit=None, manifest_edit=None, witness_raw=None, manifest_raw=None, extra_files=None,
+         image_edit=None, r3_dir=None):
+    """Write an inventory, a flat image fixture, the R3 parse of that fixture (by the real
+    parse-images command) and the two-file selection fixture. IMAGES: name -> (bytes, meta)."""
+    s = Scenario()
+    s.images, s.base, s.dtbo, s.claim = images, base, dtbo, claim
+    parts = {name: (capacity or {}).get(name, 64 * F.MIB) for name in images}
+    parts["pmos_root"] = 8 * 1024 ** 3
+    root = fresh(label)
+    s.root = root
+    s.inv = root / "inventory" / "R2.json"
+    s.inv.parent.mkdir()
+    s.inv_bytes = r2_operation(parts)
+    s.inv.write_bytes(s.inv_bytes)
+    s.inv.chmod(0o644)
+    s.inv.parent.chmod(0o755)
+    s.inv_sha = digest(s.inv_bytes)
+    s.imgs = root / "images"
+    s.imgs.mkdir()
+    rows = [{"partition_name": n, "present": n in images, "size_bytes": len(images[n][0]) if n in images else None,
+             "fixture_sha256": digest(images[n][0]) if n in images else None} for n in NAMES]
+    document = {"schema": 1, "kind": B.IMAGES_KIND, "format_version": 1, "bootchain_contract_sha256": BC,
+                "request_sha256": request_sha256, "inventory_sha256": s.inv_sha, "synthetic": True, "images": rows}
+    s.images_manifest = jbytes(document)
+    for name, (data, _meta) in images.items():
+        (s.imgs / f"{name}.img").write_bytes(data)
+        (s.imgs / f"{name}.img").chmod(0o644)
+    (s.imgs / "images.json").write_bytes(s.images_manifest)
+    (s.imgs / "images.json").chmod(0o644)
+    s.imgs.chmod(0o755)
+    s.images_sha = digest(s.images_manifest)
+    s.r3_bytes = len(s.images_manifest) + sum(len(d) for d, _m in images.values())
+    s.r3 = r3_dir or root / "r3"
+    if r3_dir is None:
+        code, out, err = invoke("parse-images", "--request", request, "--inventory", s.inv, "--images", s.imgs,
+                                "--out", s.r3)
+        assert code == 0, err
+    s.r3_sums = (s.r3 / "SHA256SUMS").read_bytes()
+    s.r3_op_bytes = (s.r3 / f"operations/{R3}.json").read_bytes()
+    s.r3_parse_sha = digest(s.r3_sums)
+    s.r3_op_sha = digest(s.r3_op_bytes)
+    s.sel = root / "selection"
+    s.sel.mkdir()
+    write_selection(s, claim, witness_edit=witness_edit, manifest_edit=manifest_edit, witness_raw=witness_raw,
+                    manifest_raw=manifest_raw, extra_files=extra_files)
+    return s
+
+
+def write_selection(s, claim, *, witness_edit=None, manifest_edit=None, witness_raw=None, manifest_raw=None,
+                    extra_files=None):
+    witness = {"schema": 1, "kind": B.WITNESS_KIND, "format_version": 1, "request_sha256": request_sha256,
+               "r3_operation_sha256": s.r3_op_sha, "base_source_partition": s.base,
+               "dtbo_source_partition": s.dtbo, "synthetic": True, "claim": claim}
+    if witness_edit:
+        witness_edit(witness)
+    s.witness_bytes = witness_raw if witness_raw is not None else jbytes(witness)
+    manifest = {"schema": 1, "kind": B.SELECTION_KIND, "format_version": 1, "bootchain_contract_sha256": BC,
+                "request_sha256": request_sha256, "inventory_sha256": s.inv_sha, "r3_parse_sha256": s.r3_parse_sha,
+                "r3_operation_sha256": s.r3_op_sha, "images_sha256": s.images_sha,
+                "base_source_partition": s.base, "dtbo_source_partition": s.dtbo,
+                "witness_bytes": len(s.witness_bytes), "witness_sha256": digest(s.witness_bytes), "synthetic": True}
+    if manifest_edit:
+        manifest_edit(manifest)
+    s.manifest_doc, s.witness_doc = manifest, witness
+    s.manifest_bytes = manifest_raw if manifest_raw is not None else jbytes(manifest)
+    for name in ("selection.json", "witness.json"):
+        if (s.sel / name).exists() or (s.sel / name).is_symlink():
+            (s.sel / name).unlink()
+    for name, data in {"selection.json": s.manifest_bytes, "witness.json": s.witness_bytes,
+                       **(extra_files or {})}.items():
+        (s.sel / name).write_bytes(data)
+        (s.sel / name).chmod(0o644)
+    s.sel.chmod(0o755)
+    s.S = s.r3_bytes + len(s.manifest_bytes) + len(s.witness_bytes)
+
+
+def cli(command, s, *extra):
+    if command == "plan-selection":
+        return [command, "--request", request, "--inventory", s.inv, *extra]
+    return [command, "--request", request, "--inventory", s.inv, "--images", s.imgs, "--r3-parse", s.r3,
+            "--selection", s.sel, *extra]
+
+
+def args_of(s, **extra):
+    return type("Args", (), dict(request=str(request), inventory=str(s.inv), images=str(s.imgs),
+                                 r3_parse=str(s.r3), selection=str(s.sel), **{k: str(v) for k, v in extra.items()}))
+
+
+def parse_ok(s, label="out"):
+    counter[0] += 1
+    out = work / f"{label}-{counter[0]}"
+    summary, _raw = expect_ok(*cli("parse-selection", s, "--out", out))
+    return summary, out
+
+
+def read_op(out):
+    return json.loads((out / f"operations/{R4}.json").read_text())
+
+
+def read_parse(out):
+    return json.loads((out / "parse.json").read_text())
+
+
+def fdt_case(label, data, code):
+    try:
+        B.parse_fdt_component(data)
+    except B.SelectionError as error:
+        assert error.code == code, f"{label}: expected {code}, got {error.code}: {error}"
+        text = str(error)
+        assert text.endswith(f"(code {code})") and "\n" not in text
+        assert CANARY not in text and not re.search(r"\d{3,}", text), text
+    else:
+        raise AssertionError(f"{label}: accepted")
+    ok(f"{label} is {code}")
+
+
+# --- FDT: boundaries and malformed forms -------------------------------------------------------
+
+blobs = B.parse_fdt_component(S.fdt())
+assert len(blobs) == 1 and blobs[0]["bytes"] == len(S.fdt()) and blobs[0]["compatible"] == [S.COMPATIBLE]
+assert (blobs[0]["nodes"], blobs[0]["properties"], blobs[0]["max_depth"]) == (1, 1, 1)
+two = B.parse_fdt_component(S.fdt() + S.fdt(compatible=(b"x,y",)))
+assert [row["offset"] for row in two] == [0, len(S.fdt())] and two[1]["compatible"] == [b"x,y"]
+for count in (1, 2, 63, 64):
+    assert len(B.parse_fdt_component(b"".join(S.fdt() for _ in range(count)))) == count
+fdt_case("65 concatenated blobs", b"".join(S.fdt() for _ in range(65)), "selection-budget")
+# tightly concatenated blobs only: no scan, no gap, no trailing byte
+fdt_case("a gap of zero bytes between blobs", S.fdt() + bytes(8) + S.fdt(), "selection-corrupt")
+fdt_case("a trailing zero word after the last blob", S.fdt() + bytes(4), "selection-corrupt")
+fdt_case("trailing bytes shorter than a header", S.fdt() + b"\x01", "selection-corrupt")
+fdt_case("a trailing blob-shaped tail with a bad magic", S.fdt() + S.fdt(header={"magic": 0xD00DFEEE}), "selection-corrupt")
+fdt_case("an empty component", b"", "selection-unsupported")
+# versions and header shape
+fdt_case("a v16 blob", S.fdt(version=16, last_comp=16), "selection-unsupported")
+fdt_case("a v18 blob", S.fdt(version=18, last_comp=16), "selection-unsupported")
+fdt_case("a v17 blob with last_comp_version 17", S.fdt(last_comp=17), "selection-unsupported")
+fdt_case("a v17 blob with last_comp_version 15", S.fdt(last_comp=15), "selection-unsupported")
+fdt_case("last_comp_version above the version", S.fdt(version=17, last_comp=18), "selection-corrupt")
+fdt_case("a bad magic", S.fdt(header={"magic": 0}), "selection-corrupt")
+fdt_case("a truncated header", S.fdt()[:39], "selection-corrupt")
+fdt_case("a total size past the component", S.fdt(header={"totalsize": len(S.fdt()) + 4}), "selection-corrupt")
+fdt_case("a total size below the header", S.fdt(header={"totalsize": 39}), "selection-corrupt")
+fdt_case("a misaligned structure offset", S.fdt(header={"off_dt_struct": 0x39}), "selection-corrupt")
+fdt_case("a misaligned reserve map offset", S.fdt(header={"off_mem_rsvmap": 44}), "selection-corrupt")
+fdt_case("a structure size that is not a multiple of four", S.fdt(header={"size_dt_struct": 0x3E}), "selection-corrupt")
+fdt_case("a structure block overlapping the header", S.fdt(header={"off_dt_struct": 32}), "selection-corrupt")
+fdt_case("a strings block running past the blob", S.fdt(header={"size_dt_strings": 4096}), "selection-corrupt")
+fdt_case("a structure block running past the blob", S.fdt(header={"size_dt_struct": 4096}), "selection-corrupt")
+fdt_case("a structure block too short for a root node", S.fdt(header={"size_dt_struct": 12}), "selection-corrupt")
+good = S.fdt()
+fields = struct.unpack(">10I", good[:40])
+off_strings = fields[3]
+fdt_case("a strings block overlapping the structure block",
+         S.fdt(header={"off_dt_strings": fields[2] + 8}), "selection-corrupt")
+gapped = bytearray(S.fdt(gap=8))
+assert B.parse_fdt_component(bytes(gapped))[0]["bytes"] == len(gapped), "a zero gap between blocks is allowed"
+gapped[60] = 1
+fdt_case("nonzero bytes in a gap between blocks", bytes(gapped), "selection-corrupt")
+fdt_case("nonzero slack after the last block", (lambda b: b[:-1] + b"\x01")(S.fdt(pad=8)), "selection-corrupt")
+valid_pad = B.parse_fdt_component(S.fdt(pad=16))
+assert valid_pad[0]["bytes"] == len(S.fdt(pad=16))
+# reserve map
+assert B.parse_fdt_component(S.fdt(reserve=[(0x1000, 0x2000), (0x5000, 0)]))[0]["compatible"] == [S.COMPATIBLE]
+assert B.parse_fdt_component(S.fdt(reserve=[(0x2000, 0x1000), (0x1000, 0x1000)]))[0]["compatible"] == [S.COMPATIBLE], "adjacent reservations may be unordered"
+fdt_case("overlapping memory reservations", S.fdt(reserve=[(0x1000, 0x2000), (0x2000, 0x2000)]), "selection-corrupt")
+fdt_case("duplicate memory reservations", S.fdt(reserve=[(0x1000, 0x1000), (0x1000, 0x1000)]), "selection-corrupt")
+fdt_case("a memory reservation wrapping the address space", S.fdt(reserve=[(2**64 - 1, 2)]), "selection-corrupt")
+fdt_case("a reserve map without its terminator", (lambda b: b[:40] + b"\x01" * 16 + b[56:])(S.fdt()), "selection-corrupt")
+# structure tokens
+root_structure = (
+    S.be32(S.BEGIN_NODE) + S.pad4(b"\0")
+    + S.be32(S.PROP) + S.be32(len(S.COMPATIBLE) + 1) + S.be32(0)
+    + S.pad4(S.COMPATIBLE + b"\0")
+    + S.be32(S.END_NODE) + S.be32(S.END)
+)
+leading_nop = B.parse_fdt_component(
+    S.fdt(compatible=None, struct_raw=S.be32(S.NOP) + root_structure, strings_raw=b"compatible\0")
+)
+assert leading_nop[0]["properties"] == 1, "FDT_NOP before the root node is ignored"
+fdt_case("an unknown structure token", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(7) + S.be32(2) + S.be32(9)), "selection-corrupt")
+fdt_case("a missing FDT_END", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(2) + S.be32(4)), "selection-corrupt")
+fdt_case("a structure block ending in a node", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(4) + S.be32(4)), "selection-corrupt")
+fdt_case("bytes after FDT_END", S.fdt(extra_after_end=S.be32(4)), "selection-corrupt")
+fdt_case("a second FDT_END", S.fdt(extra_after_end=S.be32(9)), "selection-corrupt")
+fdt_case("FDT_END inside an open node", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(9) + S.be32(2) + S.be32(2) + S.be32(9)), "selection-corrupt")
+fdt_case("an unbalanced extra FDT_END_NODE", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(2) + S.be32(2) + S.be32(9) + S.be32(4)), "selection-corrupt")
+fdt_case("an unclosed node", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(1) + b"c\0\0\0" + S.be32(2) + S.be32(9)), "selection-corrupt")
+fdt_case("a property outside any node", S.fdt(struct_raw=S.be32(3) + S.be32(0) + S.be32(0) + S.be32(1) + bytes(4) + S.be32(2) + S.be32(9)), "selection-corrupt")
+property_after_child = (
+    S.be32(S.BEGIN_NODE) + S.pad4(b"\0")
+    + S.be32(S.BEGIN_NODE) + S.pad4(b"child\0") + S.be32(S.END_NODE)
+    + S.be32(S.PROP) + S.be32(len(S.COMPATIBLE) + 1) + S.be32(0)
+    + S.pad4(S.COMPATIBLE + b"\0")
+    + S.be32(S.END_NODE) + S.be32(S.END)
+)
+fdt_case(
+    "a property after a child node",
+    S.fdt(compatible=None, struct_raw=property_after_child, strings_raw=b"compatible\0"),
+    "selection-corrupt",
+)
+fdt_case("a second root node", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(2) + S.be32(1) + bytes(4) + S.be32(2) + S.be32(9)), "selection-corrupt")
+fdt_case("a named root node", S.fdt(root_name=b"root"), "selection-corrupt")
+fdt_case("a node name with a slash", S.fdt(children=[S.node(b"a/b")]), "selection-corrupt")
+fdt_case("a node name with a question mark", S.fdt(children=[S.node(b"x?")]), "selection-corrupt")
+fdt_case("a node name with an empty name before its unit address", S.fdt(children=[S.node(b"@0")]), "selection-corrupt")
+fdt_case("a node name with an empty unit address", S.fdt(children=[S.node(b"a@")]), "selection-corrupt")
+fdt_case("a node name with multiple unit-address separators", S.fdt(children=[S.node(b"a@@b")]), "selection-corrupt")
+fdt_case("an empty child node name", S.fdt(children=[S.node(b"")]), "selection-corrupt")
+fdt_case("a node name with a non-ASCII byte", S.fdt(children=[S.node(b"\xffname")]), "selection-corrupt")
+assert B.parse_fdt_component(S.fdt(children=[S.node(b"AZaz09,._+-@0")]))[0]["nodes"] == 2
+fdt_case("duplicate sibling node names", S.fdt(children=[S.node(b"x"), S.node(b"x")]), "selection-corrupt")
+fdt_case("a node name without a terminator", S.fdt(struct_raw=S.be32(1) + b"abcd"), "selection-corrupt")
+nops = B.parse_fdt_component(S.fdt(nops=3))
+assert nops[0]["properties"] == 1, "FDT_NOP tokens are skipped"
+# property and string references
+prop = lambda length, offset, value=b"": S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(3) + S.be32(length) + S.be32(offset) + value + S.be32(2) + S.be32(9),
+                                              strings_raw=b"compatible\0")
+fdt_case("a property name offset past the strings block", prop(0, 99), "selection-corrupt")
+fdt_case("a property value past the structure block", prop(4096, 0), "selection-corrupt")
+fdt_case("a property name without a terminator", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(3) + S.be32(0) + S.be32(0) + S.be32(2) + S.be32(9),
+                                                       strings_raw=b"compatible"), "selection-corrupt")
+fdt_case("an empty property name", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(3) + S.be32(0) + S.be32(0) + S.be32(2) + S.be32(9),
+                                         strings_raw=b"\0compatible\0"), "selection-corrupt")
+fdt_case("a property name with a slash", S.fdt(root_props=[(b"a/b", b"")]), "selection-corrupt")
+fdt_case("a property name with a non-ASCII byte", S.fdt(root_props=[(b"\xff", b"")]), "selection-corrupt")
+assert B.parse_fdt_component(S.fdt(root_props=[(b"AZaz09,._+*#?-", b"")]))[0]["properties"] == 2
+fdt_case("duplicate property names", S.fdt(root_props=[(b"x", b"a"), (b"x", b"b")]), "selection-corrupt")
+fdt_case("a nonzero property padding byte", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(3) + S.be32(1) + S.be32(0) + b"\0\x01\0\0" + S.be32(2) + S.be32(9),
+                                                  strings_raw=b"compatible\0"), "selection-corrupt")
+# the root compatible: only the root node's, exactly once, a NUL-terminated list of 1..16 tokens of 1..64 bytes
+fdt_case("no root compatible", S.fdt(compatible=None), "selection-unsupported")
+fdt_case("a compatible only on a child node", S.fdt(compatible=None, children=[S.node(b"soc", [(b"compatible", S.strlist(S.COMPATIBLE))])]),
+         "selection-unsupported")
+nested = B.parse_fdt_component(S.fdt(children=[S.node(b"soc", [(b"compatible", S.strlist(b"child,only"))])]))
+assert nested[0]["compatible"] == [S.COMPATIBLE], "a child compatible is never the root compatible"
+fdt_case("a duplicate root compatible", S.fdt(root_props=[(b"compatible", S.strlist(b"a,b"))]), "selection-corrupt")
+fdt_case("a root compatible without a terminator", S.fdt(root_compatible=b"abc"), "selection-corrupt")
+fdt_case("an empty root compatible", S.fdt(root_compatible=b""), "selection-corrupt")
+fdt_case("a root compatible with an empty token", S.fdt(root_compatible=b"a,b\0\0c\0"), "selection-corrupt")
+fdt_case("a root compatible that is a lone NUL", S.fdt(root_compatible=b"\0"), "selection-corrupt")
+fdt_case("a root compatible token with a control byte", S.fdt(root_compatible=b"a\x01b\0"), "selection-corrupt")
+fdt_case("a root compatible token with a high byte", S.fdt(root_compatible=b"a\xffb\0"), "selection-corrupt")
+assert len(B.parse_fdt_component(S.fdt(compatible=tuple(b"t%d" % i for i in range(16))))[0]["compatible"]) == 16
+fdt_case("17 root compatible tokens", S.fdt(compatible=tuple(b"t%d" % i for i in range(17))), "selection-budget")
+assert B.parse_fdt_component(S.fdt(compatible=(b"a" * 64,)))[0]["compatible"] == [b"a" * 64]
+fdt_case("a 65-byte root compatible token", S.fdt(compatible=(b"a" * 65,)), "selection-budget")
+# limits: names, depth, nodes, properties
+assert B.parse_fdt_component(S.fdt(children=[S.node(b"n" * 128)]))
+fdt_case("a 129-byte node name", S.fdt(children=[S.node(b"n" * 129)]), "selection-budget")
+assert B.parse_fdt_component(S.fdt(root_props=[(b"p" * 128, b"")]))
+fdt_case("a 129-byte property name", S.fdt(root_props=[(b"p" * 129, b"")]), "selection-budget")
+assert B.parse_fdt_component(S.fdt(children=[S.chain(63)]))[0]["max_depth"] == 64
+fdt_case("depth 65", S.fdt(children=[S.chain(64)]), "selection-budget")
+assert B.parse_fdt_component(S.fdt(children=S.many_nodes(4095)))[0]["nodes"] == 4096
+fdt_case("4097 nodes", S.fdt(children=S.many_nodes(4096)), "selection-budget")
+assert B.parse_fdt_component(S.fdt(root_props=S.many_properties(8191)))[0]["properties"] == 8192
+fdt_case("8193 properties", S.fdt(root_props=S.many_properties(8192)), "selection-budget")
+ok("FDT limits are exact at their bound and one over, per blob")
+# exact token matching: the contract compatible is one whole token, never a prefix or substring
+token = S.COMPATIBLE
+for candidate, expected in (((token,), True), ((b"x,y", token), True), ((token + b"-x",), False), ((b"x" + token,), False),
+                            ((token[:-1],), False), ((token.upper(),), False), ((b"x,y",), False)):
+    parsed = B.parse_fdt_component(S.fdt(candidate))
+    assert (token in parsed[0]["compatible"]) is expected, candidate
+ok("the root compatible matches the contract constant only as one exact token")
+
+# --- the standard scenario: plan, parse, verify, determinism ---------------------------------------
+
+STANDARD = standard_images()
+scn = make(STANDARD, f"{CANARY}-standard", claim={"dtb_index": 1, "dtbo_entry_index": 2})
+plan, _ = expect_ok(*cli("plan-selection", scn))
+assert plan["kind"] == B.SELECTION_PLAN_KIND and plan["inventory_sha256"] == scn.inv_sha
+assert plan["selection_parser"] == contract["selection_parser"] and plan["blockers"] == contract["blockers"]
+assert plan["expected_inputs"]["selection_fixture"] == ["selection.json", "witness.json"]
+assert plan["expected_inputs"]["r3_images"]["present"] == sorted(STANDARD)
+assert plan["request_binding"]["operation"] == R4
+assert [plan["request_binding"][key] for key in BUDGET_KEYS] == [65536, 67121152, 65536]
+assert all(v is False for v in plan["authority"].values()) and plan["remote_commands"] == []
+assert plan["qualification"] == contract["qualification"] and plan["deferred"] == contract["deferred"]
+assert CANARY not in json.dumps(plan)
+out_dir = work / "standard-out"
+summary, _raw = expect_ok(*cli("parse-selection", scn, "--out", out_dir))
+assert summary["status"] == "parsed" and summary["operation"] == R4 and summary["hardware_bytes_read"] == 0
+assert [summary[name] for name in TRIPLE] == [None, None, None]
+assert summary["dtb_count"] == 3 and summary["dtbo_entry_count"] == 4
+assert all(summary[key] is False for key in contract["authority"]) and summary["blocker_count"] == 7
+assert sorted(os.listdir(out_dir)) == ["SHA256SUMS", "operations", "parse.json"]
+assert sorted(os.listdir(out_dir / "operations")) == [f"{R4}.json"]
+for relative, mode in (("parse.json", 0o644), ("SHA256SUMS", 0o644), ("operations", 0o755)):
+    assert stat.S_IMODE((out_dir / relative).stat().st_mode) == mode, relative
+operation_bytes = (out_dir / f"operations/{R4}.json").read_bytes()
+operation = json.loads(operation_bytes)
+assert operation == {
+    "schema": 3, "kind": C.OPERATION_KIND, "id": R4, "request_sha256": request_sha256, "transport": C.TRANSPORT,
+    "read_domain": "fixture", "read_only": True, "bytes_read": scn.S,
+    "data": {"dtb_count": 3, "selected_board_id": None, "selected_board_revision": None, "dtbo_entry_count": 4,
+             "compatible_prefix": "qcom,canoe-mtp", "selection_source": None}}
+assert operation_bytes == jbytes(operation) and len(operation_bytes) <= 65536
+document, _ = C.validate_operation(operation_bytes, R4_ROW, request_sha256, collector_env.identity)
+assert [document["data"][name] for name in TRIPLE] == [None, None, None], "the emitted selection triple is always null"
+parse_doc = read_parse(out_dir)
+M = 0
+for name, (data, meta) in STANDARD.items():
+    ranges = [tuple(item.values())[1:3] for item in F.expected(data, meta)["coverage"]["ranges"]]
+    if name == "vendor_boot_a":  # the chosen base: its complete dtb component joins the covered ranges
+        dtb = next(item for item in meta["components"] if item["role"] == "dtb")
+        assert dtb["size"] == len(DEFAULT_DTB)
+        ranges.append((dtb["offset"], dtb["size"]))
+    M += sum(size for _offset, size in F.merge(ranges))
+O = len(operation_bytes)
+acc = parse_doc["accounting"]
+assert {key: acc[key] for key in ("scope", "fixture_payload_bytes", "fixture_payload_read_bytes", "r3_fixture_bytes",
+                                  "selection_input_bytes", "represented_metadata_bytes", "operation_output_bytes",
+                                  "hardware_bytes_read", "hardware_transport")} == {
+    "scope": "one-admitted-fixture-snapshot", "fixture_payload_bytes": scn.S, "fixture_payload_read_bytes": scn.S,
+    "r3_fixture_bytes": scn.r3_bytes, "selection_input_bytes": len(scn.manifest_bytes) + len(scn.witness_bytes),
+    "represented_metadata_bytes": M, "operation_output_bytes": O, "hardware_bytes_read": 0, "hardware_transport": "none"}
+assert acc["dependency_reads"]["counted_in_S"] is False
+assert acc["dependency_reads"]["r2_inventory_bytes"] == len(scn.inv_bytes)
+assert acc["dependency_reads"]["r3_parse_artifact_bytes"] == sum(
+    len(p.read_bytes()) for p in scn.r3.rglob("*") if p.is_file())
+assert parse_doc["kind"] == B.SELECTION_PARSE_KIND and parse_doc["format_version"] == "0.4.0"
+assert parse_doc["selection_parser_version"] == "1.0.0" and parse_doc["profile"] == B.SELECTION_PROFILE
+assert parse_doc["provenance"] == {"kind": "synthetic-parser-provenance", "captured": False,
+                                   "hardware_qualified": False, "collector_labels_are_not_provenance": True}
+for key, value in (("bootchain_contract_sha256", BC), ("request_sha256", request_sha256),
+                   ("inventory_sha256", scn.inv_sha), ("images_sha256", scn.images_sha),
+                   ("r3_parse_sha256", scn.r3_parse_sha), ("r3_operation_sha256", scn.r3_op_sha),
+                   ("selection_sha256", digest(scn.manifest_bytes)), ("witness_sha256", digest(scn.witness_bytes))):
+    assert parse_doc[key] == value, key
+assert [row["path"] for row in parse_doc["inputs"]] == ["selection.json", "witness.json"]
+assert parse_doc["scope"]["base_source_partition"] == "vendor_boot_a" and parse_doc["scope"]["dtbo_source_partition"] == "dtbo_a"
+dtb_rows = parse_doc["parsed"]["dtb_blobs"]
+assert [(row["index"], row["offset"], row["bytes"]) for row in dtb_rows] == [
+    (0, 0, len(S.fdt(compatible=(b"other,board",)))),
+    (1, len(S.fdt(compatible=(b"other,board",))), len(S.fdt(compatible=(b"vendor,x", S.COMPATIBLE)))),
+    (2, len(S.fdt(compatible=(b"other,board",))) + len(S.fdt(compatible=(b"vendor,x", S.COMPATIBLE))), len(S.fdt()))]
+assert [row["has_contract_token"] for row in dtb_rows] == [False, True, True]
+assert [row["compatible_token_count"] for row in dtb_rows] == [1, 2, 1]
+assert parse_doc["parsed"]["dtb_count"] == 3 and parse_doc["parsed"]["dtbo_entry_count"] == 4
+assert parse_doc["witness"] == {"classification": "unverified-synthetic-witness-claim", "claim_present": True,
+                                "dtb_index": 1, "dtbo_entry_index": 2}
+assert parse_doc["membership"] == {
+    "computed": True, "result": "claimed-indexes-are-members", "base_candidate_has_contract_token": True,
+    "decoded_table_entry": {"id": 9, "revision": 1, "encoding": "dt-table-entry-offsets-8-and-12-big-endian",
+                            "scope": "parse-sidecar-only"},
+    "promoted_to_selection": False}
+classes = {row["item"]: row["class"] for row in parse_doc["classification"]}
+assert classes["dtb_count"] == classes["dtbo_entry_count"] == "parsed-bytes"
+assert classes["witness.dtb_index"] == classes["witness.dtbo_entry_index"] == "unverified-synthetic-witness-claim"
+assert classes["membership"] == "computed-membership-result" and classes["compatible_prefix"] == "contract-constant"
+assert all(classes[name] == "not-established" for name in (*TRIPLE, "selection_provenance", "selection_freshness", "board_semantics"))
+assert {"actual-selected-board-id", "actual-selected-board-revision", "actual-selection-source", "selection-provenance",
+        "selection-freshness", "board-semantics", "selection-source-semantics", "multi-overlay-ordering"} == set(parse_doc["not_established"])
+op_row = parse_doc["operation"]
+assert [op_row[name] for name in TRIPLE] == [None, None, None] and op_row["bytes"] == O
+assert op_row["dtb_count"] == 3 and op_row["dtbo_entry_count"] == 4 and op_row["compatible_prefix"] == "qcom,canoe-mtp"
+assert [op_row[key] for key in BUDGET_KEYS] == [65536, 67121152, 65536]
+assert parse_doc["qualification"] == contract["qualification"] and parse_doc["deferred"] == contract["deferred"]
+assert parse_doc["unresolved_claims"] == contract["coverage"]["unresolved_claims"]
+assert len(parse_doc["blockers"]) == 7 and all(row["state"] == "missing" for row in parse_doc["blockers"])
+assert len(parse_doc["authority"]) == 9 and all(v is False for v in parse_doc["authority"].values())
+assert parse_doc["synthetic"] is True and parse_doc["live"] is False and parse_doc["executes"] is False
+assert parse_doc["remote_commands"] == [] and parse_doc["complete_capture"] is False
+assert parse_doc["kit_snapshot_reverified"] is False
+sums = (out_dir / "SHA256SUMS").read_text()
+assert sums == "".join(f"{digest((out_dir / p).read_bytes())}  {p}\n"
+                       for p in sorted(["parse.json", f"operations/{R4}.json"], key=lambda p: p.encode()))
+assert len((out_dir / "parse.json").read_bytes()) <= 131072 and len(sums) <= 1024
+for path in out_dir.rglob("*"):
+    if path.is_file():
+        content = path.read_bytes()
+        for forbidden in (CANARY.encode(), str(work).encode(), F.blob("e0", 40), S.COMPATIBLE + b"-x", scn.witness_bytes,
+                          F.blob("vb", 24), b"other,board"):
+            assert forbidden not in content, (path.name, forbidden[:8])
+        assert not path.name.endswith((".img", ".dtb", ".dtbo", "witness.json")), "no binary or witness copy is published"
+verify, _ = expect_ok(*cli("verify-selection", scn, "--parse", out_dir))
+assert verify["status"] == "verified" and verify["parse_sha256"] == summary["parse_sha256"]
+assert verify["operation_sha256"] == summary["operation_sha256"] and [verify[name] for name in TRIPLE] == [None] * 3
+ok("plan, parse and verify agree: exact R4 fragment with a null selection triple, collector validation, accounting S/M/O, classification, value-free output, no copies")
+
+second = work / "standard-out-2"
+expect_ok(*cli("parse-selection", scn, "--out", second))
+for relative in ("SHA256SUMS", "parse.json", f"operations/{R4}.json"):
+    assert (out_dir / relative).read_bytes() == (second / relative).read_bytes(), relative
+ok("a second parse of the same inputs is byte for byte identical")
+
+# --- witness: claim null, nonzero indexes, duplicates, membership, incompatible candidates -----------
+
+
+def decoded(out):
+    return read_parse(out)["membership"]
+
+
+null_scn = make(STANDARD, "null-claim", claim=None)
+_, null_out = parse_ok(null_scn)
+assert read_op(null_out)["data"] == operation["data"], "the operation is the same with and without a claim"
+assert decoded(null_out) == {"computed": True, "result": "no-claim", "base_candidate_has_contract_token": None,
+                             "decoded_table_entry": None, "promoted_to_selection": False}
+assert read_parse(null_out)["witness"]["claim_present"] is False and read_parse(null_out)["witness"]["dtb_index"] is None
+ok("a null claim yields counts only and no membership result")
+
+for index, entry_index, expected_id, expected_rev in ((1, 0, 7, 3), (2, 1, 7, 3), (1, 3, 0, 0), (2, 2, 9, 1)):
+    s = make(STANDARD, "claim", claim={"dtb_index": index, "dtbo_entry_index": entry_index})
+    _, out = parse_ok(s)
+    assert read_op(out)["data"] == operation["data"] and [read_op(out)["data"][n] for n in TRIPLE] == [None] * 3
+    assert decoded(out)["decoded_table_entry"]["id"] == expected_id and decoded(out)["decoded_table_entry"]["revision"] == expected_rev
+# duplicate ids and revisions (entries 0 and 1) decode independently and never select anything
+a = make(STANDARD, "dup-a", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+b = make(STANDARD, "dup-b", claim={"dtb_index": 1, "dtbo_entry_index": 1})
+assert decoded(parse_ok(a)[1])["decoded_table_entry"] == decoded(parse_ok(b)[1])["decoded_table_entry"]
+assert read_op(parse_ok(a)[1])["data"] == read_op(parse_ok(b)[1])["data"]
+ok("claimed indexes decode their own table entry; duplicate ids and revisions are valid and select nothing")
+
+# big-endian words at entry offsets 8 and 12, and nothing else, whatever the other words hold
+distinct = [S.entry(F.blob(f"x{i}", 30), 0x01020304 * (i % 2) + i, 0xA0B0C0D0 - i, (0xDEADBEEF, i, i, i)) for i in range(5)]
+s = make(standard_images(entries=distinct), "words", claim={"dtb_index": 1, "dtbo_entry_index": 4})
+decoded_entry = decoded(parse_ok(s)[1])["decoded_table_entry"]
+assert (decoded_entry["id"], decoded_entry["revision"]) == (4, 0xA0B0C0D0 - 4)
+flat = standard_images(entries=[S.entry(b"x" * 30, 0x01020304, 0x05060708, (9, 9, 9, 9))])
+s = make(flat, "words-be", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+assert decoded(parse_ok(s)[1])["decoded_table_entry"]["id"] == 0x01020304
+assert decoded(parse_ok(s)[1])["decoded_table_entry"]["revision"] == 0x05060708
+ok("the decoded id and revision are the big-endian words at entry offsets 8 and 12")
+
+# the highest indexes with maximal sets: 64 blobs and 256 entries
+sixty_four = b"".join(S.fdt(compatible=((b"t%d" % i, S.COMPATIBLE) if i == 63 else (b"t%d" % i,))) for i in range(64))
+entries_256 = entries_of(256)
+s = make(standard_images(dtb=sixty_four, entries=entries_256), "max-claim", claim={"dtb_index": 63, "dtbo_entry_index": 255})
+_, out = parse_ok(s)
+assert read_op(out)["data"]["dtb_count"] == 64 and read_op(out)["data"]["dtbo_entry_count"] == 256
+assert decoded(out)["decoded_table_entry"] == {"id": 256, "revision": 355, "encoding": "dt-table-entry-offsets-8-and-12-big-endian",
+                                               "scope": "parse-sidecar-only"}
+assert len(read_parse(out)["parsed"]["dtb_blobs"]) == 64
+ok("64 blobs and 256 table entries parse, and the highest witness indexes are members")
+s = make(standard_images(dtb=sixty_four + S.fdt(), entries=entries_256), "blobs-65", claim=None)
+expect_fail("65 blobs in the base component", cli("parse-selection", s, "--out", work / "b65"), "selection-budget", [work / "b65"])
+ok("65 blobs are a selection budget refusal")
+
+
+def witness_rejected(label, claim, images=STANDARD, base="vendor_boot_a", code="selection-witness-rejected"):
+    s = make(images, "wit", claim=claim, base=base)
+    out = work / f"wit-out-{counter[0]}"
+    expect_fail(label, cli("parse-selection", s, "--out", out), code, [out])
+    return s
+
+
+witness_rejected("a dtb index equal to the parsed blob count", {"dtb_index": 3, "dtbo_entry_index": 0})
+witness_rejected("a dtbo entry index equal to the parsed entry count", {"dtb_index": 1, "dtbo_entry_index": 4})
+witness_rejected("a dtb index past the count with a valid entry", {"dtb_index": 63, "dtbo_entry_index": 0})
+witness_rejected("a dtbo entry index past the count with a valid blob", {"dtb_index": 1, "dtbo_entry_index": 255})
+witness_rejected("a claim naming an incompatible base candidate", {"dtb_index": 0, "dtbo_entry_index": 0})
+for label, claim in (("a dtb index of 64", {"dtb_index": 64, "dtbo_entry_index": 0}),
+                     ("a dtbo entry index of 256", {"dtb_index": 0, "dtbo_entry_index": 256}),
+                     ("a negative dtb index", {"dtb_index": -1, "dtbo_entry_index": 0}),
+                     ("a boolean index", {"dtb_index": True, "dtbo_entry_index": 0}),
+                     ("a string index", {"dtb_index": "1", "dtbo_entry_index": 0}),
+                     ("a float index", {"dtb_index": 1.0, "dtbo_entry_index": 0}),
+                     ("a claim with an extra key", {"dtb_index": 1, "dtbo_entry_index": 0, "board_id": 7}),
+                     ("a claim missing an index", {"dtb_index": 1}),
+                     ("an empty claim", {})):
+    witness_rejected(label, claim)
+# the incompatible-candidate rule uses the chosen candidate only: any other blob may match
+only_second = S.fdt(compatible=(b"a,b",)) + S.fdt(compatible=(S.COMPATIBLE,))
+s = make(standard_images(dtb=only_second), "only-second", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+parse_ok(s)
+witness_rejected("a claim on the first of two blobs when only the second matches",
+                 {"dtb_index": 0, "dtbo_entry_index": 0}, standard_images(dtb=only_second))
+witness_rejected("a claim when no blob carries the exact token", {"dtb_index": 0, "dtbo_entry_index": 0},
+                 standard_images(dtb=S.fdt(compatible=(S.COMPATIBLE + b"-x",)) + S.fdt(compatible=(b"x" + S.COMPATIBLE,))))
+ok("claims are accepted only inside the parsed sets and only on a candidate with the exact contract token")
+s = make(standard_images(dtb=S.fdt(compatible=(b"a,b",))), "no-token-null-claim", claim=None)
+_, out = parse_ok(s)
+assert read_op(out)["data"]["dtb_count"] == 1 and [read_op(out)["data"][n] for n in TRIPLE] == [None] * 3
+ok("a null claim over blobs that carry no contract token still yields counts and a null selection")
+
+# witness.json shape: strict, canonical, typed
+for label, edit in (("a witness with a changed kind", lambda w: w.update(kind="other")),
+                    ("a witness at schema 2", lambda w: w.update(schema=2)),
+                    ("a witness at format 2", lambda w: w.update(format_version=2)),
+                    ("a witness that is not synthetic", lambda w: w.update(synthetic=False)),
+                    ("a witness with an extra key", lambda w: w.update(extra=1)),
+                    ("a witness without a claim key", lambda w: w.pop("claim")),
+                    ("a witness naming init_boot as the base", lambda w: w.update(base_source_partition="init_boot_a")),
+                    ("a witness with a path as a scope name", lambda w: w.update(base_source_partition="/dev/sda1")),
+                    ("a witness with a non-hash request binding", lambda w: w.update(request_sha256="x"))):
+    s = make(STANDARD, "wshape", witness_edit=edit)
+    out = work / f"wshape-out-{counter[0]}"
+    expect_fail(label, cli("parse-selection", s, "--out", out), None, [out])
+for label, raw in (("a witness that is not JSON", b"{"), ("a witness with indentation", None),
+                   ("a witness with duplicate keys", b'{"schema": 1, "schema": 1}\n'),
+                   ("a witness that is a list", b"[]\n")):
+    s = make(STANDARD, "wraw", witness_raw=raw if raw is not None else json.dumps({"x": 1}, indent=2).encode())
+    out = work / f"wraw-out-{counter[0]}"
+    expect_fail(label, cli("parse-selection", s, "--out", out), None, [out])
+ok("a malformed, non-canonical or mistyped witness is refused with a fixed line")
+
+# --- scope: the fixed base and dtbo source partitions --------------------------------------------
+
+boot_v2 = F.boot_legacy(2, kernel=F.blob("k", 700), ramdisk=F.blob("r", 90), dtb=S.fdt() + S.fdt(), page=4096)
+for base, image, suffix, count in (("boot", boot_v2, "", 2), ("boot_b", boot_v2, "_b", 2), ("recovery_a", boot_v2, "_a", 2),
+                                   ("vendor_boot_b", vendor_image(S.fdt() + S.fdt(), 3), "_b", 2),
+                                   ("vendor_kernel_boot", vendor_image(S.fdt(), 4), "", 1),
+                                   ("vendor_kernel_boot_a", vendor_image(S.fdt(), 3), "_a", 1),
+                                   ("vendor_boot", vendor_image(S.fdt() + S.fdt() + S.fdt(), 4), "", 3)):
+    images = {base: image, "dtbo" + suffix: dtbo_image(DEFAULT_ENTRIES)}
+    s = make(images, "scope", base=base, dtbo="dtbo" + suffix, claim={"dtb_index": 0, "dtbo_entry_index": 0})
+    _, out = parse_ok(s)
+    assert read_op(out)["data"]["dtb_count"] == count, base
+    assert read_parse(out)["scope"]["base_source_partition"] == base
+    assert [read_op(out)["data"][n] for n in TRIPLE] == [None] * 3
+ok("every supported base partition family, version and slot suffix parses, paired with the dtbo of the same suffix")
+for label, name, image in (("a boot v1 base without a dtb component", "boot_a", F.boot_legacy(1, kernel=F.blob("k", 700))),
+                           ("a boot v3 base without a dtb component", "boot_a", F.boot_modern(3, kernel=F.blob("k", 700), ramdisk=F.blob("r", 90))),
+                           ("a boot v4 base without a dtb component", "boot_a", F.boot_modern(4, kernel=F.blob("k", 700))),
+                           ("a boot v2 base with an empty dtb component", "boot_a", F.boot_legacy(2, kernel=F.blob("k", 700))),
+                           ("a vendor_boot v3 base with an empty dtb component", "vendor_boot_a", vendor_image(b"", 3)),
+                           ("a vendor_boot v4 base with an empty dtb component", "vendor_boot_a", vendor_image(b"", 4))):
+    s = make({name: image, "dtbo_a": dtbo_image(DEFAULT_ENTRIES)}, "nodtb", base=name)
+    out = work / f"nodtb-out-{counter[0]}"
+    expect_fail(label, cli("parse-selection", s, "--out", out), "selection-unsupported", [out])
+s = make(STANDARD, "suffix-mismatch", base="vendor_boot_a", dtbo="dtbo_b")
+expect_fail("a base and dtbo with different slot suffixes", cli("parse-selection", s, "--out", work / "sfx"),
+            "selection-unsupported", [work / "sfx"])
+s = make(STANDARD, "suffix-unsuffixed", base="vendor_boot_a", dtbo="dtbo")
+expect_fail("a suffixed base with an unsuffixed dtbo", cli("parse-selection", s, "--out", work / "sfx2"),
+            "selection-unsupported", [work / "sfx2"])
+s = make({k: v for k, v in STANDARD.items() if k != "dtbo_a"} | {"dtbo_b": dtbo_image(DEFAULT_ENTRIES)}, "absent-dtbo",
+         base="vendor_boot_a", dtbo="dtbo_a")
+expect_fail("a dtbo source partition absent from the R3 fixture", cli("parse-selection", s, "--out", work / "abs1"),
+            "selection-binding-mismatch", [work / "abs1"])
+s = make({k: v for k, v in STANDARD.items() if k != "vendor_boot_a"} | {"vendor_boot_b": vendor_image(S.fdt())}, "absent-base",
+         base="vendor_boot_a", dtbo="dtbo_a")
+expect_fail("a base source partition absent from the R3 fixture", cli("parse-selection", s, "--out", work / "abs2"),
+            "selection-binding-mismatch", [work / "abs2"])
+s = make(STANDARD, "init-boot-base", base="init_boot_a")
+expect_fail("init_boot is never a base source", cli("parse-selection", s, "--out", work / "ib"),
+            "selection-input-rejected", [work / "ib"])
+ok("the scope is the fixed enum: a dtb-less, empty, absent, mismatched-suffix or init_boot source is refused with a fixed code")
+
+# --- DT table boundaries -----------------------------------------------------------------------------
+
+one = make(standard_images(entries=[S.entry(b"p", 1, 1)]), "one-entry", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+_, out = parse_ok(one)
+assert read_op(out)["data"]["dtbo_entry_count"] == 1
+s = make(standard_images(entries=entries_256), "e256", claim={"dtb_index": 1, "dtbo_entry_index": 255})
+assert read_op(parse_ok(s)[1])["data"]["dtbo_entry_count"] == 256
+payload_noise = [S.entry(bytes(range(256)) * 2, 5, 5), S.entry(S.fdt()[:7], 5, 5), S.entry(b"\xd0\x0d\xfe\xed", 5, 5)]
+s = make(standard_images(entries=payload_noise), "noise", claim={"dtb_index": 1, "dtbo_entry_index": 1})
+assert decoded(parse_ok(s)[1])["decoded_table_entry"] == {"id": 5, "revision": 5, "encoding": "dt-table-entry-offsets-8-and-12-big-endian", "scope": "parse-sidecar-only"}
+ok("1 and 256 table entries parse, and a DTBO payload that is not a device tree is never parsed")
+# an empty DT table and a 257-entry table are refused by the shared R3 admission before any R4 code runs
+for label, mutate, r3_code in (
+        ("an empty DT table", lambda raw: (struct.pack_into(">I", raw, 16, 0), raw)[1], "image-unsupported"),
+        ("a 257-entry DT table", lambda raw: (struct.pack_into(">I", raw, 16, 257), raw)[1], "image-budget")):
+    raw = mutate(bytearray(S.dtbo(entries_of(3))))
+    holder = make({"vendor_boot_a": vendor_image(S.fdt()), "dtbo_a": dtbo_image(entries_of(3))}, "dtbo-holder", claim=None)
+    (holder.imgs / "dtbo_a.img").write_bytes(bytes(raw))
+    manifest = json.loads(holder.images_manifest)
+    for row in manifest["images"]:
+        if row["partition_name"] == "dtbo_a":
+            row.update(size_bytes=len(raw), fixture_sha256=digest(bytes(raw)))
+    (holder.imgs / "images.json").write_bytes(jbytes(manifest))
+    expect_fail(label, cli("parse-selection", holder, "--out", work / "shape-out"), r3_code, [work / "shape-out"])
+ok("an empty and a 257-entry DT table are refused by the shared R3 admission under its own codes")
+
+# --- bindings: forged manifests, witnesses and R3 artifacts ---------------------------------------------
+
+BASE = make(STANDARD, "binding", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+parse_ok(BASE)
+for field in ("bootchain_contract_sha256", "request_sha256", "inventory_sha256", "r3_parse_sha256",
+              "r3_operation_sha256", "images_sha256", "witness_sha256"):
+    s = make(STANDARD, "forge", claim={"dtb_index": 1, "dtbo_entry_index": 0},
+             manifest_edit=lambda m, field=field: m.update({field: "1" * 64}))
+    expect_fail(f"selection.json with a forged {field}", cli("parse-selection", s, "--out", work / f"forge-{field}"),
+                "selection-binding-mismatch", [work / f"forge-{field}"])
+for label, edit in (("a witness size one byte off", lambda m: m.update(witness_bytes=m["witness_bytes"] + 1)),
+                    ("a witness size of zero", lambda m: m.update(witness_bytes=0)),
+                    ("a manifest at schema 2", lambda m: m.update(schema=2)),
+                    ("a manifest of another kind", lambda m: m.update(kind=B.WITNESS_KIND)),
+                    ("a manifest with an extra path field", lambda m: m.update(path="/etc/passwd")),
+                    ("a manifest naming a parser", lambda m: m.update(parser="fdt-v1")),
+                    ("a manifest naming an offset", lambda m: m.update(offset=0)),
+                    ("a manifest naming a limit", lambda m: m.update(max_blobs=99)),
+                    ("a manifest that is not synthetic", lambda m: m.update(synthetic=False))):
+    s = make(STANDARD, "forge2", claim={"dtb_index": 1, "dtbo_entry_index": 0}, manifest_edit=edit)
+    expect_fail(label, cli("parse-selection", s, "--out", work / f"forge2-out-{counter[0]}"), None, [work / f"forge2-out-{counter[0]}"])
+for label, edit in (("a witness bound to another request", lambda w: w.update(request_sha256="2" * 64)),
+                    ("a witness bound to another R3 operation", lambda w: w.update(r3_operation_sha256="3" * 64)),
+                    ("a witness for another base partition of the same suffix",
+                     lambda w: w.update(base_source_partition="vendor_kernel_boot_a"))):
+    s = make(STANDARD, "forge3", claim={"dtb_index": 1, "dtbo_entry_index": 0}, witness_edit=edit)
+    expect_fail(label, cli("parse-selection", s, "--out", work / f"forge3-out-{counter[0]}"), "selection-binding-mismatch",
+                [work / f"forge3-out-{counter[0]}"])
+s = make(STANDARD, "forge3b", claim={"dtb_index": 1, "dtbo_entry_index": 0}, witness_edit=lambda w: w.update(dtbo_source_partition="dtbo_b"))
+expect_fail("a witness whose scope pairs two different slot suffixes", cli("parse-selection", s, "--out", work / "forge3b-out"),
+            "selection-unsupported", [work / "forge3b-out"])
+swapped = make(STANDARD, "swap", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+(swapped.sel / "witness.json").write_bytes(jbytes({**swapped.witness_doc, "claim": {"dtb_index": 2, "dtbo_entry_index": 0}}))
+expect_fail("a witness swapped after the manifest hashed it", cli("parse-selection", swapped, "--out", work / "swap-out"),
+            "selection-binding-mismatch", [work / "swap-out"])
+# the witness never hashes the manifest, and the manifest hashes the witness one way
+assert "selection_sha256" not in BASE.witness_doc and "witness_sha256" in BASE.manifest_doc
+ok("every manifest and witness binding is checked against the recomputed values; the witness is hashed one way")
+
+# the R3 parse binds nothing about the payload: it is recomputed from the exact R3 fixture bytes
+twin_a = standard_images(dtb=S.fdt() + S.fdt(), entries=DEFAULT_ENTRIES)
+unit = len(S.fdt())
+twin_b = standard_images(dtb=S.sized_fdt(2 * unit), entries=DEFAULT_ENTRIES)
+assert len(twin_a["vendor_boot_a"][0]) == len(twin_b["vendor_boot_a"][0])
+ta = make(twin_a, "twin-a", claim=None)
+tb = make(twin_b, "twin-b", claim=None)
+assert ta.r3_op_bytes == tb.r3_op_bytes, \
+    "metadata-only R3 operation bytes are identical for fixtures whose device tree payload differs"
+assert ta.images_sha != tb.images_sha and ta.r3_parse_sha != tb.r3_parse_sha
+sel_a, sel_b = parse_ok(ta)[1], parse_ok(tb)[1]
+assert read_op(sel_a)["data"]["dtb_count"] == 2 and read_op(sel_b)["data"]["dtb_count"] == 1
+ok("two fixtures with byte-identical R3 operations parse to different R4 counts: the R3 operation alone cannot bind the payload")
+mixed = make(twin_b, "twin-mixed", claim=None, r3_dir=ta.r3)
+assert mixed.r3_op_sha == ta.r3_op_sha
+expect_fail("the R3 parse of another fixture whose R3 operation bytes are identical",
+            cli("parse-selection", mixed, "--out", work / "twin-mixed-out"), "selection-binding-mismatch", [work / "twin-mixed-out"])
+forged_images = make(twin_b, "twin-forged", claim=None, r3_dir=tb.r3)
+forged_images_manifest = ta.manifest_bytes  # a selection manifest that was bound to the other fixture's images.json
+(forged_images.sel / "selection.json").write_bytes(forged_images_manifest)
+expect_fail("a selection manifest bound to another image fixture with identical R3 metadata",
+            cli("parse-selection", forged_images, "--out", work / "twin-forge"), "selection-binding-mismatch", [work / "twin-forge"])
+ok("a changed device tree payload under unchanged R3 metadata is caught by the images.json binding")
+
+# the R3 artifact is recomputed and compared entry for entry and byte for byte
+for label, mutate, code in (
+        ("an R3 parse with a flipped operation byte",
+         lambda s: (s.r3 / f"operations/{R3}.json").write_bytes((s.r3 / f"operations/{R3}.json").read_bytes().replace(b"metadata-only", b"metadata-onlx", 1)),
+         "selection-binding-mismatch"),
+        ("an R3 parse with a flipped parse.json byte",
+         lambda s: (s.r3 / "parse.json").write_bytes((s.r3 / "parse.json").read_bytes().replace(b"synthetic", b"synthetiX", 1)),
+         "selection-binding-mismatch"),
+        ("an R3 parse with a changed SHA256SUMS",
+         lambda s: (s.r3 / "SHA256SUMS").write_bytes(b"0" * 64 + b"  parse.json\n"), "selection-binding-mismatch"),
+        ("an R3 parse with an extra file", lambda s: (s.r3 / "extra").write_bytes(b"x"), "selection-binding-mismatch"),
+        ("an R3 parse missing its operation", lambda s: (s.r3 / f"operations/{R3}.json").unlink(), "selection-binding-mismatch"),
+        ("an R3 parse with a symlinked parse.json",
+         lambda s: ((s.r3 / "parse.json").unlink(), (s.r3 / "parse.json").symlink_to(s.r3 / "SHA256SUMS")), "selection-input-rejected"),
+        ("an R3 parse with a hard-linked parse.json", lambda s: os.link(s.r3 / "parse.json", s.root / "alias"), "selection-input-rejected"),
+        ("an R3 parse file made executable", lambda s: (s.r3 / "parse.json").chmod(0o755), None),
+        ("an R3 parse that is a plain file", lambda s: (shutil.rmtree(s.r3), s.r3.write_bytes(b"x")), "selection-input-rejected")):
+    s = make(STANDARD, "r3tamper", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+    for path in s.r3.rglob("*"):
+        os.chmod(path, 0o755 if path.is_dir() else 0o644)
+    mutate(s)
+    out = work / f"r3tamper-out-{counter[0]}"
+    expect_fail(label, cli("parse-selection", s, "--out", out), code, [out])
+foreign = make(standard_images(entries=[S.entry(b"z", 1, 1)]), "r3-foreign", claim=None)
+s = make(STANDARD, "r3-wrong-fixture", claim=None, r3_dir=foreign.r3)
+expect_fail("an R3 parse produced from another fixture", cli("parse-selection", s, "--out", work / "r3wrong"),
+            "selection-binding-mismatch", [work / "r3wrong"])
+ok("the R3 parse is recomputed from the exact fixture bytes and refused on any difference, extra file, link or mode change")
+
+# --- old and mixed generations: no adapters ---------------------------------------------------------------
+
+old_inventory = make(STANDARD, "old-r2", claim=None)
+(old_inventory.inv).write_bytes(r2_operation({n: 64 * F.MIB for n in STANDARD} | {"pmos_root": 8 * 1024 ** 3}, schema=2))
+expect_fail("an R2 inventory at the previous envelope schema 2", cli("parse-selection", old_inventory, "--out", work / "old2"),
+            "image-operation-rejected", [work / "old2"])
+(old_inventory.inv).write_bytes(r2_operation({n: 64 * F.MIB for n in STANDARD} | {"pmos_root": 8 * 1024 ** 3}, schema=1))
+expect_fail("an R2 inventory at the legacy envelope schema 1", cli("parse-selection", old_inventory, "--out", work / "old1"),
+            "image-operation-rejected", [work / "old1"])
+old_op = json.loads(operation_bytes)
+for label, value in (("an R4 operation at the previous schema 2", 2), ("an R4 operation at schema 4", 4)):
+    try:
+        C.validate_operation(jbytes({**old_op, "schema": value}), R4_ROW, request_sha256, collector_env.identity)
+    except C.CollectError:
+        ok(f"{label} is refused by the collector")
+    else:
+        raise AssertionError(label)
+stale = make(STANDARD, "stale", claim=None, manifest_edit=lambda m: m.update(bootchain_contract_sha256="2" * 64))
+expect_fail("a selection manifest bound to a previous bootchain contract", cli("parse-selection", stale, "--out", work / "stale-out"),
+            "selection-binding-mismatch", [work / "stale-out"])
+mixed_request = make(STANDARD, "mixed-gen", claim=None, manifest_edit=lambda m: m.update(request_sha256="4" * 64))
+expect_fail("a selection manifest bound to another request generation", cli("parse-selection", mixed_request, "--out", work / "mixed-out"),
+            "selection-binding-mismatch", [work / "mixed-out"])
+forged_old = work / "forged-old-generation"
+shutil.copytree(out_dir, forged_old)
+os.chmod(forged_old, 0o755)
+for path in forged_old.rglob("*"):
+    os.chmod(path, 0o755 if path.is_dir() else 0o644)
+
+
+def old_generation(label, **changes):
+    target = work / f"oldgen-{counter[0] + 1}"
+    counter[0] += 1
+    shutil.copytree(forged_old, target)
+    doc = json.loads((target / "parse.json").read_text())
+    doc.update(changes)
+    (target / "parse.json").write_bytes(jbytes(doc))
+    (target / "SHA256SUMS").write_text("".join(f"{digest((target / p).read_bytes())}  {p}\n"
+                                               for p in sorted(["parse.json", f"operations/{R4}.json"], key=lambda p: p.encode())))
+    expect_fail(label, cli("verify-selection", scn, "--parse", target), None)
+
+
+old_generation("a parse stamped with the previous 0.3.0 format", format_version="0.3.0")
+old_generation("a parse stamped with a previous selection parser version", selection_parser_version="0.9.0")
+ok("previous and mixed generations are refused: stale envelope schemas, contracts, requests and parse stamps; there are no adapters")
+
+# --- the null selection triple ---------------------------------------------------------------------------
+
+FULL = {"selected_board_id": 7, "selected_board_revision": 1, "selection_source": "bootconfig"}
+
+
+def triple_result(**fields):
+    doc = json.loads(operation_bytes)
+    doc["data"].update(fields)
+    try:
+        C.validate_operation(jbytes(doc), R4_ROW, request_sha256, collector_env.identity)
+    except C.CollectError as error:
+        return str(error)
+    return None
+
+
+assert triple_result() is None
+for mask in range(1, 7):
+    partial = {name: (FULL[name] if mask >> bit & 1 else None) for bit, name in enumerate(TRIPLE)}
+    message = triple_result(**partial)
+    assert message is not None and "must all be set or all be null" in message, partial
+assert triple_result(**FULL) is None, "a full tuple stays structurally representable for the collector"
+assert triple_result(selected_board_id=0, selected_board_revision=0, selection_source="device-tree") is None
+request_doc = json.loads((request / "request.json").read_text())
+for mask in range(1, 8):
+    data = {"dtb_count": 3, "dtbo_entry_count": 4, "compatible_prefix": "qcom,canoe-mtp",
+            **{name: (FULL[name] if mask >> bit & 1 else None) for bit, name in enumerate(TRIPLE)}}
+    raw = jbytes({**json.loads(operation_bytes), "data": data})
+    try:
+        B.validate_selection_operation(env, request_doc, request_sha256, raw)
+    except B.SelectionError as error:
+        assert error.code == "selection-operation-rejected", (mask, error)
+    else:
+        raise AssertionError(f"a non-null selection triple {mask:03b} reached an accepted R4 operation")
+assert B.validate_selection_operation(env, request_doc, request_sha256, operation_bytes)["data"]["selected_board_id"] is None
+ok("the collector accepts only all-null or all-set triples (zero is a value); this parser accepts only the all-null operation")
+for out in (out_dir, null_out):
+    doc = read_op(out)["data"]
+    assert [doc[name] for name in TRIPLE] == [None, None, None]
+for label, mutate in (("an R4 operation carrying a full selection tuple",
+                       lambda v: v["data"].update(FULL)),
+                      ("an R4 operation carrying only a source", lambda v: v["data"].update(selection_source="bootconfig"))):
+    target = work / f"nonnull-{counter[0] + 1}"
+    counter[0] += 1
+    shutil.copytree(out_dir, target)
+    for path in [target, *target.rglob("*")]:
+        os.chmod(path, 0o755 if path.is_dir() else 0o644)
+    value = json.loads((target / f"operations/{R4}.json").read_text())
+    mutate(value)
+    (target / f"operations/{R4}.json").write_bytes(jbytes(value))
+    (target / "SHA256SUMS").write_text("".join(f"{digest((target / p).read_bytes())}  {p}\n"
+                                               for p in sorted(["parse.json", f"operations/{R4}.json"], key=lambda p: p.encode())))
+    expect_fail(label, cli("verify-selection", scn, "--parse", target), None)
+ok("a published parse whose operation carries any selection field is refused by verify")
+
+# --- budgets: S, M and O are exact at their bound and refused one over --------------------------------------
+
+for name, constant, exact in (("S", "SELECTION_MAX_FIXTURE_INPUT_BYTES", scn.S),
+                              ("M", "SELECTION_MAX_REPRESENTED_METADATA_BYTES", M),
+                              ("O", "SELECTION_MAX_OPERATION_BYTES", O)):
+    out_exact = work / f"budget-{name}-exact"
+    result = set_constant(constant, exact, lambda: B.command_parse_selection(env, args_of(scn, out=out_exact)))
+    assert os.path.isdir(out_exact) and result["status"] == "parsed", name
+    set_constant(constant, exact, lambda: B.command_verify_selection(env, args_of(scn, parse=out_exact)))
+    for label, run in (("parse", lambda: B.command_parse_selection(env, args_of(scn, out=work / f"budget-{name}-over"))),
+                       ("verify", lambda: B.command_verify_selection(env, args_of(scn, parse=out_dir)))):
+        try:
+            set_constant(constant, exact - 1, run)
+        except B.SelectionError as error:
+            assert error.code == "selection-budget" and CANARY not in str(error), (name, label, error)
+        else:
+            raise AssertionError(f"{name} one byte over its bound was accepted by {label}")
+        assert not os.path.lexists(work / f"budget-{name}-over")
+ok("S, M and O are exact at their bound and refused one byte over, each against its own limit")
+assert B.SELECTION_MAX_FIXTURE_INPUT_BYTES == R4_ROW["max_fixture_input_bytes"] == 64 * 1024 * 1024 + 8192 + 4096
+assert B.SELECTION_MAX_REPRESENTED_METADATA_BYTES == R4_ROW["max_hardware_read_bytes"] == 65536
+assert B.SELECTION_MAX_OPERATION_BYTES == R4_ROW["max_output_bytes"] == 65536
+assert B.MAX_IMAGE_BYTES == 16777216
+# output file bounds: parse.json 131072, operation 65536, SHA256SUMS 1024, total 197632
+assert (B.SELECTION_MAX_PARSE_BYTES, B.SELECTION_MAX_OPERATION_BYTES, B.SELECTION_MAX_SUMS_BYTES,
+        B.SELECTION_MAX_OUTPUT_BYTES) == (131072, 65536, 1024, 197632)
+# The bounds sit inside parse.json's own definitions, so patching one changes the document: the
+# per-file and total bounds are exercised on the check itself, and the pipeline is wired to it.
+exact = {"parse.json": bytes(131072), f"operations/{R4}.json": bytes(65536), "SHA256SUMS": bytes(1024)}
+B.check_selection_output_bounds(exact)
+assert sum(len(v) for v in exact.values()) == 197632
+for name, grow in (("parse.json", 1), (f"operations/{R4}.json", 1), ("SHA256SUMS", 1)):
+    over = dict(exact)
+    over[name] = over[name] + bytes(grow)
+    try:
+        B.check_selection_output_bounds(over)
+    except B.SelectionError as error:
+        assert error.code == "selection-budget"
+    else:
+        raise AssertionError(f"{name} one byte over its bound was accepted")
+total_only = {"parse.json": bytes(131072), f"operations/{R4}.json": bytes(65536), "SHA256SUMS": bytes(1024)}
+try:
+    set_constant("SELECTION_MAX_OUTPUT_BYTES", 197631, lambda: B.check_selection_output_bounds(total_only))
+except B.SelectionError as error:
+    assert error.code == "selection-budget"
+else:
+    raise AssertionError("the output total one byte over its bound was accepted")
+try:
+    set_constant("SELECTION_MAX_PARSE_BYTES", 10, lambda: B.command_parse_selection(env, args_of(scn, out=work / "pj-over")))
+except B.SelectionError as error:
+    assert error.code == "selection-budget"
+else:
+    raise AssertionError("the pipeline does not enforce the parse.json bound")
+assert not os.path.lexists(work / "pj-over")
+ok("parse.json and the output total are exact at their bound and refused one byte over")
+
+# M with real bytes: the base dtb component sized so M is exactly 65536, then one byte more
+fixed = F.expected(*dtbo_image([S.entry(b"p", 1, 1)]))["coverage"]["covered_bytes"]
+vendor_probe = vendor_image(S.fdt())
+fixed += F.expected(*vendor_probe)["coverage"]["covered_bytes"]
+size_for_exact_m = 65536 - fixed
+exact_images = {"vendor_boot_a": vendor_image(S.sized_fdt(size_for_exact_m)), "dtbo_a": dtbo_image([S.entry(b"p", 1, 1)])}
+s = make(exact_images, "m-exact", claim={"dtb_index": 0, "dtbo_entry_index": 0})
+_, out = parse_ok(s)
+assert read_parse(out)["accounting"]["represented_metadata_bytes"] == 65536
+over_images = {"vendor_boot_a": vendor_image(S.sized_fdt(size_for_exact_m + 1)), "dtbo_a": dtbo_image([S.entry(b"p", 1, 1)])}
+s = make(over_images, "m-over", claim=None)
+expect_fail("represented metadata of 65537 bytes", cli("parse-selection", s, "--out", work / "m-over-out"),
+            "selection-budget", [work / "m-over-out"])
+ok("M is exactly 65536 with a real fixture and refused at 65537")
+# the selection files' own size bounds are checked at admission, before any payload read
+big_manifest = make(STANDARD, "sel-8193", claim=None, manifest_raw=b" " * 8193)
+expect_fail("selection.json above 8192 bytes", cli("parse-selection", big_manifest, "--out", work / "sel-big"),
+            "selection-input-rejected", [work / "sel-big"])
+big_witness = make(STANDARD, "wit-4097", claim=None, witness_raw=b" " * 4097)
+expect_fail("witness.json above 4096 bytes", cli("parse-selection", big_witness, "--out", work / "wit-big"),
+            "selection-input-rejected", [work / "wit-big"])
+for label, kind, raw in (("an empty selection.json", "m", b""), ("an empty witness.json", "w", b"")):
+    s = make(STANDARD, "empty-sel", claim=None, manifest_raw=raw if kind == "m" else None, witness_raw=raw if kind == "w" else None)
+    expect_fail(label, cli("parse-selection", s, "--out", work / f"empty-{counter[0]}"), "selection-input-rejected",
+                [work / f"empty-{counter[0]}"])
+ok("selection.json and witness.json are bounded at 8192 and 4096 bytes and must be nonempty")
+
+# --- the selection fixture tree: closure, links, modes, aliases -------------------------------------------------
+
+
+def tampered(label, mutate, code, build=lambda: make(STANDARD, f"{CANARY}-t", claim={"dtb_index": 1, "dtbo_entry_index": 0})):
+    s = build()
+    mutate(s)
+    out = work / f"t-{counter[0]}"
+    expect_fail(label, cli("parse-selection", s, "--out", out), code, [out])
+    return s
+
+
+tampered("an extra bootconfig.txt in the selection fixture", lambda s: (s.sel / "bootconfig.txt").write_bytes(b"androidboot.x=1\n"),
+         "selection-input-rejected")
+tampered("an extra file named for the canary", lambda s: (s.sel / f"{CANARY}.json").write_bytes(b"x"), "selection-input-rejected")
+tampered("an extra directory", lambda s: (s.sel / CANARY).mkdir(), "selection-input-rejected")
+tampered("a missing witness.json", lambda s: (s.sel / "witness.json").unlink(), "selection-input-rejected")
+tampered("a missing selection.json", lambda s: (s.sel / "selection.json").unlink(), "selection-input-rejected")
+tampered("a detached dtb copy in the selection fixture", lambda s: (s.sel / "dtb.fdt").write_bytes(S.fdt()), "selection-input-rejected")
+tampered("a detached dtbo copy in the selection fixture", lambda s: (s.sel / "dtbo.img").write_bytes(b"x" * 64), "selection-input-rejected")
+tampered("a symlinked witness.json", lambda s: ((s.sel / "witness.json").unlink(), (s.sel / "witness.json").symlink_to(s.sel / "selection.json")),
+         "selection-input-rejected")
+tampered("a symlinked selection.json", lambda s: ((s.sel / "selection.json").unlink(), (s.sel / "selection.json").symlink_to(s.inv)),
+         "selection-input-rejected")
+tampered("a hard-linked witness.json", lambda s: os.link(s.sel / "witness.json", s.root / "alias.json"), "selection-input-rejected")
+tampered("an executable witness.json", lambda s: (s.sel / "witness.json").chmod(0o755), "selection-input-rejected")
+tampered("a group-writable selection.json", lambda s: (s.sel / "selection.json").chmod(0o664), "selection-input-rejected")
+tampered("a world-writable witness.json", lambda s: (s.sel / "witness.json").chmod(0o666), "selection-input-rejected")
+tampered("a FIFO in place of witness.json", lambda s: ((s.sel / "witness.json").unlink(), os.mkfifo(s.sel / "witness.json")),
+         "selection-input-rejected")
+tampered("a directory in place of selection.json", lambda s: ((s.sel / "selection.json").unlink(), (s.sel / "selection.json").mkdir()),
+         "selection-input-rejected")
+unsafe = make(STANDARD, f"{CANARY}-unsafe", claim=None)
+unsafe.sel.chmod(0o777)
+try:
+    expect_fail("a writable selection directory", cli("parse-selection", unsafe, "--out", work / "u1"), "selection-input-rejected", [work / "u1"])
+finally:
+    unsafe.sel.chmod(0o755)
+expect_fail("a relative selection path", ["parse-selection", "--request", request, "--inventory", scn.inv, "--images", scn.imgs,
+                                          "--r3-parse", scn.r3, "--selection", "selection", "--out", work / "u2"],
+            "selection-input-rejected", [work / "u2"])
+expect_fail("a missing selection directory", ["parse-selection", "--request", request, "--inventory", scn.inv, "--images", scn.imgs,
+                                              "--r3-parse", scn.r3, "--selection", work / f"{CANARY}-none", "--out", work / "u3"],
+            "selection-input-rejected", [work / "u3"])
+expect_fail("a missing R3 parse", ["parse-selection", "--request", request, "--inventory", scn.inv, "--images", scn.imgs,
+                                   "--r3-parse", work / f"{CANARY}-none", "--selection", scn.sel, "--out", work / "u4"],
+            "selection-input-rejected", [work / "u4"])
+alias_dir = fresh("alias")
+os.symlink(scn.sel, alias_dir / "selection")
+expect_fail("a symlinked selection path", ["parse-selection", "--request", request, "--inventory", scn.inv, "--images", scn.imgs,
+                                           "--r3-parse", scn.r3, "--selection", alias_dir / "selection", "--out", work / "u5"],
+            "selection-input-rejected", [work / "u5"])
+os.symlink(scn.r3, alias_dir / "r3")
+expect_fail("a symlinked R3 parse path", ["parse-selection", "--request", request, "--inventory", scn.inv, "--images", scn.imgs,
+                                          "--r3-parse", alias_dir / "r3", "--selection", scn.sel, "--out", work / "u6"],
+            "selection-input-rejected", [work / "u6"])
+for label, overrides in (("the selection directory equal to the images directory", {"--selection": scn.imgs}),
+                         ("the selection directory inside the images directory", {"--selection": scn.imgs / "sel"}),
+                         ("the R3 parse equal to the selection directory", {"--r3-parse": scn.sel}),
+                         ("the R3 parse inside the selection directory", {"--r3-parse": scn.sel / "r3"}),
+                         ("the inventory inside the selection directory", {"--inventory": scn.sel / "R2.json"}),
+                         ("the selection directory inside the request tree", {"--selection": request / "sel"}),
+                         ("the images directory equal to the R3 parse", {"--images": scn.r3})):
+    arguments = {"--request": request, "--inventory": scn.inv, "--images": scn.imgs, "--r3-parse": scn.r3,
+                 "--selection": scn.sel, "--out": work / f"alias-{counter[0] + 1}", **overrides}
+    counter[0] += 1
+    expect_fail(f"an aliased input: {label}", ["parse-selection", *[x for item in arguments.items() for x in item]],
+                "selection-input-rejected", [arguments["--out"]])
+for label, out_path in (("an output inside the selection directory", scn.sel / "out"),
+                        ("an output inside the R3 parse", scn.r3 / "out"),
+                        ("an output inside the images directory", scn.imgs / "out"),
+                        ("an output over the request tree", request / "out"),
+                        ("an output that equals the inventory", scn.inv),
+                        ("an output that equals the selection directory", scn.sel)):
+    expect_fail(label, cli("parse-selection", scn, "--out", out_path), "selection-input-rejected")
+existing = work / "existing-out"
+existing.mkdir()
+expect_fail("an existing output", cli("parse-selection", scn, "--out", existing), "publish-rejected")
+expect_fail("verify with a parse inside the selection directory", cli("verify-selection", scn, "--parse", scn.sel / "sub"),
+            "selection-input-rejected")
+expect_fail("verify with a missing parse", cli("verify-selection", scn, "--parse", work / f"{CANARY}-none"), "selection-input-rejected")
+ok("extra, missing, forged, symlinked, hard-linked, executable, writable, special and aliased inputs are refused with fixed codes")
+
+# mount crossing, races and zero payload bytes
+real_mount = K.mount_id_for_fd
+
+
+def crossing(original):
+    def patched(*a, **kw):
+        calls = [0]
+
+        def mount(descriptor, label):
+            calls[0] += 1
+            return real_mount(descriptor, label) + (calls[0] > 1)
+        K.mount_id_for_fd = mount
+        try:
+            return original(*a, **kw)
+        finally:
+            K.mount_id_for_fd = real_mount
+    return patched
+
+
+mount_case = make(STANDARD, "mount", claim=None)
+with_patch(B, "read_selection_fixture", lambda original: crossing(original), lambda: expect_fail(
+    "a mount crossing inside the selection fixture", cli("parse-selection", mount_case, "--out", work / "m1"),
+    "selection-input-rejected", [work / "m1"]))
+
+
+def race(action, which=1):
+    def replacement(original):
+        calls = [0]
+
+        def patched(item):
+            data = original(item)
+            calls[0] += 1
+            if calls[0] == which:
+                action(item)
+            return data
+        return patched
+    return replacement
+
+
+for label, action_for in (
+    ("a file that grows after its read", lambda s: (lambda _i: open(s.sel / "witness.json", "ab").write(b"x"))),
+    ("a new file created while reading", lambda s: (lambda _i: (s.sel / "late.json").write_bytes(b"x"))),
+    ("a file replaced while reading", lambda s: (lambda _i: ((s.sel / "selection.json").rename(s.sel / "tmp.x"),
+                                                               (s.sel / "tmp.x").rename(s.sel / "selection.json")))),
+    ("a file removed while reading", lambda s: (lambda _i: (s.sel / "witness.json").unlink())),
+    ("a file chmod-ed while reading", lambda s: (lambda _i: (s.sel / "witness.json").chmod(0o600))),
+    ("the selection directory touched while reading", lambda s: (lambda _i: os.utime(s.sel, (1, 1)))),
+):
+    s = make(STANDARD, "race", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+    out = work / f"raceout-{counter[0]}"
+    with_patch(B, "read_selection_pinned", race(action_for(s), which=2), lambda: expect_fail(
+        label, cli("parse-selection", s, "--out", out), "selection-unstable", [out]))
+for label, patched_name, action_for in (
+    ("an image fixture file changed during the R3 reparse", "read_image_pinned", lambda s: (lambda _i: open(s.imgs / "boot_a.img", "ab").write(b"x"))),
+):
+    s = make(STANDARD, "race-images", claim=None)
+    out = work / f"raceout-{counter[0]}"
+    with_patch(B, patched_name, race(action_for(s), which=2), lambda: expect_fail(
+        label, cli("parse-selection", s, "--out", out), "image-unstable", [out]))
+ok("a mount crossing and every race observable before return are refused with fixed codes")
+# a later verify against a changed source rejects
+changed = make(STANDARD, "changed-after", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+published = work / "changed-after-out"
+expect_ok(*cli("parse-selection", changed, "--out", published))
+with open(changed.imgs / "vendor_boot_a.img", "r+b") as handle:
+    handle.seek(next(item for item in changed.images["vendor_boot_a"][1]["components"] if item["role"] == "dtb")["offset"] + 3)
+    handle.write(b"\xff")
+expect_fail("verification against a changed base image", cli("verify-selection", changed, "--parse", published),
+            "image-identity-mismatch")
+with open(changed.sel / "witness.json", "ab") as handle:
+    handle.write(b" ")
+fixed_images = make(STANDARD, "changed-sel", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+published2 = work / "changed-sel-out"
+expect_ok(*cli("parse-selection", fixed_images, "--out", published2))
+with open(fixed_images.sel / "witness.json", "ab") as handle:
+    handle.write(b" ")
+expect_fail("verification against a changed witness", cli("verify-selection", fixed_images, "--parse", published2), None)
+ok("verification against a changed image or witness is refused")
+
+reads = [0]
+real_read = os.read
+
+
+def counting(descriptor, count):
+    block = real_read(descriptor, count)
+    try:
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+    except OSError:
+        target = ""
+    if target.endswith(("/selection.json", "/witness.json")):
+        reads[0] += len(block)
+    return block
+
+
+os.read = counting
+try:
+    for label, mutate in (("extra bootconfig.txt", lambda s: (s.sel / "bootconfig.txt").write_bytes(b"x")),
+                          ("missing witness", lambda s: (s.sel / "witness.json").unlink()),
+                          ("symlinked selection", lambda s: ((s.sel / "selection.json").unlink(), (s.sel / "selection.json").symlink_to(s.inv))),
+                          ("executable witness", lambda s: (s.sel / "witness.json").chmod(0o755)),
+                          ("writable selection", lambda s: (s.sel / "selection.json").chmod(0o666)),
+                          ("oversized witness", lambda s: (s.sel / "witness.json").write_bytes(b" " * 4097))):
+        s = make(STANDARD, "zero-read", claim=None)
+        reads[0] = 0
+        mutate(s)
+        code, _out, _err = invoke(*cli("parse-selection", s, "--out", work / f"zr-{counter[0]}"))
+        assert code != 0 and reads[0] == 0, (label, reads[0])
+finally:
+    os.read = real_read
+ok("a closure or metadata defect found before traversal reads zero selection payload bytes")
+
+# one buffer: the fixture hash, the R3 recomputation and the FDT parse see the same bytes
+seen = []
+real_component = B.parse_fdt_component
+
+
+def spy(component):
+    seen.append(digest(component))
+    return real_component(component)
+
+
+B.parse_fdt_component = spy
+try:
+    single = make(standard_images(), "single", claim=None)
+    expect_ok(*cli("parse-selection", single, "--out", work / "single-out"))
+finally:
+    B.parse_fdt_component = real_component
+base_data, base_meta = single.images["vendor_boot_a"]
+dtb_meta = next(item for item in base_meta["components"] if item["role"] == "dtb")
+assert seen and all(entry == digest(base_data[dtb_meta["offset"]:dtb_meta["offset"] + dtb_meta["size"]]) for entry in seen)
+ok("the parsed device tree bytes are exactly the dtb component of the admitted, hash-checked image buffer")
+
+# --- forged outputs and cross-command refusals ------------------------------------------------------------
+
+
+def forge(label, mutate, code=None):
+    target = work / f"forged-{counter[0] + 1}"
+    counter[0] += 1
+    shutil.copytree(out_dir, target)
+    for path in [target, *target.rglob("*")]:
+        os.chmod(path, 0o755 if path.is_dir() else 0o644)
+    mutate(target)
+    expect_fail(label, cli("verify-selection", scn, "--parse", target), code)
+
+
+def rewrite(relative, edit):
+    def mutate(target):
+        path = target / relative
+        value = json.loads(path.read_text())
+        edit(value)
+        path.write_bytes(jbytes(value))
+        (target / "SHA256SUMS").write_text("".join(
+            f"{digest((target / p).read_bytes())}  {p}\n"
+            for p in sorted(["parse.json", f"operations/{R4}.json"], key=lambda p: p.encode())))
+    return mutate
+
+
+forge("an extra file in the parse", lambda t: (t / "extra").write_text("x"))
+forge("a witness copy in the parse", lambda t: (t / "witness.json").write_bytes(scn.witness_bytes))
+forge("a binary copy in the parse", lambda t: (t / "dtbo_a.img").write_bytes(b"x"))
+forge("a missing SHA256SUMS", lambda t: (t / "SHA256SUMS").unlink())
+forge("a changed SHA256SUMS", lambda t: (t / "SHA256SUMS").write_text("0" * 64 + "  parse.json\n"))
+forge("a changed operation byte", lambda t: (t / f"operations/{R4}.json").write_bytes(
+    (t / f"operations/{R4}.json").read_bytes().replace(b"qcom", b"qcox", 1)))
+forge("an operation with bytes_read changed", rewrite(f"operations/{R4}.json", lambda v: v.update(bytes_read=v["bytes_read"] + 1)))
+forge("an operation with a changed dtb count", rewrite(f"operations/{R4}.json", lambda v: v["data"].update(dtb_count=2)))
+forge("an operation with a selected board id", rewrite(f"operations/{R4}.json", lambda v: v["data"].update(FULL)))
+forge("a parse with an authority flag set", rewrite("parse.json", lambda v: v["authority"].update({next(iter(v["authority"])): True})))
+forge("a parse with a blocker dropped", rewrite("parse.json", lambda v: v["blockers"].pop()))
+forge("a parse with changed accounting", rewrite("parse.json", lambda v: v["accounting"].update(hardware_bytes_read=1)))
+forge("a parse claiming hardware qualification", rewrite("parse.json", lambda v: v["qualification"].update(hardware_qualified=True)))
+forge("a parse claiming captured provenance", rewrite("parse.json", lambda v: v["provenance"].update(captured=True)))
+forge("a parse promoting the membership result", rewrite("parse.json", lambda v: v["membership"].update(promoted_to_selection=True)))
+forge("a parse with a decoded entry promoted to the operation",
+      rewrite("parse.json", lambda v: v["operation"].update(selected_board_id=9)))
+forge("a parse bound to another request", rewrite("parse.json", lambda v: v.update(request_sha256="4" * 64)))
+forge("a parse with its R3 binding changed", rewrite("parse.json", lambda v: v.update(r3_parse_sha256="5" * 64)))
+forge("a parse with its witness binding changed", rewrite("parse.json", lambda v: v.update(witness_sha256="6" * 64)))
+forge("a parse with a deferred state closed", rewrite("parse.json", lambda v: v["deferred"][0].update(state="implemented")))
+forge("a parse with a not-established item dropped", rewrite("parse.json", lambda v: v["not_established"].pop()))
+forge("a mode change", lambda t: os.chmod(t / "parse.json", 0o600))
+forge("a symlinked parse file", lambda t: ((t / "parse.json").unlink(), (t / "parse.json").symlink_to(t / "SHA256SUMS")))
+forge("an executable parse file", lambda t: os.chmod(t / "parse.json", 0o755))
+other_selection = make(STANDARD, "other-sel", claim={"dtb_index": 2, "dtbo_entry_index": 1})
+expect_fail("verify against another witness claim", cli("verify-selection", other_selection, "--parse", out_dir), None)
+expect_fail("verify against another fixture", cli("verify-selection", ta, "--parse", out_dir), None)
+expect_fail("verify-images refuses a selection artifact", ["verify-images", "--request", request, "--inventory", scn.inv,
+                                                          "--images", scn.imgs, "--parse", out_dir])
+expect_fail("verify-parse refuses a selection artifact", ["verify-parse", "--request", request, "--reads", scn.imgs, "--parse", out_dir])
+expect_fail("verify-selection refuses an R3 artifact", ["verify-selection", "--request", request, "--inventory", scn.inv,
+                                                       "--images", scn.imgs, "--r3-parse", scn.r3, "--selection", scn.sel,
+                                                       "--parse", scn.r3])
+# command scopes: GPT commands are R2-only, image commands R3-only, selection commands R4-only
+for command, arguments in (("parse", ["--request", request, "--reads", scn.imgs, "--out", work / "sc1"]),
+                           ("parse-images", ["--request", request, "--inventory", scn.inv, "--images", scn.imgs, "--out", work / "sc2"])):
+    code, out_text, err_text = invoke(command, *arguments, "--selection", scn.sel)
+    assert code != 0 and err_text.startswith("ERROR: invalid command line"), command
+for arguments in (["--request", request, "--inventory", scn.inv, "--images", scn.imgs, "--selection", scn.sel, "--out", work / "sc3"],
+                  ["--request", request, "--inventory", scn.inv, "--images", scn.imgs, "--r3-parse", scn.r3, "--out", work / "sc4"],
+                  ["--request", request, "--reads", scn.imgs, "--r3-parse", scn.r3, "--selection", scn.sel, "--out", work / "sc5"]):
+    code, out_text, err_text = invoke("parse-selection", *arguments)
+    assert code != 0 and err_text.startswith("ERROR: invalid command line"), arguments
+plan_gpt, _ = expect_ok("plan", "--request", request)
+assert plan_gpt["qualification"]["command_scope"]["parse"] == [R2] and plan_gpt["request_binding"]["operation"] == R2
+plan_images, _ = expect_ok("plan-images", "--request", request, "--inventory", scn.inv)
+assert plan_images["request_binding"]["operation"] == R3
+ok("forged outputs, bindings, null-triple promotions, authority, accounting and stale stamps are refused; the three command scopes stay separate")
+
+# --- publication: failures, races and output substitution ------------------------------------------------------
+
+out = work / "publish-fail"
+with_patch(D, "publish", lambda original: (lambda *a, **kw: (_ for _ in ()).throw(
+    D.DeploymentError(f"cannot publish /{CANARY}: Invalid argument"))),
+    lambda: expect_fail("a deployment publish failure", cli("parse-selection", scn, "--out", out), "publish-rejected", [out]))
+real_publish = D.publish
+race_scn = make(STANDARD, "publish-race", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+out = work / "publish-race-out"
+
+
+def racing_publish(out_path, protected, ids, spec, verify_built):
+    def wrapped(temporary, descriptor):
+        (race_scn.sel / "witness.json").write_bytes(jbytes({**race_scn.witness_doc, "claim": {"dtb_index": 2, "dtbo_entry_index": 0}}))
+        return verify_built(temporary, descriptor)
+    return real_publish(out_path, protected, ids, spec, wrapped)
+
+
+D.publish = racing_publish
+try:
+    expect_fail("a witness changed between the build and the published verification",
+                cli("parse-selection", race_scn, "--out", out), None, [out])
+finally:
+    D.publish = real_publish
+substitute = make(STANDARD, "publish-substitute", claim=None)
+out = work / "publish-substitute-out"
+
+
+def substituting_publish(out_path, protected, ids, spec, verify_built):
+    os.mkdir(out_path)  # an output appears after the checks and before the no-replace publish
+    return real_publish(out_path, protected, ids, spec, verify_built)
+
+
+D.publish = substituting_publish
+try:
+    expect_fail("an output substituted before the no-replace publish", cli("parse-selection", substitute, "--out", out),
+                "publish-rejected")
+    assert os.listdir(out) == [], "the substituted output is left untouched"
+finally:
+    D.publish = real_publish
+ok("publication failures are one fixed code, a changed witness is caught by the published verification, and a substituted output is never replaced")
+
+# --- privacy -----------------------------------------------------------------------------------------------
+
+hostile = make(STANDARD, f"{CANARY}-privacy", claim=None)
+(hostile.sel / "selection.json").write_bytes(b"\xff" * 64 + CANARY.encode() * 4)
+code, out_text, err_text = invoke(*cli("parse-selection", hostile, "--out", work / f"{CANARY}-out"))
+assert code != 0 and out_text == "" and CANARY not in err_text and str(work) not in err_text, err_text
+code, out_text, err_text = invoke("parse-selection", "--request", f"{work}/{CANARY}/\x1b[31m", "--inventory", scn.inv,
+                                  "--images", scn.imgs, "--r3-parse", scn.r3, "--selection", scn.sel, "--out", work / "pv")
+assert code != 0 and CANARY not in err_text and "\x1b" not in err_text and err_text.count("\n") == 1, err_text
+code, out_text, err_text = invoke("parse-selection", f"--{CANARY}", "x")
+assert code != 0 and CANARY not in err_text and err_text.count("\n") == 1, err_text
+hostile_dtb = S.fdt(compatible=(CANARY.encode(),), children=[S.node(CANARY.encode())]) + S.fdt()
+s = make(standard_images(dtb=hostile_dtb), f"{CANARY}-dtb", claim={"dtb_index": 1, "dtbo_entry_index": 0})
+_, out = parse_ok(s)
+for path in out.rglob("*"):
+    if path.is_file():
+        assert CANARY.encode() not in path.read_bytes(), path.name
+broken = S.fdt(compatible=(CANARY.encode(),)) + S.fdt(header={"magic": 0})
+s = make(standard_images(dtb=broken), f"{CANARY}-broken", claim=None)
+expect_fail("a corrupt device tree whose strings carry the canary", cli("parse-selection", s, "--out", work / "pv2"),
+            "selection-corrupt", [work / "pv2"])
+ok("hostile paths, names, bytes, compatible strings and options never reach a diagnostic or an output")
+
+# --- descriptors -------------------------------------------------------------------------------------------
+
+before = len(os.listdir("/proc/self/fd"))
+expect_ok(*cli("verify-selection", scn, "--parse", out_dir))
+expect_fail("a failing verify", cli("verify-selection", ta, "--parse", out_dir), None)
+fd_case = make(STANDARD, "fd", claim=None, manifest_edit=lambda m: m.update(images_sha256="7" * 64))
+expect_fail("a failing parse", cli("parse-selection", fd_case, "--out", work / "fd-out"), "selection-binding-mismatch")
+assert len(os.listdir("/proc/self/fd")) == before, "descriptors leaked"
+print("ok - myron bootchain selection tests passed")
+PY
+
+pass "myron bootchain selection tests passed"

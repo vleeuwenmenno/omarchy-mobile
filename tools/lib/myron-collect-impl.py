@@ -24,11 +24,11 @@ import stat
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO = Path(__file__).resolve().parent.parent
 PREFLIGHT_TOOL = REPO / "tools/myron-preflight"
-PINNED_VERSIONS = {"preflight": "0.3.0", "snapshot": "0.2.0", "deployment": "0.4.0"}
-OPERATION_SCHEMA = 2  # every R1-R7 envelope; schema 1 and a mix of generations are refused
+PINNED_VERSIONS = {"preflight": "0.4.0", "snapshot": "0.2.0", "deployment": "0.4.0"}
+OPERATION_SCHEMA = 3  # every R1-R7 envelope; schemas 1 and 2 and a mix of generations are refused
 READ_DOMAIN = "fixture"  # the only domain: no hardware transport exists
 ENVELOPE_KEYS = [
     "schema", "kind", "id", "request_sha256", "transport", "read_domain", "read_only",
@@ -382,16 +382,19 @@ def r3_profile() -> dict:
                            "min_entries": 1, "max_entries": MAX_DT_ENTRIES}),
         ],
     }
-# The board id and revision are null together (no board selected) or set together.
+# The board id, board revision and selection source are null together (no selection is
+# established) or all set together. A zero id or revision is a value, not an absence.
 DTB_FIELDS = {
     "dtb_count": _int(0, 64),
     "selected_board_id": _nullable(_int(0, 2**32 - 1)),
     "selected_board_revision": _nullable(_int(0, 2**32 - 1)),
     "dtbo_entry_count": _int(0, 256),
     "compatible_prefix": _identity("device.compatible"),
-    "selection_source": _enum(["bootconfig", "device-tree", "dtbo-header"]),
+    "selection_source": _nullable(_enum(["bootconfig", "device-tree", "dtbo-header"])),
 }
-DTB_CONSTRAINTS = [_null_together("selected_board_id", "selected_board_revision")]
+DTB_CONSTRAINTS = [
+    _null_together("selected_board_id", "selected_board_revision", "selection_source"),
+]
 
 
 def policy_registry() -> dict:

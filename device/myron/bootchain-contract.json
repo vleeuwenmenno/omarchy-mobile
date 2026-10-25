@@ -58,11 +58,11 @@
   "components": {
     "capture_contract": {
       "path": "device/myron/capture-contract.json",
-      "sha256": "7948af6d5b9f90e76062956833956b94aabfe8a817f0e4fe1db40793fb2a8e86"
+      "sha256": "0d9bcbe04e11b813e765149dc2265ce689d3755ab3445fb2c4f4feb5f5a769f1"
     },
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "420b98ccf4e9dc8d900f2584b5af7d44dc5b38110c8a035ba56d8cf575d8dc4d"
+      "sha256": "31abcfe10bff616834c8ca7eda3047f92a164dc117ca65f036754f6a826aef5b"
     }
   },
   "coverage": {
@@ -155,7 +155,23 @@
         "state": "unresolved"
       },
       {
-        "claim": "r4-selection-provenance-successor-required",
+        "claim": "r4-selection-provenance-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r4-selection-source-semantics-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r4-actual-myron-witness-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r4-selection-freshness-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r4-multi-overlay-ordering-not-established",
         "state": "unresolved"
       }
     ]
@@ -165,9 +181,12 @@
       "id": "R4-dtb-dtbo-selection",
       "requires": [
         "a concrete selected-index source: parsing a DTBO or FDT does not prove selection",
-        "an actual Myron witness and contract cross-checks"
+        "an actual Myron witness and contract cross-checks",
+        "captured provenance and freshness of the witness and of the images it indexes",
+        "a qualified source semantics: which partition, format and field names the live selection",
+        "an ordering model for more than one overlay: this synthetic gate binds one base and one overlay index"
       ],
-      "state": "not-implemented",
+      "state": "hardware-witness-required",
       "successor_gate": "r4-selection-source-qualification"
     }
   ],
@@ -184,7 +203,7 @@
   },
   "evidence_level": "synthetic-binary-parser-only",
   "executes": false,
-  "format_version": "0.3.0",
+  "format_version": "0.4.0",
   "human_approval_required": true,
   "identity": {
     "device.codename": "myron",
@@ -228,7 +247,7 @@
         "R7-kernel-identity-revalidation"
       ],
       "operation_kind": "myron-precaptured-operation",
-      "operation_schema": 2,
+      "operation_schema": 3,
       "produces": [
         "R3-boot-image-headers"
       ],
@@ -698,7 +717,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-bootchain-impl.py",
-    "sha256": "0906017a0f8dbc5e09bba06b71fdeae95a65823046975c9e06173df88fde9573"
+    "sha256": "8522a930d07fa7c082119cc32a1da3e18eabedbdd4c66aa39e4768206a789b06"
   },
   "input": {
     "closure": [
@@ -882,7 +901,7 @@
     "header bytes after the 92-byte header must be zero: a profile restriction, not universal GPT validity",
     "a partition name fills at most 35 UTF-16 units and must be NUL terminated (a profile restriction)",
     "bootable_flag is legacy-bios-bootable-bit and proves no Android priority, success, active slot, bootability or recovery viability",
-    "R4 selection is not implemented: it is a recorded successor gate. The GPT parse produces only the R2 operation fragment and the image parse produces only the R3 operation fragment: neither is a capture",
+    "the GPT parse produces only the R2 operation fragment, the image parse only the R3 operation fragment and the selection parse only an R4 fragment with a null selection triple: none is a capture, and which board a real device selects stays a recorded hardware-witness successor gate",
     "bytes_read is fixture payload accounting only: it counts consumed fixture bytes and is no device I/O",
     "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
     "the bootchain contract pins the bootchain implementation bytes; the collector implementation is bound only through the capture contract",
@@ -897,7 +916,7 @@
     "hardware evidence or captured provenance",
     "authorization of any read, deployment or boot",
     "closing any blocker",
-    "R4 DTB or DTBO selection, hardware acquisition of images, or any complete R1-R7 capture",
+    "an actual R4 DTB or DTBO selection, a selected board id, revision or source, hardware acquisition of images, or any complete R1-R7 capture",
     "Android slot, priority, success or recovery qualification"
   ],
   "output": {
@@ -957,9 +976,9 @@
     "verification": "recompute-from-request-and-reads-byte-for-byte"
   },
   "pinned_versions": {
-    "collector": "0.2.0",
+    "collector": "0.3.0",
     "deployment": "0.4.0",
-    "preflight": "0.3.0",
+    "preflight": "0.4.0",
     "snapshot": "0.2.0"
   },
   "profile": {
@@ -1143,23 +1162,540 @@
       ],
       "parse-images": [
         "R3-boot-image-headers"
+      ],
+      "parse-selection": [
+        "R4-dtb-dtbo-selection"
       ]
     },
     "deferred_operations": [
       {
         "id": "R4-dtb-dtbo-selection",
-        "state": "not-implemented",
+        "state": "hardware-witness-required",
         "successor_gate": "r4-selection-source-qualification"
       }
     ],
     "hardware_qualified": false,
     "implemented_operations": [
       "R2-gpt-and-recovery-inventory",
-      "R3-boot-image-headers"
-    ]
+      "R3-boot-image-headers",
+      "R4-dtb-dtbo-selection"
+    ],
+    "r4_capability": {
+      "captured_provenance": false,
+      "counts_from_synthetic_bytes": true,
+      "hardware_qualified": false,
+      "selected_board_fields_produced": false,
+      "synthetic_index_binding": true
+    }
   },
   "remote_commands": [],
   "schema": 1,
+  "selection_parser": {
+    "accounting": {
+      "M": "per image the union of the reused R3 metadata coverage and, for the one base image, the complete parsed base-DTB component range, overlap counted once, summed: represented_metadata_bytes, no hardware read",
+      "O": "canonical serialized R4 operation bytes including newline and whitespace",
+      "S": "complete R3 fixture bytes (images.json plus every present image) plus selection.json plus witness.json: operation bytes_read, fixture_payload_bytes and fixture_payload_read_bytes",
+      "bound_sources": {
+        "M": "collector R4 max_hardware_read_bytes",
+        "O": "collector R4 max_output_bytes",
+        "S": "collector R4 max_fixture_input_bytes"
+      },
+      "bounds": {
+        "M_max_bytes": 65536,
+        "O_max_bytes": 65536,
+        "S_max_bytes_per_gather": 67121152,
+        "hardware_read_max_bytes": 65536,
+        "image_max_bytes": 16777216,
+        "output_total_max_bytes": 197632,
+        "parse_json_max_bytes": 131072,
+        "sha256sums_max_bytes": 1024
+      },
+      "dependency_reads": "the request tree, the R2 inventory and the R3 parse artifact are dependency reads reported separately and never counted in S",
+      "hardware_bytes_read": 0,
+      "hardware_transport": "none",
+      "rereads": "parse-selection gathers three times and verify-selection twice: each gather is bounded by S separately",
+      "scope": "one-admitted-fixture-snapshot"
+    },
+    "binding": {
+      "binds": [
+        "bootchain_contract_sha256",
+        "request_sha256",
+        "inventory_sha256",
+        "r3_parse_sha256",
+        "r3_operation_sha256",
+        "images_sha256",
+        "base_source_partition",
+        "dtbo_source_partition",
+        "witness_bytes",
+        "witness_sha256"
+      ],
+      "original_r3_fixture": "the exact image fixture bytes the R3 parser admitted: no detached dtb or dtbo copy",
+      "r3_artifact": "recomputed from the exact admitted image buffers and compared entry for entry and byte for byte with --r3-parse",
+      "r3_metadata_hashes_alone": "insufficient: they do not bind the payload",
+      "witness_hashed_one_way": "selection.json hashes witness.json; the witness never hashes the manifest"
+    },
+    "capability": {
+      "captured_provenance": false,
+      "counts_from_synthetic_bytes": true,
+      "hardware_qualified": false,
+      "selected_board_fields_produced": false,
+      "synthetic_index_binding": true
+    },
+    "capture": {
+      "collector_transport_label_is_not_provenance": true,
+      "complete_capture": false,
+      "does_not_produce": [
+        "R1-identity-and-slot",
+        "R2-gpt-and-recovery-inventory",
+        "R3-boot-image-headers",
+        "R5-module-load-order",
+        "R6-storage-and-mount-model",
+        "R7-kernel-identity-revalidation"
+      ],
+      "operation_kind": "myron-precaptured-operation",
+      "operation_schema": 3,
+      "produces": [
+        "R4-dtb-dtbo-selection"
+      ],
+      "read_domain": "fixture",
+      "selection_triple": "always-null",
+      "transport": "external-precaptured-fixture",
+      "validated_by": [
+        "validate_operation",
+        "null-selection-triple"
+      ]
+    },
+    "commands": [
+      "plan-selection",
+      "parse-selection",
+      "verify-selection"
+    ],
+    "diagnostics": {
+      "codes": {
+        "publish-rejected": "the output could not be published safely",
+        "selection-binding-mismatch": "the selection fixture, witness or R3 parse disagrees with its bindings or the exact R3 fixture",
+        "selection-budget": "a count, size or accounting bound was exceeded",
+        "selection-corrupt": "the device tree or DT table bytes are internally inconsistent",
+        "selection-input-rejected": "the selection fixture, an input path or a dependency artifact failed safe admission",
+        "selection-operation-rejected": "the collector or this parser refused the produced R4 operation",
+        "selection-unstable": "an input changed while it was admitted or read",
+        "selection-unsupported": "the bytes may be valid but lie outside the supported selection profile",
+        "selection-witness-rejected": "the witness is malformed or its claim is not a member of the parsed sets"
+      },
+      "shared": "the shared request, R2 inventory and R3 image admission keep their documented request-rejected and image-* codes",
+      "value_free": "fixed categories only: untrusted paths, names, bytes, sizes, hashes, board ids, compatible strings and exception text are never echoed"
+    },
+    "evidence_level": "synthetic-binary-selection-count-and-index-membership-only",
+    "executes": false,
+    "formats": {
+      "dt_table": {
+        "decoded": "only for the sidecar's claimed entry; duplicates allowed; custom words opaque; payload never parsed",
+        "entries": {
+          "max": 256,
+          "min": 1
+        },
+        "entry_words": {
+          "id": {
+            "bytes": 4,
+            "endian": "big",
+            "offset": 8
+          },
+          "revision": {
+            "bytes": 4,
+            "endian": "big",
+            "offset": 12
+          }
+        },
+        "layout": "the R3 DT table v0 layout rules, reused",
+        "never_infers_selection_by": [
+          "id",
+          "singleton",
+          "highest-revision",
+          "entry-0"
+        ]
+      },
+      "fdt": {
+        "classification": "malformed is corrupt, valid but outside the profile is unsupported, numeric overruns are budget",
+        "component": "the exact R3 dtb component: one blob or tightly concatenated blobs, no scan, no gap, no trailing byte",
+        "empty_component": "unsupported",
+        "endian": "big",
+        "header_bytes": 40,
+        "last_comp_version": 16,
+        "limits": {
+          "blobs": 64,
+          "compatible_token_bytes": [
+            1,
+            64
+          ],
+          "compatible_tokens": [
+            1,
+            16
+          ],
+          "depth": 64,
+          "name_bytes": 128,
+          "nodes": 4096,
+          "properties_per_blob": 8192
+        },
+        "match": "exact token equality with the contract compatible",
+        "root_compatible": "root node only; duplicate root compatible is corrupt; missing is unsupported",
+        "validated": [
+          "magic",
+          "header",
+          "block extents and alignment",
+          "reserve map terminator",
+          "structure tokens",
+          "balanced iterative traversal",
+          "string references",
+          "single FDT_END",
+          "zero gaps and slack",
+          "exact component consumption"
+        ],
+        "version": 17
+      }
+    },
+    "independently_versioned": true,
+    "input": {
+      "bootconfig_txt": "rejected as an extra file: bootconfig is not parsed",
+      "closure": [
+        "selection.json",
+        "witness.json"
+      ],
+      "closure_checked_before_payload_read": true,
+      "configurable": "nothing: caller paths, offsets, parser names, algorithms and limits are fixed here",
+      "entries_max": 3,
+      "extra_entries": "reject",
+      "files": [
+        {
+          "max_bytes": 8192,
+          "min_bytes": 1,
+          "path": "selection.json",
+          "role": "selection-manifest"
+        },
+        {
+          "max_bytes": 4096,
+          "min_bytes": 1,
+          "path": "witness.json",
+          "role": "synthetic-witness"
+        }
+      ],
+      "json": "strict canonical ASCII; duplicate keys, floats, booleans for integers rejected",
+      "layout": "flat",
+      "safety": [
+        "flat-tree-only",
+        "exact-closure-before-payload-read",
+        "no-symlinks",
+        "no-hardlinks",
+        "no-executable-files",
+        "no-special-files",
+        "no-mount-crossing",
+        "no-writable-ancestry",
+        "no-aliases-of-inputs",
+        "stable-while-read",
+        "metadata-admitted-before-payload-read",
+        "names-revalidated-after-read",
+        "closure-derived-from-admitted-manifest",
+        "immutable-captured-buffers",
+        "value-free-diagnostics",
+        "trusted-inventory-file",
+        "exact-r3-fixture-reparse",
+        "witness-hashed-one-way"
+      ],
+      "schemas": {
+        "selection.json": {
+          "fields": {
+            "base_source_partition": {
+              "type": "enum",
+              "values": [
+                "boot",
+                "boot_a",
+                "boot_b",
+                "recovery",
+                "recovery_a",
+                "recovery_b",
+                "vendor_boot",
+                "vendor_boot_a",
+                "vendor_boot_b",
+                "vendor_kernel_boot",
+                "vendor_kernel_boot_a",
+                "vendor_kernel_boot_b"
+              ]
+            },
+            "bootchain_contract_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "dtbo_source_partition": {
+              "type": "enum",
+              "values": [
+                "dtbo",
+                "dtbo_a",
+                "dtbo_b"
+              ]
+            },
+            "format_version": {
+              "max": 1,
+              "min": 1,
+              "type": "int"
+            },
+            "images_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "inventory_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "kind": {
+              "type": "enum",
+              "values": [
+                "myron-synthetic-r4-selection"
+              ]
+            },
+            "r3_operation_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "r3_parse_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "request_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "schema": {
+              "max": 1,
+              "min": 1,
+              "type": "int"
+            },
+            "synthetic": {
+              "const": true,
+              "type": "bool"
+            },
+            "witness_bytes": {
+              "max": 4096,
+              "min": 1,
+              "type": "int"
+            },
+            "witness_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            }
+          }
+        },
+        "witness.json": {
+          "fields": {
+            "base_source_partition": {
+              "type": "enum",
+              "values": [
+                "boot",
+                "boot_a",
+                "boot_b",
+                "recovery",
+                "recovery_a",
+                "recovery_b",
+                "vendor_boot",
+                "vendor_boot_a",
+                "vendor_boot_b",
+                "vendor_kernel_boot",
+                "vendor_kernel_boot_a",
+                "vendor_kernel_boot_b"
+              ]
+            },
+            "claim": {
+              "of": {
+                "fields": {
+                  "dtb_index": {
+                    "max": 63,
+                    "min": 0,
+                    "type": "int"
+                  },
+                  "dtbo_entry_index": {
+                    "max": 255,
+                    "min": 0,
+                    "type": "int"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "nullable"
+            },
+            "dtbo_source_partition": {
+              "type": "enum",
+              "values": [
+                "dtbo",
+                "dtbo_a",
+                "dtbo_b"
+              ]
+            },
+            "format_version": {
+              "max": 1,
+              "min": 1,
+              "type": "int"
+            },
+            "kind": {
+              "type": "enum",
+              "values": [
+                "myron-synthetic-r4-witness"
+              ]
+            },
+            "r3_operation_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "request_sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            },
+            "schema": {
+              "max": 1,
+              "min": 1,
+              "type": "int"
+            },
+            "synthetic": {
+              "const": true,
+              "type": "bool"
+            }
+          }
+        }
+      },
+      "scope": {
+        "base_source_partitions": [
+          "boot",
+          "boot_a",
+          "boot_b",
+          "recovery",
+          "recovery_a",
+          "recovery_b",
+          "vendor_boot",
+          "vendor_boot_a",
+          "vendor_boot_b",
+          "vendor_kernel_boot",
+          "vendor_kernel_boot_a",
+          "vendor_kernel_boot_b"
+        ],
+        "dtbo_source_partitions": [
+          "dtbo",
+          "dtbo_a",
+          "dtbo_b"
+        ],
+        "init_boot": "never a base source: it carries no dtb",
+        "slot_suffix": "the two source partitions must share one suffix: a synthetic profile restriction, no active-slot claim"
+      },
+      "snapshot_claim": "descriptor-read snapshot only: not atomic, no writer exclusion",
+      "witness": {
+        "binds": [
+          "request_sha256",
+          "r3_operation_sha256",
+          "base_source_partition",
+          "dtbo_source_partition"
+        ],
+        "claim": "null or exactly dtb_index 0..63 and dtbo_entry_index 0..255",
+        "meaning": "synthetic unverified claim: membership and binding only"
+      }
+    },
+    "kinds": {
+      "manifest": "myron-synthetic-r4-selection",
+      "parse": "myron-synthetic-r4-selection-parse",
+      "plan": "myron-synthetic-r4-selection-parse-plan",
+      "witness": "myron-synthetic-r4-witness"
+    },
+    "limitations": [
+      "synthetic binary parser qualification only: the fixture bytes were never read from a phone or a block device and carry no captured provenance",
+      "the mechanism establishes counts and index membership only: it never produces a selected board id, revision or selection source, and closes no hardware-witness gate",
+      "hardware discovery may reveal another source or format: this is the final planned synthetic gate, not guaranteed final parser work",
+      "one base DTB partition (boot, recovery, vendor_boot or vendor_kernel_boot, with a boot v2 or a vendor_boot dtb component) and one dtbo partition with the same slot suffix; no active-slot claim",
+      "FDT v17 with last_comp_version 16 only, at most 64 tightly concatenated blobs, depth 64, 4096 nodes, 8192 properties, 128-byte names and a 1..16 token root compatible list; other valid variants are refused as unsupported, numeric overruns as budget, malformed bytes as corrupt",
+      "an empty dtb component and a dtb component without a root compatible are refused as unsupported: the parser never invents a candidate",
+      "DT table v0 with the R3 layout rules; a table with more than 256 entries is refused by the shared R3 admission under its image-budget code before any R4 code runs",
+      "the R3 fixture is reparsed and the R3 artifact recomputed from the exact admitted buffers; the R3 artifact's metadata hashes alone would not bind the payload and are never trusted without that recomputation",
+      "operation bytes_read is S and is fixture payload accounting, no device I/O; the request, R2 inventory and R3 artifact dependency reads are reported separately",
+      "each complete gather admits at most 64 MiB plus 12 KiB (S): parse-selection gathers three times (admission, temporary and published verification) and verify-selection twice, so total invocation I/O exceeds S",
+      "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot and not writer exclusion; a later verify against a changed source rejects",
+      "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
+      "publication is durable only if the output parent's fsync succeeds; a failure there removes the just-published output by identity on a best-effort basis"
+    ],
+    "live": false,
+    "membership": {
+      "claim_null": "no membership check; counts only",
+      "claim_set": [
+        "both indexes inside the parsed counts",
+        "the chosen base candidate carries the exact contract compatible token",
+        "the selected table entry id and revision are decoded into the sidecar only"
+      ],
+      "promotion": "never: a membership result and a decoded entry do not become selected_board_* fields"
+    },
+    "not_established": [
+      "actual-selected-board-id",
+      "actual-selected-board-revision",
+      "actual-selection-source",
+      "selection-provenance",
+      "selection-freshness",
+      "selection-source-semantics",
+      "board-semantics",
+      "multi-overlay-ordering"
+    ],
+    "operation": {
+      "compatible_prefix": "the capture contract's device.compatible constant",
+      "dtb_count": "parsed blob count",
+      "dtbo_entry_count": "parsed DT table entry count",
+      "selected_board_id": null,
+      "selected_board_revision": null,
+      "selection_source": null
+    },
+    "output": {
+      "binary_copies": false,
+      "checksums": {
+        "covers": [
+          "parse.json",
+          "operations/R4-dtb-dtbo-selection.json"
+        ],
+        "path": "SHA256SUMS",
+        "sorted": "canonical-byte-order-of-path"
+      },
+      "deterministic": true,
+      "directories": [
+        "operations"
+      ],
+      "extra_entries": "reject",
+      "files": [
+        "SHA256SUMS",
+        "operations/R4-dtb-dtbo-selection.json",
+        "parse.json"
+      ],
+      "kind": "myron-synthetic-r4-selection-parse",
+      "max_bytes": {
+        "SHA256SUMS": 1024,
+        "operations/R4-dtb-dtbo-selection.json": 65536,
+        "parse.json": 131072,
+        "total": 197632
+      },
+      "modes": {
+        "directories": "0755",
+        "files": "0644"
+      },
+      "published": "atomic-no-replace",
+      "verification": "recompute-from-request-inventory-images-r3-parse-and-selection-byte-for-byte",
+      "witness_copies": false
+    },
+    "profile": "r4-synthetic-fdt-v17-dt-table-v0-index-membership-only",
+    "semantic_limits": [
+      "dtb_count and dtbo_entry_count are counts parsed from the admitted synthetic bytes: FDT blobs in the one chosen base partition's dtb component and entries of the one chosen DT table",
+      "selected_board_id, selected_board_revision and selection_source are always null: no actual selection, source, provenance or freshness is established",
+      "the witness indexes are unverified synthetic claims: membership is a computed check that the claimed indexes lie inside the parsed sets and that the claimed base candidate carries the exact contract compatible token",
+      "a decoded DT table entry id and revision appear only in the parse sidecar as the claimed entry's raw big-endian words: never an operation field and never a selected board",
+      "no selection is inferred from an id, a singleton, the highest revision or entry 0; duplicate ids and revisions are valid",
+      "DT table custom words are opaque and a DTBO payload is never parsed as a device tree",
+      "the root compatible check matches one exact token and implies no board, SoC variant or boot behavior",
+      "one base source and one overlay index only: no multi-overlay ordering, no live merged tree and no complete-device claim",
+      "bootconfig is not parsed: an extra bootconfig.txt is refused and no androidboot key or board semantics are interpreted",
+      "the matching slot suffix of the two source partitions is a synthetic profile restriction, not an active-slot claim"
+    ],
+    "status": "synthetic-r4-parse-recorded",
+    "synthetic": true,
+    "transport": "synthetic-binary-selection-fixture",
+    "version": "1.0.0"
+  },
   "status": "synthetic-parse-recorded",
   "synthetic": true,
   "transport": "synthetic-binary-gpt-fixture"

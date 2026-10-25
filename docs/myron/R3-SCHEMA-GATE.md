@@ -29,7 +29,13 @@ bootchain row below is the Phase A state.
 | `tools/myron-preflight` | 0.3.0 | capture schema `myron-capture-evidence-v2`, three separate budgets per requested read, R3 emits as leaf paths |
 | `tools/lib/myron-collect-impl.py` | 0.2.0 | operation schema 2 with `read_domain`, nested typed policy engine, R3 profile and rules |
 | `tools/lib/myron-session-impl.py` | 0.2.0 | R3 summary input generation 2 (1 MiB), nested coverage registry |
-| `tools/lib/myron-bootchain-impl.py` | 0.2.0 (0.3.0 in Phase 2.15B) | GPT to R2 only; operation schema 2; R3 was a successor gate |
+| `tools/lib/myron-bootchain-impl.py` | 0.2.0 (0.3.0 in Phase 2.15B, 0.4.0 in Phase 2.15C) | GPT to R2 only; operation schema 2; R3 was a successor gate |
+
+Phase 2.15C ([R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)) later moved the same
+tools once more, deliberately: preflight 0.4.0 (capture schema
+`myron-capture-evidence-v3`), collector 0.3.0 (operation schema 3), session 0.3.0 and
+bootchain 0.4.0. The R3 schema and data semantics described here are unchanged; the
+envelope bytes and request bindings change, and schema 2 artifacts refuse.
 
 The deployment (0.4.0), snapshot (0.2.0), kernel and GPU contracts are
 unchanged. Contract and request documents keep their structural `schema` 1;

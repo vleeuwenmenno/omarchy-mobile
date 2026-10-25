@@ -48,11 +48,11 @@
   "components": {
     "capture_contract": {
       "path": "device/myron/capture-contract.json",
-      "sha256": "7948af6d5b9f90e76062956833956b94aabfe8a817f0e4fe1db40793fb2a8e86"
+      "sha256": "0d9bcbe04e11b813e765149dc2265ce689d3755ab3445fb2c4f4feb5f5a769f1"
     },
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "420b98ccf4e9dc8d900f2584b5af7d44dc5b38110c8a035ba56d8cf575d8dc4d"
+      "sha256": "31abcfe10bff616834c8ca7eda3047f92a164dc117ca65f036754f6a826aef5b"
     }
   },
   "coverage": {
@@ -288,7 +288,7 @@
         "operation": "R4-dtb-dtbo-selection"
       },
       {
-        "classification": "synthetic-projection",
+        "classification": "unverified-source-claim",
         "field": "selection_source",
         "operation": "R4-dtb-dtbo-selection"
       },
@@ -518,6 +518,11 @@
         "claim": "selection-supplied-not-derived-from-boot-image-bytes",
         "field": "dtbo_entry_count",
         "operation": "R4-dtb-dtbo-selection"
+      },
+      {
+        "claim": "selection-supplied-not-derived-from-boot-image-bytes",
+        "field": "selection_source",
+        "operation": "R4-dtb-dtbo-selection"
       }
     ]
   },
@@ -534,7 +539,7 @@
   },
   "evidence_level": "synthetic-adapter-rehearsal-only",
   "executes": false,
-  "format_version": "0.2.0",
+  "format_version": "0.3.0",
   "human_approval_required": true,
   "identity": {
     "device.codename": "myron",
@@ -546,7 +551,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-session-impl.py",
-    "sha256": "244e8136bc2930e84d04c9b5f8ef3a9411fcb24339ab77ac3870fe4a130225d6"
+    "sha256": "ca30d6188ac796ede7e3df9091299262aea22bf47e98c51e48e6ac85fbc9a73d"
   },
   "input": {
     "closure": [
@@ -656,7 +661,7 @@
         "path": "r7-bootconfig.txt"
       }
     ],
-    "format_version": "0.2.0",
+    "format_version": "0.3.0",
     "json": "strict canonical ASCII; duplicate keys, floats, booleans for integers rejected",
     "json_depth_max": 8,
     "kind": "myron-synthetic-reads",
@@ -1129,8 +1134,8 @@
             ]
           },
           "schema": {
-            "max": 1,
-            "min": 1,
+            "max": 2,
+            "min": 2,
             "type": "int"
           },
           "selected_board_id": {
@@ -1150,14 +1155,18 @@
             "type": "nullable"
           },
           "selection_source": {
-            "type": "enum",
-            "values": [
-              "bootconfig",
-              "device-tree",
-              "dtbo-header"
-            ]
+            "of": {
+              "type": "enum",
+              "values": [
+                "bootconfig",
+                "device-tree",
+                "dtbo-header"
+              ]
+            },
+            "type": "nullable"
           }
-        }
+        },
+        "rule": "selected_board_id, selected_board_revision and selection_source are all null or all set"
       },
       "r6-filesystem.json": {
         "fields": {
@@ -1246,7 +1255,7 @@
           "format_version": {
             "type": "enum",
             "values": [
-              "0.2.0"
+              "0.3.0"
             ]
           },
           "kind": {
@@ -1324,7 +1333,7 @@
     "synthetic input adaptation only: the fixture bytes were never read from a phone",
     "collector validation proves structure and cross-checks only, not that any value is true",
     "R2 is a synthetic projection, not a GPT binary parse",
-    "R3 image summaries (every offset, size, hash and coverage range) and the R4 selection are explicit claims, not parsed from image or device-tree bytes; R3 has no parser in this phase",
+    "R3 image summaries (every offset, size, hash and coverage range) and the R4 selection are explicit claims in this adapter, not parsed from image or device-tree bytes (no image or device-tree parser is used here)",
     "R3 coverage and hash values are unverified-source-claims: full-image coverage proves no provenance or hardware freshness, and metadata-only coverage leaves payload, padding and EOF unverified",
     "R5 order is the fixture file order, not historical load chronology",
     "R7 command line and bootconfig are deliberately narrow projections, not full parsers",
@@ -1421,9 +1430,9 @@
     "verification": "recompute-from-request-and-reads-byte-for-byte"
   },
   "pinned_versions": {
-    "collector": "0.2.0",
+    "collector": "0.3.0",
     "deployment": "0.4.0",
-    "preflight": "0.3.0",
+    "preflight": "0.4.0",
     "snapshot": "0.2.0"
   },
   "registry": {
@@ -1473,7 +1482,8 @@
       {
         "derivations": [
           "the record is copied field by field; no selection is inferred",
-          "the board id and revision are both set or both null"
+          "the board id, revision and selection source are all set or all null; a zero id or revision is a value",
+          "a non-null tuple stays a synthetic claim: it is never promoted to parsed hardware evidence"
         ],
         "id": "R4-dtb-dtbo-selection",
         "inputs": [

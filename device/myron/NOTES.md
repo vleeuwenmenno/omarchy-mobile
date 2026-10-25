@@ -114,9 +114,23 @@ collector. It is synthetic binary parser qualification only: sector size and
 disk length are explicit synthetic claims, `bootable_flag` is the literal GPT
 attributes bit 2 (`legacy-bios-bootable-bit`, no Android priority, success,
 active-slot, bootability or recovery claim), and nothing is acquired from a
-phone. R4 is not implemented: the R4 selection-source qualification is a
-required successor gate. See
+phone. Selecting a board is not established here: the R4 selection-source
+qualification is a required successor gate. See
 [BOOTCHAIN-GATE.md](../../docs/myron/BOOTCHAIN-GATE.md).
+
+Phase 2.15C moves the preflight to 0.4.0 (capture schema `myron-capture-evidence-v3`,
+R4 gets its own fixture budget), the collector to 0.3.0 (operation envelopes schema 3;
+R4's `selection_source` is nullable and the board id, revision and source are all null
+or all set), the session to 0.3.0 (`r4-selection.json` schema 2) and the bootchain to
+0.4.0, a second deliberate generation break with no adapters. The bootchain adds
+`plan-selection`, `parse-selection` and `verify-selection` (selection parser 1.0.0): it
+reparses the exact R3 image fixture bytes, counts the flattened device tree blobs of one
+fixed base partition and the DT table entries of one dtbo, and checks a synthetic index
+witness for membership and binding only. The R4 operation it emits always has a null
+board id, revision and source. R4 stays deferred as `hardware-witness-required`
+(successor `r4-selection-source-qualification`); authority stays all false and the seven
+blockers stay missing. See
+[R4-SELECTION-GATE.md](../../docs/myron/R4-SELECTION-GATE.md).
 
 Phase 2.15B moves the bootchain to 0.3.0 and adds `plan-images`, `parse-images`
 and `verify-images`: synthetic Android boot v0-v4, vendor boot v3/v4 and DT table

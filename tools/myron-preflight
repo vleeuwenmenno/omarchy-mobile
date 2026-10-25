@@ -20,13 +20,13 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 REPO = Path(__file__).resolve().parent.parent
 SNAPSHOT_TOOL = REPO / "tools/myron-snapshot"
 PREFLIGHT_CONTRACT_PATH = "device/myron/preflight-contract.json"
 CONTRACT_KIND = "myron-hardware-read-preflight-contract"
 REQUEST_KIND = "myron-hardware-read-approval-request"
-CAPTURE_SCHEMA = "myron-capture-evidence-v2"
+CAPTURE_SCHEMA = "myron-capture-evidence-v3"
 DECISION = "refused-pending-live-evidence"
 REQUEST_MAX_JSON_DEPTH = 8  # the deepest legitimate request (R7 field policy) nests exactly 8 levels
 HEX256 = re.compile(r"[0-9a-f]{64}")
@@ -127,6 +127,11 @@ R7_BOOTCONFIG_ALLOWLIST = [
 R3_BUDGETS = (
     1024 * 1024,  # max_output_bytes: the serialized R3 operation document
     64 * 1024 * 1024,  # max_fixture_input_bytes: fixture payload a rehearsal may consume
+    64 * 1024,  # max_hardware_read_bytes: aggregate metadata coverage of any future read
+)
+R4_BUDGETS = (
+    64 * 1024,  # max_output_bytes: the serialized R4 operation document
+    64 * 1024 * 1024 + 12288,  # max_fixture_input_bytes: the R3 fixture plus selection.json (8 KiB) and witness.json (4 KiB)
     64 * 1024,  # max_hardware_read_bytes: aggregate metadata coverage of any future read
 )
 # R3 emits are leaf paths of the typed nested image structure (`*` is a list index). The
@@ -409,7 +414,7 @@ def requested_reads() -> list[dict]:
             R3_EMITS,
         ),
         read_operation(
-            "R4-dtb-dtbo-selection", [boot], uniform(64 * 1024),
+            "R4-dtb-dtbo-selection", [boot], R4_BUDGETS,
             ["live-bootconfig-dt-selection-fields", "live-device-tree-compatible-prefix",
              "dtbo-header-selection-fields"],
             ["dtb-count", "selected-board-id", "selected-board-revision",

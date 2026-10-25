@@ -2,7 +2,7 @@
 # Myron synthetic R3 image parsers (Phase 2.15B)
 
 Status (2026-10-25): offline, deterministic, **synthetic binary parser
-qualification**. `tools/myron-bootchain` 0.3.0 gains three commands that parse
+qualification**. `tools/myron-bootchain` 0.3.0 (0.4.0 since Phase 2.15C, see the note below) gains three commands that parse
 synthetic Android boot (v0-v4), vendor_boot (v3, v4) and DT table (v0) images
 into the exact, metadata-only R3 operation (`R3-boot-image-headers`, the 18-row
 schema of [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) that `tools/myron-collect`
@@ -15,12 +15,20 @@ evidence or qualification, **not** authorization and **not** blocker closure.
 No SSH, ADB, fastboot, block device, firmware or vendor byte is read or
 committed: the tests generate every image at runtime in a temporary directory.
 All nine authority flags stay `false`, all seven blockers stay `missing`, and
-R4 (DTB/DTBO selection) is still not implemented.
+R4 (DTB/DTBO selection) was not implemented in this phase; Phase 2.15C adds a
+separate synthetic count and index-membership mechanism that never produces a
+selection ([R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)).
 
 Command-specific truth: `parse` produces only R2; `parse-images` produces only
-R3. The bootchain contract's overall qualification lists both R2 and R3 as
-implemented (synthetic-fixtures-only, `captured_provenance: false`,
-`hardware_qualified: false`) and R4 alone as deferred.
+R3 (and `parse-selection`, Phase 2.15C, only R4). The bootchain contract's
+qualification lists R2, R3 and R4 as implemented (synthetic-fixtures-only,
+`captured_provenance: false`, `hardware_qualified: false`; R4 as parser and count
+mechanics only) with R4 deferred as `hardware-witness-required`.
+
+Phase 2.15C is a second deliberate generation break: bootchain 0.4.0, collector
+0.3.0, preflight 0.4.0 and operation schema 3. The R3 operation data semantics and
+the image parser contract (1.0.0) are unchanged, but the envelope bytes and request
+bindings change, so artifacts and manifests of the 0.3.0 generation refuse.
 
 ## Commands
 
@@ -183,7 +191,9 @@ GPT matrix.
 - The collector, preflight, snapshot and deployment imports remain trusted
   version-pinned dependencies, not byte-pinned.
 
-The next gates are **R4 selection** (`r4-selection-source-qualification`) and a
+The next gates are **R4 selection-source qualification**
+(`r4-selection-source-qualification`, the hardware-witness gate that
+[R4-SELECTION-GATE.md](R4-SELECTION-GATE.md) keeps open) and a
 separate **hardware acquisition gate** (a transport that counts actual returned
 bytes, rereads and overreads separately, with provenance and freshness). Both
 need a human-reviewed request and approval; neither is authorized here.

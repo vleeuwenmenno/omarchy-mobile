@@ -32,16 +32,16 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import hashlib, json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-capture-collector-contract"
-assert value["format_version"] == "0.2.0"
+assert value["format_version"] == "0.3.0"
 assert value["pinned_versions"] == {
-    "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0",
+    "deployment": "0.4.0", "preflight": "0.4.0", "snapshot": "0.2.0",
 }
 assert value["transport"] == "external-precaptured-fixture"
-assert value["capture_schema"] == "myron-capture-evidence-v2"
-assert value["capture"]["operation_schema"] == 2 and value["capture"]["read_domain"] == "fixture"
+assert value["capture_schema"] == "myron-capture-evidence-v3"
+assert value["capture"]["operation_schema"] == 3 and value["capture"]["read_domain"] == "fixture"
 assert value["capture"]["legacy_generations"] == "reject-no-adapters"
 envelope = value["policy"]["operation_envelope"]
-assert envelope["schema"] == 2 and envelope["read_domain"] == "fixture"
+assert envelope["schema"] == 3 and envelope["read_domain"] == "fixture"
 assert envelope["keys"] == ["schema", "kind", "id", "request_sha256", "transport", "read_domain",
                             "read_only", "bytes_read", "data"]
 assert len(value["blockers"]) == 7
@@ -241,7 +241,7 @@ DATA = {
 
 def operation_document(operation_id, req_sha=None, data=None, **overrides):
     value = {
-        "schema": 2, "kind": C.OPERATION_KIND, "id": operation_id,
+        "schema": 3, "kind": C.OPERATION_KIND, "id": operation_id,
         "request_sha256": req_sha or request_sha256, "transport": C.TRANSPORT,
         "read_domain": "fixture", "read_only": True, "bytes_read": 4096,
         "data": copy.deepcopy(data if data is not None else DATA[operation_id]),
@@ -437,13 +437,19 @@ bad_capture("missing data field", {R1: lambda d: d["data"].pop("soc")})
 bad_capture("operation schema bool", {R1: lambda d: d.update(schema=True)})
 bad_capture("operation schema 1 (previous generation)", {R1: lambda d: d.update(schema=1)},
             match="R1-identity-and-slot schema differs")
-bad_capture("operation schema 3", {R1: lambda d: d.update(schema=3)})
-bad_capture("operation schema float", {R1: lambda d: d.update(schema=2.0)})
-bad_capture("operation schema string", {R1: lambda d: d.update(schema="2")})
+bad_capture("operation schema 2 (previous generation)", {R1: lambda d: d.update(schema=2)},
+            match="R1-identity-and-slot schema differs")
+bad_capture("operation schema 4", {R1: lambda d: d.update(schema=4)})
+bad_capture("operation schema float", {R1: lambda d: d.update(schema=3.0)})
+bad_capture("operation schema string", {R1: lambda d: d.update(schema="3")})
 bad_capture("schema 1 envelope without a read domain",
             {R1: lambda d: (d.update(schema=1), d.pop("read_domain"))})
 bad_capture("hybrid capture: one operation back at schema 1", {R6: lambda d: d.update(schema=1)},
             match="R6-storage-and-mount-model schema differs")
+bad_capture("hybrid capture: one operation at the previous schema 2", {R6: lambda d: d.update(schema=2)},
+            match="R6-storage-and-mount-model schema differs")
+bad_capture("hybrid capture: every operation but the last at schema 2", {
+    operation: (lambda d: d.update(schema=2)) for operation in (R1, R2, R3, R4, R5, R6)})
 bad_capture("hybrid capture: every operation but the last at schema 1", {
     operation: (lambda d: d.update(schema=1)) for operation in (R1, R2, R3, R4, R5, R6)})
 bad_capture("wrong operation id", {R1: lambda d: d.update(id=R2)})
@@ -500,6 +506,9 @@ bad_capture("R3 operation without the read domain", {R3: lambda d: d.pop("read_d
 bad_capture("R3 operation in a hardware domain", {R3: lambda d: d.update(read_domain="hardware")},
             match="R3-boot-image-headers read domain differs")
 bad_capture("R4 half selection", {R4: lambda d: d["data"].update(selected_board_revision=None)})
+bad_capture("R4 source without a board", {R4: lambda d: d["data"].update(
+    selected_board_id=None, selected_board_revision=None)})
+bad_capture("R4 board without a source", {R4: lambda d: d["data"].update(selection_source=None)})
 bad_capture("R4 dtb count", {R4: lambda d: d["data"].update(dtb_count=65)})
 bad_capture("R4 source", {R4: lambda d: d["data"].update(selection_source="adb")})
 bad_capture("R5 non-sequential order", {R5: lambda d: d["data"]["load_order_index"].reverse()})
@@ -881,8 +890,8 @@ ok("capture contract tampering and a changed preflight contract fail closed")
 patched_tools = fresh("version-pin") / "tools"
 shutil.copytree(repo / "tools", patched_tools, ignore=shutil.ignore_patterns("__pycache__"))
 source = (patched_tools / "myron-preflight").read_text()
-assert 'VERSION = "0.3.0"' in source
-(patched_tools / "myron-preflight").write_text(source.replace('VERSION = "0.3.0"', 'VERSION = "0.2.1"', 1))
+assert 'VERSION = "0.4.0"' in source
+(patched_tools / "myron-preflight").write_text(source.replace('VERSION = "0.4.0"', 'VERSION = "0.2.1"', 1))
 saved_tool, saved_module = C.PREFLIGHT_TOOL, C._preflight
 C.PREFLIGHT_TOOL, C._preflight = patched_tools / "myron-preflight", None
 try:
@@ -1358,10 +1367,15 @@ r4_policy = committed["policy"]["operations"][R4]
 for name in ("selected_board_id", "selected_board_revision"):
     assert r4_policy["fields"][name] == {"type": "nullable", "of": {
         "type": "int", "min": 0, "max": 2**32 - 1}}, name
+assert r4_policy["fields"]["selection_source"] == {"type": "nullable", "of": {
+    "type": "enum", "values": ["bootconfig", "device-tree", "dtbo-header"]}}
 for name in ("dtb_count", "dtbo_entry_count"):
     assert r4_policy["fields"][name]["type"] == "int"
 assert r4_policy["constraints"] == [{
-    "type": "null_together", "fields": ["selected_board_id", "selected_board_revision"]}]
+    "type": "null_together",
+    "fields": ["selected_board_id", "selected_board_revision", "selection_source"]}]
+assert [r4_policy["budgets"][key] for key in ("max_output_bytes", "max_fixture_input_bytes",
+                                                "max_hardware_read_bytes")] == [65536, 67121152, 65536]
 assert committed["policy"]["operations"][R5]["reference_module_order"] == D.REFERENCE_MODULE_ORDER
 assert all("constraints" in row for row in committed["policy"]["operations"].values())
 ok("serialized policy states the nested R3 forms, the nullable image, the profile and the board pairing")
@@ -1981,20 +1995,34 @@ def r4_result(**fields):
 
 
 assert r4_result() is None
-assert r4_result(selected_board_id=None, selected_board_revision=None) is None
-assert r4_result(selected_board_id=None) == "R4 selected_board_id, selected_board_revision must all be set or all be null"
-assert r4_result(selected_board_revision=None) is not None
+TRIPLE = ("selected_board_id", "selected_board_revision", "selection_source")
+FULL = {"selected_board_id": 7, "selected_board_revision": 1, "selection_source": "bootconfig"}
+EMPTY = dict.fromkeys(TRIPLE)
+TRIPLE_MESSAGE = "R4 selected_board_id, selected_board_revision, selection_source must all be set or all be null"
+assert r4_result(**EMPTY) is None, "all three null: the only form the bootchain parser emits"
+assert r4_result(**FULL) is None
+for source in ("bootconfig", "device-tree", "dtbo-header"):
+    assert r4_result(selection_source=source) is None
+# Every one of the six partial combinations of the triple is refused with the same fixed message.
+for mask in range(1, 7):
+    partial = {name: (FULL[name] if mask >> bit & 1 else None) for bit, name in enumerate(TRIPLE)}
+    assert r4_result(**partial) == TRIPLE_MESSAGE, partial
+# Zero is a value, not an absence: a full tuple with zero id and revision is valid, a null is not zero.
+assert r4_result(selected_board_id=0, selected_board_revision=0) is None
+assert r4_result(selected_board_id=0, selected_board_revision=0, selection_source="device-tree") is None
+assert r4_result(selected_board_id=0, selected_board_revision=None) == TRIPLE_MESSAGE
+assert r4_result(selected_board_id=None, selected_board_revision=0) == TRIPLE_MESSAGE
 assert r4_result(selected_board_id=2**32) is not None and r4_result(selected_board_id=-1) is not None
 assert r4_result(selected_board_id=True) is not None and r4_result(selected_board_id="7") is not None
-assert r4_result(selected_board_id=None, selected_board_revision=3) is not None
-assert r4_result(dtb_count=None) is not None and r4_result(selection_source=None) is not None
+assert r4_result(selection_source="adb") is not None and r4_result(selection_source=0) is not None
+assert r4_result(dtb_count=None) is not None
 assert r4_result(dtbo_entry_count=None) is not None and r4_result(compatible_prefix=None) is not None
 assert [name for name in dir(C) if name.startswith(("parse_", "derive_", "select_"))] == [], \
     "the collector has no parser and no selection logic: R3 is schema only and R4 is unimplemented"
 assert set(C.policy_registry()["operations"][R4]["fields"]) == {
     "dtb_count", "selected_board_id", "selected_board_revision", "dtbo_entry_count",
-    "compatible_prefix", "selection_source"}, "R4 is unchanged by the R3 migration"
-ok("R4 accepts both board fields null or both integers, never one, and nothing else null; no parser exists")
+    "compatible_prefix", "selection_source"}, "the R4 field set is unchanged by the nullable-triple migration"
+ok("R4 accepts the selection triple all null or all set (zero is a value), never a partial triple, and nothing else null; no parser exists")
 
 # 2. Policy drift changes the validator and the derived contract together.
 
@@ -2176,6 +2204,8 @@ inconsistent("operation envelope keys", lambda r: r["operation_envelope"]["keys"
              match="operation envelope differs")
 inconsistent("pairing over a non-nullable field", lambda r: r["operations"][R4]["fields"].update(
     selected_board_id={"type": "int", "min": 0, "max": 1}))
+inconsistent("pairing over a mandatory selection source", lambda r: r["operations"][R4]["fields"].update(
+    selection_source={"type": "enum", "values": ["bootconfig"]}), match="null_together field selection_source cannot be null")
 inconsistent("pairing over an unknown field", lambda r: r["operations"][R4]["constraints"][0][
     "fields"].append("missing"))
 inconsistent("pairing over one field", lambda r: r["operations"][R4]["constraints"][0].update(
@@ -2289,7 +2319,7 @@ SOURCE_EDITS = {
     "a skipped adjacent-range merge rule": lambda t: t.replace(
         'if item["offset"] == previous_end:', "if False:", 1),
     "an operation schema that also admits 1": lambda t: t.replace(
-        'document["schema"] != OPERATION_SCHEMA', 'document["schema"] not in (1, 2)', 1),
+        'document["schema"] != OPERATION_SCHEMA', 'document["schema"] not in (2, 3)', 1),
     "a request budget comparison left out": lambda t: t.replace(
         'if budgets != policy["budgets"] or "max_bytes" in spec:', "if False:", 1),
     "a weakened order recomputation": lambda t: t.replace("] == declared", "] != []", 1),

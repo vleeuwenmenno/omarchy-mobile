@@ -26,7 +26,7 @@ tools/myron-bootchain derive-contract > "$tmp/derived.json" || fail "derive-cont
 cmp -s "$tmp/derived.json" device/myron/bootchain-contract.json \
   || fail "committed bootchain contract differs from derive-contract (regenerate it, see docs/myron/R3-PARSER-GATE.md)"
 tools/myron-bootchain show | cmp -s - "$tmp/derived.json" || fail "show differs from derive-contract"
-pass "derive-contract output equals the committed 0.3.0 bootchain contract byte for byte"
+pass "derive-contract output equals the committed 0.4.0 bootchain contract byte for byte"
 
 mkdir "$tmp/fixture"
 MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
@@ -281,19 +281,19 @@ def reject(name, label, data, code):
 # --- the contract ------------------------------------------------------------------------
 
 contract = json.loads(bootchain_contract_bytes)
-assert contract["format_version"] == "0.3.0"
-assert contract["pinned_versions"] == {"collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0",
+assert contract["format_version"] == "0.4.0"
+assert contract["pinned_versions"] == {"collector": "0.3.0", "deployment": "0.4.0", "preflight": "0.4.0",
                                        "snapshot": "0.2.0"}
 parser = contract["image_parser"]
 assert parser["version"] == "1.0.0" and parser["independently_versioned"] is True
 assert parser["commands"] == ["plan-images", "parse-images", "verify-images"]
 assert parser["capture"]["produces"] == [R3] and R2 in parser["capture"]["does_not_produce"]
 assert contract["capture"]["produces"] == [R2] and R3 in contract["capture"]["does_not_produce"]
-assert contract["qualification"]["implemented_operations"] == [R2, R3]
-assert contract["qualification"]["command_scope"] == {"parse": [R2], "parse-images": [R3]}
+assert contract["qualification"]["implemented_operations"] == [R2, R3, R4]
+assert contract["qualification"]["command_scope"] == {"parse": [R2], "parse-images": [R3], "parse-selection": [R4]}
 assert contract["qualification"]["captured_provenance"] is False
 assert contract["qualification"]["hardware_qualified"] is False
-assert [(row["id"], row["state"]) for row in contract["deferred"]] == [(R4, "not-implemented")]
+assert [(row["id"], row["state"]) for row in contract["deferred"]] == [(R4, "hardware-witness-required")]
 claims = [row["claim"] for row in contract["coverage"]["unresolved_claims"]]
 assert "r3-binary-parser-successor-required" not in claims
 assert {"r3-acquisition-provenance-not-established", "r3-image-freshness-not-established",
@@ -314,7 +314,7 @@ assert parser["output"]["binary_copies"] is False
 assert C.policy_registry()["operations"][R3]["budgets"]["max_output_bytes"] == 1048576
 for name in ("capture", "preflight", "deployment", "snapshot", "session", "stage", "kernel"):
     assert "bootchain" not in (repo / f"device/myron/{name}-contract.json").read_text(), "pins are one-way"
-ok("the 0.3.0 contract binds the independent image-parser contract, the R2/R3 command scopes, R4 alone deferred and every false authority")
+ok("the 0.4.0 contract binds the independent image-parser contract, the R2/R3/R4 command scopes, R4 hardware-witness-deferred and every false authority")
 
 # --- positive parsers: every supported version, family, role and page size -------------------
 
@@ -721,7 +721,7 @@ assert sorted(os.listdir(out_dir / "operations")) == [f"{R3}.json"]
 assert stat.S_IMODE((out_dir / "parse.json").stat().st_mode) == 0o644
 operation_bytes = (out_dir / f"operations/{R3}.json").read_bytes()
 operation = json.loads(operation_bytes)
-assert operation["schema"] == 2 and operation["read_domain"] == "fixture" and operation["transport"] == C.TRANSPORT
+assert operation["schema"] == 3 and operation["read_domain"] == "fixture" and operation["transport"] == C.TRANSPORT
 assert operation["bytes_read"] == scn.S and operation["data"] == {"images": expected_rows}
 assert len(operation_bytes) <= 65536 and operation_bytes == jbytes(operation)
 document, _ = C.validate_operation(operation_bytes, R3_ROW, request_sha256, collector_env.identity)
@@ -739,7 +739,7 @@ assert {key: acc[key] for key in ("scope", "fixture_payload_bytes", "fixture_pay
     "fixture_payload_read_bytes": scn.S, "fixture_image_hash_bytes": scn.sizes,
     "represented_metadata_bytes": M, "operation_output_bytes": O, "hardware_bytes_read": 0,
     "hardware_transport": "none", "full_image_evidence": False}
-assert parse_doc["kind"] == B.IMAGE_PARSE_KIND and parse_doc["format_version"] == "0.3.0"
+assert parse_doc["kind"] == B.IMAGE_PARSE_KIND and parse_doc["format_version"] == "0.4.0"
 assert parse_doc["provenance"] == {"kind": "synthetic-parser-provenance", "captured": False,
                                    "hardware_qualified": False, "collector_labels_are_not_provenance": True}
 assert parse_doc["bootchain_contract_sha256"] == BC and parse_doc["inventory_sha256"] == scn.inv_sha
@@ -884,7 +884,7 @@ stale = make(STANDARD, "stale-contract")
 stale_doc = json.loads(stale.manifest)
 stale_doc["bootchain_contract_sha256"] = "2" * 64
 (stale.imgs / "images.json").write_bytes(jbytes(stale_doc))
-expect_fail("manifest bound to an old 0.2.0 contract", cli("parse-images", stale, "--out", work / "b3"),
+expect_fail("manifest bound to an old 0.3.0 contract", cli("parse-images", stale, "--out", work / "b3"),
             "image-identity-mismatch", [work / "b3"])
 no_inventory = make(STANDARD, "inventory-rejected", req_sha="3" * 64)
 expect_fail("an inventory bound to another request", cli("parse-images", no_inventory, "--out", work / "b4"),
@@ -1174,7 +1174,7 @@ forge("a parse with a hash flipped", rewrite(f"operations/{R3}.json", lambda v: 
                                             if v["data"]["images"][0]["image"] else v["data"]["images"][2]["image"]["header"].update(sha256="b" * 64)))
 forge("a full-image claim", rewrite(f"operations/{R3}.json", lambda v: [r["image"]["coverage"].update(kind="full-image") for r in v["data"]["images"] if r["image"]]))
 forge("an operation with bytes_read changed", rewrite(f"operations/{R3}.json", lambda v: v.update(bytes_read=v["bytes_read"] + 1)))
-forge("a parse with a stale 0.2.0 format_version", rewrite("parse.json", lambda v: v.update(format_version="0.2.0")))
+forge("a parse with a stale 0.3.0 format_version", rewrite("parse.json", lambda v: v.update(format_version="0.3.0")))
 forge("a parse with an authority flag set", rewrite("parse.json", lambda v: v["authority"].update(
     {next(iter(v["authority"])): True})))
 forge("a parse with a blocker dropped", rewrite("parse.json", lambda v: v["blockers"].pop()))
@@ -1215,16 +1215,16 @@ ok("hostile paths, names, bytes and options never reach a diagnostic or an outpu
 # --- GPT command compatibility ---------------------------------------------------------------
 
 code, out_text, err_text = invoke("show")
-assert code == 0 and json.loads(out_text)["format_version"] == "0.3.0"
+assert code == 0 and json.loads(out_text)["format_version"] == "0.4.0"
 for command in ("parse", "verify-parse"):
     code, _o, err_text = invoke(command, "--request", request)
     assert code != 0 and err_text.startswith("ERROR: invalid command line"), command
 gpt_plan, _ = expect_ok("plan", "--request", request)
-assert gpt_plan["kind"] == "myron-synthetic-gpt-parse-plan" and gpt_plan["format_version"] == "0.3.0"
+assert gpt_plan["kind"] == "myron-synthetic-gpt-parse-plan" and gpt_plan["format_version"] == "0.4.0"
 assert gpt_plan["request_binding"]["operation"] == R2 and gpt_plan["qualification"]["command_scope"]["parse"] == [R2]
-assert "R4 selection is not implemented" in json.dumps(gpt_plan)
+assert "hardware-witness successor gate" in json.dumps(gpt_plan)
 assert gpt_plan["output_closure"]["files"] == sorted(["SHA256SUMS", "parse.json", f"operations/{R2}.json"])
-ok("the GPT show/plan commands keep their R2 scope and output closure under 0.3.0 (the full GPT matrix runs in tests/myron-bootchain)")
+ok("the GPT show/plan commands keep their R2 scope and output closure under 0.4.0 (the full GPT matrix runs in tests/myron-bootchain)")
 
 # --- descriptors ---------------------------------------------------------------------------
 

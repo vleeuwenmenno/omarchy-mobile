@@ -25,11 +25,11 @@ import re
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO = Path(__file__).resolve().parent.parent
 COLLECT_TOOL = REPO / "tools/myron-collect"
 PINNED_VERSIONS = {
-    "collector": "0.2.0", "preflight": "0.3.0", "snapshot": "0.2.0", "deployment": "0.4.0",
+    "collector": "0.3.0", "preflight": "0.4.0", "snapshot": "0.2.0", "deployment": "0.4.0",
 }
 SESSION_CONTRACT_PATH = "device/myron/session-contract.json"
 IMPLEMENTATION_PATH = "tools/lib/myron-session-impl.py"
@@ -52,6 +52,7 @@ READS_ENTRIES = 13  # the closure (manifest included) plus one: anything past it
 JSON_DEPTH = 8
 PLAN_DEPTH = 8
 R3_SUMMARY_SCHEMA = 2  # the nested R3 generation; the parallel-array schema 1 form is refused
+R4_SELECTION_SCHEMA = 2  # the nullable-triple R4 generation; schema 1 (a mandatory source) is refused
 HEX256 = re.compile(r"[0-9a-f]{64}")
 RECOVERY_NAME = re.compile(r"recovery(_a|_b)?")
 IMAGE_NAME_LIKE = re.compile(
@@ -145,7 +146,8 @@ DERIVATIONS = {
     ],
     R4_ID: [
         "the record is copied field by field; no selection is inferred",
-        "the board id and revision are both set or both null",
+        "the board id, revision and selection source are all set or all null; a zero id or revision is a value",
+        "a non-null tuple stays a synthetic claim: it is never promoted to parsed hardware evidence",
     ],
     R5_ID: [
         "each line is module name, a tab, then the taint flags; file order is kept",
@@ -208,7 +210,7 @@ COVERAGE = [
     (R4_ID, "selected_board_revision", CLAIM, "selection-supplied-not-derived-from-boot-image-bytes"),
     (R4_ID, "dtbo_entry_count", CLAIM, "selection-supplied-not-derived-from-boot-image-bytes"),
     (R4_ID, "compatible_prefix", PROJECTION, None),
-    (R4_ID, "selection_source", PROJECTION, None),
+    (R4_ID, "selection_source", CLAIM, "selection-supplied-not-derived-from-boot-image-bytes"),
     (R5_ID, "module_names", PARSED, None),
     (R5_ID, "load_order_index", PARSED, None),
     (R5_ID, "taint_flags", PARSED, None),
@@ -228,7 +230,7 @@ LIMITATIONS = [
     "synthetic input adaptation only: the fixture bytes were never read from a phone",
     "collector validation proves structure and cross-checks only, not that any value is true",
     "R2 is a synthetic projection, not a GPT binary parse",
-    "R3 image summaries (every offset, size, hash and coverage range) and the R4 selection are explicit claims, not parsed from image or device-tree bytes; R3 has no parser in this phase",
+    "R3 image summaries (every offset, size, hash and coverage range) and the R4 selection are explicit claims in this adapter, not parsed from image or device-tree bytes (no image or device-tree parser is used here)",
     "R3 coverage and hash values are unverified-source-claims: full-image coverage proves no provenance or hardware freshness, and metadata-only coverage leaves payload, padding and EOF unverified",
     "R5 order is the fixture file order, not historical load chronology",
     "R7 command line and bootconfig are deliberately narrow projections, not full parsers",
@@ -375,14 +377,16 @@ def raw_schemas() -> dict:
         },
         "r4-selection.json": {
             "fields": {
-                "schema": schema, "kind": kind("myron-synthetic-selection"),
+                "schema": c._int(R4_SELECTION_SCHEMA, R4_SELECTION_SCHEMA),
+                "kind": kind("myron-synthetic-selection"),
                 "compatible_prefix": c._text(COMPATIBLE),
                 "dtb_count": c._int(0, 64),
                 "dtbo_entry_count": c._int(0, 256),
                 "selected_board_id": c._nullable(c._int(0, 2**32 - 1)),
                 "selected_board_revision": c._nullable(c._int(0, 2**32 - 1)),
-                "selection_source": c._enum(["bootconfig", "device-tree", "dtbo-header"]),
+                "selection_source": c._nullable(c._enum(["bootconfig", "device-tree", "dtbo-header"])),
             },
+            "rule": "selected_board_id, selected_board_revision and selection_source are all null or all set",
         },
         "r6-filesystem.json": {
             "fields": {
@@ -805,8 +809,9 @@ def derive_r3(raw: bytes, inventory: list) -> dict:
 def derive_r4(raw: bytes) -> dict:
     schema = raw_schemas()["r4-selection.json"]
     values = check_fields(parse_json(raw, "R4 selection"), schema["fields"], "R4 selection")
-    if (values["selected_board_id"] is None) != (values["selected_board_revision"] is None):
-        raise SessionError("R4 board id and revision must both be set or both be null")
+    triple = ("selected_board_id", "selected_board_revision", "selection_source")
+    if len({values[name] is None for name in triple}) != 1:
+        raise SessionError("R4 board id, revision and selection source must all be set or all be null")
     return {
         name: values[name] for name in (
             "dtb_count", "selected_board_id", "selected_board_revision", "dtbo_entry_count",

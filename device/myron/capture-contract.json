@@ -24,16 +24,16 @@
     "kind": "myron-precaptured-fixture",
     "legacy_generations": "reject-no-adapters",
     "operation_kind": "myron-precaptured-operation",
-    "operation_schema": 2,
+    "operation_schema": 3,
     "read_domain": "fixture",
     "total_max_bytes": 4194304,
     "trusted_local_files_only": true
   },
-  "capture_schema": "myron-capture-evidence-v2",
+  "capture_schema": "myron-capture-evidence-v3",
   "components": {
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "420b98ccf4e9dc8d900f2584b5af7d44dc5b38110c8a035ba56d8cf575d8dc4d"
+      "sha256": "31abcfe10bff616834c8ca7eda3047f92a164dc117ca65f036754f6a826aef5b"
     }
   },
   "evidence": {
@@ -63,7 +63,7 @@
     "package-install",
     "network-access"
   ],
-  "format_version": "0.2.0",
+  "format_version": "0.3.0",
   "identity": {
     "device.codename": "myron",
     "device.compatible": "qcom,canoe-mtp",
@@ -74,12 +74,12 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-collect-impl.py",
-    "sha256": "d41944c520ec592e11348082b026e369fd255afc05ce0d251b3dfdd6e61e0502"
+    "sha256": "759b6c4538a83ed62290ad29418dc5f1a963ba1dbe3d1956fdb25f70b378b7d2"
   },
   "kind": "myron-capture-collector-contract",
   "pinned_versions": {
     "deployment": "0.4.0",
-    "preflight": "0.3.0",
+    "preflight": "0.4.0",
     "snapshot": "0.2.0"
   },
   "policy": {
@@ -156,7 +156,7 @@
         "data"
       ],
       "read_domain": "fixture",
-      "schema": 2
+      "schema": 3
     },
     "operations": {
       "R1-identity-and-slot": {
@@ -796,7 +796,7 @@
       },
       "R4-dtb-dtbo-selection": {
         "budgets": {
-          "max_fixture_input_bytes": 65536,
+          "max_fixture_input_bytes": 67121152,
           "max_hardware_read_bytes": 65536,
           "max_output_bytes": 65536
         },
@@ -804,7 +804,8 @@
           {
             "fields": [
               "selected_board_id",
-              "selected_board_revision"
+              "selected_board_revision",
+              "selection_source"
             ],
             "type": "null_together"
           }
@@ -842,12 +843,15 @@
             "type": "nullable"
           },
           "selection_source": {
-            "type": "enum",
-            "values": [
-              "bootconfig",
-              "device-tree",
-              "dtbo-header"
-            ]
+            "of": {
+              "type": "enum",
+              "values": [
+                "bootconfig",
+                "device-tree",
+                "dtbo-header"
+              ]
+            },
+            "type": "nullable"
           }
         },
         "input_path": "operations/R4-dtb-dtbo-selection.json"
@@ -1203,7 +1207,7 @@
       ],
       "field_policy": {},
       "id": "R4-dtb-dtbo-selection",
-      "max_fixture_input_bytes": 65536,
+      "max_fixture_input_bytes": 67121152,
       "max_hardware_read_bytes": 65536,
       "max_output_bytes": 65536,
       "never_emits": [

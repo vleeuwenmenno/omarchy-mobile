@@ -5,7 +5,7 @@ Status (2026-10-25): offline, deterministic, **synthetic binary parser
 qualification**. The GPT half of `tools/myron-bootchain` proves one thing: one
 narrow GPT profile, supplied as synthetic bytes, parses byte for byte into the
 exact R2 operation (`R2-gpt-and-recovery-inventory`) that `tools/myron-collect`
-0.2.0 already consumes, and the collector accepts the result unchanged. Version
+0.3.0 already consumes, and the collector accepts the result unchanged. Version
 0.2.0 (Phase 2.15A, [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) moved the R2 envelope
 to schema 2 with `read_domain: "fixture"`, split the old `max_bytes` into the
 three request budgets and re-pinned the collector 0.2.0 and preflight 0.3.0.
@@ -14,12 +14,17 @@ independent `plan-images`, `parse-images` and `verify-images` commands that
 parse synthetic boot, vendor boot and DT table images into the R3 operation, and
 deliberately breaks the contract pin and artifact format (0.2.0 manifests and
 artifacts refuse). The GPT commands keep their semantics and emit equivalent R2
-operation bytes: `parse` still produces only R2. R4 selection stays a successor
-gate.
+operation bytes: `parse` still produces only R2. Version 0.4.0 (Phase 2.15C,
+[R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)) is a second deliberate break (operation
+schema 3, collector 0.3.0, preflight 0.4.0, the 0.3.0 pin and artifacts refuse) and
+adds `plan-selection`, `parse-selection` and `verify-selection`: a synthetic R4
+count and index-membership mechanism whose selection triple is always null. Actual
+selection stays a hardware-witness successor gate.
 
 It is **not** real captured provenance, **not** a live transport, **not**
 hardware evidence, **not** authorization, **not** blocker closure, and **not**
-qualification of R3 or R4. Nothing here reads a phone or a block device. All
+qualification of R3 or R4 (R4's selected board id, revision and source are never produced).
+Nothing here reads a phone or a block device. All
 seven blockers stay `missing` and every authority flag stays `false`.
 
 ## What this gate qualifies, and what it does not
@@ -35,7 +40,7 @@ unique GUID), so it stays private: the tests build theirs in a temporary
 directory, and no raw binary fixture is committed. The parsed artifact omits
 every GUID and never copies raw bytes.
 
-## Staged scope: R3 is implemented separately, R4 is a successor gate
+## Staged scope: R3 and the R4 mechanism are implemented separately, R4 selection is a successor gate
 
 The independent design review rejected a combined R2/R3/R4 phase: the R3 row
 could not honestly represent the OS version of a vendor boot or DTBO image, and
@@ -64,13 +69,20 @@ therefore parses R2 only. R3 followed as its own gate (Phase 2.15B,
   There is no concrete selected-index source. Parsing a DTBO or a device-tree
   blob does not prove which entry the bootloader selects. R4 needs an actual
   Myron witness for the selection and cross-checks against the contracts before
-  any parser may claim `selected_board_id` or `selected_board_revision`.
+  any parser may claim `selected_board_id`, `selected_board_revision` or
+  `selection_source`. Phase 2.15C ([R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)) adds
+  only the offline mechanism: counts parsed from the same exact R3 fixture bytes and
+  a synthetic index witness checked for membership and binding. Its R4 operation
+  carries a null selection triple, always.
 
-R4 appears in the contract, the plan and every parse artifact as the one
-`not-implemented` row, and the parser has no R4 code. The contract's
-qualification lists R2 and R3 as implemented with a per-command scope
-(`parse`: R2, `parse-images`: R3), `captured_provenance: false` and
-`hardware_qualified: false`.
+R4 appears in the contract, the plan and every parse artifact as the one deferred
+row, state `hardware-witness-required`, successor `r4-selection-source-qualification`.
+The contract's qualification lists R2, R3 and R4 as implemented (R4 as parser and
+count mechanics only) with a per-command scope (`parse`: R2, `parse-images`: R3,
+`parse-selection`: R4), an `r4_capability` object (`counts_from_synthetic_bytes` and
+`synthetic_index_binding` true; `selected_board_fields_produced`,
+`captured_provenance` and `hardware_qualified` false) and `captured_provenance: false`
+and `hardware_qualified: false`.
 
 ## Commands
 
@@ -82,6 +94,9 @@ qualification lists R2 and R3 as implemented with a per-command scope
 | `plan-images --request R --inventory O` | R3 counterpart of `plan`: see [R3-PARSER-GATE.md](R3-PARSER-GATE.md). |
 | `parse-images --request R --inventory O --images D --out P` | Parse synthetic boot, vendor boot and DT table images into the metadata-only R3 operation. |
 | `verify-images --request R --inventory O --images D --parse P` | Recompute the image parse; `P` must match byte for byte. |
+| `plan-selection --request R --inventory O` | R4 counterpart of `plan`: see [R4-SELECTION-GATE.md](R4-SELECTION-GATE.md). |
+| `parse-selection --request R --inventory O --images D --r3-parse P3 --selection S --out O4` | Count device tree blobs and DT table entries from the exact R3 fixture bytes, check a synthetic index witness for membership and binding, and emit the R4 operation with a null selection triple. |
+| `verify-selection --request R --inventory O --images D --r3-parse P3 --selection S --parse O4` | Recompute the selection parse; `O4` must match byte for byte. |
 | `parse --request R --reads D --out O` | Parse the synthetic reads in `D` and publish a new parse artifact. |
 | `verify-parse --request R --reads D --parse O` | Recompute the whole parse from `R` and `D`; `O` must match byte for byte. |
 
@@ -266,8 +281,11 @@ complete device and disk inventory (one GPT only), the protective MBR (not
 parsed), Android slot semantics, bootability, R3 acquisition provenance, image
 freshness and hardware transport (`r3-acquisition-provenance-not-established`,
 `r3-image-freshness-not-established`, `r3-hardware-transport-not-established`),
-and R4 selection provenance. (Version 0.2.0 listed
-`r3-binary-parser-successor-required`; the synthetic R3 parsers resolve it.)
+and the R4 claims (`r4-selection-provenance-not-established`,
+`r4-selection-source-semantics-not-established`, `r4-actual-myron-witness-not-established`,
+`r4-selection-freshness-not-established`, `r4-multi-overlay-ordering-not-established`).
+(Version 0.2.0 listed `r3-binary-parser-successor-required`; the synthetic R3 parsers
+resolve it.)
 
 The standalone parse is an **operation fragment**, never a complete capture. The
 `parse` command produces no R1 or R3-R7 operation. `tests/myron-bootchain` composes the
@@ -286,14 +304,15 @@ semantics differ from the recomputation.
 
 ## Bootchain contract
 
-`device/myron/bootchain-contract.json` (0.3.0) is derived and canonical; the
+`device/myron/bootchain-contract.json` (0.4.0) is derived and canonical; the
 tool refuses any other bytes. Regenerate it deliberately with
 `tools/myron-bootchain derive-contract` whenever the implementation changes (the
 digest of the implementation bytes is part of it). It also carries the
 independently versioned `image_parser` contract (1.0.0, see
-[R3-PARSER-GATE.md](R3-PARSER-GATE.md)). It binds:
+[R3-PARSER-GATE.md](R3-PARSER-GATE.md)) and `selection_parser` contract (1.0.0, see
+[R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)). It binds:
 
-- the preflight contract (0.3.0) and the capture contract (collector 0.2.0)
+- the preflight contract (0.4.0) and the capture contract (collector 0.3.0)
   hashes, and the deployment, snapshot and kernel-reference hashes they carry;
 - the bootchain implementation digest: `tools/myron-bootchain` is a minimal loader
   (the same pattern as `myron-collect` and `myron-session`) that reads
@@ -379,8 +398,9 @@ Residuals, as in Phase 2.13:
   compile or implementation-import failure as one fixed `loader-rejected` line.
 - `bootable_flag` is a bit, not a bootability claim.
 - The dependency imports are version-pinned, not byte-pinned.
-- R4 selection is not implemented; R3 is parsed from synthetic fixtures only
-  ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)).
+- R4 selection is not established: the synthetic R4 mechanism counts and binds indexes
+  but always emits a null selection triple ([R4-SELECTION-GATE.md](R4-SELECTION-GATE.md));
+  R3 is parsed from synthetic fixtures only ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)).
 
 ## Later producer (not part of this phase)
 

@@ -2,7 +2,7 @@
 # Myron fixture capture gate (Phase 2.12)
 
 Status (2026-10-24): offline, deterministic, structure-only.
-`tools/myron-collect` 0.2.0 checks a **pre-captured fixture** against one
+`tools/myron-collect` 0.3.0 checks a **pre-captured fixture** against one
 preflight request and records that it matched. It is **not live evidence**,
 **not approval**, and **clears no blocker**. It has **no live transport**: it
 executes nothing, contacts no phone, and reads only local files.
@@ -14,6 +14,17 @@ to 18 typed image rows. Version 0.1.0 captures (schema 1) and any capture that
 mixes generations are refused; there are no adapters. The collector still has
 no parser: every R3 value is a fixture claim it judges for consistency, not
 truth.
+
+Version 0.3.0 (Phase 2.15C, [R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)) is a
+second deliberate generation break: every operation envelope is integer `schema`
+3, the capture schema is `myron-capture-evidence-v3`, and the collector pins
+preflight 0.4.0. Schema 1 and 2 envelopes and any capture that mixes generations
+are refused; there are no adapters. R2 and R3 data semantics are unchanged, but
+envelope bytes and request bindings change. R4's `selection_source` becomes a
+nullable enum and the `null_together` constraint covers `selected_board_id`,
+`selected_board_revision` and `selection_source`: the triple is all null or a
+full non-null tuple, and an integer zero is a value, never an absence. The
+collector still has no parser and no selection logic.
 
 The only transport is `external-precaptured-fixture`: a trusted local tree
 that someone else produced earlier. Nothing here proves the fixture came from
@@ -143,8 +154,9 @@ the same spec. R3's `image` is `nullable`; the profile and the named semantic
 rules (`policy.operations.R3.rules`, `profile`, `cross_rules`) are serialized
 beside it and read back by the validator, and `check_policy` refuses a registry
 that lists a rule it does not implement or a profile constant that contradicts a
-typed bound. R4's board id and revision are `nullable` integers with a
-`null_together` constraint. The previous boolean variants (R3 `absent`) and
+typed bound. R4's board id, board revision and selection source are `nullable`
+(integers and a three-value enum) with one `null_together` constraint over all
+three. The previous boolean variants (R3 `absent`) and
 `list_lengths` constraints are gone. The validators evaluate exactly these
 specs, so the serialized policy and the accepted forms cannot disagree, and the
 recursive shape check is depth-bounded.
@@ -205,7 +217,7 @@ byte, including the data, from the request and the capture.
 
 ## Safety and publication
 
-The tool imports exact `myron-preflight` 0.3.0, `myron-snapshot` 0.2.0 and
+The tool imports exact `myron-preflight` 0.4.0, `myron-snapshot` 0.2.0 and
 `myron-deployment` 0.4.0 in-process and refuses any other version. The capture
 contract pins the preflight contract hash; the preflight contract does not
 reference the capture contract. The tool starts no process and has no network

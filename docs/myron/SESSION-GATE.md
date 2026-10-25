@@ -2,14 +2,19 @@
 # Myron synthetic adapter rehearsal (Phase 2.13)
 
 Status (2026-10-25): offline, deterministic, **synthetic**.
-`tools/myron-session` 0.2.0 proves one thing: a fixed, reviewed set of
+`tools/myron-session` 0.3.0 proves one thing: a fixed, reviewed set of
 **synthetic** input projections can be adapted deterministically into the exact
-R1-R7 capture fixture that `tools/myron-collect` 0.2.0 already consumes, and
+R1-R7 capture fixture that `tools/myron-collect` 0.3.0 already consumes, and
 the collector accepts the result unchanged. Version 0.2.0 (Phase 2.15A,
 [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) migrates the R3 input to the nested
 18-row image summaries and every operation to schema 2 with
 `read_domain: "fixture"`; it adds no parser, and every R3 summary value is a
-synthetic claim.
+synthetic claim. Version 0.3.0 (Phase 2.15C, [R4-SELECTION-GATE.md](R4-SELECTION-GATE.md))
+moves every operation to schema 3 and the `r4-selection.json` input to schema 2:
+`selection_source` becomes nullable and the board id, revision and source are all
+null or all set (zero is a value). The session stays a synthetic JSON claim
+adapter: a non-null tuple remains structurally representable but is never promoted
+to parsed hardware evidence, and schema 1 selection records are refused.
 
 It is **not** real acquisition, **not** a live transport, **not** hardware
 evidence, **not** authorization, **not** blocker closure, and **not**
@@ -49,7 +54,7 @@ r7-release.txt  r7-notes.bin  r7-cmdline.txt  r7-bootconfig.txt
 ```
 
 `reads.json` carries exactly `schema` 1, `kind` `myron-synthetic-reads`,
-`format_version` `0.2.0`, `session_contract_sha256`, `request_sha256`,
+`format_version` `0.3.0`, `session_contract_sha256`, `request_sha256`,
 `synthetic: true` and `files`: one row of `path`, `bytes`, `sha256` per payload
 file, sorted by path. The contract and request hashes bind the reads to one
 session contract and one request. The registry in the contract, not the input,
@@ -130,7 +135,7 @@ appear.
 | R1 | two explicit source records, each a subset of six observed facts | the facts both records hold are compared; any difference, or no overlap, rejects; `sources_agree` is derived and never accepted; the two records must cover every fact, and nothing is filled from the expected identity |
 | R2 | `synthetic-gpt-projection-v1`: `sector_bytes`, `disk_lbas`, rows of `name`, `first_lba`, `last_lba`, `simulated_bootable` | size is `(last - first + 1) * sector_bytes`; suffix from the name; recovery from the name; rows must be in ascending `first_lba` order, unique, non-overlapping and inside the disk; output is sorted by name; flags are copied, never inferred |
 | R3 | `synthetic-header-summaries-v2`: `schema` 2 and the collector's 18-row image form | copied as supplied; every offset, size, hash and coverage range is an unverified fixture claim, never recomputed; the collector's typed rows, named semantic rules and R2 cross rules judge it (18 rows, `image` null exactly where R2 lacks the name, `image.size_bytes` within the R2 partition); metadata-only and full-image coverage stay distinct; the previous parallel-array form and `schema` 1 are refused |
-| R4 | explicit selection record | copied; the board id and revision are both set or both null; no selection is inferred |
+| R4 | explicit selection record (`schema` 2) | copied; the board id, revision and selection source are all set or all null (zero is a value); no selection is inferred and a non-null tuple stays a synthetic claim |
 | R5 | strict TSV: module name, tab, taint flags | file order is kept; indexes are line positions (not historical load chronology); names repeat if equal after treating `-` and `_` alike; the declared-order flag is recomputed |
 | R6 | purpose-specific JSON: GPT name, filesystem, mount options, `block_size`, `allocation_unit_bytes`, `block_count`, `free_block_count` | totals are `block_count * allocation_unit_bytes` and free is `free_block_count * allocation_unit_bytes` (the free-block count, `f_bfree`), each floored to 1 MiB; `ro` with `rw` rejects; sizes above 2^50 or below 1 MiB reject |
 | R7 | one release line, bounded notes bytes, command line, bootconfig | release parsed; notes hashed (the bytes are not kept); the command line is space-separated tokens and the bootconfig is one `key=value` per line; only keys and values the request lists are accepted; quoting, escapes, comments, nesting, unknown or duplicate keys, and unlisted values reject rather than being filtered |
@@ -192,10 +197,10 @@ re-sealed checksum list is refused.
 
 ## Session contract
 
-`device/myron/session-contract.json` (0.2.0) is derived and canonical; the tool
+`device/myron/session-contract.json` (0.3.0) is derived and canonical; the tool
 refuses any other bytes. It binds:
 
-- the preflight contract (0.3.0) and the capture contract (collector 0.2.0)
+- the preflight contract (0.4.0) and the capture contract (collector 0.3.0)
   hashes, and the deployment, snapshot and kernel-reference hashes they carry;
 - the session implementation digest: `tools/myron-session` is a minimal loader
   (the same pattern as `myron-collect`) that reads `tools/lib/myron-session-impl.py`
@@ -261,7 +266,9 @@ failure.
   ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)), and Phase 2.15B adds separate,
   synthetic-only Android boot/vendor_boot/DT-table parsers into R3
   ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)); neither changes this descriptor
-  rehearsal, and R4 still has no parser.
+  rehearsal. Phase 2.15C adds a separate synthetic R4 count and index-membership
+  mechanism ([R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)); it never produces a
+  selection and is not used by this adapter.
 - R3 image summaries (including all hashes and coverage) and the R4 selection
   are claims, not parsed values. Full-image coverage proves no provenance or
   hardware freshness; metadata-only coverage leaves payload, padding and EOF

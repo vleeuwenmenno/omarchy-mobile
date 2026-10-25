@@ -39,9 +39,9 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import hashlib, json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-synthetic-bootchain-contract"
-assert value["format_version"] == "0.3.0"
+assert value["format_version"] == "0.4.0"
 assert value["pinned_versions"] == {
-    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0",
+    "collector": "0.3.0", "deployment": "0.4.0", "preflight": "0.4.0", "snapshot": "0.2.0",
 }
 assert value["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert value["dependencies"]["byte_pinned"] is False
@@ -473,7 +473,7 @@ assert contract["bound_contracts"]["deployment_contract"]["sha256"] == contracts
 assert contract["bound_contracts"]["kernel_reference"]["sha256"] == contracts.reference_sha256
 assert contract["bound_contracts"]["snapshot_contract"]["sha256"] == snapshot_sha
 assert contract["pinned_versions"] == {
-    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0"}
+    "collector": "0.3.0", "deployment": "0.4.0", "preflight": "0.4.0", "snapshot": "0.2.0"}
 assert contract["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert contract["dependencies"]["byte_pinned"] is False and "not pinned" in contract["dependencies"]["note"]
 assert contract["implementation"] == B.implementation_binding()
@@ -532,15 +532,17 @@ assert [row["claim"] for row in contract["coverage"]["unresolved_claims"]] == [
     "complete-device-disk-inventory-not-established", "protective-mbr-not-parsed",
     "android-slot-semantics-not-established", "bootability-not-established",
     "r3-acquisition-provenance-not-established", "r3-image-freshness-not-established",
-    "r3-hardware-transport-not-established", "r4-selection-provenance-successor-required"]
+    "r3-hardware-transport-not-established", "r4-selection-provenance-not-established",
+    "r4-selection-source-semantics-not-established", "r4-actual-myron-witness-not-established",
+    "r4-selection-freshness-not-established", "r4-multi-overlay-ordering-not-established"]
 assert any("does NOT prove Android slot priority" in t for t in contract["coverage"]["semantic_limits"])
 assert [(row["id"], row["state"], row["successor_gate"]) for row in contract["deferred"]] == [
-    (R4, "not-implemented", "r4-selection-source-qualification")]
+    (R4, "hardware-witness-required", "r4-selection-source-qualification")]
 assert "later_acquisition_qualification" not in contract["deferred"][0]
 assert contract["qualification"]["captured_provenance"] is False
 assert contract["qualification"]["hardware_qualified"] is False
-assert contract["qualification"]["implemented_operations"] == [R2, R3]
-assert contract["qualification"]["command_scope"] == {"parse": [R2], "parse-images": [R3]}
+assert contract["qualification"]["implemented_operations"] == [R2, R3, R4]
+assert contract["qualification"]["command_scope"] == {"parse": [R2], "parse-images": [R3], "parse-selection": [R4]}
 assert any("successor" in text or "not implemented" in text for text in contract["limitations"])
 assert any("R4" in text and "complete R1-R7 capture" in text for text in contract["non_goals"])
 assert not re.search(r"\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b", bootchain_contract_bytes.decode())
@@ -752,7 +754,7 @@ assert all(e.mode == 0o755 for e in entries if e.kind == "dir")
 OP = data[f"operations/{R2}.json"]
 operation = json.loads(OP)
 assert operation == {
-    "schema": 2, "kind": "myron-precaptured-operation", "id": R2, "request_sha256": request_sha256,
+    "schema": 3, "kind": "myron-precaptured-operation", "id": R2, "request_sha256": request_sha256,
     "transport": "external-precaptured-fixture", "read_domain": "fixture", "read_only": True,
     "bytes_read": BYTES_READ, "data": EXPECTED_DATA}
 assert OP == jbytes(operation) and len(OP) <= R2_ROW["max_output_bytes"]
@@ -771,7 +773,7 @@ assert set(parse_doc) == {
     "complete_capture", "inputs", "operation", "accounting", "coverage", "semantic_limits",
     "unresolved_claims", "deferred", "qualification", "limitations", "non_goals", "blockers",
     "authority"}
-assert parse_doc["kind"] == "myron-synthetic-gpt-parse" and parse_doc["format_version"] == "0.3.0"
+assert parse_doc["kind"] == "myron-synthetic-gpt-parse" and parse_doc["format_version"] == "0.4.0"
 assert parse_doc["profile"] == "gpt-v1-128x128-primary-backup"
 assert parse_doc["inventory_scope"] == "one-synthetic-gpt"
 assert parse_doc["evidence_level"] == "synthetic-binary-parser-only"
@@ -961,7 +963,7 @@ def write_capture(base, r2_bytes, others, extra_manifest=None):
     files = {f"operations/{R2}.json": r2_bytes}
     for operation_id, value in others.items():
         files[f"operations/{operation_id}.json"] = jbytes({
-            "schema": 2, "kind": "myron-precaptured-operation", "id": operation_id,
+            "schema": 3, "kind": "myron-precaptured-operation", "id": operation_id,
             "request_sha256": request_sha256, "transport": "external-precaptured-fixture",
             "read_domain": "fixture", "read_only": True, "bytes_read": 4096, "data": value})
     manifest = {
@@ -2377,7 +2379,7 @@ assert not [p for p in tracked if re.search(r"(^|/)gpt[-_].*\.bin$|(^|/)geometry
 assert (repo / "tools/myron-bootchain").exists() and "tests/myron-bootchain" in (repo / "tests/all").read_text()
 assert sum(1 for line in (repo / "tests/all").read_text().splitlines() if "tests/myron-bootchain" in line) == 1
 plan_all = json.dumps(plan_a)
-assert "R4 selection is not implemented" in plan_all and "neither is a capture" in plan_all
+assert "hardware-witness successor gate" in plan_all and "none is a capture" in plan_all
 assert "r3-binary-image-parsers" not in plan_all and "r3-boot-image-schema-migration" not in plan_all
 assert "r4-selection-source-qualification" in plan_all
 ok("existing contracts and tools are untouched, R4 is the one recorded successor gate, the GPT parse still produces only R2, no raw fixture is committed")
@@ -2413,7 +2415,7 @@ drift("coverage semantics change", lambda: B.COVERAGE.__setitem__(
 drift("limitation text change", lambda: B.LIMITATIONS.append("x"), lambda: B.LIMITATIONS.pop())
 drift("unresolved claim change", lambda: B.UNRESOLVED.append("x"), lambda: B.UNRESOLVED.pop())
 drift("deferred gate change", lambda: B.DEFERRED[0].update(state="implemented"),
-      lambda: B.DEFERRED[0].update(state="not-implemented"))
+      lambda: B.DEFERRED[0].update(state="hardware-witness-required"))
 drift("R4 prerequisite change", lambda: B.DEFERRED[0]["requires"].append("a hardware transport"),
       lambda: B.DEFERRED[0]["requires"].pop())
 drift("image parser limitation change", lambda: B.IMAGE_LIMITATIONS.append("x"), lambda: B.IMAGE_LIMITATIONS.pop())
@@ -2644,9 +2646,9 @@ def version_pin(label, tool, old, new, expect):
 
 
 version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
-            'VERSION = "0.2.0"', 'VERSION = "0.2.1"', "(code dependency-version)")
+            'VERSION = "0.3.0"', 'VERSION = "0.2.1"', "(code dependency-version)")
 version_pin("a preflight at another version", "tools/myron-preflight",
-            'VERSION = "0.3.0"', 'VERSION = "0.2.1"', "(code dependency-rejected)")
+            'VERSION = "0.4.0"', 'VERSION = "0.2.1"', "(code dependency-rejected)")
 ok("dependency version pins are enforced")
 
 # Dependency acquisition is fully protected. Every case runs in a fresh process, so no import
@@ -2765,9 +2767,9 @@ VERSION_LINE = "bootchain dependencies are not the pinned versions (code depende
 base = startup_copy("hostile-version")
 target = base / "tools/lib/myron-collect-impl.py"
 text = target.read_text()
-assert 'VERSION = "0.2.0"' in text
-target.write_text(text.replace('VERSION = "0.2.0"', f'VERSION = "{CANARY}\\nERROR: injected\\x1b[31m"', 1))
-startup_refusal("hostile version", base, expected=f"ERROR: {VERSION_LINE}\n", leaks=("injected", "\x1b", "0.2.0", "0.3.0"))
+assert 'VERSION = "0.3.0"' in text
+target.write_text(text.replace('VERSION = "0.3.0"', f'VERSION = "{CANARY}\\nERROR: injected\\x1b[31m"', 1))
+startup_refusal("hostile version", base, expected=f"ERROR: {VERSION_LINE}\n", leaks=("injected", "\x1b", "0.3.0", "0.4.0"))
 
 # An unexpected ValueError at runtime is one fixed line; the text never leaves.
 def raiser(error):

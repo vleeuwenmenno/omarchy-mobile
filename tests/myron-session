@@ -33,9 +33,9 @@ python3 - "$tmp/show.json" <<'PY' || exit 1
 import hashlib, json, sys
 value = json.load(open(sys.argv[1]))
 assert value["kind"] == "myron-synthetic-session-contract"
-assert value["format_version"] == "0.2.0"
+assert value["format_version"] == "0.3.0"
 assert value["pinned_versions"] == {
-    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0",
+    "collector": "0.3.0", "deployment": "0.4.0", "preflight": "0.4.0", "snapshot": "0.2.0",
 }
 assert value["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert value["dependencies"]["byte_pinned"] is False
@@ -300,7 +300,7 @@ def good_files():
             "schema": 2, "kind": "myron-synthetic-header-summaries",
             "images": copy.deepcopy(IMAGE_ROWS)}),
         "r4-selection.json": jbytes({
-            "schema": 1, "kind": "myron-synthetic-selection", "compatible_prefix": "qcom,canoe-mtp",
+            "schema": 2, "kind": "myron-synthetic-selection", "compatible_prefix": "qcom,canoe-mtp",
             "dtb_count": 2, "dtbo_entry_count": 3, "selected_board_id": 7,
             "selected_board_revision": 1, "selection_source": "bootconfig"}),
         "r5-modules.tsv": "".join(f"{name}\t{taint}\n" for name, taint in MODULES).encode(),
@@ -317,7 +317,7 @@ def good_files():
 
 def manifest_document(files, req_sha=None, **overrides):
     value = {
-        "schema": 1, "kind": S.READS_KIND, "format_version": "0.2.0",
+        "schema": 1, "kind": S.READS_KIND, "format_version": "0.3.0",
         "session_contract_sha256": SC, "request_sha256": req_sha or request_sha256,
         "synthetic": True,
         "files": [{"path": name, "bytes": len(files[name]), "sha256": digest(files[name])}
@@ -397,7 +397,7 @@ assert contract["bound_contracts"]["deployment_contract"]["sha256"] == contracts
 assert contract["bound_contracts"]["kernel_reference"]["sha256"] == contracts.reference_sha256
 assert contract["bound_contracts"]["snapshot_contract"]["sha256"] == snapshot_sha
 assert contract["pinned_versions"] == {
-    "collector": "0.2.0", "deployment": "0.4.0", "preflight": "0.3.0", "snapshot": "0.2.0"}
+    "collector": "0.3.0", "deployment": "0.4.0", "preflight": "0.4.0", "snapshot": "0.2.0"}
 assert contract["dependencies"]["trust"] == "trusted-version-pinned-imports"
 assert contract["dependencies"]["byte_pinned"] is False
 assert "not pinned" in contract["dependencies"]["note"]
@@ -636,7 +636,7 @@ assert "$(" not in result_text and "export " not in result_text
 for operation in OPERATION_IDS:
     document = json.loads(data[f"capture/operations/{operation}.json"])
     assert document == {
-        "schema": 2, "kind": C.OPERATION_KIND, "id": operation, "request_sha256": request_sha256,
+        "schema": 3, "kind": C.OPERATION_KIND, "id": operation, "request_sha256": request_sha256,
         "transport": C.TRANSPORT, "read_domain": "fixture", "read_only": True,
         "bytes_read": BYTES_READ[operation], "data": EXPECTED[operation]}, operation
     assert data[f"capture/operations/{operation}.json"] == D.render_json(document)
@@ -801,7 +801,7 @@ for run in range(5):
     expect_ok("rehearse", "--request", request, "--reads", base, "--out", out)
     expect_ok("verify-rehearsal", "--request", request, "--reads", base, "--rehearsal", out)
     document = json.loads(walk(out)[1][f"capture/operations/{R3}.json"])
-    assert document["data"]["images"] == rows and document["schema"] == 2
+    assert document["data"]["images"] == rows and document["schema"] == 3
     assert document["read_domain"] == "fixture" and document["bytes_read"] == len(summary)
     code_out, code_err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(code_out), contextlib.redirect_stderr(code_err):
@@ -1233,7 +1233,7 @@ for name in ("r1-source-a.json", "r2-partitions.json", "r3-header-summaries.json
     json_case(f"{name} missing field", name, lambda v: v.pop("kind"), match="fields differ")
     json_case(f"{name} wrong kind", name, lambda v: v.update(kind="other"))
     json_case(f"{name} schema as bool", name, lambda v: v.update(schema=True))
-    other = 1 if name == "r3-header-summaries.json" else 2  # R3's summaries are generation 2
+    other = 1 if name in ("r3-header-summaries.json", "r4-selection.json") else 2  # R3's summaries and R4's selection are generation 2
     json_case(f"{name} schema {other}", name, lambda v, other=other: v.update(schema=other))
     json_case(f"{name} schema 3", name, lambda v: v.update(schema=3))
     bad_reads(f"{name} not canonical", {name: json.dumps(json.loads(good_files()[name])).encode()},
@@ -1375,10 +1375,16 @@ bad_reads("R3 summary over 1 MiB", {R3F: b" " * (MIB + 1)}, match="byte bounds")
 json_case("R3 nested unknown key", R3F, lambda v: r3_row(v, "boot_a")["image"]["coverage"].update(extra=1),
           match="fields differ")
 
-json_case("R4 half selection id", "r4-selection.json", lambda v: v.update(selected_board_revision=None),
-          match="both be set or both be null")
-json_case("R4 half selection revision", "r4-selection.json", lambda v: v.update(selected_board_id=None),
-          match="both be set or both be null")
+TRIPLE = ("selected_board_id", "selected_board_revision", "selection_source")
+FULL_TRIPLE = {"selected_board_id": 7, "selected_board_revision": 1, "selection_source": "bootconfig"}
+for mask in range(1, 7):
+    json_case(f"R4 partial selection triple {mask:03b}", "r4-selection.json",
+              lambda v, mask=mask: v.update({name: (FULL_TRIPLE[name] if mask >> bit & 1 else None)
+                                             for bit, name in enumerate(TRIPLE)}),
+              match="must all be set or all be null")
+json_case("R4 schema 1 (a mandatory selection source) is the previous generation", "r4-selection.json",
+          lambda v: v.update(schema=1))
+json_case("R4 schema 3", "r4-selection.json", lambda v: v.update(schema=3))
 json_case("R4 id as string", "r4-selection.json", lambda v: v.update(selected_board_id="7"))
 json_case("R4 id as bool", "r4-selection.json", lambda v: v.update(selected_board_id=True))
 json_case("R4 id out of range", "r4-selection.json", lambda v: v.update(selected_board_id=2**32))
@@ -1389,9 +1395,17 @@ json_case("R4 missing source", "r4-selection.json", lambda v: v.pop("selection_s
 json_case("R4 inferred nested board", "r4-selection.json", lambda v: v.update(board={"id": 7}))
 json_case("R4 wrong compatible is refused by the collector", "r4-selection.json",
           lambda v: v.update(compatible_prefix="qcom,other"), match="differs from the contract identity")
-derived = rehearse_ok("r4 null pair", edit_json("r4-selection.json", lambda v: v.update(
-    selected_board_id=None, selected_board_revision=None)))
-assert derived[R4]["selected_board_id"] is None and derived[R4]["selected_board_revision"] is None
+derived = rehearse_ok("r4 null triple", edit_json("r4-selection.json", lambda v: v.update(
+    selected_board_id=None, selected_board_revision=None, selection_source=None)))
+assert [derived[R4][name] for name in TRIPLE] == [None, None, None]
+derived = rehearse_ok("r4 zero id and revision with a source (zero is a value, not an absence)",
+                      edit_json("r4-selection.json", lambda v: v.update(
+                          selected_board_id=0, selected_board_revision=0, selection_source="dtbo-header")))
+assert [derived[R4][name] for name in TRIPLE] == [0, 0, "dtbo-header"]
+for source in ("bootconfig", "device-tree", "dtbo-header"):
+    derived = rehearse_ok(f"r4 full triple from {source}", edit_json("r4-selection.json", lambda v, source=source:
+                                                                       v.update(selection_source=source)))
+    assert derived[R4]["selection_source"] == source
 
 json_case("R6 filesystem", "r6-filesystem.json", lambda v: v.update(filesystem="ntfs"))
 json_case("R6 mount option", "r6-filesystem.json", lambda v: v.update(mount_options=["rw", "uid=1000"]))
@@ -2632,9 +2646,9 @@ def version_pin(label, tool, old, new, expect):
 
 
 version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
-            'VERSION = "0.2.0"', 'VERSION = "0.2.1"', "unsupported verifier versions")
-version_pin("a preflight at another version", "tools/myron-preflight",
             'VERSION = "0.3.0"', 'VERSION = "0.2.1"', "unsupported verifier versions")
+version_pin("a preflight at another version", "tools/myron-preflight",
+            'VERSION = "0.4.0"', 'VERSION = "0.2.1"', "unsupported verifier versions")
 ok("dependency version pins are enforced")
 
 print("ok - myron session rehearsal tests passed")

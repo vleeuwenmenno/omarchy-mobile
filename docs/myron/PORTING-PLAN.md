@@ -163,7 +163,7 @@ capture or restore, clears no blocker and authorizes nothing
 
 Phase 2.10 (laptop-only, mechanism done):
 `device/myron/preflight-contract.json` and `tools/myron-preflight` (0.3.0 since
-Phase 2.15A) bind a re-verified kit and snapshot into a refusal-only
+Phase 2.15A, 0.4.0 since Phase 2.15C) bind a re-verified kit and snapshot into a refusal-only
 hardware-read approval request. The request maps all seven open blockers to
 their real evidence producer and declares seven bounded, redacted future read
 operations, but its execution and collected-evidence lists are empty and every
@@ -171,14 +171,14 @@ authority flag is false. It contacts no phone and is not approval
 ([PREFLIGHT-GATE.md](PREFLIGHT-GATE.md)).
 
 Phase 2.12 (laptop-only, mechanism done): `device/myron/capture-contract.json`
-and `tools/myron-collect` (0.2.0 since Phase 2.15A) validate a bounded **pre-captured fixture**
+and `tools/myron-collect` (0.2.0 since Phase 2.15A, 0.3.0 since Phase 2.15C) validate a bounded **pre-captured fixture**
 tree against one preflight request and record structure-only evidence. This is
 fixture evidence, not live evidence and not approval; it has no live transport,
 clears no blocker and sets no authority flag
 ([CAPTURE-GATE.md](CAPTURE-GATE.md)).
 
 Phase 2.13 (laptop-only, rehearsal done): `device/myron/session-contract.json`
-and `tools/myron-session` (0.2.0 since Phase 2.15A) adapt a fixed set of **synthetic** input
+and `tools/myron-session` (0.2.0 since Phase 2.15A, 0.3.0 since Phase 2.15C) adapt a fixed set of **synthetic** input
 projections into the exact R1-R7 capture fixture and prove the unchanged
 collector accepts it. This is not acquisition, a live transport, hardware
 evidence, authorization, blocker closure or device-format qualification; no GPT,
@@ -186,16 +186,16 @@ Android boot-image or device-tree parser exists
 ([SESSION-GATE.md](SESSION-GATE.md)).
 
 Phase 2.14 (laptop-only, synthetic parser done): `device/myron/bootchain-contract.json`
-and `tools/myron-bootchain` (0.2.0 since Phase 2.15A, 0.3.0 since Phase 2.15B)
-parse one **synthetic**
+and `tools/myron-bootchain` (0.2.0 since Phase 2.15A, 0.3.0 since Phase 2.15B,
+0.4.0 since Phase 2.15C) parse one **synthetic**
 GPT (revision 1.0, 92-byte headers, 128 entries of 128 bytes, primary and backup
 copies) byte for byte into the R2 operation fragment the unchanged collector
 accepts. This is synthetic binary parser qualification only: no captured
 provenance, live transport, hardware evidence, authorization or blocker closure.
-R4 (selection) is **not** implemented and stays a required successor gate: the
-R4 selection-source qualification (a concrete selected-index source, an actual
-Myron witness and contract cross-checks; parsing a DTBO or FDT does not prove
-selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
+Which board a real device selects (R4 selection) is **not** established and stays
+a required successor gate: the R4 selection-source qualification (a concrete
+selected-index source, an actual Myron witness and contract cross-checks; parsing
+a DTBO or FDT does not prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
 
 Phase 2.15B (laptop-only, synthetic R3 parsers done): bootchain 0.3.0 adds
 `plan-images`, `parse-images` and `verify-images`, which parse a flat fixture of
@@ -210,6 +210,23 @@ seven blockers open ([R3-PARSER-GATE.md](R3-PARSER-GATE.md)). The next gates
 are R4 selection-source qualification and a separate hardware acquisition gate
 (a transport that counts returned bytes, rereads and overreads separately, with
 provenance and freshness).
+
+Phase 2.15C (laptop-only, synthetic R4 mechanism done; the final planned
+synthetic gate, not guaranteed final parser work): preflight 0.4.0, collector
+0.3.0, session 0.3.0 and bootchain 0.4.0 are a second deliberate generation break
+(capture schema `myron-capture-evidence-v3`, operation envelopes schema 3, session
+`r4-selection.json` schema 2; no adapters). R4's `selection_source` becomes nullable and
+the board id, revision and source are all null or all set. Bootchain adds
+`plan-selection`, `parse-selection` and `verify-selection`
+(selection parser 1.0.0): the exact R3 image fixture bytes are reparsed, the flattened
+device tree blobs of one fixed base partition and the DT table entries of one dtbo are
+counted, and a synthetic index witness is checked for membership and binding only. The
+emitted R4 operation always carries a null selected board id, revision and source.
+R4 stays deferred as `hardware-witness-required` with successor
+`r4-selection-source-qualification`: parser and count mechanics are implemented, the
+actual Myron witness, source semantics, provenance, freshness and multi-overlay
+ordering are not. Authority stays all false and all seven blockers stay open
+([R4-SELECTION-GATE.md](R4-SELECTION-GATE.md)).
 
 Phase 2.15A (laptop-only, schema done): the preflight (0.3.0), collector
 (0.2.0), session (0.2.0) and bootchain (0.2.0) tools migrate to one R3
