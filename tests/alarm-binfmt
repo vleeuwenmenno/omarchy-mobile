@@ -1,0 +1,308 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# tools/lib/alarm.sh's aarch64 binfmt handling and the Docker call sites that
+# use it, against a fixture binfmt_misc directory and fake docker/gpg (no
+# Docker, no emulation, no network, no sudo, no write to /proc):
+#   F handler            works in every mode, adds no Docker argument
+#   handler without F    package containers only, through a read-only bind
+#                        mount of its exact static interpreter; the rootfs
+#                        build refuses it (pacstrap, scriptlets, arch-chroot)
+#   disabled / globally disabled / competing / absent handlers refuse
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+ROOT=$PWD
+t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+fail() { printf 'not ok - %s\n' "$1" >&2; [[ ! -f $t/log ]] || cat "$t/log" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+# A tiny ELF64 program: one PT_LOAD (static), optionally a PT_INTERP (dynamic)
+elf() { # PATH static|dynamic
+  python3 -I - "$1" "$2" <<'PY'
+import struct
+import sys
+
+path, kind = sys.argv[1], sys.argv[2]
+types = [1] + ([3] if kind == "dynamic" else [])
+header = bytearray(64)
+header[:7] = b"\x7fELF\x02\x01\x01"
+struct.pack_into("<HHIQQQIHHHHHH", header, 16, 2, 62, 1, 0x400000, 64, 0, 0, 64, 56, len(types), 64, 0, 0)
+body = b"".join(struct.pack("<IIQQQQQQ", kind_, 5, 0, 0x400000, 0x400000, 0, 0, 0x1000) for kind_ in types)
+with open(path, "wb") as stream:
+    stream.write(bytes(header) + body)
+PY
+  chmod 755 "$1"
+}
+MAGIC=7f454c460201010000000000000000000200b700
+node() { # DIR NAME STATE INTERPRETER FLAGS [MAGIC [MASK [OFFSET]]]
+  mkdir -p "$1"
+  printf '%s\ninterpreter %s\nflags: %s\noffset %s\nmagic %s\nmask %s\n' \
+    "$3" "$4" "$5" "${8:-0}" "${6:-$MAGIC}" \
+    "${7:-ffffffffffffff00fffffffffffffffffeffffff}" > "$1/$2"
+}
+fresh() { rm -rf "$t/b"; mkdir -p "$t/b"; printf enabled > "$t/b/status"; printf register-placeholder > "$t/b/register"; }
+
+# Run alarm_require_binfmt MODE in a subshell; prints "ARGS:..." on success
+run() { # MODE
+  (
+    set -euo pipefail
+    source tools/lib/alarm.sh
+    ALARM_DOCKER_QEMU_ARGS=(stale-argument)
+    ALARM_BINFMT_DIR=$t/b alarm_require_binfmt "$1"
+    printf 'ARGS:%s\n' "${ALARM_DOCKER_QEMU_ARGS[*]}"
+  ) > "$t/log" 2>&1
+}
+ok_args() { # MODE EXPECTED-ARGS NAME
+  run "$1" || fail "$3 is refused in $1 mode"
+  [[ $(tail -1 "$t/log") == "ARGS:$2" ]] || fail "$3 gives the wrong Docker arguments in $1 mode: $(tail -1 "$t/log")"
+}
+refused() { # MODE EXPECT NAME
+  if run "$1"; then fail "$3 is accepted in $1 mode"; fi
+  grep -q -- "$2" "$t/log" || fail "$3 is refused for the wrong reason in $1 mode"
+  if grep -q 'ARGS:' "$t/log"; then fail "$3 left Docker arguments in $1 mode"; fi
+}
+
+elf "$t/qemu-static" static
+elf "$t/qemu-dynamic" dynamic
+MOUNT="--mount type=bind,src=$t/qemu-static,dst=$t/qemu-static,readonly"
+
+# Handlers with F: normal success, no extra argument, stale arguments reset
+fresh; node "$t/b" qemu-aarch64 enabled /usr/bin/qemu-aarch64-static F
+for mode in package rootfs; do ok_args "$mode" "" "a Debian-style F handler"; done
+fresh; node "$t/b" aarch64-linux enabled /run/binfmt/aarch64-linux OCF
+for mode in package rootfs; do ok_args "$mode" "" "a NixOS-style F handler"; done
+pass "enabled handlers with the F flag succeed in both modes without Docker arguments"
+
+# Without F: package containers get the exact interpreter, read-only
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" ""
+ok_args package "$MOUNT" "a static non-F interpreter"
+refused rootfs 'needs the aarch64 binfmt handler qemu-aarch64 with the F (fix-binary) flag' "a non-F handler"
+refused rootfs 'arch-chroot' "a non-F handler"
+pass "a non-F handler gets a read-only bind mount for packages and is refused for the rootfs"
+
+# The interpreter must be exactly right
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-dynamic" ""
+refused package 'not a static executable' "a dynamic interpreter"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/missing" ""
+refused package 'not an executable regular file' "a missing interpreter"
+ln -s "$t/qemu-static" "$t/qemu-link"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-link" ""
+refused package 'not an executable regular file' "a symlinked interpreter"
+cp "$t/qemu-static" "$t/qemu-noexec"; chmod 644 "$t/qemu-noexec"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-noexec" ""
+refused package 'not an executable regular file' "a non-executable interpreter"
+fresh; node "$t/b" qemu-aarch64 enabled "$t" ""
+refused package 'not an executable regular file' "a directory interpreter"
+fresh; node "$t/b" qemu-aarch64 enabled "relative/qemu" ""
+refused package 'cannot be mounted' "a relative interpreter"
+fresh; node "$t/b" qemu-aarch64 enabled "/tmp/a,b/qemu" ""
+refused package 'cannot be mounted' "an interpreter path with a comma"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/../qemu" ""
+refused package 'cannot be mounted' "an interpreter path with .."
+head -c 8 /dev/zero > "$t/not-elf"; chmod 755 "$t/not-elf"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/not-elf" ""
+refused package 'not a static executable' "a non-ELF interpreter"
+pass "only an exact, absolute, executable, static, non-symlink interpreter is mounted"
+
+# Disabled, globally disabled, absent, competing
+fresh; node "$t/b" qemu-aarch64 disabled "$t/qemu-static" F
+refused package 'is disabled (qemu-aarch64)' "a disabled node"
+refused rootfs 'is disabled' "a disabled node"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; printf disabled > "$t/b/status"
+refused package 'globally disabled' "a globally disabled binfmt_misc"
+refused rootfs 'globally disabled' "a globally disabled binfmt_misc"
+fresh
+refused package 'no usable aarch64 binfmt handler' "no node"
+fresh; node "$t/b" qemu-arm enabled /usr/bin/qemu-arm-static F 7f454c4601010100000000000000000002002800
+refused package 'no usable aarch64 binfmt handler' "only a non-aarch64 node"
+rm -rf "$t/b"
+refused package 'is not mounted' "a missing binfmt_misc"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; node "$t/b" aarch64-linux enabled /run/binfmt/aarch64-linux F
+refused package 'competing aarch64 binfmt handlers' "two enabled nodes"
+refused rootfs 'competing aarch64 binfmt handlers' "two enabled nodes"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; node "$t/b" .aarch64-linux enabled /run/binfmt/aarch64-linux ""
+refused package 'competing aarch64 binfmt handlers' "a visible F node and hidden non-F node"
+refused rootfs 'competing aarch64 binfmt handlers' "a visible F node and hidden non-F node"
+# Enumeration must neither inherit nor change the caller's glob state.
+fresh; node "$t/b" .qemu-aarch64 enabled /usr/bin/qemu-aarch64-static F
+if ! (
+  source tools/lib/alarm.sh
+  shopt -s dotglob
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt rootfs
+  shopt -q dotglob
+) >"$t/log" 2>&1; then fail "dotglob duplicates or refuses a hidden F handler"; fi
+fresh; node "$t/b" qemu-aarch64 enabled /usr/bin/qemu-aarch64-static F
+if ! (
+  source tools/lib/alarm.sh
+  shopt -s failglob
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt rootfs
+  shopt -q failglob
+) >"$t/log" 2>&1; then fail "failglob refuses a visible F handler or is not restored"; fi
+if ! (
+  source tools/lib/alarm.sh
+  set -f
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt rootfs
+  [[ $- == *f* ]]
+) >"$t/log" 2>&1; then fail "noglob hides a visible F handler or is not restored"; fi
+if ! (
+  source tools/lib/alarm.sh
+  GLOBIGNORE=qemu-aarch64
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt rootfs
+  [[ $GLOBIGNORE == qemu-aarch64 ]]
+) >"$t/log" 2>&1; then fail "GLOBIGNORE hides a visible F handler or is not restored"; fi
+pass "binfmt enumeration is complete and preserves inherited glob state"
+# Bit 16's low bit is ignored by the standard mask. The kernel therefore sees
+# this alternate magic as the same aarch64 predicate; preflight must too.
+ALT_MAGIC=7f454c460201010000000000000000000300b700
+fresh; node "$t/b" alternate-aarch64 enabled /run/binfmt/alternate-aarch64 F "$ALT_MAGIC"
+ok_args rootfs "" "an equivalent masked F handler"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; node "$t/b" alternate-aarch64 enabled "$t/qemu-static" "" "$ALT_MAGIC"
+refused package 'competing aarch64 binfmt handlers' "canonical and masked-equivalent enabled nodes"
+refused rootfs 'competing aarch64 binfmt handlers' "canonical and masked-equivalent enabled nodes"
+FULL_MASK=ffffffffffffffffffffffffffffffffffffffff
+fresh; node "$t/b" pie-aarch64 enabled /run/binfmt/pie-aarch64 F "$ALT_MAGIC" "$FULL_MASK"
+ok_args rootfs "" "an exact ET_DYN-only F handler"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; node "$t/b" pie-aarch64 enabled "$t/qemu-static" "" "$ALT_MAGIC" "$FULL_MASK"
+refused package 'competing aarch64 binfmt handlers' "canonical F and exact ET_DYN-only non-F nodes"
+refused rootfs 'competing aarch64 binfmt handlers' "canonical F and exact ET_DYN-only non-F nodes"
+# OSABI is not fixed by the AArch64 ELF ABI. An exact Linux-OSABI predicate is
+# therefore a real competitor even though a zero-filled representative misses it.
+LINUX_OSABI_MAGIC=7f454c4602010103
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; node "$t/b" linux-osabi-aarch64 enabled "$t/qemu-static" "" "$LINUX_OSABI_MAGIC" ffffffffffffffff
+refused package 'competing aarch64 binfmt handlers' "canonical F and exact Linux-OSABI non-F nodes"
+refused rootfs 'competing aarch64 binfmt handlers' "canonical F and exact Linux-OSABI non-F nodes"
+# A predicate can start after e_ident and mask variable fields. This one fixes
+# EM_AARCH64, ELF e_version and e_ehsize while leaving intervening bytes free.
+LATE_MAGIC=b70001000000000000000000000000000000000000000000000000000000000000004000
+LATE_MASK=ffffffffffff00000000000000000000000000000000000000000000000000000000ffff
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; node "$t/b" late-aarch64 enabled "$t/qemu-static" "" "$LATE_MAGIC" "$LATE_MASK" 18
+refused package 'competing aarch64 binfmt handlers' "canonical F and late-header non-F nodes"
+refused rootfs 'competing aarch64 binfmt handlers' "canonical F and late-header non-F nodes"
+fresh; node "$t/b" wrong-offset enabled /usr/bin/qemu-aarch64-static F "$MAGIC" '' 1
+refused package 'no usable aarch64 binfmt handler' "a matching magic at another offset"
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" F; node "$t/b" aarch64-linux disabled /run/binfmt/aarch64-linux ""
+ok_args package "" "an enabled F node beside a disabled one"
+# binfmt_misc extension registrations have no magic/mask/offset fields. A
+# disabled one is inert and must not make an otherwise valid setup fail.
+printf 'disabled\ninterpreter /usr/bin/jarwrapper\nflags: \nextension .jar\n' > "$t/b/jar"
+ok_args rootfs "" "an enabled F node beside a disabled extension handler"
+printf 'enabled\ninterpreter /usr/bin/wine\nflags: \nextension .exe\n' > "$t/b/winexe"
+ok_args package "" "an enabled F node beside enabled and disabled extension handlers"
+ok_args rootfs "" "an enabled F node beside enabled and disabled extension handlers"
+printf 'enabled\ninterpreter /usr/bin/wine\nflags: F\noffset 0\nmagic %s\nmask %s\nextension .exe\n' \
+  "$MAGIC" ffffffffffffff00fffffffffffffffffeffffff > "$t/b/mixed"
+refused package 'mixes extension and magic predicates' "an enabled mixed extension/magic handler"
+refused rootfs 'mixes extension and magic predicates' "an enabled mixed extension/magic handler"
+fresh; printf 'enabled\ninterpreter /usr/bin/wine\nflags: \nextension .exe\n' > "$t/b/winexe"
+refused package 'no usable aarch64 binfmt handler' "only an enabled extension handler"
+refused rootfs 'no usable aarch64 binfmt handler' "only an enabled extension handler"
+fresh; node "$t/b" qemu-aarch64 disabled "$t/qemu-static" F; node "$t/b" aarch64-linux enabled "$t/qemu-static" ""
+ok_args package "$MOUNT" "a disabled node beside an enabled non-F one"
+pass "disabled, globally disabled, absent, masked-equivalent and competing handlers are handled"
+
+# A matcher implementation failure is not evidence that a handler is
+# unrelated. Rootfs preflight must fail closed instead of silently skipping it.
+fresh; node "$t/b" qemu-aarch64 enabled /usr/bin/qemu-aarch64-static F
+if (
+  source tools/lib/alarm.sh
+  alarm_binfmt_matches_aarch64() { return 42; }
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt rootfs
+) >"$t/log" 2>&1; then
+  fail "a binfmt matcher failure is accepted"
+fi
+grep -q 'cannot evaluate whether binfmt handler qemu-aarch64 matches aarch64 (matcher status 42)' "$t/log" ||
+  fail "a binfmt matcher failure is refused for the wrong reason"
+pass "binfmt matcher failures fail closed"
+
+# Malformed handler predicates are parser failures, not proven nonmatches. A
+# valid F handler beside one malformed enabled node must therefore fail closed.
+for malformed in offset magic mask; do
+  fresh; node "$t/b" qemu-aarch64 enabled /usr/bin/qemu-aarch64-static F
+  case $malformed in
+    offset) node "$t/b" malformed enabled "$t/qemu-static" "" "$MAGIC" '' bad ;;
+    magic) node "$t/b" malformed enabled "$t/qemu-static" "" zzzz '' 0 ;;
+    mask) node "$t/b" malformed enabled "$t/qemu-static" "" "$MAGIC" abc 0 ;;
+  esac
+  refused rootfs 'cannot evaluate whether binfmt handler malformed matches aarch64' "a malformed $malformed predicate"
+done
+pass "malformed binfmt predicates fail closed"
+
+# Arguments are replaced, not appended, on every call in the same shell
+(
+  source tools/lib/alarm.sh
+  fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" ""
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt package
+  [[ ${#ALARM_DOCKER_QEMU_ARGS[@]} == 2 ]] || exit 1
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt package
+  [[ ${#ALARM_DOCKER_QEMU_ARGS[@]} == 2 ]] || exit 2
+  node "$t/b" qemu-aarch64 enabled /usr/bin/qemu-aarch64-static F
+  ALARM_BINFMT_DIR=$t/b alarm_require_binfmt package
+  [[ ${#ALARM_DOCKER_QEMU_ARGS[@]} == 0 ]] || exit 3
+) >/dev/null 2>&1 || fail "ALARM_DOCKER_QEMU_ARGS is not reset on each call (status $?)"
+pass "ALARM_DOCKER_QEMU_ARGS is reset on each alarm_require_binfmt"
+
+# Docker call site 1: the build image's setup container (alarm_build_image)
+mkdir -p "$t/bin" "$t/keyrings" "$t/cache"
+for f in omarchy.gpg omarchy-trusted omarchy-revoked; do : > "$t/keyrings/$f"; done
+printf tarball > "$t/cache/ArchLinuxARM-aarch64-latest.tar.gz"
+cat > "$t/bin/docker" <<'SH'
+#!/bin/bash
+echo "docker $*" >> "$CALLS"
+[[ $1 == image && $2 == inspect ]] && exit 1
+exit 0
+SH
+cat > "$t/bin/gpg" <<'SH'
+#!/bin/bash
+# Fake gpg: a good signature by the pinned build key, nothing else
+for a; do [[ $a == --verify ]] && echo "[GNUPG:] VALIDSIG 0000 0 0 0 0 0 0 0 0 68B3537F39A313B3E574D06777193F152BDBE6A6"; done
+exit 0
+SH
+chmod +x "$t/bin/docker" "$t/bin/gpg"
+export CALLS=$t/calls
+call_site() { # MODE: the real alarm_fetch MODE, then alarm_build_image
+  rm -f "$CALLS"
+  (cd "$t/cache" && md5sum ArchLinuxARM-aarch64-latest.tar.gz > ArchLinuxARM-aarch64-latest.tar.gz.md5)
+  : > "$t/cache/ArchLinuxARM-aarch64-latest.tar.gz.sig"
+  echo key > "$t/cache/alarm-builder.asc"
+  (
+    set -euo pipefail
+    export PATH="$t/bin:$PATH" ALARM_CACHE=$t/cache OMARCHY_KEYRING_DIR=$t/keyrings ALARM_BINFMT_DIR=$t/b
+    source tools/lib/alarm.sh
+    alarm_fetch "$1"
+    alarm_build_image "$ROOT" >/dev/null
+  ) > "$t/log" 2>&1
+}
+fresh; node "$t/b" qemu-aarch64 enabled "$t/qemu-static" ""
+call_site package || fail "the real alarm_fetch/alarm_build_image fail for a mountable non-F handler"
+grep -q "^docker run --platform linux/arm64 $MOUNT --name omamobile-alarm-setup-" "$CALLS" ||
+  fail "the setup container does not get the interpreter mount: $(grep '^docker run' "$CALLS")"
+call_site rootfs && fail "the real alarm_fetch accepts a non-F handler for the rootfs"
+grep -q 'F (fix-binary) flag' "$t/log" || fail "alarm_fetch rootfs refuses for the wrong reason"
+[[ ! -e $CALLS ]] || ! grep -q '^docker run' "$CALLS" || fail "a refused rootfs started a container"
+fresh; node "$t/b" qemu-aarch64 enabled /usr/bin/qemu-aarch64-static F
+call_site rootfs || fail "the real alarm_fetch refuses an F handler for the rootfs"
+grep -q '^docker run --platform linux/arm64 --name omamobile-alarm-setup-' "$CALLS" ||
+  fail "an F handler adds Docker arguments to the setup container"
+pass "alarm_fetch and the setup container's docker run follow the binfmt matrix"
+
+# The other call sites are checked statically here and run in their own tests
+grep -q 'alarm_fetch rootfs' tools/build-rootfs || fail "tools/build-rootfs does not ask for the rootfs binfmt mode"
+if grep -n 'ALARM_DOCKER_QEMU_ARGS' tools/build-rootfs rootfs/build-inside; then
+  fail "the rootfs build must never mount an emulator"
+fi
+[[ $(grep -c '"${ALARM_DOCKER_QEMU_ARGS\[@\]}"' tools/build-packages) == 1 ]] || fail "tools/build-packages's container run lacks the qemu arguments"
+[[ $(grep -c '"${ALARM_DOCKER_QEMU_ARGS\[@\]}"' tools/lib/alarm.sh) == 1 ]] || fail "alarm_build_image's container run lacks the qemu arguments"
+[[ $(grep -c 'docker run' tools/build-packages tools/lib/alarm.sh tools/build-rootfs | awk -F: '{s+=$2} END {print s}') == 3 ]] ||
+  fail "a new docker run call site needs a binfmt decision here"
+pass "every docker run call site is accounted for"
+
+# rootfs/build-inside validates staged trust with Python inside the builder,
+# before the target root has any bearing on the builder's executables.
+grep -Eq '^pacman -Syu --noconfirm --needed .*([[:space:]])python([[:space:]]|$)' tools/lib/alarm-setup ||
+  fail "the builder image does not install Python for rootfs/build-inside"
+pass "the builder image installs Python for rootfs validation"
+
+# Nothing in the binfmt code writes binfmt_misc or escalates
+if sed -n '/^alarm_require_binfmt/,/^}/p' tools/lib/alarm.sh | grep -Eq 'sudo|mkdir|tee |install -d|>>?[[:space:]]*"?\$(dir|file)|/register'; then
+  fail "alarm_require_binfmt writes binfmt_misc or escalates"
+fi
+pass "alarm_require_binfmt only reads"

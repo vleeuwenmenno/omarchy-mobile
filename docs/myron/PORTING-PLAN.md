@@ -319,6 +319,13 @@ generation never overwrites the same version: choose a new version or remove
 the previous output deliberately.
 `tests/rootfs-stage` inspects a stage tree read-only.
 
+A machine without the signing key can stage from a separate, unsigned,
+development-only repository (`tools/build-packages --dev-unsigned`, then
+`env DEVICE=myron tools/build-rootfs --dev-unsigned --stage-only`): see
+[DEV-UNSIGNED.md](DEV-UNSIGNED.md). That stage is named `dev-unsigned`, says so
+in its MANIFEST, is not a release and is refused by `tools/myron-deployment`.
+Whether the real containers accept it is untested until one real run.
+
 `ROOTFS_PACKAGE_PROFILE=myron` replaces the shared Pixel-oriented package
 lists for this stage. It explicitly includes NetworkManager, ModemManager,
 libqmi, GeoClue, PipeWire/WirePlumber, Chrony, BlueZ, Hyprland, and the isolated

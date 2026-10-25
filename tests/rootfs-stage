@@ -12,20 +12,24 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
-# check_stage TREE MANIFEST: prints the first violation and returns 1
+# check_stage TREE MANIFEST [NAMED]: prints the first violation and returns 1.
+# NAMED=1 also checks that the tree's name says dev-unsigned exactly when the
+# stage carries the development repository marker.
 check_stage() {
-  local tree=$1 manifest=$2 p
+  local tree=$1 manifest=$2 named=${3:-0} p
   [[ -d $tree ]] || { echo "no stage tree $tree"; return 1; }
   [[ -f $manifest ]] || { echo "no MANIFEST"; return 1; }
-  if ! p=$(python3 - "$tree" "$manifest" 2>&1 <<'PY'
+  if ! p=$(python3 - "$tree" "$manifest" "$named" 2>&1 <<'PY'
 import fnmatch
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 
 root = Path(sys.argv[1])
 manifest = Path(sys.argv[2])
+named = sys.argv[3] == "1"
 required = [
     "usr/share/omamobile/device.conf",
     "usr/share/omamobile/device-myron/version",
@@ -230,6 +234,82 @@ if modules is not None:
     finally:
         os.close(descriptor)
 
+# Repository mode: the marker inside the staged repository, the MANIFEST line
+# and (for a named stage) the directory name must all tell the same story.
+DEV_MARKER = "var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned"
+DEV_MARKER_TEXT = (
+    b"development-only: unsigned package repository\n"
+    b"release-authority: false\n"
+    b"deployment-authorized: false\n"
+)
+DEV_LINE = "repository signatures: none (unsigned development build; not a release)"
+SIGNED_LINE = "repository signatures: signed release"
+if lstat_beneath(DEV_MARKER) is not None:
+    if read_beneath(root, DEV_MARKER, "development marker") != DEV_MARKER_TEXT:
+        fail("development marker does not hold the exact bytes")
+    if DEV_LINE not in manifest_lines:
+        fail("MANIFEST lacks the unsigned development repository line")
+    if SIGNED_LINE in manifest_lines:
+        fail("MANIFEST claims a signed release for a development stage")
+    if named and "dev-unsigned" not in root.name:
+        fail("a development stage must have dev-unsigned in its name")
+    repository = open_beneath(root, "var/lib/omamobile/repo/aarch64", "development repository")
+    try:
+        if any(name.endswith(".sig") for name in os.listdir(f"/proc/self/fd/{repository}")):
+            fail("signature file in the development repository")
+    finally:
+        os.close(repository)
+else:
+    if DEV_LINE in manifest_lines:
+        fail("MANIFEST claims an unsigned development repository without its marker")
+    if SIGNED_LINE not in manifest_lines:
+        fail("MANIFEST lacks the signed release repository line")
+    if named and "dev-unsigned" in root.name:
+        fail("a stage named dev-unsigned lacks the development marker")
+
+# The final trust is the committed one: Required, never the build's relaxation
+conf = read_beneath(root, "etc/pacman.conf", "staged pacman.conf").decode("utf-8")
+conf_lines = [line.strip() for line in conf.splitlines() if not line.strip().startswith("#")]
+if [l for l in conf_lines if l.lower().startswith("siglevel")] != ["SigLevel = Required DatabaseOptional"]:
+    fail("staged pacman.conf SigLevel is not Required DatabaseOptional")
+if [l for l in conf_lines if l.lower().startswith("localfilesiglevel")] != ["LocalFileSigLevel = Optional"]:
+    fail("staged pacman.conf LocalFileSigLevel differs")
+if any(l.lower().startswith("remotefilesiglevel") for l in conf_lines):
+    fail("staged pacman.conf carries a RemoteFileSigLevel")
+if "trustall" in conf.lower() or "trustedonly" in conf.lower():
+    fail("staged pacman.conf leaks the build's Optional/TrustAll trust")
+section = None
+omamobile = []
+for line in conf_lines:
+    if line.startswith("["):
+        section = line
+    elif section == "[omamobile]" and line:
+        omamobile.append(line)
+if omamobile != ["Include = /etc/pacman.d/omamobile-mirrorlist"]:
+    fail("staged [omamobile] repository differs from the local mirrorlist include")
+mirrorlist = read_beneath(
+    root, "etc/pacman.d/omamobile-mirrorlist", "staged [omamobile] mirrorlist"
+).decode("utf-8")
+mirror_directives = [
+    line.strip()
+    for line in mirrorlist.splitlines()
+    if line.strip() and not line.strip().startswith("#")
+]
+if mirror_directives != ["Server = file:///var/lib/omamobile/repo/$arch"]:
+    fail("staged [omamobile] mirrorlist differs from the one-server allowlist")
+upstream_mirrorlist = read_beneath(
+    root, "etc/pacman.d/mirrorlist", "staged upstream mirrorlist"
+).decode("utf-8")
+upstream_directives = [
+    line.strip()
+    for line in upstream_mirrorlist.splitlines()
+    if line.strip() and not line.strip().startswith("#")
+]
+if not upstream_directives or any(
+    re.fullmatch(r"Server\s*=\s*\S+", line) is None for line in upstream_directives
+):
+    fail("staged upstream mirrorlist contains a non-Server directive")
+
 # lexists semantics: a dangling symlink at these paths counts as present.
 for path in (
     "vendor", "odm", "system_ext",
@@ -252,6 +332,8 @@ PAYLOAD_NAMES = (
     "initramfs*", "*.img", "*.img.zst",
 )
 
+QEMU_NAMES = ("qemu-*-static", "qemu-aarch64*", "qemu-user*")
+
 def scan(directory, relative, depth):
     # Any error while walking is a rejection: an unreadable subtree is unverified.
     if depth > 256:
@@ -262,6 +344,8 @@ def scan(directory, relative, depth):
         traversal_failed(relative or ".", error)
     for name in names:
         path = f"{relative}/{name}" if relative else name
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in QEMU_NAMES):
+            fail(f"qemu emulator payload {path}")
         if any(fnmatch.fnmatchcase(name, pattern) for pattern in PAYLOAD_NAMES):
             fail(f"kernel, module, or boot payload {path}")
         try:
@@ -306,6 +390,11 @@ synthetic() { # DIR
   mkdir -p "$d/tree/usr/lib/firmware"
   : > "$d/tree/usr/lib/firmware/regulatory.db"
   : > "$d/tree/usr/lib/firmware/regulatory.db.p7s"
+  # The committed final trust, as tools/build-rootfs stages it
+  mkdir -p "$d/tree/etc/pacman.d" "$d/tree/var/lib/omamobile/repo/aarch64"
+  sed 's/@OMARCHY_CHANNEL@/stable/' rootfs/pacman.conf > "$d/tree/etc/pacman.conf"
+  printf 'Server = https://mirror.example.invalid/$arch/$repo\n' > "$d/tree/etc/pacman.d/mirrorlist"
+  : > "$d/tree/var/lib/omamobile/repo/aarch64/omamobile.db"
   cat > "$d/MANIFEST" <<'M'
 # Omarchy Mobile root STAGE (not bootable, not an image)
 version: synthetic
@@ -313,16 +402,26 @@ stage: non-bootable; not image-ready; not hardware-qualified
 rootfs integration: external-contract
 rootfs package profile: myron
 package closure: required present; forbidden absent
+repository signatures: signed release
 kernel modules: none (external contract, no module payload)
 boot payload: none; proprietary payload: none
 M
+}
+
+# The same stage built from the unsigned development repository (--dev-unsigned)
+synthetic_dev() { # DIR
+  local d=$1
+  synthetic "$d"
+  printf 'development-only: unsigned package repository\nrelease-authority: false\ndeployment-authorized: false\n' \
+    > "$d/tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned"
+  sed -i 's/^repository signatures: .*/repository signatures: none (unsigned development build; not a release)/' "$d/MANIFEST"
 }
 
 if (($#)); then
   requested=${1%/}
   [[ $requested == *omamobile-rootfs-stage-* ]] || fail "$requested is not an omamobile-rootfs-stage tree"
   stage=$(realpath -e -- "$requested") || fail "no stage tree $requested"
-  if msg=$(check_stage "$stage" "$stage.MANIFEST"); then pass "stage tree $stage"; else fail "$msg"; fi
+  if msg=$(check_stage "$stage" "$stage.MANIFEST" 1); then pass "stage tree $stage"; else fail "$msg"; fi
   [[ ! -e $stage.img && ! -e $stage.img.zst && ! -e $stage.img.zst.sha256 ]] || fail "an image or checksum sits beside the stage"
   pass "no image or checksum beside the stage"
   exit 0
@@ -413,3 +512,78 @@ accept_symlinks() {
   pass "standard Arch symlinks and an empty modules directory are accepted"
 }
 accept_symlinks
+
+# Repository mode, trust and emulator payload (tools/build-rootfs --dev-unsigned)
+reject_dev() { # NAME EXPECT MUTATION... (starts from a valid development stage)
+  local name=$1 expect=$2 msg; shift 2
+  chmod -R u+rwx "$t/m" 2>/dev/null || true
+  rm -rf "$t/m"; mkdir "$t/m"; synthetic_dev "$t/m"
+  (cd "$t/m" && "$@")
+  if msg=$(check_stage "$t/m/tree" "$t/m/MANIFEST"); then fail "$name is accepted"; fi
+  grep -q "$expect" <<<"$msg" || fail "$name rejected for the wrong reason: $msg"
+  pass "$name is rejected"
+}
+rm -rf "$t/m"; mkdir "$t/m"; synthetic_dev "$t/m"
+check_stage "$t/m/tree" "$t/m/MANIFEST" >/dev/null || fail "a development stage with marker and manifest line is rejected"
+pass "a development stage with marker and manifest line is accepted"
+# Names: dev-unsigned in the name exactly when the stage is a development stage
+mkdir "$t/n"; synthetic_dev "$t/n"
+mv "$t/n/tree" "$t/n/omamobile-rootfs-stage-dev-unsigned-x-aarch64"
+check_stage "$t/n/omamobile-rootfs-stage-dev-unsigned-x-aarch64" "$t/n/MANIFEST" 1 >/dev/null ||
+  fail "a correctly named development stage is rejected"
+mv "$t/n/omamobile-rootfs-stage-dev-unsigned-x-aarch64" "$t/n/omamobile-rootfs-stage-x-aarch64"
+if msg=$(check_stage "$t/n/omamobile-rootfs-stage-x-aarch64" "$t/n/MANIFEST" 1); then fail "a development stage without dev-unsigned in its name is accepted"; fi
+grep -q "must have dev-unsigned in its name" <<<"$msg" || fail "unnamed development stage rejected for the wrong reason: $msg"
+rm -rf "$t/s"; mkdir "$t/s"; synthetic "$t/s"
+mv "$t/s/tree" "$t/s/omamobile-rootfs-stage-dev-unsigned-x-aarch64"
+if msg=$(check_stage "$t/s/omamobile-rootfs-stage-dev-unsigned-x-aarch64" "$t/s/MANIFEST" 1); then fail "a signed stage named dev-unsigned is accepted"; fi
+grep -q "lacks the development marker" <<<"$msg" || fail "misnamed signed stage rejected for the wrong reason: $msg"
+pass "stage names say dev-unsigned exactly for development stages"
+reject_dev "a development stage with a signed-release manifest" "lacks the unsigned development repository line" \
+  sed -i 's/^repository signatures: .*/repository signatures: signed release/' MANIFEST
+reject_dev "a development stage with both manifest lines" "claims a signed release" \
+  bash -c 'echo "repository signatures: signed release" >> MANIFEST'
+reject "a signed stage with the unsigned manifest line" "unsigned development repository without its marker" \
+  sed -i 's/^repository signatures: .*/repository signatures: none (unsigned development build; not a release)/' MANIFEST
+reject "a stage without a repository signature line" "lacks the signed release repository line" \
+  sed -i '/^repository signatures: /d' MANIFEST
+reject "a signed stage with a marker lacking the manifest line" "unsigned development repository line" \
+  bash -c 'printf "development-only: unsigned package repository\nrelease-authority: false\ndeployment-authorized: false\n" > tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned'
+reject_dev "a marker with other bytes" "exact bytes" \
+  bash -c 'printf "development-only: unsigned package repository\nrelease-authority: true\ndeployment-authorized: false\n" > tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned'
+reject_dev "a marker without its final newline" "exact bytes" \
+  bash -c 'printf "development-only: unsigned package repository\nrelease-authority: false\ndeployment-authorized: false" > tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned'
+reject_dev "a dangling marker symlink" "not a regular file" \
+  bash -c 'rm tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned; ln -s /nonexistent-omamobile tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned'
+reject_dev "a marker directory" "not a regular file" \
+  bash -c 'rm tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned; mkdir tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned'
+reject_dev "a marker FIFO" "not a regular file" \
+  bash -c 'rm tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned; mkfifo tree/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned'
+reject_dev "a signature in the development repository" "signature file in the development repository" \
+  ln -s /nonexistent-omamobile tree/var/lib/omamobile/repo/aarch64/x.pkg.tar.zst.sig
+reject_dev "a TrustAll relaxation in the staged pacman.conf" "SigLevel is not Required" \
+  bash -c 'sed -i "s/^SigLevel = .*/SigLevel = TrustAll/" tree/etc/pacman.conf'
+reject_dev "a TrustAll remark left in the staged pacman.conf" "leaks" \
+  bash -c 'echo "# SigLevel = TrustAll" >> tree/etc/pacman.conf'
+reject_dev "an Optional TrustedOnly stanza in the staged pacman.conf" "SigLevel is not Required" \
+  bash -c 'sed -i "s/^\[omamobile\]/[omamobile]\nSigLevel = Optional TrustedOnly/" tree/etc/pacman.conf'
+reject_dev "a staged pacman.conf with Optional global trust" "SigLevel is not Required DatabaseOptional" \
+  bash -c 'sed -i "s/^SigLevel = .*/SigLevel = Optional/" tree/etc/pacman.conf'
+reject_dev "a staged pacman.conf with a per-repository SigLevel" "SigLevel is not Required DatabaseOptional" \
+  bash -c 'sed -i "s/^\[omarchy\]/[omarchy]\nSigLevel = Optional/" tree/etc/pacman.conf'
+reject_dev "a staged build-time file:///repo server" "staged \[omamobile\] repository differs" \
+  bash -c 'sed -i "s#^Include = /etc/pacman.d/omamobile-mirrorlist#Server = file:///repo/\$arch#" tree/etc/pacman.conf'
+reject_dev "a signature relaxation in the included mirrorlist" "one-server allowlist" \
+  bash -c 'echo "SigLevel = Optional TrustAll" >> tree/etc/pacman.d/omamobile-mirrorlist'
+reject_dev "a signature relaxation in the upstream mirrorlist" "non-Server directive" \
+  bash -c 'echo "SigLevel = Optional TrustAll" >> tree/etc/pacman.d/mirrorlist'
+reject_dev "a nested include in the upstream mirrorlist" "non-Server directive" \
+  bash -c 'echo "Include = /etc/pacman.d/unchecked" >> tree/etc/pacman.d/mirrorlist'
+reject_dev "a missing staged pacman.conf" "missing or unsafe" rm tree/etc/pacman.conf
+reject_dev "a qemu static emulator" "qemu emulator payload" \
+  bash -c 'mkdir -p tree/usr/bin && : > tree/usr/bin/qemu-aarch64-static'
+reject "a qemu binfmt registration" "qemu emulator payload" \
+  bash -c 'mkdir -p tree/usr/lib/binfmt.d && : > tree/usr/lib/binfmt.d/qemu-aarch64.conf'
+reject_dev "an image beside the development stage payload" "boot payload" bash -c 'mkdir -p tree/boot && : > tree/boot/boot.img'
+reject_dev "a kernel module in a development stage" "kernel modules in the stage" bash -c 'mkdir -p tree/usr/lib/modules/6.12 && : > tree/usr/lib/modules/6.12/x'
+reject_dev "a vendor path in a development stage" "proprietary or vendor path" mkdir tree/vendor

@@ -12,6 +12,10 @@
 # ALLOW_MISSING (both space-separated), KERNEL_RELEASE, MODULES_SHA256,
 # GIT_COMMIT, ALARM_SHA256, OMARCHY_CHANNEL, OUT_UID, OUT_GID,
 # ROOTFS_INTEGRATION (kernel-modules or external-contract) and STAGE_ONLY (0/1).
+# ROOTFS_DEV_UNSIGNED (0/1), REPO_STANZA_SED, DEV_MARKER_NAME, DEV_MARKER_TEXT,
+# DEV_MANIFEST_LINE and SIGNED_MANIFEST_LINE come from tools/build-rootfs: with
+# ROOTFS_DEV_UNSIGNED=1 /repo is the unsigned development repository (Myron
+# stage only) and only the per-run [omamobile] stanza trusts it unsigned.
 # STAGE_ONLY=1 needs external-contract: no /modules, no image, the tree goes to
 # /out/stage and the MANIFEST says it is a non-bootable stage.
 set -euo pipefail
@@ -39,8 +43,33 @@ else
 fi
 trap 'chown -R "$OUT_UID:$OUT_GID" /var/cache/pacman/pkg /out 2>/dev/null || true' EXIT
 
+# Signed or development repository: the mode, the marker and the stanza agree
+DEV_UNSIGNED=${ROOTFS_DEV_UNSIGNED:-0}
+[[ $DEV_UNSIGNED == 0 || $DEV_UNSIGNED == 1 ]] || die "bad ROOTFS_DEV_UNSIGNED '$DEV_UNSIGNED'"
+marker=/repo/aarch64/${DEV_MARKER_NAME:-.omamobile-dev-unsigned}
+if [[ $DEV_UNSIGNED == 1 ]]; then
+  [[ ${DEVICE:-} == myron && $STAGE_ONLY == 1 && $ROOTFS_INTEGRATION == external-contract ]] ||
+    die "ROOTFS_DEV_UNSIGNED=1 needs DEVICE=myron, STAGE_ONLY=1 and ROOTFS_INTEGRATION=external-contract"
+  for signing_path in /src/keys /src/keys/fingerprint /src/keys/gnupg; do
+    if [[ $signing_path == /src/keys ]]; then
+      [[ ! -L $signing_path && ( ! -e $signing_path || -d $signing_path ) ]] && continue
+    fi
+    [[ ! -e $signing_path && ! -L $signing_path ]] ||
+      die "the development build refuses signing material exposed through /src"
+  done
+  [[ -f $marker && ! -L $marker ]] && cmp -s "$marker" <(printf '%s' "${DEV_MARKER_TEXT:?}") ||
+    die "the development repository marker is missing or not exact"
+  [[ -z $(find /repo/aarch64 -name '*.sig' -print -quit) ]] || die "the development repository holds a signature file"
+  [[ ${REPO_STANZA_SED:?} == *'SigLevel = Optional TrustedOnly'* ]] || die "the development stanza does not trust the repository"
+  manifest_repo_line=${DEV_MANIFEST_LINE:?}
+else
+  [[ ! -e $marker && ! -L $marker ]] || die "the signed repository holds the development marker"
+  [[ ${REPO_STANZA_SED:?} != *SigLevel* ]] || die "the signed stanza relaxes SigLevel"
+  manifest_repo_line=${SIGNED_MANIFEST_LINE:?}
+fi
+
 # [omamobile] first, from the repository being shipped
-sed -i "0,/^\[omarchy\]/s//[omamobile]\nServer = file:\/\/\/repo\/\$arch\n\n[omarchy]/" /etc/pacman.conf
+sed -i "$REPO_STANZA_SED" /etc/pacman.conf
 pacman -Sy >/dev/null
 available() { pacman -Sp --print-format %n "$1" >/dev/null 2>&1; }
 
@@ -112,7 +141,74 @@ fi
 
 say "pacman.conf and the [omamobile] repository"
 sed "s/@OMARCHY_CHANNEL@/$OMARCHY_CHANNEL/" /src/rootfs/pacman.conf > "$T/etc/pacman.conf"
-install -Dm644 /etc/pacman.d/mirrorlist "$T/etc/pacman.d/mirrorlist"
+# The shipped trust never carries the build's: Required, never Optional or TrustAll
+[[ $(grep -c '^[[:space:]]*SigLevel' "$T/etc/pacman.conf") == 1 ]] &&
+  grep -qx 'SigLevel = Required DatabaseOptional' "$T/etc/pacman.conf" &&
+  ! grep -Eq 'TrustAll|TrustedOnly' "$T/etc/pacman.conf" ||
+  die "the staged pacman.conf does not keep SigLevel = Required DatabaseOptional"
+if [[ $ROOTFS_PACKAGE_PROFILE == myron ]]; then
+  mirrorlist=$T/etc/pacman.d/omamobile-mirrorlist
+  [[ -f $mirrorlist && ! -L $mirrorlist ]] &&
+    cmp -s "$mirrorlist" /src/packages/omamobile-device-myron/etc/omamobile-mirrorlist ||
+    die "the staged [omamobile] mirrorlist differs from the committed one-server policy"
+fi
+# pacman.conf includes this file for every upstream repository. Copy it through
+# a no-follow descriptor only when every effective line is a Server directive;
+# an injected Include or SigLevel must never survive into the published stage.
+python3 -I - "/etc/pacman.d/mirrorlist" "$T/etc/pacman.d/mirrorlist" <<'PY'
+import os
+import re
+import stat
+import sys
+
+source = sys.argv[1]
+target = sys.argv[2]
+try:
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError as error:
+    raise SystemExit(f"unsafe upstream mirrorlist: {error.strerror}")
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("unsafe upstream mirrorlist: not a regular file")
+    data = os.read(descriptor, 1024 * 1024 + 1)
+finally:
+    os.close(descriptor)
+if len(data) > 1024 * 1024:
+    raise SystemExit("unsafe upstream mirrorlist: too large")
+try:
+    text = data.decode("utf-8")
+except UnicodeDecodeError:
+    raise SystemExit("unsafe upstream mirrorlist: not UTF-8")
+directives = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+if not directives or any(not re.fullmatch(r"Server\s*=\s*\S+", line) for line in directives):
+    raise SystemExit("unsafe upstream mirrorlist: only Server directives are allowed")
+os.makedirs(os.path.dirname(target), exist_ok=True)
+flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+try:
+    output = os.open(target, flags)
+except FileNotFoundError:
+    try:
+        output = os.open(target, flags | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as error:
+        raise SystemExit(f"unsafe staged upstream mirrorlist: {error.strerror}")
+except OSError as error:
+    raise SystemExit(f"unsafe staged upstream mirrorlist: {error.strerror}")
+try:
+    metadata = os.fstat(output)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit("unsafe staged upstream mirrorlist: not an independent regular file")
+    os.ftruncate(output, 0)
+    os.fchmod(output, 0o644)
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(output, remaining)
+        if written == 0:
+            raise SystemExit("unsafe staged upstream mirrorlist: short write")
+        remaining = remaining[written:]
+finally:
+    os.close(output)
+PY
 mkdir -p "$T/var/lib/omamobile/repo/aarch64"
 cp -a /repo/aarch64/. "$T/var/lib/omamobile/repo/aarch64/"
 chown -R 0:0 "$T/var/lib/omamobile/repo"
@@ -185,6 +281,7 @@ say "MANIFEST"
   echo "omarchy channel: $OMARCHY_CHANNEL"
   echo "rootfs package profile: $ROOTFS_PACKAGE_PROFILE"
   echo "package closure: $package_closure"
+  echo "$manifest_repo_line"
   if [[ $STAGE_ONLY == 1 ]]; then
     echo "stage: non-bootable; not image-ready; not hardware-qualified"
     echo "rootfs integration: external-contract"

@@ -1,0 +1,274 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# tools/build-rootfs --dev-unsigned (Myron --stage-only, development only), the
+# host side, with a fake container (no Docker, no pacstrap, no pacman, no
+# chroot, no network, no phone): what it refuses before any work, which
+# repository it mounts, the shared lock it holds while the container runs, the
+# dev-unsigned stage name, the trust and manifest the container is told to
+# use, no-clobber, and that the signed default is unchanged. It does NOT prove
+# that pacman installs unsigned packages or that the stage resolves: that needs
+# a real build (docs/myron/DEV-UNSIGNED.md).
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+t=$(mktemp -d)
+bgpid=""
+cleanup() { [[ -z $bgpid ]] || kill "$bgpid" 2>/dev/null || true; chmod -R u+rwx "$t" 2>/dev/null || true; rm -rf "$t"; }
+trap cleanup EXIT
+fail() { printf 'not ok - %s\n' "$1" >&2; [[ ! -f $t/log ]] || sed 's/^/    | /' "$t/log" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+command -v flock >/dev/null || { echo "ok - # skip: no flock on this machine"; exit 0; }
+
+R=$t/repo
+DEV=out/dev-unsigned/repo/aarch64
+MARKER_NAME=.omamobile-dev-unsigned
+MARKER_TEXT=$'development-only: unsigned package repository\nrelease-authority: false\ndeployment-authorized: false\n'
+DEV_LINE='repository signatures: none (unsigned development build; not a release)'
+SIGNED_LINE='repository signatures: signed release'
+
+python3 -I - "$t/qemu-static" <<'PY'
+import struct, sys
+header = bytearray(64)
+header[:7] = b"\x7fELF\x02\x01\x01"
+struct.pack_into("<HHIQQQIHHHHHH", header, 16, 2, 62, 1, 0x400000, 64, 0, 0, 64, 56, 1, 64, 0, 0)
+open(sys.argv[1], "wb").write(bytes(header) + struct.pack("<IIQQQQQQ", 1, 5, 0, 0x400000, 0x400000, 0, 0, 0x1000))
+PY
+chmod 755 "$t/qemu-static"
+mkdir -p "$t/b" "$t/bin" "$t/cache"
+printf enabled > "$t/b/status"
+binfmt() { # F|plain
+  printf 'enabled\ninterpreter %s\nflags: %s\noffset 0\nmagic 7f454c460201010000000000000000000200b700\nmask ffffffffffffff00fffffffffffffffffeffffff\n' \
+    "$t/qemu-static" "$([[ $1 == F ]] && echo F)" > "$t/b/qemu-aarch64"
+}
+binfmt F
+printf fixture > "$t/cache/ArchLinuxARM-aarch64-latest.tar.gz"
+
+cat > "$t/bin/docker" <<'SH'
+#!/bin/bash
+# Fake docker: records every call; on `run` checks the repository lock the
+# way a concurrent writer would and leaves a minimal stage and MANIFEST
+echo "docker $*" >> "$CALLS"
+# One line per argument (some carry newlines), for exact assertions
+[[ $1 != run ]] || for argument; do printf 'ARG %s\n' "$argument" >> "$CALLS"; done
+if [[ $1 == volume ]]; then exit 0; fi
+if [[ $1 == run ]]; then
+  previous= output= lock=
+  for argument; do
+    [[ $previous == -v && $argument == *:/out ]] && output=${argument%:/out}
+    [[ $previous == -v && $argument == *:/repo:ro ]] && lock=${argument%:/repo:ro}/.repo.lock
+    previous=$argument
+  done
+  [[ -n $output && -n $lock ]] || exit 91
+  if flock -n -x "$lock" true 2>/dev/null; then echo "LOCK-FREE" >> "$CALLS"; else echo "LOCK-HELD" >> "$CALLS"; fi
+  if flock -n -s "$lock" true 2>/dev/null; then echo "SHARED-OK" >> "$CALLS"; fi
+  mkdir -p "$output/stage"
+  printf '# Omarchy Mobile root STAGE (not bootable, not an image)\n' > "$output/MANIFEST"
+  exit 0
+fi
+exit 92
+SH
+cat > "$t/bin/git" <<'SH'
+#!/bin/sh
+if [ "$1" = rev-parse ]; then echo deadbeef0000; fi
+exit 0
+SH
+chmod +x "$t/bin/docker" "$t/bin/git"
+export CALLS=$t/calls
+
+new_repo() {
+  chmod -R u+rwx "$R" 2>/dev/null || true
+  rm -rf "$R"
+  mkdir -p "$R/tools/lib" "$R/rootfs" "$R/tests" "$R/device/myron" "$R/device/probe"
+  cp tools/build-rootfs "$R/tools/"
+  cp tools/lib/alarm.sh tools/lib/dev-repo.sh "$R/tools/lib/"
+  cp rootfs/packages.base rootfs/packages.omamobile rootfs/packages.base.myron rootfs/packages.omamobile.myron "$R/rootfs/"
+  cp device/myron/device.conf "$R/device/myron/"
+  printf 'CODENAME=probe\nPACKAGE=probe\nBOOT_METHOD=external-android\nROOTFS_INTEGRATION=external-contract\nBOOT_IMAGES=""\nUFS_RW=""\n' > "$R/device/probe/device.conf"
+  # The real binfmt code runs; the network part of alarm_fetch does not
+  cat >> "$R/tools/lib/alarm.sh" <<'SH'
+alarm_fetch() { echo "alarm_fetch ${1:-}" >> "$CALLS"; alarm_require_binfmt "${1:-package}"; }
+alarm_build_image() { echo fake-aarch64-builder; }
+SH
+  printf '#!/bin/sh\necho "rootfs-stage $*" >> "$CALLS"\nexit 0\n' > "$R/tests/rootfs-stage"
+  chmod +x "$R/tests/rootfs-stage"
+  rm -f "$CALLS"
+}
+dev_repo() { # a valid development repository
+  mkdir -p "$R/$DEV"
+  printf '%s' "$MARKER_TEXT" > "$R/$DEV/$MARKER_NAME"
+  : > "$R/$DEV/omamobile.db.tar.gz"
+  : > "$R/$DEV/omamobile.files.tar.gz"
+  ln -s omamobile.db.tar.gz "$R/$DEV/omamobile.db"
+  ln -s omamobile.files.tar.gz "$R/$DEV/omamobile.files"
+  echo pkg > "$R/$DEV/x-1-1-aarch64.pkg.tar.zst"
+}
+signed_repo() { mkdir -p "$R/out/repo/aarch64"; : > "$R/out/repo/aarch64/omamobile.db"; }
+rootfs() { # ARGS...  (env DEVICE defaults to myron)
+  (cd "$R" && PATH="$t/bin:$PATH" ALARM_CACHE=$t/cache ALARM_BINFMT_DIR=$t/b DEVICE=${DEVICE:-myron} tools/build-rootfs "$@") > "$t/log" 2>&1
+}
+no_work() { # NAME: no container, no validation, no stage workspace or output
+  [[ ! -e $CALLS ]] || ! grep -q '^docker \|^rootfs-stage ' "$CALLS" || fail "$1 reached docker or the validator: $(cat "$CALLS")"
+  [[ -z $(find "$R/out" -maxdepth 1 -name '.rootfs-stage-*' -o -maxdepth 1 -name 'omamobile-rootfs-*' 2>/dev/null) ]] || fail "$1 left stage output behind"
+}
+refuses() { # NAME EXPECT ARGS...
+  local name=$1 expect=$2; shift 2
+  if rootfs "$@"; then fail "$name is accepted"; fi
+  grep -q -- "$expect" "$t/log" || fail "$name is refused for the wrong reason"
+  no_work "$name"
+}
+
+# --- refusals before any work -----------------------------------------------
+new_repo; dev_repo
+refuses "--dev-unsigned without --stage-only" 'unsupported BOOT_METHOD=external-android' --dev-unsigned --version x
+DEVICE=probe refuses "--dev-unsigned for another device" '--dev-unsigned is only for DEVICE=myron' --dev-unsigned --stage-only --version x
+for form in fingerprint-file gnupg-dir gnupg-dangling-link fingerprint-dangling-link keys-file keys-dangling-link; do
+  new_repo; dev_repo
+  case $form in
+    fingerprint-file) mkdir "$R/keys"; echo FAKEKEY > "$R/keys/fingerprint" ;;
+    gnupg-dir) mkdir -p "$R/keys/gnupg" ;;
+    gnupg-dangling-link) mkdir "$R/keys"; ln -s /nonexistent-omamobile "$R/keys/gnupg" ;;
+    fingerprint-dangling-link) mkdir "$R/keys"; ln -s /nonexistent-omamobile "$R/keys/fingerprint" ;;
+    keys-file) echo unexpected > "$R/keys" ;;
+    keys-dangling-link) ln -s /nonexistent-omamobile "$R/keys" ;;
+  esac
+  refuses "--dev-unsigned with $form" 'signing material' --dev-unsigned --stage-only --version x
+  [[ ! -e $R/out/dev-unsigned/repo/.repo.lock ]] || fail "$form: the lock was taken before the signing-material refusal"
+done
+pass "--dev-unsigned is Myron --stage-only only and refuses signing material before any work"
+
+new_repo
+refuses "a missing development repository" 'no \[omamobile\] repository in out/dev-unsigned/repo' --dev-unsigned --stage-only --version x
+new_repo; dev_repo; rm "$R/$DEV/$MARKER_NAME"
+refuses "a development repository without its marker" 'lacks the development marker' --dev-unsigned --stage-only --version x
+new_repo; dev_repo; printf 'wrong\n' > "$R/$DEV/$MARKER_NAME"
+refuses "a development repository with other marker bytes" 'exact bytes' --dev-unsigned --stage-only --version x
+new_repo; dev_repo; rm "$R/$DEV/$MARKER_NAME"; ln -s /nonexistent-omamobile "$R/$DEV/$MARKER_NAME"
+refuses "a development repository with a dangling marker" 'not a regular file' --dev-unsigned --stage-only --version x
+new_repo; dev_repo; mkfifo "$R/$DEV/x.sig" 2>/dev/null || ln -s /nonexistent-omamobile "$R/$DEV/x.sig"
+refuses "a development repository holding a signature" 'holds a signature file' --dev-unsigned --stage-only --version x
+new_repo; dev_repo; rm "$R/$DEV/x.sig" 2>/dev/null || true; ln -s /nonexistent-omamobile "$R/$DEV/y.sig"
+refuses "a development repository holding a dangling signature" 'holds a signature file' --dev-unsigned --stage-only --version x
+new_repo; dev_repo; mv "$R/out/dev-unsigned/repo" "$R/out/dev-unsigned/other"; ln -s other "$R/out/dev-unsigned/repo"
+refuses "a linked development repository directory" 'not a real directory' --dev-unsigned --stage-only --version x
+pass "the development repository must be a real directory with the exact marker, a database and no signature"
+
+new_repo; signed_repo; printf '%s' "$MARKER_TEXT" > "$R/out/repo/aarch64/$MARKER_NAME"
+refuses "the signed rootfs build with the development marker in out/repo" 'development-only unsigned repository marker' --stage-only --version x
+new_repo; signed_repo; ln -s /nonexistent-omamobile "$R/out/repo/aarch64/$MARKER_NAME"
+refuses "the signed rootfs build with a dangling marker in out/repo" 'development-only unsigned repository marker' --stage-only --version x
+new_repo; signed_repo
+refuses "a signed version named dev-unsigned" 'reserved for --dev-unsigned' --stage-only --version dev-unsigned-1
+pass "the signed rootfs build refuses the marker (any type) and the dev-unsigned name"
+
+# --- QEMU: the rootfs needs F ----------------------------------------------
+new_repo; dev_repo; binfmt plain
+refuses "a development rootfs without the F flag" 'F (fix-binary) flag' --dev-unsigned --stage-only --version x
+new_repo; signed_repo
+refuses "a signed rootfs without the F flag" 'F (fix-binary) flag' --stage-only --version x
+binfmt F
+pass "the rootfs build refuses a handler without F in both modes, before any container"
+
+# --- the development build, host side ---------------------------------------
+new_repo; dev_repo
+rootfs --dev-unsigned --stage-only --version t1 || fail "the mocked development stage fails"
+name=omamobile-rootfs-stage-dev-unsigned-t1-aarch64
+[[ -d $R/out/$name && -f $R/out/$name.MANIFEST ]] || fail "the development stage has the wrong name"
+[[ -z $(find "$R/out" -maxdepth 1 -name 'omamobile-rootfs-stage-t1-*') ]] || fail "a signed-named output appeared"
+[[ ! -e $R/out/repo ]] || fail "the development build created out/repo"
+grep -q '^alarm_fetch rootfs$' "$CALLS" || fail "the rootfs build did not ask for the rootfs binfmt mode"
+has() { grep -qxF -- "ARG $1" "$CALLS"; }
+has "$R/out/dev-unsigned/repo:/repo:ro" || fail "the container does not mount the development repository"
+[[ $(grep -c '^ARG .*:/repo:ro$' "$CALLS") == 1 ]] || fail "more than one repository mount"
+! grep -qF -- "ARG $R/out/repo" "$CALLS" || fail "the container sees the signed repository"
+! has --mount || fail "the rootfs container mounts an emulator"
+has ROOTFS_DEV_UNSIGNED=1 || fail "the container is not told it is a development build"
+has "DEV_MANIFEST_LINE=$DEV_LINE" || fail "the container lacks the exact development manifest line"
+grep -qxF 'deployment-authorized: false' "$CALLS" || fail "the container lacks the marker bytes"
+grep -F 'ARG REPO_STANZA_SED=' "$CALLS" | grep -qF 'SigLevel = Optional TrustedOnly' || fail "the development stanza is not passed"
+grep -q "^rootfs-stage .*$name\$" "$CALLS" || fail "the candidate was not validated under its dev-unsigned name: $(grep '^rootfs-stage' "$CALLS")"
+grep -qx 'LOCK-HELD' "$CALLS" && grep -qx 'SHARED-OK' "$CALLS" || fail "the shared repository lock is not held while the container runs"
+! grep -qx 'LOCK-FREE' "$CALLS" || fail "a writer could take the lock while the container ran"
+pass "the development stage is named dev-unsigned, mounts only out/dev-unsigned, holds the shared lock and passes the exact trust and manifest to the container"
+
+# No-clobber, and dev/signed names never collide
+rm -f "$CALLS"
+echo sentinel > "$R/out/$name/sentinel"; cp "$R/out/$name.MANIFEST" "$t/manifest.keep"
+if rootfs --dev-unsigned --stage-only --version t1; then fail "a same-version development rerun is accepted"; fi
+grep -q 'already exists' "$t/log" || fail "the rerun is refused for the wrong reason"
+[[ ! -e $CALLS ]] || fail "the refused rerun reached docker or the validator"
+[[ $(cat "$R/out/$name/sentinel") == sentinel ]] && cmp -s "$R/out/$name.MANIFEST" "$t/manifest.keep" || fail "the rerun touched the earlier development stage"
+rm -f "$R/out/$name.MANIFEST"
+if rootfs --dev-unsigned --stage-only --version t1; then fail "a rerun replaced a tree whose manifest was removed"; fi
+[[ $(cat "$R/out/$name/sentinel") == sentinel ]] || fail "the rerun overwrote a lone tree"
+pass "a development stage is never replaced"
+
+# --- the signed default -------------------------------------------------------
+new_repo; signed_repo
+ROOTFS_DEV_UNSIGNED=1 DEV_UNSIGNED=1 OMAMOBILE_DEV_UNSIGNED=1 rootfs --stage-only --version t2 || fail "the mocked signed stage fails"
+[[ -d $R/out/omamobile-rootfs-stage-t2-aarch64 && ! -e $R/out/omamobile-rootfs-stage-dev-unsigned-t2-aarch64 ]] || fail "the signed stage has the wrong name"
+has "$R/out/repo:/repo:ro" || fail "the signed container does not mount out/repo"
+has ROOTFS_DEV_UNSIGNED=0 || fail "an ambient variable reached the signed container"
+has "SIGNED_MANIFEST_LINE=$SIGNED_LINE" || fail "the signed manifest line is missing"
+! grep -F 'ARG REPO_STANZA_SED=' "$CALLS" | grep -qF 'SigLevel' || fail "the signed stanza relaxes SigLevel"
+grep -q 'DEVELOPMENT ONLY' "$t/log" && fail "the signed build announces itself as development"
+grep -qx 'LOCK-HELD' "$CALLS" && ! grep -qx 'LOCK-FREE' "$CALLS" || fail "the signed build does not hold the repository lock"
+[[ ! -e $R/out/dev-unsigned ]] || fail "the signed build created the development tree"
+pass "the signed default is unchanged: out/repo, Required, signed manifest line, ambient variables ignored"
+
+# --- locking ----------------------------------------------------------------
+new_repo; dev_repo
+lock=$R/out/dev-unsigned/repo/.repo.lock
+: > "$lock"
+flock -x "$lock" sleep 60 & bgpid=$!
+sleep 0.3
+refuses "a development rootfs while a writer holds the lock" 'another repository writer' --dev-unsigned --stage-only --version x
+kill "$bgpid" 2>/dev/null || true; wait "$bgpid" 2>/dev/null || true; bgpid=""
+[[ ! -e $R/$DEV/.repo.lock && $(find "$R/$DEV" -mindepth 1 -maxdepth 1 | wc -l) == 6 ]] ||
+  fail "the lock file is inside aarch64 or the repository changed"
+pass "a rootfs build fails fast while a writer holds the exclusive lock"
+
+# --- source checks of the container script -----------------------------------
+grep -q 'REPO_STANZA_SED' rootfs/build-inside && grep -q 'ROOTFS_DEV_UNSIGNED' rootfs/build-inside || fail "build-inside ignores the development mode"
+grep -q 'sed "s/@OMARCHY_CHANNEL@/\$OMARCHY_CHANNEL/" /src/rootfs/pacman.conf' rootfs/build-inside || fail "build-inside no longer stages the committed pacman.conf"
+grep -q 'SigLevel = Required DatabaseOptional' rootfs/pacman.conf || fail "the committed pacman.conf no longer says Required DatabaseOptional"
+pass "build-inside stages the committed pacman.conf after the per-run stanza"
+
+# Execute the exact embedded mirrorlist copier against hostile destination
+# types. It must validate an opened descriptor before changing any bytes and
+# must never block on a FIFO supplied by staged package contents.
+python3 -I - rootfs/build-inside "$t/mirrorlist-copy.py" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+marker = 'python3 -I - "/etc/pacman.d/mirrorlist" "$T/etc/pacman.d/mirrorlist" <<\'PY\'\n'
+start = text.index(marker) + len(marker)
+end = text.index("\nPY\n", start)
+Path(sys.argv[2]).write_text(text[start:end] + "\n")
+PY
+printf '## fixture\nServer = https://example.invalid/$arch/$repo\n' > "$t/upstream-mirrorlist"
+copy_mirrorlist() { python3 -I "$t/mirrorlist-copy.py" "$t/upstream-mirrorlist" "$1" >"$t/log" 2>&1; }
+
+target=$t/staged-mirrorlist
+printf old-content > "$target"
+copy_mirrorlist "$target" || fail "the mirrorlist copier refuses an independent regular destination"
+cmp -s "$target" "$t/upstream-mirrorlist" || fail "the mirrorlist copier did not replace the independent destination"
+
+victim=$t/mirrorlist-victim
+printf 'must-survive\n' > "$victim"
+rm -f "$target"; ln "$victim" "$target"
+if copy_mirrorlist "$target"; then fail "the mirrorlist copier accepts a hardlinked destination"; fi
+[[ $(cat "$victim") == must-survive ]] || fail "the mirrorlist copier truncated a hardlink before rejecting it"
+grep -q 'not an independent regular file' "$t/log" || fail "a hardlinked mirrorlist is rejected for the wrong reason"
+
+rm -f "$target"; mkfifo "$target"
+set +e
+timeout 2s python3 -I "$t/mirrorlist-copy.py" "$t/upstream-mirrorlist" "$target" >"$t/log" 2>&1
+status=$?
+set -e
+[[ $status != 0 ]] || fail "the mirrorlist copier accepts a FIFO destination"
+[[ $status != 124 ]] || fail "the mirrorlist copier blocks on a FIFO destination"
+
+rm -f "$target"; ln -s "$victim" "$target"
+if copy_mirrorlist "$target"; then fail "the mirrorlist copier accepts a symlink destination"; fi
+[[ $(cat "$victim") == must-survive ]] || fail "the mirrorlist copier changed a symlink target"
+pass "the staged mirrorlist is opened nonblocking and mutated only after descriptor validation"

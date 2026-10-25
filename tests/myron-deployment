@@ -706,6 +706,14 @@ def write(path, data=b""):
 rootfs_case("a bootable manifest", "non-bootable stage marker", lambda t: None,
             lambda text: text.replace("# Omarchy Mobile root STAGE", "# Omarchy Mobile root image", 1))
 rootfs_case("a manifest lacking a line", "MANIFEST lacks", lambda t: None, lambda text: text.replace("rootfs package profile: myron\n", ""))
+rootfs_case("a development-only unsigned stage manifest", "development-only unsigned stage", lambda t: None,
+            lambda text: text + "repository signatures: none (unsigned development build; not a release)\n")
+rootfs_case("a development repository marker in the stage", "development-only unsigned stage",
+            lambda t: write(t / "var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned",
+                            b"development-only: unsigned package repository\nrelease-authority: false\ndeployment-authorized: false\n"))
+rootfs_case("a dangling development marker in the stage", "development-only unsigned stage",
+            lambda t: ((t / "var/lib/omamobile/repo/aarch64").mkdir(parents=True),
+                       (t / "var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned").symlink_to("/nonexistent-omamobile")))
 rootfs_case("a wrong device boot method", "device.conf lacks", lambda t: (t / "usr/share/omamobile/device.conf").write_text("BOOT_METHOD=fastboot\n"))
 rootfs_case(
     "a non-UTF-8 device contract",

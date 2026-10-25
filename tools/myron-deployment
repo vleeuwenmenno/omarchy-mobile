@@ -101,6 +101,9 @@ ROOTFS_MANIFEST_LINES = [
     "package closure: required present; forbidden absent",
     "kernel modules: none (external contract, no module payload)",
 ]
+# A stage built from the unsigned development repository is never deployable
+ROOTFS_DEV_MARKER_NAME = ".omamobile-dev-unsigned"
+ROOTFS_DEV_MANIFEST_LINE = "repository signatures: none (unsigned development build; not a release)"
 ROOTFS_ABSENT = [
     "vendor", "odm", "system_ext",
     "usr/share/omamobile/myron-runtime-assets", "var/lib/omamobile/myron-assets",
@@ -1086,6 +1089,12 @@ def check_rootfs(root: str, manifest_path: str, contracts: Contracts) -> tuple[d
     if not manifest_text.startswith(ROOTFS_MARKER):
         raise DeploymentError("MANIFEST lacks the non-bootable stage marker")
     manifest_lines = set(manifest_text.splitlines())
+    if ROOTFS_DEV_MANIFEST_LINE in manifest_lines or any(
+        entry.path.rsplit("/", 1)[-1] == ROOTFS_DEV_MARKER_NAME for entry in tree.entries
+    ):
+        raise DeploymentError(
+            "development-only unsigned stage: deployment is not authorized"
+        )
     for expected in ROOTFS_MANIFEST_LINES:
         if expected not in manifest_lines:
             raise DeploymentError(f"MANIFEST lacks {expected}")

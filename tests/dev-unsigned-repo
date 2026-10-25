@@ -1,0 +1,652 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# The explicit, separate, development-only UNSIGNED package repository
+# (tools/build-packages --dev-unsigned, tools/lib/dev-repo.sh), tested with fake
+# docker/gpg/ssh in a throwaway copy of the tools (no Docker, no emulation, no
+# network, no phone, no signing key):
+#   isolation from out/repo, the exact marker inside aarch64 and special files,
+#   dangling signatures, signing material, ambient variables that must not
+#   activate the mode, locking, no-clobber, and the signed/phone-facing tools
+#   (build-packages, repo-build, repo-push) refusing the marker before any
+#   change or phone contact.
+# What it does not do: run pacman, makepkg or a chroot.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+t=$(mktemp -d)
+bgpid=""
+cleanup() { [[ -z $bgpid ]] || kill "$bgpid" 2>/dev/null || true; chmod -R u+rwx "$t" 2>/dev/null || true; rm -rf "$t"; }
+trap cleanup EXIT
+fail() { printf 'not ok - %s\n' "$1" >&2; [[ ! -f $t/log ]] || sed 's/^/    | /' "$t/log" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+for tool in bsdtar repo-add flock python3; do
+  command -v "$tool" >/dev/null || { echo "ok - # skip: no $tool on this machine"; exit 0; }
+done
+
+R=$t/repo
+MARKER_NAME=.omamobile-dev-unsigned
+MARKER_TEXT=$'development-only: unsigned package repository\nrelease-authority: false\ndeployment-authorized: false\n'
+DEV=out/dev-unsigned/repo/aarch64
+
+# A fake static aarch64 interpreter registered without F, so the package
+# container run must carry the read-only mount
+python3 -I - "$t/qemu-static" <<'PY'
+import struct, sys
+header = bytearray(64)
+header[:7] = b"\x7fELF\x02\x01\x01"
+struct.pack_into("<HHIQQQIHHHHHH", header, 16, 2, 62, 1, 0x400000, 64, 0, 0, 64, 56, 1, 64, 0, 0)
+body = struct.pack("<IIQQQQQQ", 1, 5, 0, 0x400000, 0x400000, 0, 0, 0x1000)
+open(sys.argv[1], "wb").write(bytes(header) + body)
+PY
+chmod 755 "$t/qemu-static"
+mkdir -p "$t/b" "$t/bin" "$t/cache"
+printf enabled > "$t/b/status"
+printf 'enabled\ninterpreter %s\nflags: \noffset 0\nmagic 7f454c460201010000000000000000000200b700\nmask ffffffffffffff00fffffffffffffffffeffffff\n' \
+  "$t/qemu-static" > "$t/b/qemu-aarch64"
+
+cat > "$t/bin/docker" <<'SH'
+#!/bin/bash
+# Fake docker: records the call, then drops a minimal package where the real
+# container would (the /work mount's out/ directory)
+echo "docker $*" >> "$CALLS"
+[[ $1 == run ]] || exit 0
+work="" name=""
+prev=""
+for argument; do
+  [[ $prev == -v && $argument == *:/work ]] && work=${argument%:/work}
+  [[ $argument == NAME=* ]] && name=${argument#NAME=}
+  prev=$argument
+done
+[[ -n $work && -n $name ]] || exit 91
+[[ ${FAKE_DOCKER_FAIL_NAME:-} != "$name" ]] || exit 1
+mkdir -p "$work/out" "$work/pkg"
+printf 'pkgname = %s\npkgbase = %s\npkgver = 1-1\npkgdesc = fixture\nurl = https://example.invalid\nbuilddate = 1\npackager = test\nsize = 1\narch = aarch64\nlicense = MIT\n' \
+  "$name" "$name" > "$work/pkg/.PKGINFO"
+(cd "$work/pkg" && bsdtar --zstd -cf "$work/out/$name-1-1-aarch64.pkg.tar.zst" .PKGINFO)
+SH
+cat > "$t/bin/gpg" <<'SH'
+#!/bin/bash
+echo "gpg $*" >> "$GPGCALLS"
+for a; do
+  if [[ $a == --detach-sign ]]; then
+    for last; do :; done
+    : > "$last.sig"
+  fi
+done
+exit 0
+SH
+chmod +x "$t/bin/docker" "$t/bin/gpg"
+export CALLS=$t/calls GPGCALLS=$t/gpg-calls PHONECALLS=$t/phone-calls
+
+new_repo() {
+  chmod -R u+rwx "$R" 2>/dev/null || true
+  rm -rf "$R"
+  mkdir -p "$R/tools/lib" "$R/packages/fixture" "$R/packages/fixture2"
+  cp tools/build-packages tools/repo-build tools/repo-push "$R/tools/"
+  cp tools/lib/dev-repo.sh tools/lib/alarm.sh "$R/tools/lib/"
+  for n in fixture fixture2; do
+    printf 'pkgname=%s\npkgver=1\npkgrel=1\narch=(aarch64)\n' "$n" > "$R/packages/$n/PKGBUILD"
+  done
+  # The real alarm.sh (so the real binfmt code runs), without its network part
+  cat >> "$R/tools/lib/alarm.sh" <<'SH'
+alarm_fetch() { alarm_require_binfmt "${1:-package}"; mkdir -p "$ALARM_CACHE/pkg" "$ALARM_CACHE/src"; }
+alarm_build_image() { echo fake-aarch64-builder; }
+SH
+  cat > "$R/tools/phone-ssh" <<'SH'
+#!/bin/sh
+echo "phone-ssh $*" >> "$PHONECALLS"
+exit 97
+SH
+  chmod +x "$R/tools/phone-ssh"
+  rm -f "$CALLS" "$GPGCALLS" "$PHONECALLS"
+}
+run_tool() { # TOOL ARGS...  (output in $t/log)
+  local tool=$1; shift
+  (cd "$R" && PATH="$t/bin:$PATH" ALARM_CACHE=$t/cache ALARM_BINFMT_DIR=$t/b "tools/$tool" "$@") > "$t/log" 2>&1
+}
+bp() { run_tool build-packages "$@"; }
+# The lock file is the one thing a refused writer may create
+tree() { (cd "$R" && find out keys ! -name .repo.lock \( -type f -printf '%p f %s\n' -o -printf '%p %y %l\n' \) 2>/dev/null | LC_ALL=C sort || true); }
+no_side_effects() { # NAME: nothing ran, nothing was written
+  [[ ! -e $CALLS && ! -e $GPGCALLS && ! -e $PHONECALLS ]] || fail "$1 reached docker, gpg or the phone: $(cat "$CALLS" "$GPGCALLS" "$PHONECALLS" 2>/dev/null | head -3)"
+}
+refuses() { # NAME EXPECT TOOL ARGS...
+  local name=$1 expect=$2 before after; shift 2
+  before=$(tree)
+  if run_tool "$@"; then fail "$name is accepted"; fi
+  grep -q -- "$expect" "$t/log" || fail "$name is refused for the wrong reason"
+  no_side_effects "$name"
+  after=$(tree)
+  [[ $before == "$after" ]] || fail "$name changed the tree: $(diff <(echo "$before") <(echo "$after") | head -5)"
+}
+
+# --- A: a development build -------------------------------------------------
+new_repo
+bp --dev-unsigned packages/fixture || fail "the development build fails"
+d=$R/$DEV
+[[ -f $d/$MARKER_NAME && ! -L $d/$MARKER_NAME && $(cat "$d/$MARKER_NAME"; echo x) == "${MARKER_TEXT}x" ]] || fail "the marker is not the exact bytes"
+cmp -s "$d/$MARKER_NAME" <(printf '%s' "$MARKER_TEXT") || fail "the marker differs byte for byte"
+[[ -f $d/fixture-1-1-aarch64.pkg.tar.zst && -L $d/omamobile.db && -f $d/omamobile.db.tar.gz && -f $d/omamobile.files.tar.gz ]] ||
+  fail "the development repository lacks the package or database"
+[[ -z $(find "$R/out" -name '*.sig' -print) ]] || fail "a signature exists in the development build"
+[[ ! -e $R/out/repo ]] || fail "the development build touched out/repo"
+[[ ! -e $GPGCALLS ]] || fail "the development build called gpg"
+[[ -z $(find "$R/out/dev-unsigned" -name '.index.*' -o -name '.marker.*' | head -1) ]] || fail "temporary index or marker files remain"
+[[ -f $R/out/dev-unsigned/repo/.repo.lock && ! -e $d/.repo.lock ]] || fail "the lock file is not outside aarch64"
+bsdtar -xOf "$d/omamobile.db.tar.gz" | grep -q '^fixture$' || fail "the database does not list the package"
+if bsdtar -xOf "$d/omamobile.db.tar.gz" | grep -q '%PGPSIG%'; then fail "the database carries a signature"; fi
+run=$(grep '^docker run' "$CALLS")
+grep -q -- "--mount type=bind,src=$t/qemu-static,dst=$t/qemu-static,readonly" <<<"$run" || fail "the package container lacks the interpreter mount: $run"
+grep -q -- '--privileged' <<<"$run" && fail "the package container is privileged"
+grep -q -- "-v $R/$DEV:/repo/aarch64:ro" <<<"$run" || fail "the container does not mount the development repository read-only"
+grep -q -- "/out/repo" <<<"$run" && fail "the container mounts the signed repository"
+pass "a development build writes only out/dev-unsigned: exact marker, no signature, no gpg, lock outside aarch64, qemu mount"
+
+# --- the per-run stanza -----------------------------------------------------
+# shellcheck disable=SC1091
+source tools/lib/dev-repo.sh
+sample=$'[options]\nSigLevel = Required DatabaseOptional\n\n[omarchy]\nServer = https://example.invalid/$arch\n'
+signed_sed=$(devrepo_stanza_sed)
+dev_sed=$(devrepo_stanza_sed dev)
+[[ $signed_sed == '0,/^\[omarchy\]/s//[omamobile]\nServer = file:\/\/\/repo\/$arch\n\n[omarchy]/' ]] || fail "the signed stanza program changed: $signed_sed"
+signed_conf=$(sed "$signed_sed" <<<"$sample")
+dev_conf=$(sed "$dev_sed" <<<"$sample")
+[[ $signed_conf == *$'[omamobile]\nServer = file:///repo/$arch\n\n[omarchy]'* && $signed_conf != *"SigLevel = Optional"* ]] || fail "the signed stanza relaxes trust: $signed_conf"
+[[ $dev_conf == *$'[omamobile]\nSigLevel = Optional TrustedOnly\nServer = file:///repo/$arch\n\n[omarchy]'* ]] || fail "the development stanza is wrong: $dev_conf"
+[[ $(grep -c SigLevel <<<"$dev_conf") == 2 && $dev_conf == *'SigLevel = Required DatabaseOptional'* ]] || fail "the development stanza touched the global trust"
+grep -qF -- "STANZA_SED=$dev_sed" <<<"$run" || fail "the development container did not get the development stanza"
+pass "the per-run [omamobile] stanza is Optional TrustedOnly only in development mode; the signed program is unchanged"
+
+# --- B: up to date, marker retained ----------------------------------------
+inode=$(stat -c %i "$d/$MARKER_NAME")
+rm -f "$CALLS"
+bp --dev-unsigned packages/fixture || fail "an up-to-date development build fails"
+grep -q 'up to date' "$t/log" || fail "an up-to-date package was rebuilt"
+[[ $(stat -c %i "$d/$MARKER_NAME") == "$inode" ]] || fail "the marker was replaced"
+pass "the marker is created once and retained"
+
+# --- C: the marker survives a failed build ---------------------------------
+new_repo
+if FAKE_DOCKER_FAIL_NAME=fixture2 bp --dev-unsigned packages/fixture2; then fail "a failing container build succeeds"; fi
+cmp -s "$R/$DEV/$MARKER_NAME" <(printf '%s' "$MARKER_TEXT") || fail "the marker is gone after a failed build"
+bp --dev-unsigned packages/fixture || fail "the build after a failure fails"
+cmp -s "$R/$DEV/$MARKER_NAME" <(printf '%s' "$MARKER_TEXT") || fail "the marker is wrong after the next build"
+pass "the exact marker is present after a failure and after the next build"
+
+# --- the signed path -------------------------------------------------------
+new_repo
+mkdir -p "$R/keys/gnupg"; echo FAKEKEY > "$R/keys/fingerprint"
+cat > "$t/bin/repo-add" <<'SH'
+#!/bin/bash
+echo "repo-add $*" >> "$GPGCALLS"
+for last; do :; done
+for a; do [[ $a == *omamobile.db.tar.gz ]] && { : > "$a"; : > "${a%.db.tar.gz}.files.tar.gz"; }; done
+exit 0
+SH
+chmod +x "$t/bin/repo-add"
+bp packages/fixture || fail "the signed build fails: $(tail -3 "$t/log")"
+rm -f "$t/bin/repo-add"
+grep -q 'gpg .*--detach-sign' "$GPGCALLS" && grep -q 'repo-add --quiet --sign --key FAKEKEY' "$GPGCALLS" || fail "the signed build no longer signs"
+[[ ! -e $R/out/dev-unsigned && ! -e $R/out/repo/aarch64/$MARKER_NAME ]] || fail "the signed build wrote development paths"
+grep -q -- '-v .*/out/repo/aarch64:/repo/aarch64:ro' "$CALLS" || fail "the signed container mount changed"
+grep -qF "STANZA_SED=$signed_sed" "$CALLS" || fail "the signed container did not get the signed stanza"
+[[ -f $R/out/repo/.repo.lock ]] || fail "the signed writer takes no repository lock"
+pass "the signed build still signs, mounts out/repo and trusts it as Required"
+
+# repo-add --sign publishes four canonical convenience links: database and
+# files indexes, plus their detached signatures. Those exact links are valid;
+# package links and every other link remain forbidden.
+new_repo
+mkdir -p "$R/out/repo/aarch64"
+for name in omamobile.db.tar.gz omamobile.db.tar.gz.sig omamobile.files.tar.gz omamobile.files.tar.gz.sig; do
+  : > "$R/out/repo/aarch64/$name"
+done
+ln -s omamobile.db.tar.gz "$R/out/repo/aarch64/omamobile.db"
+ln -s omamobile.db.tar.gz.sig "$R/out/repo/aarch64/omamobile.db.sig"
+ln -s omamobile.files.tar.gz "$R/out/repo/aarch64/omamobile.files"
+ln -s omamobile.files.tar.gz.sig "$R/out/repo/aarch64/omamobile.files.sig"
+(
+  cd "$R"
+  # shellcheck disable=SC1091
+  source tools/lib/dev-repo.sh
+  devrepo_reject_signed_repo out/repo/aarch64
+) || fail "the canonical signed repo-add links are refused"
+pass "the exact four signed repo-add database links are accepted"
+
+# A second repo-add run retains one generation of the signed database and files
+# indexes. These exact backup names are normal signed-repository artifacts.
+for name in omamobile.db.tar.gz.old omamobile.db.tar.gz.old.sig omamobile.files.tar.gz.old omamobile.files.tar.gz.old.sig; do
+  : > "$R/out/repo/aarch64/$name"
+done
+(
+  cd "$R"
+  # shellcheck disable=SC1091
+  source tools/lib/dev-repo.sh
+  devrepo_reject_signed_repo out/repo/aarch64
+) || fail "the canonical signed repo-add backup files are refused"
+pass "the exact signed repo-add backup generation is accepted"
+
+# A package can carry pgpsig metadata even when no detached .sig exists. Keep
+# the signature marker near the start and enough trailing data to force bsdtar
+# to observe a reader that exits early: the validator must still reject it and
+# publish nothing.
+sigwork=$t/signature-index
+sigout=$t/signature-published
+sigpayload=$t/signature-payload
+mkdir -p "$sigwork" "$sigpayload/fixture-1-1" "$sigout"
+{
+  printf '%%NAME%%\nfixture\n\n%%PGPSIG%%\nc2ln\n\n%%DESC%%\n'
+  head -c 1048576 /dev/zero | tr '\0' x
+  printf '\n'
+} > "$sigpayload/fixture-1-1/desc"
+bsdtar -czf "$sigwork/omamobile.db.tar.gz" -C "$sigpayload" fixture-1-1/desc
+bsdtar -czf "$sigwork/omamobile.files.tar.gz" -C "$sigpayload" fixture-1-1/desc
+ln -s omamobile.db.tar.gz "$sigwork/omamobile.db"
+ln -s omamobile.files.tar.gz "$sigwork/omamobile.files"
+if (devrepo_publish_index "$sigwork" "$sigout" 1) >"$t/log" 2>&1; then
+  fail "an embedded package signature is accepted"
+fi
+grep -q 'database carries a package signature' "$t/log" || fail "an embedded package signature is refused for the wrong reason"
+[[ -z $(find "$sigout" -mindepth 1 -print -quit) ]] || fail "an embedded package signature published an index"
+pass "embedded package signatures are rejected without a broken-pipe bypass"
+
+# Reject embedded metadata before replacing published package bytes. A failed
+# update must preserve the earlier package and its matching database exactly.
+new_repo
+bp --dev-unsigned packages/fixture || fail "the baseline development build fails"
+cp -a "$R/$DEV" "$t/repository-before-rejected-update"
+mkdir -p "$t/signed-import/payload"
+printf 'pkgname = fixture\npkgbase = fixture\npkgver = 4-1\npkgdesc = fixture\nurl = https://example.invalid\nbuilddate = 4\npackager = test\nsize = 1\narch = aarch64\nlicense = MIT\n pgpsig c2ln\n' \
+  > "$t/signed-import/payload/.PKGINFO"
+bsdtar --zstd -cf "$t/signed-import/fixture-4-1-aarch64.pkg.tar.zst" -C "$t/signed-import/payload" .PKGINFO
+rm -f "$CALLS" "$GPGCALLS" "$PHONECALLS"
+if bp --dev-unsigned --import "$t/signed-import"; then fail "an embedded-signature package update is accepted"; fi
+grep -q 'carries embedded pgpsig metadata' "$t/log" || fail "an embedded-signature update is refused for the wrong reason"
+diff -r "$t/repository-before-rejected-update" "$R/$DEV" >/dev/null || fail "a rejected embedded-signature update changed the published repository"
+no_side_effects "a rejected embedded-signature update"
+pass "embedded-signature updates are rejected before the published repository changes"
+
+# Import arguments form one transaction: a valid package in an earlier
+# directory cannot be published before a later directory is rejected.
+mkdir -p "$t/valid-import/payload"
+printf 'pkgname = fixture\npkgbase = fixture\npkgver = 2-1\npkgdesc = fixture\nurl = https://example.invalid\nbuilddate = 2\npackager = test\nsize = 1\narch = aarch64\nlicense = MIT\n' \
+  > "$t/valid-import/payload/.PKGINFO"
+bsdtar --zstd -cf "$t/valid-import/fixture-2-1-aarch64.pkg.tar.zst" -C "$t/valid-import/payload" .PKGINFO
+rm -f "$CALLS" "$GPGCALLS" "$PHONECALLS"
+if bp --dev-unsigned --import "$t/valid-import" --import "$t/signed-import"; then
+  fail "a multi-directory import with a rejected later package is accepted"
+fi
+grep -q 'carries embedded pgpsig metadata' "$t/log" || fail "a rejected later import fails for the wrong reason"
+diff -r "$t/repository-before-rejected-update" "$R/$DEV" >/dev/null || fail "a rejected later import changed the published repository"
+no_side_effects "a rejected later import"
+pass "all import directories validate before any package is published"
+
+# A successful import publishes its matching index before any later build setup
+# can fail or expose the repository to a build container.
+bp --dev-unsigned --import "$t/valid-import" || fail "a valid import fails"
+bsdtar -tf "$R/$DEV/omamobile.db.tar.gz" | grep -q '^fixture-2-1/desc$' || fail "a valid import is not indexed immediately"
+[[ -f $R/$DEV/fixture-2-1-aarch64.pkg.tar.zst && ! -e $R/$DEV/fixture-1-1-aarch64.pkg.tar.zst ]] ||
+  fail "the immediately indexed import did not replace the old package"
+pass "imports publish a matching database before build setup"
+
+# Every required metadata field in the whole batch is checked before mutation.
+cp -a "$R/$DEV" "$t/repository-before-missing-name"
+mkdir -p "$t/valid-v3/payload" "$t/missing-name/payload"
+printf 'pkgname = fixture\npkgbase = fixture\npkgver = 3-1\npkgdesc = fixture\nurl = https://example.invalid\nbuilddate = 3\npackager = test\nsize = 1\narch = aarch64\nlicense = MIT\n' \
+  > "$t/valid-v3/payload/.PKGINFO"
+printf 'pkgbase = nameless\npkgver = 1-1\npkgdesc = nameless\nurl = https://example.invalid\nbuilddate = 3\npackager = test\nsize = 1\narch = aarch64\nlicense = MIT\n' \
+  > "$t/missing-name/payload/.PKGINFO"
+bsdtar --zstd -cf "$t/valid-v3/fixture-3-1-aarch64.pkg.tar.zst" -C "$t/valid-v3/payload" .PKGINFO
+bsdtar --zstd -cf "$t/missing-name/nameless-1-1-aarch64.pkg.tar.zst" -C "$t/missing-name/payload" .PKGINFO
+rm -f "$CALLS" "$GPGCALLS" "$PHONECALLS"
+if bp --dev-unsigned --import "$t/valid-v3" --import "$t/missing-name"; then
+  fail "an import batch with missing pkgname is accepted"
+fi
+grep -q 'has no single canonical pkgname' "$t/log" || fail "missing pkgname is refused for the wrong reason"
+diff -r "$t/repository-before-missing-name" "$R/$DEV" >/dev/null || fail "missing metadata changed the published repository"
+no_side_effects "an import batch with missing pkgname"
+pass "required metadata for the complete batch validates before publication"
+
+# Prepared generations: a forced failure of the atomic exchange, repo-add
+# override grammar, a staged x86_64 replacement and the database identity all
+# leave the live generation byte for byte unchanged (or, on success, exact).
+mkpkg() { # DIR FILENAME PKGINFO-TEXT
+  mkdir -p "$1/payload"
+  printf '%s' "$3" > "$1/payload/.PKGINFO"
+  bsdtar --zstd -cf "$1/$2" -C "$1/payload" .PKGINFO
+}
+pkginfo() { # NAME VERSION ARCH [EXTRA-LINES]
+  printf 'pkgname = %s\npkgbase = %s\npkgver = %s\npkgdesc = fixture\nurl = https://example.invalid\nbuilddate = 5\npackager = test\nsize = 1\narch = %s\nlicense = MIT\n%s' "$1" "$1" "$2" "$3" "${4:-}"
+}
+snapshot() { (cd "$R/out" && find . -type f -printf '%p f %s %m %T@ ' -exec sha256sum {} \; -o -printf '%p %y %m %l\n' | LC_ALL=C sort); }
+no_leftovers() { [[ -z $(find "$R/out/dev-unsigned" \( -name '.generation.*' -o -name '.transaction.*' -o -name '.index.*' \) -print -quit) ]] || fail "$1 left a transaction or generation behind"; }
+
+new_repo
+bp --dev-unsigned packages/fixture || fail "the generation baseline build fails"
+mkpkg "$t/gen-ok" fixture-5-1-aarch64.pkg.tar.zst "$(pkginfo fixture 5-1 aarch64)"
+before=$(snapshot)
+real_python=$(command -v python3)
+cat > "$t/bin/python3" <<SH
+#!/bin/bash
+for a; do [[ \$a == exchange-generation ]] && { echo "forced exchange failure" >&2; exit 1; }; done
+exec $real_python "\$@"
+SH
+chmod +x "$t/bin/python3"
+if bp --dev-unsigned --import "$t/gen-ok"; then fail "a forced exchange failure is accepted"; fi
+rm -f "$t/bin/python3"
+grep -q 'forced exchange failure' "$t/log" || fail "the forced exchange failure is refused for the wrong reason"
+[[ $(snapshot) == "$before" ]] || fail "a forced exchange failure changed the live generation"
+no_leftovers "a forced exchange failure"
+bp --dev-unsigned --import "$t/gen-ok" || fail "the import fails once the exchange works"
+[[ -f $R/$DEV/fixture-5-1-aarch64.pkg.tar.zst && ! -e $R/$DEV/fixture-1-1-aarch64.pkg.tar.zst ]] || fail "the committed generation lacks the replacement"
+no_leftovers "a committed generation"
+pass "a forced exchange failure leaves the live generation byte for byte identical; a working exchange commits the whole generation"
+
+i=0
+for variant in leading-space-name tab-name equals-name spaced-ver leading-space-ver duplicate-ver duplicate-arch arch-no-equals trailing-space-name; do
+  i=$((i + 1))
+  case $variant in
+    leading-space-name) extra=$' pkgname = different\n' ;;
+    tab-name) extra=$'\tpkgname = different\n' ;;
+    equals-name) extra=$'pkgname=different\n' ;;
+    spaced-ver) extra=$'pkgver 99-1\n' ;;
+    leading-space-ver) extra=$'  pkgver = 99-1\n' ;;
+    duplicate-ver) extra=$'pkgver = 99-1\n' ;;
+    duplicate-arch) extra=$'arch = any\n' ;;
+    arch-no-equals) extra=$'arch x86_64\n' ;;
+    trailing-space-name) extra=$'pkgname = fixture \n' ;;
+  esac
+  mkpkg "$t/grammar-$i" fixture-6-1-aarch64.pkg.tar.zst "$(pkginfo fixture 6-1 aarch64 "$extra")"
+  before=$(snapshot)
+  if bp --dev-unsigned --import "$t/grammar-$i"; then fail "the $variant PKGINFO is accepted"; fi
+  grep -Eq 'has no single canonical|unsupported or noncanonical .PKGINFO line' "$t/log" || fail "the $variant PKGINFO is refused for the wrong reason"
+  [[ $(snapshot) == "$before" ]] || fail "the $variant PKGINFO changed the live generation"
+  no_leftovers "the $variant PKGINFO"
+done
+pass "repo-add override grammar (alternate spacing, duplicates) is rejected with the live generation unchanged"
+
+# repo-add declares every .PKGINFO key as a shell variable. Unknown names such
+# as PATH/tmpdir, or array syntax, must be rejected before repo-add can execute
+# a helper or redirect its workspace on the host.
+i=0
+for injected in 'PATH = /tmp/attacker-bin' 'tmpdir = /tmp/attacker-work' 'pkgfile = /tmp/attacker-package' 'pkgname[0] = different'; do
+  i=$((i + 1))
+  mkpkg "$t/injected-$i" fixture-6-2-aarch64.pkg.tar.zst "$(pkginfo fixture 6-2 aarch64 "$injected"$'\n')"
+  before=$(snapshot)
+  if bp --dev-unsigned --import "$t/injected-$i"; then fail "an injected .PKGINFO key is accepted: $injected"; fi
+  grep -q 'unsupported or noncanonical .PKGINFO line' "$t/log" || fail "an injected .PKGINFO key is refused for the wrong reason: $injected"
+  [[ $(snapshot) == "$before" ]] || fail "an injected .PKGINFO key changed the live generation: $injected"
+  no_leftovers "an injected .PKGINFO key"
+done
+pass "host-affecting and array-form .PKGINFO keys are rejected before repo-add"
+
+# A normal command failure must enter dev_abort before function locals unwind;
+# otherwise an EXIT trap cannot recover the dynamically scoped paths.
+real_chmod=$(command -v chmod)
+cat > "$t/bin/chmod" <<SH
+#!/bin/bash
+for argument; do
+  [[ \$argument == *.generation.* ]] && exit 1
+done
+exec "$real_chmod" "\$@"
+SH
+"$real_chmod" +x "$t/bin/chmod"
+before=$(snapshot)
+if bp --dev-unsigned --import "$t/gen-ok"; then fail "a generation chmod failure succeeds"; fi
+rm -f "$t/bin/chmod"
+grep -q 'cannot set permissions on the next development generation' "$t/log" || fail "a generation chmod failure is refused for the wrong reason"
+[[ $(snapshot) == "$before" ]] || fail "a generation chmod failure changed the live generation"
+no_leftovers "a generation chmod failure"
+pass "a command failure cleans private generations before function locals unwind"
+
+# An interrupt during repo-add must remove both private work directories and
+# leave the live generation unchanged.
+real_repo_add=$(command -v repo-add)
+cat > "$t/bin/repo-add" <<SH
+#!/bin/bash
+if [[ \${FORCE_REPO_ADD_TERM:-0} == 1 ]]; then
+  kill -TERM "\$PPID"
+  exit 143
+fi
+exec "$real_repo_add" "\$@"
+SH
+chmod +x "$t/bin/repo-add"
+before=$(snapshot)
+export FORCE_REPO_ADD_TERM=1
+if bp --dev-unsigned --import "$t/gen-ok"; then fail "a terminated repo-add succeeds"; fi
+unset FORCE_REPO_ADD_TERM
+[[ $(snapshot) == "$before" ]] || fail "a terminated repo-add changed the live generation"
+no_leftovers "a terminated repo-add"
+pass "an interrupt during repo-add cleans private generations and leaves the live repository unchanged"
+
+mkpkg "$t/x86" fixture-7-1-x86_64.pkg.tar.zst "$(pkginfo fixture 7-1 x86_64)"
+before=$(snapshot)
+if bp --dev-unsigned --import "$t/x86"; then fail "a staged x86_64 replacement is accepted"; fi
+grep -q 'has no single canonical arch' "$t/log" || fail "the x86_64 replacement is refused for the wrong reason"
+[[ $(snapshot) == "$before" ]] || fail "a rejected x86_64 replacement changed the live generation"
+no_leftovers "the x86_64 replacement"
+pass "a staged x86_64 replacement is rejected from the staged PKGINFO with the live generation unchanged"
+
+mkpkg "$t/any-pkg" other-1-2-any.pkg.tar.zst "$(pkginfo other 1-2 any)"
+bp --dev-unsigned --import "$t/any-pkg" || fail "an any-architecture import fails"
+python3 -I - "$R/$DEV" <<'PY' || fail "the database identity differs from the staged packages"
+import sys, tarfile
+root = sys.argv[1]
+want = {
+    "fixture-5-1": ("fixture-5-1-aarch64.pkg.tar.zst", "fixture", "5-1", "aarch64"),
+    "other-1-2": ("other-1-2-any.pkg.tar.zst", "other", "1-2", "any"),
+}
+got = {}
+with tarfile.open(f"{root}/omamobile.db.tar.gz") as tar:
+    for member in tar:
+        if member.name.endswith("/desc"):
+            lines = tar.extractfile(member).read().decode().split("\n")
+            field = lambda key: lines[lines.index(f"%{key}%") + 1]
+            got[member.name.split("/")[0]] = tuple(field(k) for k in ("FILENAME", "NAME", "VERSION", "ARCH"))
+assert got == want, (got, want)
+PY
+pass "the database identity, version, architecture and filenames match the staged inputs"
+
+# --- E: marker forms --------------------------------------------------------
+make_marker() { # DIR KIND
+  local dir=$1 kind=$2
+  mkdir -p "$dir"
+  case $kind in
+    wrong-bytes) printf 'development-only: unsigned package repository\nrelease-authority: true\ndeployment-authorized: false\n' > "$dir/$MARKER_NAME" ;;
+    no-newline) printf '%s' "${MARKER_TEXT%$'\n'}" > "$dir/$MARKER_NAME" ;;
+    crlf) printf '%s' "${MARKER_TEXT//$'\n'/$'\r\n'}" > "$dir/$MARKER_NAME" ;;
+    extra-line) printf '%sextra: true\n' "$MARKER_TEXT" > "$dir/$MARKER_NAME" ;;
+    empty) : > "$dir/$MARKER_NAME" ;;
+    oversized) head -c 5000 /dev/zero | tr '\0' x > "$dir/$MARKER_NAME" ;;
+    dangling-link) ln -s /nonexistent-omamobile "$dir/$MARKER_NAME" ;;
+    link-to-exact) printf '%s' "$MARKER_TEXT" > "$dir/real-marker"; ln -s real-marker "$dir/$MARKER_NAME" ;;
+    hardlink) printf '%s' "$MARKER_TEXT" > "$dir/real-marker"; ln "$dir/real-marker" "$dir/$MARKER_NAME" ;;
+    directory) mkdir "$dir/$MARKER_NAME" ;;
+    fifo) mkfifo "$dir/$MARKER_NAME" ;;
+    exact) printf '%s' "$MARKER_TEXT" > "$dir/$MARKER_NAME" ;;
+    *) fail "unknown marker kind $kind" ;;
+  esac
+}
+for kind in wrong-bytes no-newline crlf extra-line empty oversized dangling-link link-to-exact hardlink directory fifo; do
+  new_repo
+  make_marker "$R/$DEV" "$kind"
+  refuses "a $kind marker in the development repository" 'development marker' build-packages --dev-unsigned packages/fixture
+done
+pass "the development build accepts only the exact regular marker (wrong bytes, newline, CRLF, extra line, empty, oversized, dangling or valid links, directory, FIFO all refused)"
+
+# Signed and phone-facing paths refuse every marker form, the exact one included
+for kind in exact wrong-bytes dangling-link link-to-exact hardlink directory fifo; do
+  new_repo
+  mkdir -p "$R/keys/gnupg"; echo FAKEKEY > "$R/keys/fingerprint"
+  make_marker "$R/out/repo/aarch64" "$kind"
+  : > "$R/out/repo/aarch64/omamobile.db"
+  refuses "tools/build-packages with a $kind marker" 'development-only unsigned repository marker' build-packages packages/fixture
+  refuses "tools/repo-build with a $kind marker" 'development-only unsigned repository marker' repo-build
+  refuses "tools/repo-push with a $kind marker" 'development-only unsigned repository marker' repo-push
+done
+pass "signed build-packages, repo-build and repo-push refuse the marker in every form before any side effect or phone contact"
+
+# --- I: isolation -----------------------------------------------------------
+new_repo
+mkdir -p "$R/keys/gnupg"; echo FAKEKEY > "$R/keys/fingerprint"
+bp --dev-unsigned packages/fixture 2>/dev/null && fail "a development build ran beside signing material"
+rm -rf "$R/keys"
+bp --dev-unsigned packages/fixture || fail "the development build fails"
+mkdir -p "$R/out"
+ln -s dev-unsigned/repo "$R/out/repo"
+mkdir -p "$R/keys/gnupg"; echo FAKEKEY > "$R/keys/fingerprint"
+rm -f "$CALLS"
+refuses "tools/build-packages through a symlinked out/repo" 'development-only' build-packages packages/fixture
+refuses "tools/repo-build through a symlinked out/repo" 'development-only' repo-build
+refuses "tools/repo-push through a symlinked out/repo" 'development-only' repo-push
+rm "$R/out/repo"
+# A link into the development tree is refused even when no marker is reachable
+mkdir -p "$R/out/dev-unsigned/other" "$R/out/repo"
+ln -s ../dev-unsigned/other "$R/out/repo/aarch64"
+refuses "tools/build-packages through out/repo/aarch64 linked into the dev tree" 'resolves into the development-only repository' build-packages packages/fixture
+refuses "tools/repo-build through out/repo/aarch64 linked into the dev tree" 'resolves into the development-only repository' repo-build
+refuses "tools/repo-push through out/repo/aarch64 linked into the dev tree" 'resolves into the development-only repository' repo-push
+rm "$R/out/repo/aarch64"
+pass "no signed or phone-facing path can reach the development repository through a link"
+
+new_repo
+mkdir -p "$R/out/repo/aarch64"; echo signed-bytes > "$R/out/repo/aarch64/signed-1-1-aarch64.pkg.tar.zst"; echo sig > "$R/out/repo/aarch64/signed-1-1-aarch64.pkg.tar.zst.sig"
+before=$(cd "$R/out/repo" && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
+bp --dev-unsigned packages/fixture || fail "the development build fails beside a signed repository"
+after=$(cd "$R/out/repo" && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
+[[ $before == "$after" ]] || fail "the development build changed the signed repository"
+[[ ! -e $R/$DEV/signed-1-1-aarch64.pkg.tar.zst && ! -e $R/out/dev-unsigned/signed-1-1-aarch64.pkg.tar.zst ]] || fail "signed bytes were copied into the development repository"
+pass "a development build leaves the signed repository byte for byte alone and imports nothing from it"
+
+# A signed package path must never resolve to a development package. Replacing
+# the dev inode would otherwise silently change signed bytes while its old
+# detached signature stayed in place.
+new_repo
+bp --dev-unsigned packages/fixture || fail "the reverse-alias fixture build fails"
+mkdir -p "$R/out/repo/aarch64"
+pkg=fixture-1-1-aarch64.pkg.tar.zst
+ln -s "../../../dev-unsigned/repo/aarch64/$pkg" "$R/out/repo/aarch64/$pkg"
+echo signature-sentinel > "$R/out/repo/aarch64/$pkg.sig"
+before=$(sha256sum "$R/$DEV/$pkg")
+rm -f "$CALLS" "$GPGCALLS" "$PHONECALLS"
+refuses "a signed package path linked into the development repository" 'signed repository artifact is a link' build-packages --dev-unsigned --force packages/fixture
+[[ $(sha256sum "$R/$DEV/$pkg") == "$before" ]] || fail "the refused reverse link changed development package bytes"
+grep -qx signature-sentinel "$R/out/repo/aarch64/$pkg.sig" || fail "the refused reverse link changed the signed signature"
+pass "development builds refuse signed package paths that alias development artifacts"
+
+# A development package must never share an inode with a signed artifact: cp -f
+# would otherwise replace the signed bytes while leaving its signature intact.
+new_repo
+bp --dev-unsigned packages/fixture || fail "the alias fixture build fails"
+mkdir -p "$R/out/repo/aarch64"
+pkg=fixture-1-1-aarch64.pkg.tar.zst
+cp "$R/$DEV/$pkg" "$R/out/repo/aarch64/$pkg"
+rm "$R/$DEV/$pkg"
+ln "$R/out/repo/aarch64/$pkg" "$R/$DEV/$pkg"
+echo signature-sentinel > "$R/out/repo/aarch64/$pkg.sig"
+before=$(sha256sum "$R/out/repo/aarch64/$pkg")
+rm -f "$CALLS" "$GPGCALLS" "$PHONECALLS"
+refuses "a package hardlinked to the signed repository" 'not an independent regular file' build-packages --dev-unsigned --force packages/fixture
+[[ $(sha256sum "$R/out/repo/aarch64/$pkg") == "$before" ]] || fail "the refused hardlink changed signed package bytes"
+grep -qx signature-sentinel "$R/out/repo/aarch64/$pkg.sig" || fail "the refused hardlink changed the signed signature"
+pass "development packages cannot alias signed package inodes"
+
+# --- F: signatures ----------------------------------------------------------
+for kind in dangling-link regular directory link-to-file; do
+  new_repo
+  make_marker "$R/$DEV" exact
+  echo old > "$R/$DEV/old-1-1-aarch64.pkg.tar.zst"
+  case $kind in
+    dangling-link) ln -s /nonexistent-omamobile "$R/$DEV/old-1-1-aarch64.pkg.tar.zst.sig" ;;
+    regular) echo sig > "$R/$DEV/old-1-1-aarch64.pkg.tar.zst.sig" ;;
+    directory) mkdir "$R/$DEV/old-1-1-aarch64.pkg.tar.zst.sig" ;;
+    link-to-file) echo sig > "$t/sig-target"; ln -s "$t/sig-target" "$R/$DEV/old-1-1-aarch64.pkg.tar.zst.sig" ;;
+  esac
+  refuses "a $kind *.sig in the development repository" 'holds a signature file' build-packages --dev-unsigned packages/fixture
+  [[ -e $R/$DEV/old-1-1-aarch64.pkg.tar.zst.sig || -L $R/$DEV/old-1-1-aarch64.pkg.tar.zst.sig ]] || fail "a $kind signature was deleted"
+  [[ -f $R/$DEV/old-1-1-aarch64.pkg.tar.zst ]] || fail "the package beside a $kind signature was deleted"
+done
+pass "every *.sig (dangling links and directories included) is refused and never deleted in development mode"
+
+# --- G: signing material ----------------------------------------------------
+for form in fingerprint-file gnupg-dir gnupg-dangling-link fingerprint-dangling-link keys-file keys-dangling-link keys-link-to-empty-dir; do
+  new_repo
+  case $form in
+    fingerprint-file) mkdir "$R/keys"; echo FAKEKEY > "$R/keys/fingerprint" ;;
+    gnupg-dir) mkdir -p "$R/keys/gnupg" ;;
+    gnupg-dangling-link) mkdir "$R/keys"; ln -s /nonexistent-omamobile "$R/keys/gnupg" ;;
+    fingerprint-dangling-link) mkdir "$R/keys"; ln -s /nonexistent-omamobile "$R/keys/fingerprint" ;;
+    keys-file) echo unexpected > "$R/keys" ;;
+    keys-dangling-link) ln -s /nonexistent-omamobile "$R/keys" ;;
+    keys-link-to-empty-dir) mkdir "$t/empty-keys"; ln -s "$t/empty-keys" "$R/keys" ;;
+  esac
+  refuses "--dev-unsigned with $form" 'signing material' build-packages --dev-unsigned packages/fixture
+  [[ ! -e $R/out ]] || fail "--dev-unsigned with $form created output before refusing"
+  refuses "--dev-unsigned --list with $form" 'signing material' build-packages --dev-unsigned --list packages/fixture
+  rm -rf "$R/keys" "$t/empty-keys"
+done
+pass "development mode refuses any keys/fingerprint, keys/gnupg or keys link, dangling or not, before creating anything"
+
+# --- H: ambient variables ---------------------------------------------------
+new_repo
+if DEV_UNSIGNED=1 ROOTFS_DEV_UNSIGNED=1 OMAMOBILE_DEV_UNSIGNED=1 REPO_STANZA_SED=x bp packages/fixture; then fail "an ambient variable made the signed build run without a key"; fi
+grep -q 'no signing key in keys/' "$t/log" || fail "the signed build fails for the wrong reason with ambient variables"
+[[ ! -e $R/out/dev-unsigned && ! -e $R/out/repo/aarch64/$MARKER_NAME ]] || fail "an ambient variable created the development repository"
+no_side_effects "the ambient signed build"
+if DEV_UNSIGNED=1 ROOTFS_DEV_UNSIGNED=1 bp --list packages/fixture; then fail "--list ran without a key under ambient variables"; fi
+grep -q 'no signing key in keys/' "$t/log" || fail "--list with ambient variables fails for the wrong reason"
+[[ ! -e $R/out/dev-unsigned ]] || fail "an ambient variable made --list use the development repository"
+pass "DEV_UNSIGNED and friends in the environment never activate the development mode"
+
+# --- J: locking -------------------------------------------------------------
+new_repo
+mkdir -p "$R/$DEV"
+lock=$R/out/dev-unsigned/repo/.repo.lock
+: > "$lock"
+flock -x "$lock" sleep 60 & bgpid=$!
+sleep 0.3
+refuses "a development writer while another writer holds the lock" 'another repository writer' build-packages --dev-unsigned packages/fixture
+kill "$bgpid" 2>/dev/null || true; wait "$bgpid" 2>/dev/null || true
+flock -s "$lock" sleep 60 & bgpid=$!
+sleep 0.3
+refuses "a development writer while a rootfs reader holds the shared lock" 'another repository writer' build-packages --dev-unsigned packages/fixture
+kill "$bgpid" 2>/dev/null || true; wait "$bgpid" 2>/dev/null || true; bgpid=""
+ln -sf /nonexistent-omamobile "$lock.x" && rm -f "$lock.x"
+rm -f "$lock"; ln -s /etc/hostname "$lock"
+refuses "a symlinked lock file" 'not a regular lock file' build-packages --dev-unsigned packages/fixture
+rm -f "$lock"
+bp --dev-unsigned packages/fixture || fail "the writer fails once the lock is free"
+pass "writers take an exclusive flock outside aarch64 and fail fast against writers, readers and linked lock files"
+
+# --- K: no-clobber ----------------------------------------------------------
+new_repo
+mkdir -p "$R/$DEV"; echo precious > "$R/$DEV/unmarked-1-1-aarch64.pkg.tar.zst"
+refuses "an unmarked, non-empty development directory" 'no development marker' build-packages --dev-unsigned packages/fixture
+[[ $(cat "$R/$DEV/unmarked-1-1-aarch64.pkg.tar.zst") == precious && ! -e $R/$DEV/$MARKER_NAME ]] || fail "an unmarked directory was adopted or changed"
+new_repo
+mkdir -p "$R/out/dev-unsigned"; ln -s /nonexistent-omamobile "$R/out/dev-unsigned/repo"
+refuses "a symlinked development repository directory" 'not a real directory' build-packages --dev-unsigned packages/fixture
+new_repo
+mkdir -p "$R/$DEV"; make_marker "$R/$DEV" exact
+chmod 000 "$R/$DEV/$MARKER_NAME"
+if ((EUID != 0)); then
+  refuses "an unreadable marker" 'development marker' build-packages --dev-unsigned packages/fixture
+fi
+chmod 644 "$R/$DEV/$MARKER_NAME"
+pass "an unmarked, linked or unreadable development repository is refused and left untouched"
+
+# --- the documented command -------------------------------------------------
+doc=docs/myron/DEV-UNSIGNED.md
+want="omamobile-keyring omamobile-firstboot omamobile-omarchy omamobile-apps-myron omamobile-owl-widgets omamobile-shell omamobile-mirror omamobile-myron-kernel-contract omamobile-device-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland"
+got=$(sed -n '/^tools\/build-packages --dev-unsigned/,/^env DEVICE=myron/p' "$doc" | grep -o 'packages/[a-z0-9-]*' | sed 's|packages/||' | tr '\n' ' ')
+[[ ${got% } == "$want" ]] || fail "the documented build list is not the exact twelve Myron directories: $got"
+for dir in $want; do [[ -f packages/$dir/PKGBUILD ]] || fail "$dir has no PKGBUILD"; done
+grep -q '^env DEVICE=myron tools/build-rootfs --dev-unsigned --stage-only --version <version>$' "$doc" || fail "the documented stage command is wrong"
+grep -q '^pkgname=(hyprland hyprpm)' packages/hyprland/PKGBUILD || fail "hyprland no longer emits hyprland and hyprpm"
+grep -q 'hyprland. and .hyprpm' "$doc" && grep -qi 'not a release' "$doc" || fail "the document lacks the hyprpm note or the non-release statement"
+[[ $(printf '%s\n' $want | sort -u | wc -l) == 12 ]] || fail "the list has duplicates"
+for dir in $want; do
+  grep -qx "${dir#omamobile-}" <(sed -e 's/#.*//' -e 's/[[:space:]]//g' rootfs/packages.omamobile.myron | grep -v '^$' | sed 's/^omamobile-//') ||
+    [[ $dir == omamobile-owl-widgets || $dir == omamobile-myron-kernel-contract || $dir == omamobile-device-myron ]] ||
+    fail "$dir is in the documented list but is neither in the Myron rootfs profile nor a known dependency"
+done
+pass "the documented command names exactly the twelve Myron build directories and states its non-release status"

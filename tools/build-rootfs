@@ -30,7 +30,7 @@
 # to the whole userdata partition on the first boot.
 #
 #   tools/build-rootfs [--version V] [--allow-missing "PKG..."] [--keep-raw]
-#                      [--stage-only]
+#                      [--stage-only] [--dev-unsigned]
 #     DEVICE       device/<codename>/device.conf (default cheetah)
 #     KERNEL_OUT   kernel build with modules-<release>.tar.zst
 #                  (default ~/android/mainline/out-int: bin/omamobile modules)
@@ -45,22 +45,34 @@
 #                       checksum, no smoke test, no proprietary payload
 #                       An existing stage or MANIFEST of the same version is never
 #                       replaced: the build refuses (use another --version)
+#     --dev-unsigned    DEVELOPMENT ONLY, not a release: DEVICE=myron --stage-only
+#                       only. Reads the separate unsigned repository
+#                       out/dev-unsigned/repo/aarch64 (tools/build-packages
+#                       --dev-unsigned) instead of out/repo, refuses to run
+#                       where keys/fingerprint or keys/gnupg exist, and writes
+#                       out/omamobile-rootfs-stage-dev-unsigned-<version>-
+#                       aarch64/ whose MANIFEST says the repository is
+#                       unsigned. The staged pacman.conf stays Required
+#                       DatabaseOptional. The F-flag aarch64 binfmt handler is
+#                       required for every rootfs build.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 ROOT=$PWD
 source tools/lib/alarm.sh
+source tools/lib/dev-repo.sh
 
 DEVICE=${DEVICE:-cheetah}
 KERNEL_OUT=${KERNEL_OUT:-$HOME/android/mainline/out-int}
 VERSION=$(date +%Y.%m.%d)
-ALLOW_MISSING="" KEEP_RAW=0 STAGE_ONLY=0
+ALLOW_MISSING="" KEEP_RAW=0 STAGE_ONLY=0 DEV_UNSIGNED_MODE=0
 while (($#)); do
   case $1 in
     --version) VERSION=${2:?}; shift ;;
     --allow-missing) ALLOW_MISSING=${2:?}; shift ;;
     --keep-raw) KEEP_RAW=1 ;;
     --stage-only) STAGE_ONLY=1 ;;
-    -h|--help) sed -n '3,47p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --dev-unsigned) DEV_UNSIGNED_MODE=1 ;;
+    -h|--help) sed -n '3,57p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) alarm_die "unknown argument $1" ;;
   esac
   shift
@@ -118,6 +130,18 @@ if [[ $ROOTFS_PACKAGE_PROFILE == myron ]]; then
 elif [[ $DEVICE == myron && $STAGE_ONLY == 1 ]]; then
   alarm_die "$conf: a myron stage needs ROOTFS_PACKAGE_PROFILE=myron, not $ROOTFS_PACKAGE_PROFILE"
 fi
+# The development (unsigned) repository is Myron stage-only and nothing else
+if ((DEV_UNSIGNED_MODE)); then
+  [[ $DEVICE == myron && $STAGE_ONLY == 1 && $ROOTFS_INTEGRATION == external-contract ]] ||
+    alarm_die "--dev-unsigned is only for DEVICE=myron --stage-only (ROOTFS_INTEGRATION=external-contract)"
+  devrepo_refuse_signing_material
+  repo=$DEV_REPO_DIR
+else
+  [[ $VERSION != *dev-unsigned* ]] ||
+    alarm_die "version '$VERSION' is reserved for --dev-unsigned stages"
+  repo=$SIGNED_REPO_DIR
+  devrepo_reject_signed_repo "$repo"
+fi
 DEVICE_PACKAGE=$(sed -n 's/^PACKAGE=\([a-z0-9-]*\)$/\1/p' "$conf")
 [[ -n $DEVICE_PACKAGE ]] || alarm_die "$conf has no PACKAGE"
 ROOTFS_PACKAGES=$(sed -n 's/^ROOTFS_PACKAGES="\(.*\)"$/\1/p' "$conf")
@@ -131,9 +155,21 @@ fi
 [[ -f $base_list && -f $ours_list ]] ||
   alarm_die "$conf: missing rootfs package profile '$ROOTFS_PACKAGE_PROFILE'"
 
-repo=out/repo/aarch64
-[[ -f $repo/omamobile.db ]] ||
-  alarm_die "no [omamobile] repository in out/repo: build it first with tools/build-packages (or tools/repo-build)"
+if ((DEV_UNSIGNED_MODE)); then
+  [[ -f $repo/omamobile.db ]] ||
+    alarm_die "no [omamobile] repository in ${repo%/aarch64}: build it first with tools/build-packages --dev-unsigned"
+else
+  [[ -f $repo/omamobile.db ]] ||
+    alarm_die "no [omamobile] repository in out/repo: build it first with tools/build-packages (or tools/repo-build)"
+fi
+# Readers hold the repository's shared lock for the whole build, so a writer
+# cannot change the packages under the container; then it is checked again.
+devrepo_lock repo_lock_fd "$(dirname "$repo")/.repo.lock" sh
+if ((DEV_UNSIGNED_MODE)); then
+  devrepo_require_dev_repo "$repo"
+else
+  devrepo_reject_signed_repo "$repo"
+fi
 release="" modules=""
 if ((!STAGE_ONLY)); then
   [[ -f $KERNEL_OUT/include/config/kernel.release ]] || alarm_die "no kernel build in $KERNEL_OUT (KERNEL_OUT=...)"
@@ -144,10 +180,14 @@ fi
 
 name=omamobile-rootfs-$VERSION-aarch64
 ((!STAGE_ONLY)) || name=omamobile-rootfs-stage-$VERSION-aarch64
+((!DEV_UNSIGNED_MODE)) || name=omamobile-rootfs-stage-dev-unsigned-$VERSION-aarch64
 out=$ROOT/out
 mkdir -p "$out"
 # VERSION matched ^[0-9A-Za-z._-]+$ above; refuse names that are only dots
 [[ $VERSION != . && $VERSION != .. && $VERSION != -* ]] || alarm_die "bad version '$VERSION'"
+# The rootfs build needs an F-flag aarch64 binfmt handler: refuse before any
+# workspace exists (alarm_fetch below asks again, with the same answer)
+alarm_require_binfmt rootfs
 # A stage generation is never replaced: refuse before any work or container
 if ((STAGE_ONLY)); then
   for existing in "$out/$name" "$out/$name.MANIFEST"; do
@@ -167,7 +207,7 @@ else
 fi
 [[ $work == "$out"/.rootfs-* && -d $work ]] || alarm_die "unsafe work path $work"
 
-alarm_fetch
+alarm_fetch rootfs
 image=$(alarm_build_image "$ROOT")
 volume=omamobile-rootfs-target-$$
 docker volume create "$volume" >/dev/null
@@ -175,16 +215,22 @@ cleanup() { docker volume rm -f "$volume" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 start=$(date +%s)
+if ((DEV_UNSIGNED_MODE)); then
+  alarm_say "DEVELOPMENT ONLY: staging $name from the unsigned repository (not a release, no deployment authority)"
+fi
 if ((STAGE_ONLY)); then
   alarm_say "Staging $name for $DEVICE (external contract, not an image)"
 else
   alarm_say "Building $name for $DEVICE (kernel $release)"
 fi
 commit=$(git rev-parse --short=12 HEAD)$(git diff --quiet HEAD -- rootfs packages tools device 2>/dev/null || echo "-dirty")
+stanza_sed=$(devrepo_stanza_sed)
+((!DEV_UNSIGNED_MODE)) || stanza_sed=$(devrepo_stanza_sed dev)
 mount_modules=()
 ((STAGE_ONLY)) || mount_modules=(-v "$modules:/modules:ro")
+((!DEV_UNSIGNED_MODE)) || devrepo_refuse_signing_material
 docker run --rm --privileged --platform linux/arm64 \
-  -v "$ROOT:/src:ro" -v "$ROOT/out/repo:/repo:ro" "${mount_modules[@]}" \
+  -v "$ROOT:/src:ro" -v "$ROOT/$(dirname "$repo"):/repo:ro" "${mount_modules[@]}" \
   -v "$volume:/target" -v "$work:/out" -v "$ALARM_CACHE/pkg:/var/cache/pacman/pkg" \
   -e VERSION="$VERSION" -e DEVICE="$DEVICE" -e DEVICE_PACKAGE="$DEVICE_PACKAGE" \
   -e ROOTFS_PACKAGES="$ROOTFS_PACKAGES" \
@@ -193,6 +239,9 @@ docker run --rm --privileged --platform linux/arm64 \
   -e KERNEL_RELEASE="$release" -e MODULES_SHA256="${modules:+$(sha256sum < "$modules" | cut -d' ' -f1)}" \
   -e GIT_COMMIT="$commit" -e ALARM_SHA256="$(sha256sum < "$ALARM_TARBALL" | cut -d' ' -f1)" \
   -e OMARCHY_CHANNEL="$OMARCHY_CHANNEL" -e ALLOW_MISSING="$ALLOW_MISSING" \
+  -e ROOTFS_DEV_UNSIGNED="$DEV_UNSIGNED_MODE" -e REPO_STANZA_SED="$stanza_sed" \
+  -e DEV_MARKER_NAME="$DEV_REPO_MARKER_NAME" -e DEV_MARKER_TEXT="$DEV_REPO_MARKER_TEXT" \
+  -e DEV_MANIFEST_LINE="$DEV_MANIFEST_LINE" -e SIGNED_MANIFEST_LINE="$SIGNED_MANIFEST_LINE" \
   -e OUT_UID="$(id -u)" -e OUT_GID="$(id -g)" \
   "$image" bash /src/rootfs/build-inside
 
@@ -226,6 +275,7 @@ if ((STAGE_ONLY)); then
   rm -rf -- "$work"
   echo
   echo "stage tree: $stage (not bootable, not an image, no kernel or modules)"
+  ((!DEV_UNSIGNED_MODE)) || echo "DEVELOPMENT ONLY: built from the unsigned repository; not a release, deployment not authorized"
   echo "manifest:   $out/$name.MANIFEST"
   echo "staged in $(( ($(date +%s) - start) / 60 )) min"
   exit 0

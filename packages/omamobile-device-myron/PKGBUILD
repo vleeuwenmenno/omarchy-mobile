@@ -3,7 +3,7 @@
 pkgname=omamobile-device-myron
 pkgver=$(cat "${startdir:-.}/version")
 pkgrel=1
-pkgdesc="Build-only Omarchy Mobile reference metadata for Xiaomi myron"
+pkgdesc="Build-only Omarchy Mobile reference metadata and local package mirrorlist for Xiaomi myron"
 arch=(aarch64)
 url="https://github.com/derekross/omarchy-mobile"
 license=(MIT)

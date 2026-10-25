@@ -10,6 +10,10 @@
 # the phone's build directory instead (packages/mesa/README.md).
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+# The development-only unsigned repository never goes through this signed,
+# phone-facing path: refuse its marker before any change or phone contact
+source tools/lib/dev-repo.sh
+devrepo_reject_signed_repo "$SIGNED_REPO_DIR"
 
 export GNUPGHOME=$PWD/keys/gnupg
 key=$(cat keys/fingerprint)
@@ -28,6 +32,9 @@ dirs=("$@")
 ((${#dirs[@]})) || dirs=(packages/omamobile-keyring packages/omamobile-shell packages/omamobile-device-cheetah)
 
 mkdir -p "$repo"
+# One writer at a time (tools/build-packages and tools/build-rootfs take the same lock)
+devrepo_lock repo_lock_fd "$(dirname "$repo")/.repo.lock" ex
+devrepo_reject_signed_repo "$repo"
 fetch() { "$ssh" "cat '$1'" >"$repo/$(basename "$1")"; }
 
 for dir in "${dirs[@]}"; do

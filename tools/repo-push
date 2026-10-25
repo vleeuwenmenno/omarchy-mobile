@@ -5,8 +5,15 @@
 # private. Then `omarchy update` on the phone installs whatever is new.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+# The development-only unsigned repository never goes through this signed,
+# phone-facing path: refuse its marker before any change or phone contact
+source tools/lib/dev-repo.sh
+devrepo_reject_signed_repo "$SIGNED_REPO_DIR"
 
 [[ -f out/repo/aarch64/omamobile.db ]] || { echo "Run tools/repo-build first" >&2; exit 1; }
+# Shared lock: no writer changes the packages while they are sent
+devrepo_lock repo_lock_fd out/repo/.repo.lock sh
+devrepo_reject_signed_repo "$SIGNED_REPO_DIR"
 tar cf - -C out/repo aarch64 | tools/phone-ssh '
   set -e
   rm -rf /var/lib/omamobile/repo.new && mkdir -p /var/lib/omamobile/repo.new

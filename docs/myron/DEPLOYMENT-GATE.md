@@ -55,6 +55,12 @@ components or symlinks. No command runs an external program or `depmod`.
 The manifest defaults to `<rootfs-stage>.MANIFEST`, the name
 `tools/build-rootfs --stage-only` writes.
 
+A stage built from the unsigned development repository
+([DEV-UNSIGNED.md](DEV-UNSIGNED.md)) is never accepted here: its MANIFEST line
+`repository signatures: none (unsigned development build; not a release)` or the
+marker `.omamobile-dev-unsigned` in its tree makes `assemble`, `verify` and
+`gate` fail.
+
 Writers publish only to a nonexistent `OUT`: the tree is written into a private
 same-parent temp directory, verified complete, and published with
 `renameat2(RENAME_NOREPLACE)`, reopened by identity, verified again, and checked

@@ -42,7 +42,7 @@ Include = /etc/pacman.d/mirrorlist
 Include = /etc/pacman.d/mirrorlist
 CONF
 
-pacman -Syu --noconfirm --needed base-devel arch-install-scripts git sudo e2fsprogs >/dev/null
+pacman -Syu --noconfirm --needed base-devel arch-install-scripts git sudo python e2fsprogs >/dev/null
 # The tarball's own kernel and its "alarm" account are not needed to build
 pacman -Rns --noconfirm linux-aarch64 >/dev/null 2>&1 || true
 userdel -r alarm >/dev/null 2>&1 || true

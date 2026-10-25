@@ -9,6 +9,7 @@ cp bin/omamobile "$t/repo/bin/"
 cp tools/install-phone "$t/repo/tools/"
 cp tools/build-rootfs "$t/repo/tools/"
 cp tools/lib/alarm.sh "$t/repo/tools/lib/"
+cp tools/lib/dev-repo.sh "$t/repo/tools/lib/"
 cp rootfs/packages.base rootfs/packages.omamobile \
   rootfs/packages.base.myron rootfs/packages.omamobile.myron "$t/repo/rootfs/"
 cp tools/install-phone "$t/bundle/install"
@@ -130,6 +131,7 @@ OMARCHY_CHANNEL=stable
 alarm_die() { echo "error: $*" >&2; exit 1; }
 alarm_say() { echo "==> $*"; }
 alarm_fetch() { :; }
+alarm_require_binfmt() { :; }
 alarm_build_image() { echo fake-aarch64-builder; }
 SH
 mkdir -p "$t/cache" "$t/repo/out/repo/aarch64" "$t/repo/tests"

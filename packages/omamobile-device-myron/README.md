@@ -7,10 +7,11 @@ Arch kernel/module and rootfs integration is developed. Module-push, kexec,
 fastboot, image, flash, push, installer, and bootable-rootfs paths all refuse
 Myron before starting work. The sole exception is the explicit
 `tools/build-rootfs --stage-only` package-resolution tree; it carries no
-kernel, modules, boot payload, private firmware, or install path.
+kernel, modules, boot payload, private firmware, or install path. It also
+ships the local `[omamobile]` mirrorlist (`file:///var/lib/omamobile/repo/$arch`).
 
-It installs only the device descriptor, this notice, its version, and the MIT
-license. It contains no firmware, kernel, modules, systemd units, udev rules,
+It installs only the device descriptor, local package mirrorlist, this notice,
+its version, and the MIT license. It contains no firmware, kernel, modules, systemd units, udev rules,
 session configuration, boot images, partition names, writer, or pacman hook.
 Installing it cannot activate hardware support.
 
