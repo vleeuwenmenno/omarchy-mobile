@@ -36,6 +36,7 @@ pass "descriptor exposes no image or partition write path"
 
 ./install "$tmp/root"
 printf '%s\n' \
+  etc/pacman.d/omamobile-mirrorlist \
   usr/share/doc/omamobile-device-myron/README.md \
   usr/share/licenses/omamobile-device-myron/LICENSE \
   usr/share/omamobile/device-myron/version \
@@ -44,3 +45,8 @@ printf '%s\n' \
 cmp -s "$tmp/expected-files" "$tmp/actual-files" \
   || { diff -u "$tmp/expected-files" "$tmp/actual-files" >&2 || true; fail "package stages unexpected files"; }
 pass "package stages metadata only"
+
+grep -qx 'Server = file:///var/lib/omamobile/repo/\$arch' \
+  "$tmp/root/etc/pacman.d/omamobile-mirrorlist" \
+  || fail "package does not provide the local Omarchy Mobile repository"
+pass "package provides the local repository mirrorlist"

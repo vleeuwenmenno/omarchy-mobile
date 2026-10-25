@@ -9,6 +9,7 @@ url="https://github.com/derekross/omarchy-mobile"
 license=(MIT)
 provides=(omamobile-device)
 conflicts=(omamobile-device)
+backup=(etc/pacman.d/omamobile-mirrorlist)
 
 check() {
   "$startdir/test/all"

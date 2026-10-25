@@ -17,3 +17,5 @@ install -Dm644 README.md \
 install -Dm644 LICENSE \
   "$destination/usr/share/licenses/omamobile-device-myron/LICENSE"
 install -Dm644 version "$destination/usr/share/omamobile/device-myron/version"
+install -Dm644 etc/omamobile-mirrorlist \
+  "$destination/etc/pacman.d/omamobile-mirrorlist"

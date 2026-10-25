@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# Omarchy Mobile packages staged inside this rootfs. The repository remains
+# local; no network package source or deployment authority is implied.
+Server = file:///var/lib/omamobile/repo/$arch
