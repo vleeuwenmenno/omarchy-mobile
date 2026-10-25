@@ -193,8 +193,10 @@ grep -Fq 'pgrep -x ModemManager' "$audio" ||
   fail 'audio does not reject a boot where modem or GNSS userspace is active'
 for required in \
   'audio-stage.state' 'myron-omarchy-audio-stage.log' \
-  'systemctl restart myron-hardware-watchdog.service' \
-  'stage=arm result=complete watchdog=rearmed' \
+  'the original rollback watchdog is no longer active' \
+  'stage=arm action=remove-graphical-disarm watchdog=continued' \
+  'stabilization=radio-begin seconds=20' \
+  'stage=arm result=complete watchdog=continued radio_stable_seconds=20' \
   'Do not retry audio in this boot' \
   'mapper) require_common; run_mapper' \
   'transport) require_common; run_transport' \
@@ -205,6 +207,9 @@ for required in \
   grep -Fq "$required" "$audio_stage" ||
     fail "checkpointed audio stage runner lacks: $required"
 done
+if grep -Fq 'restart myron-hardware-watchdog.service' "$audio_stage"; then
+  fail 'audio staging restarts the independent rollback supervisor'
+fi
 grep -Fq 'pgrep -x ModemManager' "$audio_stage" ||
   fail 'checkpointed audio stages do not reject modem/GNSS userspace'
 grep -Fq 'sync -f "$log"' "$audio_stage" ||

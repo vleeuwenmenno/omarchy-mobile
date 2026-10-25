@@ -135,6 +135,8 @@ finish_stage() {
 arm_test() {
 	find_adsp
 	[ "$(cat "$adsp/state")" = offline ] || fail 'ADSP must be offline on a clean boot'
+	systemctl --quiet is-active myron-hardware-watchdog.service ||
+		fail 'the original rollback watchdog is no longer active'
 	previous=$(read_state)
 	case "$previous" in
 		'') ;;
@@ -146,10 +148,18 @@ arm_test() {
 	printf 'checkpointed-audio-stage\n' > "$arm"
 	chmod 0600 "$arm"
 	write_state "armed:$boot_id"
-	persist 'stage=arm result=complete watchdog=rearmed'
+	persist 'stage=arm action=remove-graphical-disarm watchdog=continued'
 	rm -f "$disarm"
-	systemctl restart myron-hardware-watchdog.service || fail 'could not re-arm rollback watchdog'
-	printf '%s\n' 'stage=arm result=complete watchdog=rearmed'
+	sync
+	[ ! -e "$disarm" ] || fail 'could not re-arm the existing rollback watchdog'
+	persist 'stage=arm stabilization=radio-begin seconds=20'
+	sleep 20
+	systemctl --quiet is-active myron-reference-radio.service ||
+		fail 'radio foundation stopped during stabilization'
+	[ -s /run/myron-wireless-ready ] || fail 'radio readiness disappeared during stabilization'
+	[ -d /sys/class/net/wlan0 ] || fail 'wlan0 did not survive radio stabilization'
+	persist 'stage=arm stabilization=radio-complete result=complete watchdog=continued'
+	printf '%s\n' 'stage=arm result=complete watchdog=continued radio_stable_seconds=20'
 }
 
 require_arm() {

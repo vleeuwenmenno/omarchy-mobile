@@ -137,11 +137,13 @@ qualified on a separate fresh boot, before ModemManager or GNSS. The
 `myron-audio-stage` runner advances only through `arm`, `mapper`, `transport`,
 `adsp`, `codecs`, `devnodes`, and `fastrpc`. It syncs the current stage and each
 module insertion to the postmarketOS root before acting. `arm` removes the
-graphical disarm marker and restarts the 900-second rollback watchdog. A hard
-reset therefore restores postmarketOS on the next boot, while the persistent
-log identifies the last attempted operation. Do not retry a failed stage in
-the same boot. Speaker output is not part of these stages and remains a
-separate low-volume safety test.
+graphical disarm marker while the original 900-second rollback watchdog is
+still active; it never restarts that independent supervisor. It then requires
+20 seconds of radio and `wlan0` stability before permitting the mapper stage.
+A hard reset therefore restores postmarketOS on the next boot, while the
+persistent log identifies the last attempted operation. Do not retry a failed
+stage in the same boot. Speaker output is not part of these stages and remains
+a separate low-volume safety test.
 
 ## Artifact record
 
