@@ -313,6 +313,31 @@ removed `hci0`, unmounted `bluetooth_b`, powered the controller off and
 disarmed rollback. The exact postmarketOS `init_boot_a` was then restored;
 Plasma, Wi-Fi and the cellular interface returned.
 
+## Battery and charging stage
+
+The next private payload adds the exact 20-file `charging` runtime from the
+reference manifest. `myron-batterysecret-start` pins the runtime's own manifest
+hash, verifies every file before execution, and launches the stock daemon with
+the source-built property shim. Its systemd service is gated by the temporary
+host-root arm marker, requires successful Myron hardware preparation, and runs
+before the display manager. It does not change charge limits or other sysfs
+controls.
+
+After the native session qualifies, run the read-only evidence probe over USB
+SSH:
+
+```text
+sudo myron-battery-stage
+```
+
+It requires the independent rollback watchdog and active authentication
+process, validates battery capacity/health/temperature plus USB voltage and
+current reporting, and confirms that UPower recognizes external power. It
+persists only bounded aggregate readings in the postmarketOS host log. UPower
+may report the battery device itself as `discharging` from instantaneous
+current direction while its daemon correctly reports `on-battery: no`; the
+Omarchy bar uses the daemon-wide external-power state.
+
 ## Next attended sequence
 
 1. Promote the qualified controller/scan sequence into a device-owned package
@@ -321,6 +346,6 @@ Plasma, Wi-Fi and the cellular interface returned.
 3. Audit sensors, telephony, fingerprint and camera as isolated subsystem
    phases; none is implied by successful Bluetooth or graphical testing.
 
-Bluetooth discovery/audio, sensors and rotation, telephony, fingerprint and
+Bluetooth pairing/audio, sensors and rotation, telephony, fingerprint and
 camera capture remain required later phases; none may be inferred from the
-successful graphical or radio tests.
+successful graphical, controller-scan or radio tests.

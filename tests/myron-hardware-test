@@ -9,6 +9,8 @@ compose=tools/myron-dev-image-compose
 initboot=tools/myron-build-test-init-boot
 initramfs=device/myron/hardware-test-initramfs
 input_stage=$overlay/usr/local/sbin/myron-input-stage
+battery_start=$overlay/usr/local/sbin/myron-batterysecret-start
+battery_stage=$overlay/usr/local/sbin/myron-battery-stage
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
@@ -25,6 +27,8 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/sbin/myron-audio-stage" \
   "$overlay/usr/local/sbin/myron-speaker-dsp-stage" \
   "$overlay/usr/local/sbin/myron-bluetooth-stage" \
+  "$battery_start" \
+  "$battery_stage" \
   "$overlay/usr/local/sbin/myron-audio-devnodes" \
   "$overlay/usr/local/sbin/myron-omarchy-prepare" \
   "$overlay/usr/local/sbin/myron-omarchy-qualify"; do
@@ -322,6 +326,46 @@ done
 grep -Fq '"$root/usr/local/sbin/myron-input-stage"' "$compose" ||
   fail 'composer does not explicitly install the input stage as executable'
 pass 'attended input probe is dynamic, exclusive, bounded and privacy-safe'
+
+for required in \
+  '49defb95564adc88f2922562fe6a04a0255f8dda07047f71cdc0fa2b78aaace0' \
+  '[ ! -L "$runtime/SHA256SUMS" ]' \
+  'sha256sum -c SHA256SUMS' \
+  'LD_PRELOAD="$runtime/lib64/libmyron-properties.so"' \
+  'exec "$runtime/bin/linker64" "$runtime/bin/batterysecret"'; do
+  grep -Fq "$required" "$battery_start" ||
+    fail "battery authentication launcher lacks: $required"
+done
+for required in \
+  '/run/myron-omarchy-hardware-ready' \
+  'myron-hardware-watchdog.service' \
+  'is-active myron-batterysecret.service' \
+  '/sys/class/power_supply/battery' \
+  '/sys/class/power_supply/usb' \
+  'battery temperature is outside 0-50 C' \
+  'UPower does not recognize connected line power' \
+  'stage=battery result=qualified writes=none' \
+  'myron-omarchy-battery-stage.log'; do
+  grep -Fq "$required" "$battery_stage" ||
+    fail "battery qualification lacks: $required"
+done
+if grep -Eq '>[[:space:]]*"?\$?(battery|usb)/' "$battery_stage"; then
+  fail 'battery qualification can write a power-supply attribute'
+fi
+battery_unit=$overlay/usr/lib/systemd/system/myron-batterysecret.service
+grep -Fq 'Requires=myron-omarchy-prepare.service' "$battery_unit" ||
+  fail 'battery authentication does not require hardware preparation'
+grep -Fq 'Before=display-manager.service' "$battery_unit" ||
+  fail 'battery authentication is not ordered before the graphical session'
+grep -Fq 'ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed' \
+  "$battery_unit" || fail 'battery authentication is not temporary-test gated'
+grep -Fq -- '--features gpu,wifi,touch,radio-base,audio-microphone,charging' "$compose" ||
+  fail 'composer does not require the complete charging runtime closure'
+grep -Fq 'chmod 0755 "$root/usr/local/lib/myron-charging/bin/linker64"' "$compose" ||
+  fail 'composer does not restore charging program execute modes'
+grep -Fq 'myron-batterysecret.service' "$compose" ||
+  fail 'composer does not enable battery authentication'
+pass 'battery authentication and read-only power qualification are exact, gated and supervised'
 
 if grep -REq '(^|[[:space:]/])(fastboot|dd|sgdisk|parted|mkfs|wipefs)([[:space:]]|$)' \
     "$overlay"; then

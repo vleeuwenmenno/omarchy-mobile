@@ -22,8 +22,8 @@ Usage: tools/myron-dev-image-compose \
 Writes a new private ext4 payload. It never contacts a phone and never writes a
 partition. The input must be the unsigned development payload from
 tools/build-rootfs --dev-payload-image. Runtime scope is GPU, Wi-Fi, touch,
-radio-base and AudioReach microphone bring-up. Hardware activation remains
-disabled until an attended, separately gated test.
+radio-base, AudioReach microphone bring-up and battery authentication. Radio
+and audio activation remain disabled until an attended, separately gated test.
 EOF
 }
 
@@ -65,7 +65,7 @@ packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify verif
   --root "$modules" >/dev/null
 packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify verify-runtime \
   --manifest /home/menno/Work/myron-postmarketos/config/myron-runtime-assets.tsv \
-  --root "$runtime" --features gpu,wifi,touch,radio-base,audio-microphone >/dev/null
+  --root "$runtime" --features gpu,wifi,touch,radio-base,audio-microphone,charging >/dev/null
 [[ $(sha256sum <"$bluetooth_probe" | cut -d' ' -f1) == \
   4a9d4da29c7ef46f4dcb08385e4c5ff85b16344884d4239c40b53923c5258608 ]] ||
   die 'Bluetooth probe is not the reviewed Attempt 71 source'
@@ -137,15 +137,18 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/lib/myron-stock-modules" \
       "$root/usr/local/lib/myron-touch" \
       "$root/usr/local/lib/myron-wireless" \
-      "$root/usr/local/lib/myron-audio"
+      "$root/usr/local/lib/myron-audio" \
+      "$root/usr/local/lib/myron-charging"
     find "$root/usr/local/lib/myron-gpu" "$root/usr/local/lib/myron-stock-modules" \
       "$root/usr/local/lib/myron-touch" "$root/usr/local/lib/myron-wireless" \
-      "$root/usr/local/lib/myron-audio" \
+      "$root/usr/local/lib/myron-audio" "$root/usr/local/lib/myron-charging" \
       -type d -exec chmod 0755 {} +
     find "$root/usr/local/lib/myron-gpu" "$root/usr/local/lib/myron-stock-modules" \
       "$root/usr/local/lib/myron-touch" "$root/usr/local/lib/myron-wireless" \
-      "$root/usr/local/lib/myron-audio" \
+      "$root/usr/local/lib/myron-audio" "$root/usr/local/lib/myron-charging" \
       -type f -exec chmod 0644 {} +
+    chmod 0755 "$root/usr/local/lib/myron-charging/bin/linker64" \
+      "$root/usr/local/lib/myron-charging/bin/batterysecret"
     # AudioReach tools use the canonical system ACDB path. The runtime stage
     # keeps the exact reference calibration under its isolated asset root;
     # publish that verified file without replacing the other base configs.
@@ -172,10 +175,13 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-speaker-dsp-stage" \
       "$root/usr/local/sbin/myron-bluetooth-stage" \
       "$root/usr/local/sbin/myron-input-stage" \
+      "$root/usr/local/sbin/myron-batterysecret-start" \
+      "$root/usr/local/sbin/myron-battery-stage" \
       "$root/usr/local/sbin/myron-audio-devnodes" \
       "$root/usr/local/sbin/myron-omarchy-prepare" \
       "$root/usr/local/sbin/myron-omarchy-qualify"
     systemctl --root="$root" enable myron-hardware-watchdog.service \
+      myron-batterysecret.service \
       myron-omarchy-prepare.service myron-omarchy-qualify.service sshd.service \
       systemd-networkd.service >/dev/null
     # Omarchy Mobile has its own non-interactive first-boot service.  Arch
@@ -193,7 +199,9 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
   /usr/local/sbin/myron-omarchy-prepare \
   /usr/local/lib/myron-gpu/modules/msm_kgsl.ko \
-  /usr/local/lib/myron-audio /etc/acdbdata/acdb_cal.acdb \
+  /usr/local/lib/myron-audio /usr/local/lib/myron-charging \
+  /usr/local/lib/myron-charging/bin/batterysecret \
+  /usr/local/sbin/myron-batterysecret-start /etc/acdbdata/acdb_cal.acdb \
   /usr/local/sbin/myron-bluetooth-qca-probe \
   /etc/backend_conf.xml /etc/card-defs.xml; do
   debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||

@@ -1,0 +1,86 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Read-only battery, USB-PD and UPower qualification for the temporary image.
+set -eu
+
+persist_dir=/run/myron-host/var/log
+persist_log=$persist_dir/myron-omarchy-battery-stage.log
+battery=/sys/class/power_supply/battery
+usb=/sys/class/power_supply/usb
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+read_value() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || die "power attribute is invalid: $1"
+  value=$(cat "$1")
+  [ -n "$value" ] || die "power attribute is empty: $1"
+  printf '%s\n' "$value"
+}
+require_integer() {
+  case $2 in
+    -*) integer_digits=${2#-} ;;
+    *) integer_digits=$2 ;;
+  esac
+  case $integer_digits in ''|*[!0-9]*) die "$1 is not an integer: $2" ;; esac
+}
+
+[ "$(id -u)" = 0 ] || die 'must run as root'
+[ -f /run/myron-omarchy-hardware-ready ] || die 'hardware preparation marker missing'
+systemctl --quiet is-active myron-hardware-watchdog.service ||
+  die 'independent rollback watchdog is not active'
+systemctl --quiet is-active myron-batterysecret.service ||
+  die 'battery authentication service is not active'
+main_pid=$(systemctl show myron-batterysecret.service -p MainPID --value)
+require_integer batterysecret_pid "$main_pid"
+[ "$main_pid" -gt 1 ] && [ -d "/proc/$main_pid" ] ||
+  die 'battery authentication process is missing'
+
+status=$(read_value "$battery/status")
+capacity=$(read_value "$battery/capacity")
+health=$(read_value "$battery/health")
+charge_type=$(read_value "$battery/charge_type")
+temperature=$(read_value "$battery/temp")
+current=$(read_value "$battery/current_now")
+voltage=$(read_value "$battery/voltage_now")
+usb_online=$(read_value "$usb/online")
+usb_current=$(read_value "$usb/current_now")
+usb_voltage=$(read_value "$usb/voltage_now")
+
+for pair in "capacity:$capacity" "temperature:$temperature" "current:$current" \
+  "voltage:$voltage" "usb_online:$usb_online" "usb_current:$usb_current" \
+  "usb_voltage:$usb_voltage"; do
+  require_integer "${pair%%:*}" "${pair#*:}"
+done
+[ "$capacity" -ge 0 ] && [ "$capacity" -le 100 ] || die "battery capacity is invalid: $capacity"
+[ "$temperature" -ge 0 ] && [ "$temperature" -le 500 ] ||
+  die "battery temperature is outside 0-50 C: $temperature deci-C"
+[ "$health" = Good ] || die "battery health is not Good: $health"
+case $status in Charging|Discharging|Full|'Not charging'|Unknown) ;; *)
+  die "unexpected battery status: $status" ;;
+esac
+[ "$usb_online" = 1 ] || die 'USB power supply is not online during USB rescue test'
+[ "$usb_voltage" -gt 0 ] && [ "$usb_current" -ge 0 ] ||
+  die 'USB voltage/current reporting is invalid'
+
+command -v upower >/dev/null 2>&1 || die 'UPower client is missing'
+upower_state=$(LANG=C timeout 10 upower -d) || die 'UPower query failed'
+printf '%s\n' "$upower_state" | grep -Eq '^  on-battery:[[:space:]]+no$' ||
+  die 'UPower does not recognize connected line power'
+
+[ -d "$persist_dir" ] && [ ! -L "$persist_dir" ] || die 'persistent log directory is invalid'
+[ ! -L "$persist_log" ] || die 'persistent battery log is linked'
+temporary=$(mktemp "$persist_dir/.myron-battery-stage.XXXXXX")
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+chmod 0600 "$temporary"
+printf '%s\n' \
+  'stage=battery result=qualified writes=none' \
+  "battery_status=$status capacity_percent=$capacity health=$health charge_type=$charge_type" \
+  "battery_temp_deci_c=$temperature current_ua=$current voltage_uv=$voltage" \
+  "usb_online=$usb_online current_ua=$usb_current voltage_uv=$usb_voltage" \
+  'upower_on_battery=no battery_auth=active' >"$temporary"
+mv -f "$temporary" "$persist_log"
+trap - EXIT HUP INT TERM
+printf 'result=qualified battery=%s%% status=%s health=%s usb_online=%s auth=active upower_on_battery=no writes=none\n' \
+  "$capacity" "$status" "$health" "$usb_online"

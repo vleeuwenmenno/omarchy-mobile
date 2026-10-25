@@ -32,7 +32,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | Feature | Status | Evidence and Arch acceptance |
 | --- | --- | --- |
 | Wi-Fi | VERIFIED_WORKING | Connected, DHCP/DNS/IPv4 internet and full NetworkManager connectivity. Preserve stock-extracted modules/firmware and service order. |
-| Bluetooth controller | PARTIAL | Firmware/NVM, hci0, and BlueZ registration passed; discovery times out. |
+| Bluetooth controller | VERIFIED_WORKING | Exact WCN786x firmware/NVM, hci0, powered BlueZ controller, and a bounded discovery event passed; pairing remains untested. |
 | USB networking / SSH | VERIFIED_WORKING | USB NCM rescue and key-based SSH proven; WLAN SSH also works. Arch needs an independent rescue link. |
 | SIM detection | VERIFIED_WORKING | ModemManager exposes an active registered modem without recording identifiers. |
 | LTE / 5G registration | VERIFIED_WORKING | Home registration with LTE and 5G NR observed. |
@@ -51,7 +51,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | Earpiece | UNKNOWN | No verified call/earpiece route. |
 | Microphones | PARTIAL | Omarchy AudioReach captured one second at 48 kHz with 41,615 nonzero samples, discarded the recording, and restored mixer state. PipeWire app path and quality remain open. |
 | Headphones / USB audio | PRESENT_UNTESTED | No attended route test recorded. |
-| Bluetooth audio | BROKEN | Bluetooth pairing is not working. |
+| Bluetooth audio | PRESENT_UNTESTED | Controller discovery works, but pairing and PipeWire Bluetooth routing remain untested. |
 | Audio routing | EXPERIMENTAL | Pulse bridge and speaker graph work on the live reference; transitions, mute, suspend/resume, and clean build remain open. |
 | Qualcomm DSP / AudioReach | PARTIAL | Checkpointed Omarchy bring-up passed mapper, transport, ADSP/Q6, codecs, ALSA devnodes and FastRPC. Canoe ACDB system-path packaging was fixed; suspend/restart stability remains open. |
 | PipeWire / WirePlumber | PARTIAL | Installed, but SSH `wpctl` showed no sink/source in that remote context; application playback evidence comes from dedicated tests. |
@@ -60,8 +60,8 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 
 | Feature | Status | Evidence and Arch acceptance |
 | --- | --- | --- |
-| Battery percentage | VERIFIED_WORKING | Live battery supply reported capacity, temperature, voltage, and current; UPower may invert charging state. |
-| Charging | VERIFIED_WORKING | Battery authentication and about 45 W from a 65 W PD source were proven; release soak remains open. |
+| Battery percentage | VERIFIED_WORKING | Live battery supply reports capacity, temperature, voltage, and current. UPower may label the battery device discharging from instantaneous current while correctly reporting external power globally. |
+| Charging | VERIFIED_WORKING | Battery authentication and about 45 W from a 65 W PD source were proven on the reference system. Exact manifest-pinned authentication and a read-only Omarchy qualification stage are now packaged; Omarchy execution remains pending. |
 | USB-C power detection | VERIFIED_WORKING | USB_PD supply online with voltage/current readings. |
 | Thermal sensors | VERIFIED_WORKING | GPU qualification gates track named CPU/GPU/battery sensors and enforce limits. |
 | CPU/GPU scaling | PRESENT_UNTESTED | Required GPU governor modules exist; no Arch policy or full scaling matrix yet. |

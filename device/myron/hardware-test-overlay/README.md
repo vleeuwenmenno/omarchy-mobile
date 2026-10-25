@@ -37,10 +37,14 @@ The attended profile uses scale `2.0` on `DSI-1`. Squeekboard keeps a separate
 portrait-height multiplier of `1.8`, so the keyboard remains usable while the
 rest of the shell gains room.
 
-The composed private image includes the verified radio-base and AudioReach
-runtime asset closure plus their userspace packages. Modem, remoteproc and
-audio activation remain disabled; installing the files alone must not start
-hardware or ModemManager.
+The composed private image includes the verified radio-base, AudioReach and
+battery-authentication runtime asset closures plus their userspace packages.
+Modem, remoteproc and audio activation remain disabled; installing those files
+alone must not start hardware or ModemManager. The checksum-pinned battery
+daemon is enabled only inside the armed temporary test and is ordered after
+hardware preparation and before the display manager. `myron-battery-stage`
+performs a separate read-only sysfs and UPower qualification while the
+independent rollback watchdog remains active.
 
 The overlay provides a Myron-specific `omamobile-gnss` command for the shell's
 Location tile. It controls the qualified raw/NMEA/MSA/MSB sources through
