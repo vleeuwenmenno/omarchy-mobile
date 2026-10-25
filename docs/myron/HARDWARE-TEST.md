@@ -280,6 +280,23 @@ Emergency cleanup is idempotent:
 sudo myron-bluetooth-stage stop
 ```
 
+## Attended physical-key stage
+
+`myron-input-stage` dynamically resolves the unique `gpio-keys`,
+`pmic_pwrkey`, and `pmic_resin` devices instead of trusting unstable event
+numbers. It takes exclusive evdev grabs for at most 20 seconds, so the
+compositor cannot lock, change volume, or interpret a screenshot chord during
+the probe. It requires both press and release for Volume Up, Volume Down, and
+Power, persists only per-label counts, and releases every grab on success,
+failure, interruption, or timeout.
+
+Run from USB SSH while someone is holding the phone, then press and release
+each key once when the `READY` line appears:
+
+```text
+sudo myron-input-stage
+```
+
 The first v9 hardware run reached the Bluetooth start checkpoint at 62.9 C,
 loaded the six exact rebuilt GKI modules, then stopped before inserting
 `btpower.ko`: an over-strict userspace check compared the stock module's

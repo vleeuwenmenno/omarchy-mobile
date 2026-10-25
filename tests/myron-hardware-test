@@ -8,6 +8,7 @@ overlay=device/myron/hardware-test-overlay
 compose=tools/myron-dev-image-compose
 initboot=tools/myron-build-test-init-boot
 initramfs=device/myron/hardware-test-initramfs
+input_stage=$overlay/usr/local/sbin/myron-input-stage
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
@@ -30,6 +31,9 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   sh -n "$script" || fail "$script parses"
   [[ -x $script ]] || fail "$script is executable"
 done
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+  "$input_stage" || fail "$input_stage parses"
+[[ -x $input_stage ]] || fail "$input_stage is not executable"
 [[ -x $initboot ]] || fail 'init_boot builder is executable'
 pass 'composer, initramfs and hardware-test scripts parse'
 
@@ -299,6 +303,25 @@ grep -Fq 'install -Dm0755 /bluetooth-probe.py' "$compose" ||
 grep -Fq '"$root/usr/local/sbin/myron-bluetooth-stage"' "$compose" ||
   fail 'composer does not explicitly install the Bluetooth runner as executable'
 pass 'Bluetooth bring-up is exact, one-shot, bounded, private and independently supervised'
+
+for required in \
+  '"gpio-keys": ("volume-up", 115)' \
+  '"pmic_pwrkey": ("power", 116)' \
+  '"pmic_resin": ("volume-down", 114)' \
+  'EVIOCGRAB = 0x40044590' \
+  'TIMEOUT_SECONDS = 20' \
+  '/run/myron-omarchy-hardware-ready' \
+  'myron-hardware-watchdog.service' \
+  'os.O_NOFOLLOW' \
+  'result=qualified power=press-release'; do
+  grep -Fq "$required" "$input_stage" ||
+    fail "attended input stage lacks: $required"
+done
+! grep -Fq '/dev/input/event0' "$input_stage" ||
+  fail 'attended input stage hardcodes unstable event numbers'
+grep -Fq '"$root/usr/local/sbin/myron-input-stage"' "$compose" ||
+  fail 'composer does not explicitly install the input stage as executable'
+pass 'attended input probe is dynamic, exclusive, bounded and privacy-safe'
 
 if grep -REq '(^|[[:space:]/])(fastboot|dd|sgdisk|parted|mkfs|wipefs)([[:space:]]|$)' \
     "$overlay"; then

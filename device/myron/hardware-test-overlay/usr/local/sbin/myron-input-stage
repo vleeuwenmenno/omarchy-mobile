@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Bounded attended Myron power and volume-key qualification."""
+
+from __future__ import annotations
+
+import fcntl
+import os
+from pathlib import Path
+import select
+import signal
+import struct
+import sys
+import time
+from typing import NoReturn
+
+
+EV_KEY = 1
+EVIOCGRAB = 0x40044590
+EVENT = struct.Struct("@llHHi")
+TIMEOUT_SECONDS = 20
+EXPECTED = {
+    "gpio-keys": ("volume-up", 115),
+    "pmic_pwrkey": ("power", 116),
+    "pmic_resin": ("volume-down", 114),
+}
+
+
+def fail(message: str) -> NoReturn:
+    print(f"ERROR: {message}", file=sys.stderr, flush=True)
+    raise SystemExit(1)
+
+
+def find_devices() -> dict[str, tuple[Path, int]]:
+    found: dict[str, tuple[Path, int]] = {}
+    for event in sorted(Path("/sys/class/input").glob("event*")):
+        try:
+            name = (event / "device/name").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        expected = EXPECTED.get(name)
+        if expected is None:
+            continue
+        label, code = expected
+        if label in found:
+            fail(f"duplicate input device for {label}")
+        found[label] = (Path("/dev/input") / event.name, code)
+    missing = sorted({label for label, _ in EXPECTED.values()} - found.keys())
+    if missing:
+        fail("missing input device: " + ",".join(missing))
+    return found
+
+
+def append_result(result: str, counts: dict[str, dict[str, int]]) -> None:
+    log = Path("/run/myron-host/var/log/myron-omarchy-input-stage.log")
+    line = " ".join(
+        f"{label}_press={counts[label]['press']} {label}_release={counts[label]['release']}"
+        for label in sorted(counts)
+    )
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(log, flags, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "a", encoding="ascii") as stream:
+        stream.write(f"result={result} {line}\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def main() -> int:
+    os.umask(0o077)
+    if os.geteuid() != 0:
+        fail("input stage must run as root")
+    if not Path("/run/myron-omarchy-hardware-ready").is_file():
+        fail("Myron hardware preparation is not ready")
+    if os.system("systemctl --quiet is-active myron-hardware-watchdog.service") != 0:
+        fail("independent rollback watchdog is not active")
+
+    devices = find_devices()
+    handles: dict[int, tuple[str, int]] = {}
+    counts = {label: {"press": 0, "release": 0} for label in devices}
+    interrupted = False
+
+    def stop(_signum: int, _frame: object) -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, stop)
+
+    try:
+        for label, (path, code) in devices.items():
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 1)
+            except BaseException:
+                os.close(fd)
+                raise
+            handles[fd] = (label, code)
+
+        print(
+            "READY: press and release Volume Up, Volume Down, and Power once",
+            flush=True,
+        )
+        deadline = time.monotonic() + TIMEOUT_SECONDS
+        while not interrupted and time.monotonic() < deadline:
+            if all(value["press"] and value["release"] for value in counts.values()):
+                append_result("qualified", counts)
+                print(
+                    "result=qualified power=press-release "
+                    "volume-up=press-release volume-down=press-release",
+                    flush=True,
+                )
+                return 0
+            remaining = max(0.0, deadline - time.monotonic())
+            ready, _, _ = select.select(handles, [], [], min(0.25, remaining))
+            for fd in ready:
+                try:
+                    data = os.read(fd, EVENT.size * 32)
+                except BlockingIOError:
+                    continue
+                label, expected_code = handles[fd]
+                for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _, _, event_type, code, value = EVENT.unpack_from(data, offset)
+                    if event_type != EV_KEY or code != expected_code:
+                        continue
+                    if value == 1:
+                        counts[label]["press"] += 1
+                        print(f"observed={label}:press", flush=True)
+                    elif value == 0:
+                        counts[label]["release"] += 1
+                        print(f"observed={label}:release", flush=True)
+        append_result("incomplete", counts)
+        fail("input stage timed out or was interrupted")
+    finally:
+        for fd in handles:
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 0)
+            except OSError:
+                pass
+            os.close(fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

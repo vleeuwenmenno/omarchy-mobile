@@ -171,6 +171,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-audio-stage" \
       "$root/usr/local/sbin/myron-speaker-dsp-stage" \
       "$root/usr/local/sbin/myron-bluetooth-stage" \
+      "$root/usr/local/sbin/myron-input-stage" \
       "$root/usr/local/sbin/myron-audio-devnodes" \
       "$root/usr/local/sbin/myron-omarchy-prepare" \
       "$root/usr/local/sbin/myron-omarchy-qualify"
