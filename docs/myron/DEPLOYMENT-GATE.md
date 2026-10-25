@@ -142,14 +142,18 @@ and the gate still refuses. The gate reports `runtime_status`,
 `stage-runtime` is the local preparation step for a source tree that also
 contains optional features. It safely traverses the complete source under the
 same bounds, retains only the selected manifest bytes, validates their hashes,
-and atomically publishes an exact no-replace closure. Optional files never
-enter the output. Staged ancestors use mode `0700`, files use `0600`, and the
-stage root created by the common publisher uses `0755`; these are private
-storage modes, not final installation permissions. Assembly recomputes its
-digest from those normalized modes. Source and manifest paths remain pinned and
-are rechecked during both pre- and post-publication verification.
+and atomically publishes an exact no-replace closure. Without `--features` it
+selects the deployment-contract closure. An attended test composer may pass an
+explicit comma-separated feature list; the output then contains exactly that
+manifest-pinned closure, including a selected source-built output when its
+manifest policy matches, without changing the deployment contract. Staged
+ancestors use mode `0700`, files use `0600`, and the stage root created by the
+common publisher uses `0755`; these are private storage modes, not final
+installation permissions. Assembly recomputes its digest from those normalized
+modes. Source and manifest paths remain pinned and are rechecked during both
+pre- and post-publication verification.
 
-The staging output contains private, `extract-only` bytes. Keep it in a
+The staging output contains private, manifest-policy-bound bytes. Keep it in a
 dedicated access-controlled local directory, for example
 `/absolute/private/myron-runtime-stage`, and never commit, package, publish or
 redistribute it. `out/` is ignored by Git but is not a secrecy boundary.

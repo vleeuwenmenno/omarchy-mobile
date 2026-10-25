@@ -1389,12 +1389,12 @@ def recheck_runtime_manifest(path: str, handle: ManifestHandle) -> None:
 
 
 def runtime_selection(
-    contracts: Contracts, manifest_path: str
+    contracts: Contracts, manifest_path: str, requested_features: list[str] | None = None
 ) -> tuple[list[dict], ManifestHandle]:
     """The pinned manifest's rows of every required feature, fail closed."""
     runtime = contracts.deployment["runtime"]
     rows, handle = capture_runtime_manifest(manifest_path, runtime["manifest_sha256"])
-    features = runtime["required_features"]
+    features = requested_features or runtime["required_features"]
     try:
         for feature in features:
             if not any(row["feature"] == feature for row in rows):
@@ -1406,7 +1406,10 @@ def runtime_selection(
                 raise DeploymentError(
                     f"required runtime target is outside {RUNTIME_TARGET_PREFIX}*: {row['target']}"
                 )
-            if row["provenance"] != "stock-extracted" or row["redistribution"] != "extract-only":
+            if requested_features is None and (
+                row["provenance"] != "stock-extracted"
+                or row["redistribution"] != "extract-only"
+            ):
                 raise DeploymentError(
                     f"required runtime row is not stock-extracted and extract-only: {row['target']}"
                 )
@@ -1475,7 +1478,12 @@ def inspect_runtime(
     return evidence, tree.directory_ids, frozenset({manifest_handle.parent_identity})
 
 
-def command_stage_runtime(contracts: Contracts, runtime: RuntimeInput, out: str) -> dict:
+def command_stage_runtime(
+    contracts: Contracts,
+    runtime: RuntimeInput,
+    out: str,
+    requested_features: list[str] | None = None,
+) -> dict:
     """Publish the exact required private runtime closure into a new local tree.
 
     The source may contain optional manifest rows and bytes.  Every source
@@ -1486,7 +1494,9 @@ def command_stage_runtime(contracts: Contracts, runtime: RuntimeInput, out: str)
     if runtime.root is None:
         raise DeploymentError("stage-runtime requires a --runtime-assets directory")
     check_runtime_scope(runtime, {"output": out})
-    selected, manifest_handle = runtime_selection(contracts, runtime.manifest)
+    selected, manifest_handle = runtime_selection(
+        contracts, runtime.manifest, requested_features
+    )
     try:
         wanted = {row["target"].lstrip("/"): row for row in selected}
         descriptor, source_identity = open_trusted_artifact(runtime.root, "runtime source root")
@@ -1548,7 +1558,9 @@ def command_stage_runtime(contracts: Contracts, runtime: RuntimeInput, out: str)
             spec,
             verify_built,
         )
-        features = list(contracts.deployment["runtime"]["required_features"])
+        features = requested_features or list(
+            contracts.deployment["runtime"]["required_features"]
+        )
         manifest_sha256 = contracts.deployment["runtime"]["manifest_sha256"]
         return {
             "status": "staged",
@@ -2537,6 +2549,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     runtime_stage.add_argument("--runtime-assets", required=True, help="canonical absolute source root")
     runtime_stage.add_argument("--runtime-manifest", required=True, help="pinned runtime manifest TSV")
+    runtime_stage.add_argument(
+        "--features",
+        help="comma-separated exact feature closure; default: deployment-contract features",
+    )
     runtime_stage.add_argument("--out", required=True)
     assemble = commands.add_parser("assemble", help="bind rootfs, overlay and contracts into a new kit")
     assemble.add_argument("--rootfs-stage", required=True)
@@ -2569,8 +2585,22 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
         elif args.command == "stage-modules":
             result = command_stage_modules(contracts, args.assets, args.out)
         elif args.command == "stage-runtime":
+            features = None
+            if args.features is not None:
+                features = args.features.split(",")
+                if (
+                    not features
+                    or any(not MANIFEST_FEATURE.fullmatch(feature) for feature in features)
+                    or len(features) != len(set(features))
+                ):
+                    raise DeploymentError(
+                        "--features must contain unique comma-separated feature names"
+                    )
             result = command_stage_runtime(
-                contracts, runtime_input(args.runtime_assets, args.runtime_manifest), args.out
+                contracts,
+                runtime_input(args.runtime_assets, args.runtime_manifest),
+                args.out,
+                features,
             )
         elif args.command == "assemble":
             result = command_assemble(

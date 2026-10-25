@@ -111,6 +111,9 @@ RUNTIME_FILES = {
     "/usr/local/lib/myron-touch/touch.fw": ("touch", RUNTIME_MARKER + b"-touch"),
 }
 RUNTIME_OPTIONAL = {"/usr/local/lib/myron-extra/optional.bin": ("camera", RUNTIME_MARKER + b"-optional")}
+RUNTIME_BUILD_OUTPUT = {
+    "/usr/local/lib/myron-extra/mapper.ko": ("audio-microphone", RUNTIME_MARKER + b"-mapper")
+}
 TSV_HEADER = "target\tsha256\tprovenance\tredistribution\tfeature\n"
 
 
@@ -120,6 +123,10 @@ def tsv_row(target, data, feature, provenance="stock-extracted", policy="extract
 
 def standard_tsv():
     rows = [tsv_row(t, d, f) for t, (f, d) in {**RUNTIME_FILES, **RUNTIME_OPTIONAL}.items()]
+    rows.extend(
+        tsv_row(t, d, f, "source-built", "build-output")
+        for t, (f, d) in RUNTIME_BUILD_OUTPUT.items()
+    )
     return (TSV_HEADER + "".join(rows)).encode()
 
 
@@ -1676,7 +1683,7 @@ def expected_evidence():
 
 # stage-runtime trims an optional-bearing private source into the exact
 # contract-required closure, with deterministic private storage modes.
-runtime_source = make_runtime({**RUNTIME_FILES, **RUNTIME_OPTIONAL})
+runtime_source = make_runtime({**RUNTIME_FILES, **RUNTIME_OPTIONAL, **RUNTIME_BUILD_OUTPUT})
 runtime_source_before = snapshot(runtime_source)
 runtime_manifest_before = RT_MANIFEST.read_bytes()
 runtime_stage_a = work / "runtime-stage-a"
@@ -1709,6 +1716,47 @@ assert next(entry for entry in stage_entries if entry.path == ".").mode == 0o755
 assert not any("optional.bin" in entry.path for entry in stage_entries)
 assert snapshot(runtime_source) == runtime_source_before
 assert RT_MANIFEST.read_bytes() == runtime_manifest_before
+
+runtime_stage_camera = work / "runtime-stage-camera"
+camera_result = expect_ok(
+    root,
+    "stage-runtime",
+    "--runtime-assets", runtime_source,
+    "--runtime-manifest", RT_MANIFEST,
+    "--features", "camera",
+    "--out", runtime_stage_camera,
+)
+camera_entries, _ = snapshot(runtime_stage_camera)
+camera_files = {entry.path for entry in camera_entries if entry.kind == "file"}
+assert camera_result["asset_count"] == 1 and camera_result["features"] == ["camera"]
+assert camera_files == {"usr/local/lib/myron-extra/optional.bin"}
+runtime_stage_audio = work / "runtime-stage-audio"
+audio_result = expect_ok(
+    root,
+    "stage-runtime",
+    "--runtime-assets", runtime_source,
+    "--runtime-manifest", RT_MANIFEST,
+    "--features", "audio-microphone",
+    "--out", runtime_stage_audio,
+)
+audio_entries, _ = snapshot(runtime_stage_audio)
+audio_files = {entry.path for entry in audio_entries if entry.kind == "file"}
+assert audio_result["asset_count"] == 1
+assert audio_files == {"usr/local/lib/myron-extra/mapper.ko"}
+for value in ("", "camera,camera", "camera,", "missing"):
+    output = fresh("runtime-stage-feature-refusal") / "out"
+    code, _, err = run_exact(
+        root,
+        "stage-runtime",
+        "--runtime-assets", runtime_source,
+        "--runtime-manifest", RT_MANIFEST,
+        "--features", value,
+        "--out", output,
+    )
+    assert code != 0 and not output.exists()
+    expected = "unique comma-separated" if value != "missing" else "no row for required feature"
+    assert expected in err
+ok("stage-runtime supports an explicit exact feature closure and rejects invalid selections")
 
 staged_runtime_kit = work / "staged-runtime-kit"
 assembled = expect_ok(root, *rt_asm(staged_runtime_kit, runtime_stage_a))
