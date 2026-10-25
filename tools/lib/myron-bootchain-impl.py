@@ -597,8 +597,12 @@ def qualification() -> dict:
 
 def load_bootchain_contract(root: Path, env) -> tuple[dict, bytes, str]:
     d = deploy()
-    data = d.read_file(f"{root}/{BOOTCHAIN_CONTRACT_PATH}", "bootchain contract", d.MAX_SMALL_BYTES)
-    value = d.strict_json(data, "bootchain contract")
+    try:
+        data = d.read_file(f"{root}/{BOOTCHAIN_CONTRACT_PATH}", "bootchain contract", d.MAX_SMALL_BYTES)
+        value = d.strict_json(data, "bootchain contract")
+    except (*admission_errors(), RecursionError):
+        # Dependency text can echo the contract's own keys or values: say only what failed.
+        raise BootchainError("bootchain contract could not be admitted (code contract-rejected)") from None
     expected = expected_bootchain_contract(env)
     if not collect().kernel().strict_equal(value, expected):
         raise BootchainError("bootchain contract differs from its derived form")
@@ -617,9 +621,23 @@ class Environment:
         self.contract_sha256 = contract_sha256
 
 
-def load_environment(root: Path) -> Environment:
+def admission_errors() -> tuple:
+    """Every class the pinned dependencies raise while admitting contracts (ValueError: numbers, UTF-8)."""
     c = collect()
-    collector_env = c.load_environment(root)
+    p = c.preflight()
+    return (c.CollectError, p.PreflightError, p.snapshot().SnapshotError, *p.deploy().handled_errors())
+
+
+def load_collector_environment(root: Path):
+    c = collect()
+    try:
+        return c.load_environment(root)
+    except (*admission_errors(), RecursionError):
+        raise BootchainError("bootchain environment could not be admitted (code environment-rejected)") from None
+
+
+def load_environment(root: Path) -> Environment:
+    collector_env = load_collector_environment(root)
     contract, contract_bytes, contract_sha256 = load_bootchain_contract(root, collector_env)
     return Environment(collector_env, contract, contract_bytes, contract_sha256)
 
@@ -965,7 +983,9 @@ def check_locations(header: dict, which: str, disk: int, sector: int) -> None:
 def decode_name(raw: bytes) -> str:
     end = next((at for at in range(0, len(raw), 2) if raw[at:at + 2] == b"\0\0"), None)
     if end is None:
-        raise CorruptGpt("GPT entry name is not NUL terminated")
+        # A field filling all 36 units has no room for the terminator this profile requires; GPT
+        # itself does not forbid that, so this is a profile restriction and not corruption.
+        raise UnsupportedGpt("GPT entry name has no NUL terminator within its 36 units")
     if any(raw[end:]):
         raise CorruptGpt("GPT entry name padding is not zero")
     try:
@@ -1407,9 +1427,20 @@ def command_verify_parse(env: Environment, args) -> dict:
     return result_summary("verified", inputs, spec)
 
 
+class UsageError(BootchainError):
+    """The command line is not one of the fixed commands; the text never carries the arguments."""
+
+
+class FixedParser(argparse.ArgumentParser):
+    """argparse echoes unknown commands, options and paths: refuse with one fixed line instead."""
+
+    def error(self, message):
+        raise UsageError("invalid command line (code usage); see --help")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
+    parser = FixedParser(prog="myron-bootchain", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True, parser_class=FixedParser)
     commands.add_parser("show", help="verify and print the committed bootchain contract")
     commands.add_parser(
         "derive-contract",
@@ -1429,7 +1460,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
+    except UsageError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
     try:
         c = collect()
     except BootchainError as error:
@@ -1443,7 +1478,7 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
         if args.command == "derive-contract":
             # No committed bootchain contract is read: the pinned upstream contracts and this
             # source alone derive the bytes that `show` verifies. Nothing is written or authorized.
-            result = expected_bootchain_contract(c.load_environment(root))
+            result = expected_bootchain_contract(load_collector_environment(root))
         else:
             env = load_environment(root)
             if args.command == "show":

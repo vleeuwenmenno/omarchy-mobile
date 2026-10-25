@@ -175,7 +175,8 @@ is unique among occupied entries (no GUID is ever emitted). Its extent needs
 by `first_lba` to find overlaps independently of table order, which is
 arbitrary. The 72-byte name is strict UTF-16LE with a NUL terminator and zero
 padding after the first NUL (so a name holds at most 35 units: a profile
-restriction); an invalid surrogate, an empty name, a name outside the
+restriction, and a field of 36 units with no NUL is refused as unsupported, not
+corrupt); an invalid surrogate, an empty name, a name outside the
 collector's `[a-z0-9_]{1,36}` pattern or a duplicate name is refused. A GPT with
 no occupied entry is refused as unsupported.
 
@@ -320,9 +321,13 @@ Residuals, as in Phase 2.13:
 - The reads are synthetic. Nothing shows a real phone's GPT would produce them or
   parse under this profile.
 - One GPT only: no protective MBR, no other disk or LUN, no complete inventory.
-- Names of 36 units, a nonzero byte after the 92-byte header and other valid GPT
-  variants are refused by the profile; that is a restriction, not a statement
-  about GPT validity.
+- A 36-unit name field has no room for the NUL terminator this profile requires,
+  so it is refused as `gpt-unsupported`: a profile restriction, not a claim that
+  such a field is invalid GPT. A nonzero byte after the 92-byte header and other
+  GPT variants are refused by the profile for the same reason.
+- Command-line, contract and environment failures print one fixed, value-free line
+  (`code usage`, `contract-rejected`, `environment-rejected`): no argument, key,
+  number or path from the input is echoed.
 - `bootable_flag` is a bit, not a bootability claim.
 - The dependency imports are version-pinned, not byte-pinned.
 - R3 and R4 are not implemented.

@@ -198,7 +198,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-bootchain-impl.py",
-    "sha256": "cedff3b2b3f770fcd0533933497d5f8acee5c9c933e4c98da68792623340fa73"
+    "sha256": "17b0ce29bf6852c05b74358dde128533b38f9da6007cea2e234e03e2a148a2d3"
   },
   "input": {
     "closure": [

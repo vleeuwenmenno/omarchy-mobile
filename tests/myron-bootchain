@@ -594,6 +594,62 @@ root = clone_root("preflight-contract-changed")
 expect_fail("preflight contract changed under the pin", ["show"], root=root)
 ok("contract tampering and changed pinned contracts fail closed")
 
+# Contract admission failures are one fixed value-free line, never a traceback.
+LEAK = "LEAK" + "z9"
+
+
+def contract_bytes_case(name, data, match="bootchain contract could not be admitted (code contract-rejected)"):
+    root = clone_root("contract-bytes")
+    (root / B.BOOTCHAIN_CONTRACT_PATH).write_bytes(data)
+    for command in (["show"], ["plan", "--request", request]):
+        expect_fail(f"{name} ({command[0]})", command, root=root, match=match, absent=(LEAK, "Traceback", "digits"),
+                    single_line=True)
+
+
+contract_bytes_case("duplicate contract key with a newline", b'{"' + LEAK.encode() + b'\\nERROR: injected": 1, "'
+                    + LEAK.encode() + b'\\nERROR: injected": 2}\n')
+contract_bytes_case("duplicate contract key", b'{"a": 1, "a": 2}\n')
+contract_bytes_case("5000-digit contract integer", b'{"a": ' + b"9" * 5000 + b"}\n")
+contract_bytes_case("invalid UTF-8 contract", b'{"a": "\xff' + LEAK.encode() + b'"}\n')
+contract_bytes_case("non-JSON contract", LEAK.encode() + b"\n")
+contract_bytes_case("non-finite contract number", b'{"a": NaN}\n')
+contract_bytes_case("deeply nested contract", b"[" * 100000 + b"]" * 100000 + b"\n")
+for name, other in (("capture", C.CAPTURE_CONTRACT_PATH), ("preflight", P.PREFLIGHT_CONTRACT_PATH)):
+    root = clone_root(f"environment-{name}")
+    (root / other).write_bytes(b'{"' + LEAK.encode() + b'\\nERROR: injected": 1, "' + LEAK.encode()
+                               + b'\\nERROR: injected": 2}\n')
+    for command in (["show"], ["derive-contract"]):
+        expect_fail(f"{name} contract malformed in the environment ({command[0]})", command, root=root,
+                    match="bootchain environment could not be admitted (code environment-rejected)",
+                    absent=(LEAK, "Traceback", "injected"), single_line=True)
+    root = clone_root(f"environment-{name}-integer")
+    (root / other).write_bytes(b'{"a": ' + b"9" * 5000 + b"}\n")
+    expect_fail(f"{name} contract with a 5000-digit integer", ["show"], root=root,
+                match="(code environment-rejected)", absent=("Traceback", "digits"), single_line=True)
+ok("malformed contracts and environments fail with fixed single-line diagnostics, echoing nothing")
+
+# argparse never echoes an unknown command, option or path.
+USAGE = "ERROR: invalid command line (code usage); see --help\n"
+for label, arguments in (
+        ("unknown command", [LEAK + "\nERROR: injected"]),
+        ("unknown command with a control byte", [LEAK + "\x1b[31m\x07"]),
+        ("no command", []),
+        ("unknown option", ["show", "--" + LEAK + "\nERROR: injected"]),
+        ("unknown option with a value", ["show", "--" + LEAK, LEAK]),
+        ("unknown root option", ["--" + LEAK, "show"]),
+        ("stray positional", ["show", LEAK + "\nERROR: injected"]),
+        ("plan without its request", ["plan"]),
+        ("parse without its reads", ["parse", "--request", LEAK, "--out", LEAK]),
+        ("parse option without a value", ["parse", "--request"]),
+        ("verify-parse without any option", ["verify-parse"]),
+        ("derive-contract option", ["derive-contract", "--" + LEAK + "\nx"]),
+        ("abbreviated-looking command", ["pars" + LEAK])):
+    err = expect_fail(label, arguments, single_line=True, absent=(LEAK, "injected", "\x1b", "\x07", "usage:", "Traceback"))
+    assert err == USAGE, (label, err)
+code, out, err = invoke("--help")
+assert code == 0 and "myron-bootchain" in out and "derive-contract" in out and err == "", (code, err)
+ok("command-line misuse prints one fixed line without the arguments, and --help still lists the commands")
+
 derived, derived_text = expect_ok("derive-contract")
 assert derived_text.encode() == bootchain_contract_bytes and derived == contract
 root = clone_root("derive-without-contract")
@@ -1207,8 +1263,8 @@ name_case("name with a lone high surrogate", b"\x00\xd8" + bytes(70), f"name is 
 name_case("name with a lone low surrogate", b"a\x00\x00\xdc" + bytes(68), "name is not valid UTF-16")
 name_case("name ending in a high surrogate", b"a\x00\x00\xd8" + bytes(68), "name is not valid UTF-16")
 name_case("name with a valid surrogate pair", units("\U0001F600") + bytes(68), f"name is outside the supported pattern {UNSUPPORTED}")
-name_case("name with no NUL", units("a" * 36), f"name is not NUL terminated {CORRUPT}")
-name_case("name with 35 units and a nonzero tail", units("a" * 35) + b"\x01\x00", "name is not NUL terminated")
+name_case("name with no NUL", units("a" * 36), f"name has no NUL terminator within its 36 units {UNSUPPORTED}")
+name_case("name with 35 units and a nonzero tail", units("a" * 35) + b"\x01\x00", "name has no NUL terminator within its 36 units")
 name_case("name padded with a nonzero byte", units("boot_a") + b"\x00\x00\x41" + bytes(57), "name padding is not zero")
 name_case("name padded with a nonzero second byte", units("boot_a") + b"\x00\x00\x00\x01" + bytes(56), "name padding is not zero")
 name_case("name padded with a trailing character", units("boot_a") + bytes(2) + units("x") + bytes(56), "name padding is not zero")
@@ -1618,9 +1674,22 @@ for canary in (MAC_CANARY, UUID_CANARY, DIGITS_CANARY, NAME_CANARY, *GPT_CANARIE
 for banned in ("android_id", "partition_uuid", "disk_guid", "raw_payload", "module_bytes"):
     assert banned.encode() not in walk(parse_a)[1][f"operations/{R2}.json"]
 raw_inputs = b"".join(FILES[name] for name in sorted(FILES) if name.endswith(".bin"))
-for window in (raw_inputs[i:i + 16] for i in range(0, len(raw_inputs), 16)):
-    if window != bytes(16) and window != bytes([0xEE]) * 16:
-        assert window not in good_output, f"raw GPT bytes were copied into an output: {window.hex()}"
+all_output = good_output + b"".join(
+    (parse_a / name).read_bytes() for name in ("SHA256SUMS", "parse.json", f"operations/{R2}.json"))
+# Every 16-byte sliding window of the raw GPT files, except the uniform filler, must be absent.
+windows = {raw_inputs[i:i + 16] for i in range(len(raw_inputs) - 15)}
+windows -= {bytes([value]) * 16 for value in range(256)}
+assert len(windows) > 100, "the privacy scan has too few distinct windows to mean anything"
+for window in windows:
+    assert window not in all_output, f"raw GPT bytes were copied into an output: {window.hex()}"
+# The disk GUID and every occupied entry's unique GUID, as binary, both mixed-endian byte
+# orders, and every text form: absent from each output and from the printed results.
+for raw in (DISK_GUID, *(unique_guid(n) for n, *_ in PARTS4096)):
+    swapped = uuid.UUID(bytes=raw).bytes_le
+    for form in (raw, swapped, raw[::-1]):
+        assert form not in all_output, f"GUID bytes in output: {form.hex()}"
+    for text in guid_forms(raw):
+        assert text.encode() not in all_output, f"GUID text in output: {text}"
 ok("identifier and privacy canaries are rejected, never echoed, and absent from every output")
 
 # --- verify-parse: every outer binding, operation, claim and checksum ---------------------
