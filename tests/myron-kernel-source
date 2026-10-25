@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# Offline tests for the Myron external kernel-source bundle verifier (Phase 2.17).
+# Offline tests for the Myron external kernel-source bundle verifier (Phases 2.17 and 2.18).
 # Everything is synthetic: no private bundle, no phone, no network, no process.
 set -euo pipefail
 export LC_ALL=C
@@ -27,7 +27,7 @@ pass "loader and implementation parse and have no process, network, environment,
 [[ ! -e device/myron/kernel-source ]] || fail "device/myron/kernel-source exists: no private bytes may live in the repository"
 pass "no bundle bytes in the repository"
 
-[[ $("$tool" --version) == 0.1.0 ]] || fail "version"
+[[ $("$tool" --version) == 0.2.0 ]] || fail "version"
 "$tool" show > "$tmp/show.json" || fail "show failed"
 cmp -s "$tmp/show.json" device/myron/kernel-source-contract.json || fail "show differs from the committed contract"
 "$tool" plan > "$tmp/plan.json" || fail "plan failed"
@@ -37,14 +37,16 @@ cmp -s "$tmp/show.json" device/myron/kernel-source-contract.json || fail "show d
 pass "production show and plan are deterministic across working directories"
 
 set +e
-for args in "" "bogus" "show extra" "plan extra" "verify" "verify --root" "verify --root a b" "--root /x" "--version x" "verify --root=/x" "verify /x"; do
+for args in "" "bogus" "show extra" "plan extra" "verify" "verify --root" "verify --root a b" "--root /x" "--version x" "verify --root=/x" "verify /x" "analyze-patches" "analyze-patches --root" "analyze-patches --root a b" "analyze-patches /x" "analyze-patches --root=/x" "analyze-patches --root /x extra"; do
   # shellcheck disable=SC2086
   KERNEL_SOURCE_ROOT=/x "$tool" $args > "$tmp/out" 2> "$tmp/err"; rc=$?
   [[ $rc -eq 2 && ! -s $tmp/out && $(cat "$tmp/err") == "myron-kernel-source: E_USAGE" ]] || fail "misuse '$args' rc=$rc"
 done
-for root in relative /nonexistent/x /tmp/ /tmp//x /tmp/./x /tmp/../x /; do
-  "$tool" verify --root "$root" > "$tmp/out" 2> "$tmp/err"; rc=$?
-  [[ $rc -eq 1 && ! -s $tmp/out && $(cat "$tmp/err") == "myron-kernel-source: E_REFUSED" ]] || fail "refusal '$root' rc=$rc"
+for command in verify analyze-patches; do
+  for root in relative /nonexistent/x /tmp/ /tmp//x /tmp/./x /tmp/../x /; do
+    "$tool" "$command" --root "$root" > "$tmp/out" 2> "$tmp/err"; rc=$?
+    [[ $rc -eq 1 && ! -s $tmp/out && $(cat "$tmp/err") == "myron-kernel-source: E_REFUSED" ]] || fail "refusal '$command $root' rc=$rc"
+  done
 done
 set -e
 pass "misuse exits 2 and refusals exit 1 with empty stdout and one fixed stderr line"
@@ -93,7 +95,7 @@ kernel = json.loads(kernel_bytes)
 contract_bytes = (repo / "device/myron/kernel-source-contract.json").read_bytes()
 assert contract_bytes == K.render_json(K.expected_contract())
 contract = json.loads(contract_bytes)
-assert contract["schema"] == 1 and contract["version"] == "0.1.0"
+assert contract["schema"] == 1 and contract["version"] == "0.2.0"
 assert contract["kernel_contract"]["sha256"] == sha(kernel_bytes)
 pins = {f["path"]: f for f in contract["bundle"]["files"]}
 assert [f["path"] for f in contract["bundle"]["files"]] == [
@@ -116,6 +118,17 @@ assert [(f["size"], f["sha256"]) for f in contract["bundle"]["files"]] == [
     (3659, "b3be02fc2c92c81542e570df02a42777ae1e7ac9bf7d5f6e4f204142ec2d32ac"),
     (658, "4d95dd11c1a002f94a25a36953a1c0303132b4c2c1af57d8291baa0176da5e6c"),
     (1032, "7ed11e94e5d242b24e5bec1213810a1b38d31a55817c29c74e8d2709d5ac54ac")]
+profile = contract["patch_structure_profile"]
+assert profile == K.patch_profile()
+assert profile["artifacts"] == 4 and profile["file_sections"] == {"min": 1, "max": 16}
+assert profile["hunks"] == {"min": 1, "max": 64, "modifying_per_section_min": 1}
+assert profile["artifact_bytes"] == 65536 and profile["line_bytes_max"] == 8192
+assert profile["path_bytes_max"] == 256
+assert profile["numeric"] == {"digits_max": 10, "value_max": 2**31 - 1, "leading_zeros": False}
+assert profile["claims"] == ["patch_structure_admission"]
+assert profile["patch_applicability"] is False and profile["application_performed"] is False
+assert profile["coordinate_policy"]["boundary"] == "start - 1 if count > 0 else start"
+assert list(profile["reason_codes"]) == profile["classifications"]
 assert all(v is False for v in contract["authority"].values())
 assert contract["activation"] == {"mode": "disabled", "blocker": "unchanged"}
 assert contract["bytes_distributed"] is False
@@ -162,7 +175,7 @@ def patched_kernel(mutate):
 with_fake(kernel_bytes, contract_bytes)
 expect("repository-size", with_fake, kernel_bytes + b" ", contract_bytes)
 expect("kernel-contract-hash", with_fake, kernel_bytes.replace(b"6.12", b"6.13"), contract_bytes)
-expect("contract-mismatch", with_fake, kernel_bytes, contract_bytes.replace(b"0.1.0", b"0.1.1"))
+expect("contract-mismatch", with_fake, kernel_bytes, contract_bytes.replace(b"0.2.0", b"0.2.1"))
 expect("contract-mismatch", with_fake, kernel_bytes, contract_bytes + b"\n")
 expect("contract-mismatch", with_fake, kernel_bytes, contract_bytes.replace(b'"size": 10578', b'"size": 10579'))
 
@@ -240,6 +253,10 @@ def lock_summary(lock=None):
     return K.validate_source_lock(jbytes(lock or synth_lock()), **LOCK_KW)
 
 
+PROFILE2 = K.patch_profile()
+PROFILE2["artifacts"] = len(SYN_NAMES)
+
+
 def make_spec(contents):
     files = []
     for path, data in contents.items():
@@ -248,7 +265,8 @@ def make_spec(contents):
         cap = 64 * 1024 if role in ("source-lock", "patch") else 4096
         files.append((path, role, len(data), sha(data), cap))
     return {"files": files, "directories": ("patches",), "qualification_sha256": sha(QUAL.encode()),
-            "gki_revision": R1, "project_count": 3, "link_count": 1, "patch_names": SYN_NAMES}
+            "gki_revision": R1, "project_count": 3, "link_count": 1, "patch_names": SYN_NAMES,
+            "profile": PROFILE2}
 
 
 def default_contents(lock=None, manifest=None, fragment=b"synthetic fragment\n"):
@@ -286,7 +304,7 @@ assert summary == {"files": 5, "directories": 1, "projects": 3, "links": 1, "ove
 document = K.verification_document(summary)
 rendered = K.render_json(document).decode()
 assert document["result"] == "private-bundle-identity-matched"
-assert document["scope"] == "identity-and-structure-only"
+assert document["scope"] == "identity-closure-lock-manifest-and-patch-order-only"
 assert all(v is False for v in document["authority"].values())
 assert document["activation"] == {"mode": "disabled", "blocker": "unchanged"}
 assert root not in rendered and "SENTINEL" not in rendered and R1 not in rendered
@@ -762,5 +780,1047 @@ for arguments in ([], ["verify"], ["show", "x"], ["--root", "/x"], ["verify", "-
                             env={"PATH": os.environ["PATH"], "KERNEL_SOURCE_ROOT": bundle})
     assert (result.returncode, result.stdout, result.stderr) == (2, b"", b"myron-kernel-source: E_USAGE\n")
 ok("CLI refusals are deterministic, value-free and ignore environment paths")
+
+# ------------------------------------------------------- Phase 2.18 patch structure
+import io
+
+P1 = K.patch_profile()
+P1["artifacts"] = 1
+
+
+def rng(start, count):
+    return str(start) if count == 1 else f"{start},{count}"
+
+
+def hunk(old_start, old_count, new_start, new_count, body, context=""):
+    return f"@@ -{rng(old_start, old_count)} +{rng(new_start, new_count)} @@{context}\n{body}"
+
+
+def sect(path="drivers/x/a.c", *hunks, index="index 1234567..89abcde 100644\n"):
+    hunks = hunks or (hunk(5, 1, 5, 1, "-old\n+new\n"),)
+    return f"diff --git a/{path} b/{path}\n{index}--- a/{path}\n+++ b/{path}\n" + "".join(hunks)
+
+
+def one(text):
+    data = text if isinstance(text, bytes) else text.encode()
+    entry = K.analyze_patch_series((data,), P1)["patches"][0]
+    return entry["classification"], tuple(entry["reason_codes"])
+
+
+def verdict(text, classification, *reasons):
+    assert one(text) == (classification, tuple(reasons)), (one(text), classification, reasons, text[:300])
+
+
+MARK = "\\ No newline at end of file\n"
+GOOD = sect()
+verdict(GOOD, "conformant")
+entry = K.analyze_patch_series((GOOD.encode(),), P1)["patches"][0]
+assert entry == {"patch_index": 1, "classification": "conformant", "parse_complete": True,
+                 "file_count": 1, "hunk_count": 1, "reason_codes": [],
+                 "repeated_file_group_count": 0}, entry
+# canonical insert and delete, omitted and zero counts, newline markers, context text, no index
+verdict(sect("a.c", hunk(5, 0, 6, 2, "+one\n+two\n")), "conformant")
+verdict(sect("a.c", hunk(5, 2, 4, 0, "-one\n-two\n")), "conformant")
+verdict(sect("a.c", hunk(0, 0, 1, 3, "+a\n+b\n+c\n")), "conformant")
+verdict(sect("a.c", hunk(1, 3, 0, 0, "-a\n-b\n-c\n")), "conformant")
+verdict(sect("a.c", hunk(3, 1, 3, 1, "-a\n+b\n")), "conformant")
+verdict(sect("a.c", hunk(3, 2, 3, 2, " x\n-a\n+b\n")), "conformant")
+verdict(sect("a.c", hunk(3, 3, 3, 3, " x\n-a\n+b\n y\n")), "conformant")
+verdict(sect("a.c", hunk(3, 1, 3, 1, "-a\n" + MARK + "+b\n" + MARK)), "conformant")
+verdict(sect("a.c", hunk(3, 2, 3, 2, " a\n" + MARK + "-b\n+c\n")), "malformed", "marker-placement")
+verdict(sect("a.c", hunk(3, 1, 3, 2, "-a\n+b\n" + MARK + "+c\n")), "malformed", "marker-placement")
+verdict(sect("a.c", hunk(3, 2, 3, 2, " a\n-b\n" + MARK + "+c\n")), "conformant")
+verdict(sect("a.c", hunk(3, 1, 3, 1, "-a\n+b\n", " int f(void) SENTINEL-CONTEXT")), "conformant")
+verdict(sect("a.c", index=""), "conformant")
+verdict(sect("a.c", index="index 1234..5678\n"), "conformant")
+verdict(sect("a.c", index="index 1234567..89abcde 100755\n"), "conformant")
+# multi-hunk cumulative coordinates and multiple sections
+two = (hunk(1, 1, 1, 3, "-a\n+b\n+c\n+d\n"), hunk(10, 1, 12, 1, "-x\n+y\n"))
+verdict(sect("a.c", *two), "conformant")
+verdict(sect("a.c", two[0], hunk(10, 1, 10, 1, "-x\n+y\n")), "noncanonical", "coordinate-mismatch")
+verdict(sect("a.c", two[0], hunk(10, 1, 14, 1, "-x\n+y\n")), "noncanonical", "coordinate-mismatch")
+verdict(sect("a.c", hunk(1, 0, 2, 1, "+a\n"), hunk(5, 0, 7, 1, "+b\n")), "conformant")
+verdict(sect("a.c", hunk(1, 0, 2, 1, "+a\n"), hunk(5, 0, 6, 1, "+b\n")), "noncanonical", "coordinate-mismatch")
+verdict(sect("a.c", hunk(1, 0, 1, 1, "+a\n")), "noncanonical", "coordinate-mismatch")
+verdict(sect("a.c", hunk(0, 1, 0, 0, "-a\n")), "noncanonical", "coordinate-mismatch")
+verdict(sect("a.c", hunk(10, 2, 10, 2, "-a\n-b\n+c\n+d\n"), hunk(5, 1, 5, 1, "-x\n+y\n")),
+        "noncanonical", "hunk-order")
+verdict(sect("a.c", hunk(10, 3, 10, 3, "-a\n-b\n-c\n+d\n+e\n+f\n"), hunk(11, 1, 11, 1, "-x\n+y\n")),
+        "noncanonical", "hunk-order")
+verdict(sect("a.c", hunk(5, 1, 5, 1, " ctx\n")), "noncanonical", "no-modifying-hunk")
+verdict(sect("a.c", hunk(5, 1, 5, 1, " ctx\n"), hunk(9, 1, 9, 1, "-a\n+b\n")), "conformant")
+verdict(sect("a.c") + sect("b/b.c") + sect("c.c"), "conformant")
+verdict(sect("a.c") + sect("b.c") + sect("a.c"), "noncanonical", "duplicate-file-section")
+assert K.analyze_patch_series((sect("a.c").encode() + sect("b.c").encode(),), P1)["patches"][0][
+    "file_count"] == 2
+# header-looking payload stays payload
+payload = ("+diff --git a/evil b/evil\n+--- a/evil\n++++ b/evil\n+@@ -1 +1 @@\n"
+           "+index abc..def 120000\n+-- \n+new file mode 100644\n")
+entry = K.analyze_patch_series((sect("a.c", hunk(1, 0, 2, 7, payload) .replace(
+    "@@ -1,0 +2,7 @@", "@@ -1,0 +2,7 @@")).encode(),), P1)["patches"][0]
+assert (entry["classification"], entry["file_count"], entry["hunk_count"]) == ("conformant", 1, 1), entry
+verdict(sect("a.c", hunk(1, 2, 1, 2, " @@ -1 +1 @@\n diff --git a/x b/x\n")), "noncanonical",
+        "no-modifying-hunk")
+# truncation, surplus, trailing junk, wrappers
+verdict("", "malformed", "truncated")
+verdict(GOOD[:-1], "malformed", "truncated")
+verdict(GOOD.replace("+new\n", ""), "malformed", "truncated")
+verdict(sect("a.c", hunk(3, 3, 3, 3, " a\n-b\n+c\n")), "malformed", "truncated")
+verdict(sect("a.c", hunk(3, 3, 3, 3, " a\n-b\n+c\n")) + sect("b.c"), "malformed", "count-mismatch")
+verdict(GOOD + "+surplus\n", "unsupported", "trailing-text")
+verdict(GOOD + "-- \n2.43.0\n", "unsupported", "trailing-text")
+verdict(GOOD + "\n", "unsupported", "trailing-text")
+verdict(GOOD + "random trailing text\n", "unsupported", "trailing-text")
+verdict(GOOD + MARK, "conformant")
+verdict(GOOD + MARK + MARK, "unsupported", "trailing-text")
+verdict("From abc Mon Sep 17\nSubject: [PATCH] SENTINEL\n\n---\n" + GOOD, "unsupported", "wrapper-or-prologue")
+verdict("\n" + GOOD, "unsupported", "wrapper-or-prologue")
+verdict("Subject: x\n\n" + GOOD, "unsupported", "wrapper-or-prologue")
+verdict(" " + GOOD, "unsupported", "wrapper-or-prologue")
+verdict(GOOD.replace("diff --git", "diff  --git", 1), "unsupported", "wrapper-or-prologue")
+verdict("diff --cc a.c\n" + GOOD, "unsupported", "combined-diff")
+verdict(sect("a.c", "@@@ -1,1 -1,1 +1,1 @@@\n-a\n"), "unsupported", "combined-diff")
+verdict(GOOD + "diff --combined a.c\n", "unsupported", "combined-diff")
+# unsupported features
+for header, reason in (("new file mode 100644\n", "new-or-deleted-file"),
+                       ("deleted file mode 100644\n", "new-or-deleted-file"),
+                       ("old mode 100644\nnew mode 100755\n", "mode-change"),
+                       ("rename from a.c\nrename to b.c\n", "rename-or-copy"),
+                       ("copy from a.c\ncopy to b.c\n", "rename-or-copy"),
+                       ("similarity index 90%\n", "rename-or-copy"),
+                       ("dissimilarity index 90%\n", "rename-or-copy"),
+                       ("Binary files a/a.c and b/a.c differ\n", "binary-patch"),
+                       ("GIT binary patch\n", "binary-patch"),
+                       ("unknown header\n", "extended-header"),
+                       ("index 1234..5678\nindex 1234..5678\n", "extended-header"),
+                       ("", None)):
+    text = f"diff --git a/a.c b/a.c\n{header}--- a/a.c\n+++ b/a.c\n" + hunk(5, 1, 5, 1, "-a\n+b\n")
+    if reason:
+        verdict(text, "unsupported", reason)
+verdict("diff --git a/a.c b/a.c\nold mode 100644\nnew mode 100755\n", "unsupported", "mode-change")
+verdict("diff --git a/a.c b/a.c\nnew file mode 100644\nindex 0000..1111\n--- /dev/null\n+++ b/a.c\n"
+        + hunk(0, 0, 1, 1, "+a\n"), "unsupported", "new-or-deleted-file")
+verdict("diff --git a/a.c b/a.c\n--- /dev/null\n+++ b/a.c\n" + hunk(0, 0, 1, 1, "+a\n"),
+        "unsupported", "new-or-deleted-file")
+verdict("diff --git a/a.c b/a.c\n--- a/a.c\n+++ /dev/null\n" + hunk(1, 1, 0, 0, "-a\n"),
+        "unsupported", "new-or-deleted-file")
+verdict(sect("a.c", index="index 1234..5678 120000\n"), "unsupported", "symlink-or-submodule-mode")
+verdict(sect("a.c", index="index 1234..5678 160000\n"), "unsupported", "symlink-or-submodule-mode")
+verdict(sect("a.c", index="index 1234..5678 100664\n"), "unsupported", "file-mode")
+for bad_index in ("index 12..34\n", "index XYZ..abc\n", "index 1234..5678 100644 x\n",
+                  "index 1234..5678,9abc 100644\n", "index 1234..5678 12345\n", "index 1234...5678\n"):
+    verdict(sect("a.c", index=bad_index), "malformed", "bad-index-line")
+# missing, conflicting, unsafe paths
+for text, reason in (
+        ("diff --git a/a.c b/a.c\n--- a/a.c\n", "truncated"),
+        ("diff --git a/a.c b/a.c\n", "truncated"),
+        ("diff --git a/a.c b/a.c\n+++ b/a.c\n--- a/a.c\n", "missing-file-header"),
+        ("diff --git a/a.c b/a.c\n--- a/a.c\n", "truncated"),
+        ("diff --git a/a.c b/a.c\n--- a/a.c\nnot plus\n", "missing-file-header"),
+        ("diff --git a/a.c b/a.c\n@@ -1 +1 @@\n", "missing-file-header"),
+        ("diff --git a/a.c b/a.c\n" + "diff --git a/b.c b/b.c\n", "missing-file-header"),
+        ("diff --git a/a.c b/b.c\n--- a/a.c\n+++ b/a.c\n", "path-mismatch"),
+        ("diff --git a/a.c b/a.c\n--- a/b.c\n+++ b/a.c\n", "path-mismatch"),
+        ("diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/b.c\n", "path-mismatch"),
+        ("diff --git a/a.c b/a.c\n--- b/a.c\n+++ b/a.c\n", "missing-file-header"),
+        ("diff --git a/a.c b/a.c\n--- a/a.c\n+++ a/a.c\n", "missing-file-header"),
+        ("diff --git x y\n", "bad-diff-header"),
+        ("diff --git a/a.c\n", "bad-diff-header"),
+        ("diff --git \n", "bad-diff-header"),
+        ("diff --git a/a.c c/a.c\n", "bad-diff-header"),
+        ("diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n", "truncated"),
+        ("diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\ndiff --git a/b.c b/b.c\n", "no-hunks"),
+        ("diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\nstray\n", "no-hunks")):
+    verdict(text, "malformed", reason)
+for path in ("/etc/passwd", "../x", "a/../x", "a/./x", ".git/config", "a/.git", ".GIT/x", "a//b",
+             "a/", "a\tb", "a\\b", 'a"b', "caf\x01", "a b"):
+    text = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n" + hunk(5, 1, 5, 1, "-a\n+b\n")
+    result = one(text)
+    assert result == ("unsupported", ("unsafe-path",)), (path, result)
+verdict('diff --git "a/a.c" "b/a.c"\n', "unsupported", "unsafe-path")
+verdict('diff --git a/a.c b/a.c\n--- "a/a.c"\n+++ b/a.c\n', "malformed", "missing-file-header")
+verdict("diff --git a/a.c b/a.c\n--- a/a.c\t2020\n+++ b/a.c\n", "unsupported", "unsafe-path")
+verdict("diff --git a//x b//x\n", "unsupported", "unsafe-path")
+verdict(sect("a,b+c=d@e/f-g_h.c"), "conformant")
+# hunk header grammar, count mismatches
+for header in ("@@ -1 +1 @", "@@ -01 +1 @@", "@@ -1 +1 @@x", "@@ -1,x +1 @@", "@@ -1 +1", "@@ 1 1 @@",
+               "@@ -1,2,3 +1 @@", "@@ -1 +1 @@\r", "@@  -1 +1 @@", "@@ -1 + 1 @@", "@@", "@@x"):
+    text = sect("a.c", header + "\n-a\n+b\n")
+    result = one(text)
+    assert result[0] in ("malformed", "unsupported"), (header, result)
+    if "\r" not in header:
+        assert result == ("malformed", ("bad-hunk-header",)), (header, result)
+verdict(sect("a.c", "@@ -5,3 +5,3 @@\n-a\n-b\n+c\n@@ -20 +20 @@\n-x\n+y\n"), "malformed", "count-mismatch")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n-a\n+b\n+c\n"), "unsupported", "trailing-text")
+verdict(sect("a.c", "@@ -5,2 +5,1 @@\n-a\n+b\n+c\n"), "malformed", "count-mismatch")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n-a\n\n+b\n"), "malformed", "count-mismatch")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n-a\n?b\n"), "malformed", "count-mismatch")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n-a\n-b\n+c\n"), "malformed", "count-mismatch")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n" + MARK + "-a\n+b\n"), "malformed", "marker-placement")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n-a\n" + MARK + MARK + "+b\n"), "malformed", "marker-placement")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n-a\n\\ no newline at end of file\n+b\n"), "malformed", "marker-placement")
+verdict(sect("a.c", "@@ -5,1 +5,1 @@\n-a\n\\\n+b\n"), "malformed", "marker-placement")
+verdict(sect("a.c", "@@ -5,0 +5,0 @@\n" + MARK), "malformed", "marker-placement")
+verdict(sect("a.c", "@@ -5,2 +5,1 @@\n-a\n" + MARK + "-b\n+c\n"), "malformed", "marker-placement")
+verdict(sect("a.c", "@@ -5,0 +5,0 @@\n"), "noncanonical", "no-modifying-hunk")
+verdict(sect("a.c", "@@ -5,0 +6,0 @@\n"), "noncanonical", "coordinate-mismatch", "no-modifying-hunk")
+# bytes: NUL, CRLF, non-ASCII, overlong lines, huge numerics
+verdict(GOOD.replace("+new", "+ne\0w"), "unsupported", "nul-byte")
+verdict(GOOD.replace("\n", "\r\n"), "unsupported", "carriage-return")
+verdict(GOOD.replace("+new", "+n\rew"), "unsupported", "carriage-return")
+verdict(GOOD.replace("+new", "+néw"), "unsupported", "non-ascii")
+verdict(GOOD.encode().replace(b"+new", b"+n\xffw"), "unsupported", "non-ascii")
+verdict(GOOD.replace("+new", "+tab\there\x01\x7f"), "conformant")
+verdict(GOOD.replace("+new", "+" + "x" * 8191), "conformant")
+verdict(GOOD.replace("+new", "+" + "x" * 8192), "limit-exceeded", "line-length")
+verdict(GOOD.replace("+new", "+" + "x" * 8191) + ("x" * 8193), "limit-exceeded", "line-length")
+verdict(sect("a.c", hunk(5, 1, 5, 1, "-old\n+new\n", " " + "c" * 8180)), "conformant")
+verdict(sect("a.c", hunk(5, 1, 5, 1, "-old\n+new\n", " " + "c" * 8181)), "limit-exceeded", "line-length")
+verdict(sect("p" * 256), "conformant")
+verdict(sect("p" * 257), "limit-exceeded", "path-length")
+verdict(sect("/".join(["q" * 64] * 3 + ["r" * 61])), "conformant")
+verdict("diff --git a/" + "p" * 257 + " b/q\n", "limit-exceeded", "path-length")
+verdict(sect("a.c", "@@ -1,x +1 @@\n"), "malformed", "bad-hunk-header")
+verdict(sect("a.c", hunk(1000000000, 0, 1000000001, 1, "+a\n")), "conformant")
+verdict(sect("a.c", hunk(2147483647, 0, 2147483647, 0, "")), "noncanonical", "no-modifying-hunk")
+verdict(sect("a.c", "@@ -2147483647 +2147483647 @@\n"), "malformed", "truncated")
+verdict(sect("a.c", "@@ -1,2147483648 +1 @@\n"), "limit-exceeded", "numeric-value")
+verdict(sect("a.c", "@@ -1 +2147483648 @@\n"), "limit-exceeded", "numeric-value")
+verdict(sect("a.c", "@@ -9999999999 +1 @@\n"), "limit-exceeded", "numeric-value")
+verdict(sect("a.c", "@@ -12345678901 +1 @@\n"), "limit-exceeded", "numeric-digits")
+verdict(sect("a.c", "@@ -1 +1," + "9" * 5000 + " @@\n"), "limit-exceeded", "numeric-digits")
+verdict(sect("a.c", "@@ -1 +1," + "9" * 8200 + " @@\n"), "limit-exceeded", "line-length")
+verdict(sect("a.c", "@@ -1 +1,99999999999999999999 @@\n"), "limit-exceeded", "numeric-digits")
+# exact and +1 counts and sizes at the production profile
+FULL = K.patch_profile()
+many_sections = "".join(sect(f"d/f{index}.c") for index in range(16))
+verdict(many_sections, "conformant")
+assert K.analyze_patch_series((many_sections.encode(),), P1)["patches"][0]["file_count"] == 16
+verdict(many_sections + sect("d/f16.c"), "limit-exceeded", "file-section-limit")
+verdict(sect("a.c", *[hunk(10 * i + 1, 1, 10 * i + 1, 1, "-a\n+b\n") for i in range(64)]), "conformant")
+entry = K.analyze_patch_series((sect("a.c", *[hunk(10 * i + 1, 1, 10 * i + 1, 1, "-a\n+b\n")
+                                              for i in range(64)]).encode(),), P1)["patches"][0]
+assert (entry["file_count"], entry["hunk_count"]) == (1, 64)
+verdict(sect("a.c", *[hunk(10 * i + 1, 1, 10 * i + 1, 1, "-a\n+b\n") for i in range(65)]),
+        "limit-exceeded", "hunk-limit")
+spread = "".join(sect(f"d/f{i}.c", *[hunk(10 * j + 1, 1, 10 * j + 1, 1, "-a\n+b\n") for j in range(4)])
+                 for i in range(16))
+verdict(spread, "conformant")
+verdict(spread + sect("d/g.c"), "limit-exceeded", "file-section-limit")
+verdict(spread[:spread.rindex("diff --git")] + sect("d/f15.c", *[
+    hunk(10 * j + 1, 1, 10 * j + 1, 1, "-a\n+b\n") for j in range(5)]), "limit-exceeded", "hunk-limit")
+
+
+def padded(size):
+    lines = "".join("+" + "z" * 6000 + "\n" for _ in range(10))
+    head = sect("a.c", hunk(1, 0, 2, 11, lines + "+")).encode() + b"\n"
+    pad = size - len(head)
+    assert 0 <= pad < 8000, pad
+    return head.replace(b"+\n", b"+" + b"y" * pad + b"\n")
+
+
+assert len(padded(65536)) == 65536 and len(padded(65537)) == 65537
+verdict(padded(65536), "conformant")
+verdict(padded(65537), "limit-exceeded", "artifact-bytes")
+# lowered limits through a modified profile
+tight = copy.deepcopy(P1)
+tight["file_sections"]["max"] = 2
+tight["hunks"]["max"] = 3
+tight["line_bytes_max"] = 40
+tight["path_bytes_max"] = 5
+tight["numeric"].update(digits_max=2, value_max=50)
+tight["artifact_bytes"] = 1000
+
+
+def tight_verdict(text, classification, *reasons):
+    entry = K.analyze_patch_series((text.encode(),), tight)["patches"][0]
+    assert (entry["classification"], tuple(entry["reason_codes"])) == (classification, reasons), entry
+
+
+tight_verdict(sect("a.c"), "conformant")
+tight_verdict(sect("a.c") + sect("b.c") + sect("c.c"), "limit-exceeded", "file-section-limit")
+tight_verdict(sect("abcdef"), "limit-exceeded", "path-length")
+tight_verdict(sect("a.c", hunk(51, 1, 51, 1, "-a\n+b\n")), "limit-exceeded", "numeric-value")
+tight_verdict(sect("a.c", hunk(5, 100, 5, 100, "-a\n+b\n")), "limit-exceeded", "numeric-digits")
+tight_verdict(sect("a.c", hunk(5, 1, 5, 1, "-" + "x" * 50 + "\n+b\n")), "limit-exceeded", "line-length")
+tight_verdict(sect("a.c", *[hunk(10 * i + 1, 1, 10 * i + 1, 1, "-a\n+b\n") for i in range(3)]), "conformant")
+tight_verdict(sect("a.c", *[hunk(10 * i + 1, 1, 10 * i + 1, 1, "-a\n+b\n") for i in range(4)]),
+              "limit-exceeded", "hunk-limit")
+tight_verdict(sect("a.c", hunk(5, 1, 5, 1, "-a\n+b\n", " " * 1)) + "\n" * 1000, "limit-exceeded", "artifact-bytes")
+ok("structural analyzer classifies conformant, noncanonical, malformed, unsupported and limit-exceeded fixtures")
+
+# ---------------------------------------------- Phase 2.18 round 2: format-patch envelope
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+MBOX = f"From {COMMIT} Mon Sep 17 00:00:00 2001\n"
+HEADERS = ("From: A U Thor <author@example.invalid>\n", "Date: Mon, 1 Jan 2024 00:00:00 +0000\n",
+           "Subject: [PATCH] synthetic subject\n")
+STAT = " a.c | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\n"
+FOOT = "-- \n2.43.0\n"
+
+
+def envelope(diff, message="Body line\n", stat="", footer="", headers=HEADERS, mbox=MBOX, sep="---\n"):
+    return mbox + "".join(headers) + "\n" + message + sep + stat + diff + footer
+
+
+def entry_of(text):
+    data = text if isinstance(text, bytes) else text.encode()
+    return K.analyze_patch_series((data,), P1)["patches"][0]
+
+
+# accepted shapes
+verdict(envelope(GOOD), "conformant")
+verdict(envelope(GOOD, stat=STAT), "conformant")
+verdict(envelope(GOOD, footer=FOOT), "conformant")
+verdict(envelope(GOOD, stat=STAT, footer=FOOT), "conformant")
+verdict(envelope(GOOD, message=""), "conformant")
+verdict(envelope(GOOD, message="\n\n"), "conformant")
+verdict(envelope(GOOD, message="one\n\ntwo\tthree\n\n"), "conformant")
+folded = ("From: A U Thor\n <author@example.invalid>\n\tcontinued\n", "Date: D\n  more\n",
+          "Subject: [PATCH] s\n a\n b\n")
+verdict(envelope(GOOD, headers=folded), "conformant")
+looking = ("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n-- \n2.43.0\n\n"
+           "From: x\nSubject: y\n -----\n----\n --- \n")
+verdict(envelope(GOOD, message=looking, footer=FOOT), "conformant")
+assert entry_of(envelope(sect("a.c") + sect("b.c"), stat=STAT, footer=FOOT))["file_count"] == 2
+assert entry_of(envelope(GOOD, stat=STAT, footer=FOOT)) == entry_of(GOOD)
+for version in ("2.0", "2.43.0", "1.2.3.4", "999.999.999.999"):
+    verdict(envelope(GOOD, footer=f"-- \n{version}\n"), "conformant")
+
+# bare and wrapped bodies classify identically, including cumulative-coordinate failures
+bodies = [
+    GOOD, sect("a.c") + sect("b.c"), sect("a.c") + sect("b.c") + sect("a.c"),
+    sect("a.c", hunk(0, 0, 1, 3, "+a\n+b\n+c\n")), sect("a.c", hunk(1, 3, 0, 0, "-a\n-b\n-c\n")),
+    sect("a.c", hunk(5, 0, 6, 2, "+one\n+two\n")), sect("a.c", hunk(5, 2, 4, 0, "-one\n-two\n")),
+    sect("a.c", *two), sect("a.c", two[0], hunk(10, 1, 10, 1, "-x\n+y\n")),
+    sect("a.c", hunk(1, 0, 1, 1, "+a\n")), sect("a.c", hunk(0, 1, 0, 0, "-a\n")),
+    sect("a.c", hunk(1, 0, 2, 1, "+a\n"), hunk(5, 0, 6, 1, "+b\n")),
+    sect("a.c", "@@ -5,0 +6,0 @@\n"), sect("a.c", "@@ -5,0 +5,0 @@\n"),
+    sect("a.c", hunk(10, 2, 10, 2, "-a\n-b\n+c\n+d\n"), hunk(5, 1, 5, 1, "-x\n+y\n")),
+    sect("a.c", hunk(5, 1, 5, 1, " ctx\n")),
+    sect("a.c", hunk(3, 1, 3, 1, "-a\n" + MARK + "+b\n" + MARK)),
+    sect("a.c", hunk(3, 2, 3, 2, " a\n" + MARK + "-b\n+c\n")),
+    GOOD[:-1], GOOD + "+surplus\n", GOOD.replace("+new", "+ne\0w"), GOOD.replace("+new", "+néw"),
+    sect("a.c", "@@ -1,2147483648 +1 @@\n"), sect("p" * 257), sect("a.c", "@@ -5,1 +5,1 @@\n-a\n-b\n+c\n"),
+    "diff --git a/a.c b/a.c\nnew file mode 100644\n--- /dev/null\n+++ b/a.c\n",
+]
+for body in bodies:
+    bare = entry_of(body)
+    for wrapped in (envelope(body), envelope(body, stat=STAT, footer=FOOT), envelope(body, footer=FOOT)):
+        got = entry_of(wrapped)
+        if bare["classification"] in ("conformant", "noncanonical"):
+            assert got == bare, (body[:200], bare, got)
+        elif bare["reason_codes"] == ["truncated"] and wrapped.endswith(FOOT) and body.endswith("\n") is False:
+            assert got["classification"] != "conformant"
+        else:
+            assert (got["classification"], got["reason_codes"]) == (
+                bare["classification"], bare["reason_codes"]) or wrapped.endswith(FOOT) and \
+                bare["reason_codes"] == ["trailing-text"], (body[:200], bare, got)
+verdict(envelope(sect("a.c", two[0], hunk(10, 1, 10, 1, "-x\n+y\n")), stat=STAT, footer=FOOT),
+        "noncanonical", "coordinate-mismatch")
+verdict(envelope(sect("a.c", hunk(1, 0, 2, 1, "+a\n"), hunk(5, 0, 6, 1, "+b\n"))),
+        "noncanonical", "coordinate-mismatch")
+verdict(envelope(sect("a.c", hunk(0, 0, 1, 1, "+a\n"))), "conformant")
+verdict(envelope(sect("a.c", hunk(1, 0, 1, 1, "+a\n")), footer=FOOT), "noncanonical", "coordinate-mismatch")
+# an invalid ending overrides provisional coordinate results
+stale = sect("a.c", two[0], hunk(10, 1, 10, 1, "-x\n+y\n"))
+assert entry_of(envelope(stale, footer=FOOT))["classification"] == "noncanonical"
+overridden = entry_of(envelope(stale, footer="-- \nSENTINEL custom\n\n"))
+assert overridden == {"patch_index": 1, "classification": "unsupported", "parse_complete": False,
+                      "file_count": None, "hunk_count": None, "reason_codes": ["unknown-footer"]}, overridden
+series = K.analyze_patch_series((envelope(stale, footer="-- \nx\n\n").encode(), GOOD.encode(),
+                                 GOOD.encode(), GOOD.encode()), K.patch_profile())
+assert all("repeated_file_group_count" not in e for e in series["patches"])
+
+# header-looking, footer-looking and diff-looking hunk payload stays payload
+payload = ("+From: x\n+Date: y\n+---\n+-- \n+2.43.0\n+\n+diff --git a/z b/z\n+From " + COMMIT +
+           " Mon Sep 17 00:00:00 2001\n")
+inner = sect("a.c", hunk(1, 0, 2, 8, payload))
+verdict(envelope(inner, stat=STAT, footer=FOOT), "conformant")
+assert entry_of(envelope(inner, footer=FOOT)) == entry_of(inner)
+dash = sect("a.c", hunk(1, 1, 1, 1, "-- \n+-- \n"))
+verdict(envelope(dash, footer=FOOT), "conformant")
+verdict(envelope(sect("a.c", hunk(1, 3, 1, 3, "-a\n-- \n-c\n+b\n+c\n+d\n")), footer=FOOT), "conformant")
+# footer text inside a hunk that still expects lines is not a footer
+verdict(envelope(sect("a.c", hunk(1, 3, 1, 1, "-a\n+b\n")) + FOOT), "malformed", "count-mismatch")
+verdict(envelope(sect("a.c", hunk(1, 3, 1, 1, "-a\n-- \n+b\n")) + "2.43.0\n\n"), "malformed", "count-mismatch")
+
+# selection only at byte zero: no search, no resynchronization, no backtracking
+verdict("\n" + envelope(GOOD), "unsupported", "wrapper-or-prologue")
+verdict(" " + envelope(GOOD), "unsupported", "wrapper-or-prologue")
+verdict("junk\n" + envelope(GOOD), "unsupported", "wrapper-or-prologue")
+verdict(MBOX.replace("2001", "2002") + "".join(HEADERS) + "\n---\n" + GOOD, "unsupported", "wrapper-or-prologue")
+verdict(MBOX.replace(COMMIT, COMMIT[:39]) + "".join(HEADERS) + "\n---\n" + GOOD, "unsupported", "wrapper-or-prologue")
+verdict(MBOX.replace(COMMIT, COMMIT.upper()) + "".join(HEADERS) + "\n---\n" + GOOD, "unsupported", "wrapper-or-prologue")
+verdict(MBOX.replace(COMMIT, COMMIT + "0") + "".join(HEADERS) + "\n---\n" + GOOD, "unsupported", "wrapper-or-prologue")
+verdict(GOOD + envelope(GOOD), "unsupported", "trailing-text")
+verdict(MBOX + "".join(HEADERS[::-1]) + "\n---\n" + GOOD, "unsupported", "envelope-header")
+verdict(MBOX + "garbage\n" + "".join(HEADERS) + "\n---\n" + GOOD, "malformed", "bad-envelope")
+verdict(MBOX, "malformed", "truncated")
+verdict(MBOX[:-1], "malformed", "truncated")
+
+# headers: exact order, once each, nothing extra
+F, D, S = HEADERS
+for headers, classification, reason in (
+        ((D, F, S), "unsupported", "envelope-header"),
+        ((F, S, D), "unsupported", "envelope-header"),
+        ((F, F, D, S), "unsupported", "envelope-header"),
+        ((F, D, D, S), "unsupported", "envelope-header"),
+        ((F, D, S, S), "unsupported", "envelope-header"),
+        ((F, D, S, "Message-ID: <x@example.invalid>\n"), "unsupported", "envelope-header"),
+        ((F, "X-Extra: 1\n", D, S), "unsupported", "envelope-header"),
+        (("X-Extra: 1\n", F, D, S), "unsupported", "envelope-header"),
+        ((F, D, S, "To: nobody\n"), "unsupported", "envelope-header"),
+        ((F, D, S, "MIME-Version: 1.0\n"), "unsupported", "mime-encoding"),
+        ((F, D, S, "Content-Type: text/plain; charset=UTF-8\n"), "unsupported", "mime-encoding"),
+        ((F, D, S, "Content-Transfer-Encoding: 8bit\n"), "unsupported", "mime-encoding"),
+        ((F, D, "MIME-Version: 1.0\n", S), "unsupported", "mime-encoding"),
+        ((F, D), "malformed", "bad-envelope"),
+        ((F,), "malformed", "bad-envelope"),
+        ((), "malformed", "bad-envelope"),
+        ((F, D, "Subject:\n"), "unsupported", "envelope-header"),
+        ((F, D, "Subject: \n"), "malformed", "bad-envelope"),
+        ((F, "Date: \n", S), "malformed", "bad-envelope"),
+        (("From: \n", D, S), "malformed", "bad-envelope"),
+        ((F, D, S + " \n"), "malformed", "bad-envelope"),
+        ((F, D, S + "\t\n"), "malformed", "bad-envelope"),
+        ((F, D, "Subject: a\x01b\n"), "malformed", "bad-envelope"),
+        ((F, D, "Subject: a\x7fb\n"), "malformed", "bad-envelope"),
+        (("From: a\x0bb\n", D, S), "malformed", "bad-envelope"),
+        ((F, D, S + " c\x01\n"), "malformed", "bad-envelope")):
+    verdict(envelope(GOOD, headers=headers), classification, reason)
+verdict(MBOX + "".join(HEADERS), "malformed", "truncated")
+verdict(MBOX + "".join(HEADERS) + "\n", "malformed", "missing-separator")
+verdict(envelope(GOOD, headers=(F, D, "Subject: a\0b\n")), "unsupported", "nul-byte")
+verdict(envelope(GOOD, headers=(F, D, "Subject: a\rb\n")), "unsupported", "carriage-return")
+verdict(envelope(GOOD, headers=(F, D, "Subject: ab\xe9\n")), "unsupported", "non-ascii")
+verdict(envelope(GOOD, message="b\xe9\n"), "unsupported", "non-ascii")
+verdict(envelope(GOOD, message="b\0\n"), "unsupported", "nul-byte")
+verdict(envelope(GOOD, message="a\x01b\n"), "malformed", "bad-envelope")
+verdict(envelope(GOOD, message="a\x7f\n"), "malformed", "bad-envelope")
+verdict(envelope(GOOD, message="-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\ntext\n"),
+        "unsupported", "pgp-signature")
+verdict(envelope(GOOD, message="-----BEGIN PGP SIGNATURE-----\n"), "unsupported", "pgp-signature")
+
+# separator: the first exact '---' decides and is never retried
+verdict(MBOX + "".join(HEADERS) + "\nbody\n" + GOOD, "malformed", "missing-separator")
+verdict(MBOX + "".join(HEADERS) + "\n" + GOOD, "malformed", "missing-separator")
+verdict(envelope(GOOD, sep="----\n"), "malformed", "missing-separator")
+verdict(envelope(GOOD, sep="--- \n"), "malformed", "missing-separator")
+verdict(envelope(GOOD, sep=" ---\n"), "malformed", "missing-separator")
+verdict(envelope(GOOD, sep="--\n"), "malformed", "missing-separator")
+verdict(envelope(GOOD, message="body\n", sep="---\nmore message\n---\n"), "unsupported", "no-diff-envelope")
+verdict(envelope(GOOD, sep="---\n\n"), "unsupported", "no-diff-envelope")
+verdict(envelope(GOOD, sep="---\ncover letter text\n"), "unsupported", "no-diff-envelope")
+verdict(envelope(GOOD, sep="---\ndiff --cc a.c\n"), "unsupported", "combined-diff")
+verdict(envelope("", sep="---\n"), "malformed", "truncated")
+verdict(envelope("", sep="---"), "malformed", "truncated")
+verdict(envelope("", message="cover only\n", sep=""), "malformed", "missing-separator")
+verdict(envelope(" diff --git a/a.c b/a.c\n"), "malformed", "bad-stat-block")
+verdict(envelope(GOOD.replace("diff --git", "diff --gitx", 1)), "unsupported", "no-diff-envelope")
+
+# stat block framing
+S1 = " 1 file changed, 1 insertion(+), 1 deletion(-)\n"
+ROW = " a.c | 2 +-\n"
+for stat, classification, reason in (
+        (ROW + S1 + "\n", "conformant", None),
+        (ROW + " 1 file changed\n\n", "conformant", None),
+        (ROW + " 2 files changed, 3 insertions(+)\n\n", "conformant", None),
+        (ROW + " 1 file changed, 3 deletions(-)\n\n", "conformant", None),
+        (ROW + " 0 files changed, 1 insertion(+), 2 deletions(-)\n\n", "conformant", None),
+        (" b/c.c |  10 ++++++++--\n" + ROW + S1 + "\n", "conformant", None),
+        (" a.c |  0\n" + S1 + "\n", "conformant", None),
+        (" a.c | 12345 ++++\n" + S1 + "\n", "conformant", None),
+        (" a.c|1\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" a.c |1\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (S1 + "\n", "malformed", "bad-stat-block"),
+        (ROW + "\n", "malformed", "bad-stat-block"),
+        (ROW, "malformed", "bad-stat-block"),
+        (ROW + S1, "unsupported", "unknown-stat"),
+        ("  a.c | 2 +-\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        ("a.c | 2 +-\n" + S1 + "\n", "unsupported", "no-diff-envelope"),
+        (" a.c | 02 +-\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" a.c | x +-\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" a.c | 2 +-x\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" a.c | 2 \n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" a.c | 2  +-\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" a.c | 2 *\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" ../a.c | 2 +-\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" /a.c | 2 +-\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (" a/.git/c | 2 +-\n" + S1 + "\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file  changed\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 filechanged\n\n", "malformed", "bad-stat-block"),
+        (ROW + "1 file changed\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 01 file changed\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file changed, 1 deletion(-), 1 insertion(+)\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file changed, 1 insertion(-)\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file changed, 1 deletion(+)\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file changed, 1 insertion(+), 1 insertion(+)\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file changed,  1 insertion(+)\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file changed, 1 changes(+)\n\n", "malformed", "bad-stat-block"),
+        (ROW + " 1 file changed, 1 insertion(+),\n\n", "malformed", "bad-stat-block"),
+        (ROW + S1 + " create mode 100644 a.c\n\n", "unsupported", "unknown-stat"),
+        (ROW + S1 + "\n\n", "unsupported", "no-diff-envelope"),
+        (ROW + S1 + "\nnote\n", "unsupported", "no-diff-envelope"),
+        (ROW + S1 + "\n " + S1, "unsupported", "no-diff-envelope"),
+        (ROW + " 1 file changed, 1 insertion(+)\n \n", "unsupported", "unknown-stat")):
+    text = envelope(GOOD, stat=stat)
+    if classification == "conformant":
+        verdict(text, "conformant")
+    else:
+        verdict(text, classification, reason)
+verdict(envelope(GOOD, stat=ROW + " 99999999999 files changed\n\n"), "limit-exceeded", "numeric-digits")
+verdict(envelope(GOOD, stat=ROW + " 2147483648 files changed\n\n"), "limit-exceeded", "numeric-value")
+verdict(envelope(GOOD, stat=" a.c | 2147483648 +\n" + S1 + "\n"), "limit-exceeded", "numeric-value")
+verdict(envelope(GOOD, stat=" a.c | 2147483647 +\n" + S1 + "\n"), "conformant")
+verdict(envelope(GOOD, stat=" a.c | 1 +\n 2147483647 files changed\n\n"), "conformant")
+verdict(envelope(GOOD, stat=f" {'p' * 256} | 1 +\n" + S1 + "\n"), "conformant")
+verdict(envelope(GOOD, stat=f" {'p' * 257} | 1 +\n" + S1 + "\n"), "limit-exceeded", "path-length")
+
+# envelope limits, exact and +1
+EMPTY_PRELUDE = envelope("").replace("Body line\n", "")
+
+
+def stat_rows(rows):
+    return "".join(f" f{i}.c | 1 +\n" for i in range(rows)) + S1 + "\n"
+
+
+def prelude_bytes(size):
+    base = len(envelope("", message="").encode())
+    remaining = size - base
+    assert remaining >= 0
+    full, extra = divmod(remaining, 100)
+    message = ("m" * 99 + "\n") * full + ("" if extra == 0 else "n" * (extra - 1) + "\n")
+    text = envelope(GOOD, message=message)
+    assert text.index("diff --git") == size, (text.index("diff --git"), size)
+    return text
+
+
+verdict(prelude_bytes(16384), "conformant")
+verdict(prelude_bytes(16385), "limit-exceeded", "envelope-bytes")
+verdict(prelude_bytes(16383), "conformant")
+assert entry_of(prelude_bytes(16384))["parse_complete"] is True
+LINES_BASE = 6
+verdict(envelope(GOOD, message="\n" * (256 - LINES_BASE)), "conformant")
+verdict(envelope(GOOD, message="\n" * (257 - LINES_BASE)), "limit-exceeded", "envelope-lines")
+verdict(envelope(GOOD, message="\n" * (255 - LINES_BASE)), "conformant")
+verdict(envelope(GOOD, message="x\n" * 300), "limit-exceeded", "envelope-lines")
+verdict(envelope(GOOD, message=("y" * 99 + "\n") * 200), "limit-exceeded", "envelope-bytes")
+verdict(envelope(GOOD, stat=STAT, message="\n" * (256 - LINES_BASE - 3)), "conformant")
+verdict(envelope(GOOD, stat=STAT, message="\n" * (257 - LINES_BASE - 3)), "limit-exceeded", "envelope-lines")
+verdict(envelope(GOOD, stat=STAT, message="\n" * (256 - LINES_BASE - 2)), "limit-exceeded", "envelope-lines")
+for continuations, expected in ((29, ("conformant",)), (30, ("limit-exceeded", "header-lines")),
+                                (28, ("conformant",))):
+    verdict(envelope(GOOD, headers=(F, D, S + " c\n" * continuations)), *expected)
+verdict(envelope(GOOD, headers=(F + " c\n" * 10, D + " c\n" * 10, S + " c\n" * 9)), "conformant")
+verdict(envelope(GOOD, headers=(F + " c\n" * 10, D + " c\n" * 10, S + " c\n" * 10)),
+        "limit-exceeded", "header-lines")
+verdict(envelope(GOOD, headers=(F + " c\n" * 40, D, S)), "limit-exceeded", "header-lines")
+verdict(envelope(GOOD, stat=stat_rows(16)), "conformant")
+verdict(envelope(GOOD, stat=stat_rows(17)), "limit-exceeded", "stat-rows")
+verdict(envelope(GOOD, stat=stat_rows(15)), "conformant")
+verdict(envelope(GOOD, message="m" * 8192 + "\n"), "conformant")
+verdict(envelope(GOOD, message="m" * 8193 + "\n"), "limit-exceeded", "line-length")
+verdict(envelope(GOOD, headers=(F, D, "Subject: " + "s" * 8183 + "\n")), "conformant")
+verdict(envelope(GOOD, headers=(F, D, "Subject: " + "s" * 8184 + "\n")), "limit-exceeded", "line-length")
+prefix = len(envelope("", message="").encode())
+body_exact = padded(65536 - prefix).decode()
+assert len(envelope(body_exact, message="").encode()) == 65536
+verdict(envelope(body_exact, message=""), "conformant")
+verdict(envelope(padded(65537 - prefix).decode(), message=""), "limit-exceeded", "artifact-bytes")
+# the 16 section, 64 hunk, path and numeric limits still apply inside an envelope
+verdict(envelope(many_sections, footer=FOOT), "conformant")
+verdict(envelope(many_sections + sect("d/f16.c"), footer=FOOT), "limit-exceeded", "file-section-limit")
+verdict(envelope(sect("a.c", *[hunk(10 * i + 1, 1, 10 * i + 1, 1, "-a\n+b\n") for i in range(65)])),
+        "limit-exceeded", "hunk-limit")
+verdict(envelope(sect("p" * 257)), "limit-exceeded", "path-length")
+# lowered envelope bounds through a modified profile
+tight_env = copy.deepcopy(P1)
+tight_env["envelope"].update(prelude_bytes_max=300, prelude_lines_max=12, header_lines_max=4,
+                             stat_rows_max=2)
+
+
+def tight_env_verdict(text, classification, *reasons):
+    entry = K.analyze_patch_series((text.encode(),), tight_env)["patches"][0]
+    assert (entry["classification"], tuple(entry["reason_codes"])) == (classification, reasons), entry
+
+
+tight_env_verdict(envelope(GOOD), "conformant")
+tight_env_verdict(envelope(GOOD, headers=(F, D, S + " c\n")), "conformant")
+tight_env_verdict(envelope(GOOD, headers=(F, D, S + " c\n c\n")), "limit-exceeded", "header-lines")
+tight_env_verdict(envelope(GOOD, stat=stat_rows(2)), "conformant")
+tight_env_verdict(envelope(GOOD, stat=stat_rows(3)), "limit-exceeded", "stat-rows")
+tight_env_verdict(envelope(GOOD, message="\n" * 6), "conformant")
+tight_env_verdict(envelope(GOOD, message="\n" * 7), "limit-exceeded", "envelope-lines")
+tight_env_verdict(envelope(GOOD, message="m" * 150 + "\n"), "limit-exceeded", "envelope-bytes")
+
+# endings: nothing but EOF or the exact signature
+verdict(envelope(GOOD, footer="-- \n2.43.0\n"), "conformant")
+verdict(envelope(GOOD, footer="-- \n"), "malformed", "bad-footer")
+verdict(envelope(GOOD, footer="-- "), "malformed", "truncated")
+verdict(envelope(GOOD, footer="-- \n2.43.0"), "malformed", "truncated")
+verdict(envelope(GOOD, footer="-- \n2.43.0\n\n"), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer="-- \n2.43.0\nmore\n"), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer="-- \n2.43.0\n-- \n"), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer=FOOT + FOOT), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer=FOOT + envelope(GOOD)), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer=FOOT + "tail"), "malformed", "truncated")
+verdict(envelope(GOOD, footer=FOOT[:-1] + "\r\n"), "unsupported", "carriage-return")
+verdict(envelope(GOOD) + envelope(GOOD), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer=FOOT) + envelope(GOOD, footer=FOOT), "unsupported", "trailing-text")
+verdict(envelope(GOOD) + "\n", "unsupported", "trailing-text")
+verdict(envelope(GOOD) + "random\n", "unsupported", "trailing-text")
+verdict(envelope(GOOD) + "--\n", "unsupported", "trailing-text")
+verdict(envelope(GOOD) + " -- \n2.43.0\n", "unsupported", "trailing-text")
+verdict(envelope(GOOD) + "-- \n\n", "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2.43.0.1.2\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2.4300.0\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2.43.0-rc1\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2.43.0 \n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2..0\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n02.43\n"), "conformant")
+verdict(envelope(GOOD, footer="-- \ngit version 2.43.0\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \nSIGNED-OFF custom\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2.43.0\nextra\n"), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer="-- \n2.43.0\n \n"), "unsupported", "trailing-text")
+verdict(envelope(GOOD, footer="-- \n\n2.43.0\n"), "unsupported", "unknown-footer")
+verdict(envelope(GOOD, footer="-- \n2.43.0\n").replace("-- \n", "--\n"), "unsupported", "trailing-text")
+# a footer is not recognized in a bare diff, and only outside a completed hunk
+verdict(GOOD + FOOT, "unsupported", "trailing-text")
+verdict(envelope(sect("a.c", hunk(5, 1, 5, 1, "-a\n+b\n")) + MARK, footer=FOOT), "conformant")
+
+# cross-hunk no-newline markers persist for the whole file section
+verdict(sect("a.c", hunk(1, 1, 0, 0, "-a\n" + MARK), hunk(5, 1, 4, 1, "-b\n+c\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(1, 1, 0, 0, "-a\n" + MARK), hunk(5, 0, 5, 1, "+c\n")), "conformant")
+verdict(sect("a.c", hunk(1, 0, 2, 1, "+a\n" + MARK), hunk(5, 0, 6, 1, "+b\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(1, 0, 2, 1, "+a\n" + MARK), hunk(5, 1, 5, 0, "-b\n")), "conformant")
+verdict(sect("a.c", hunk(3, 2, 3, 2, "-a\n+b\n x\n" + MARK), hunk(10, 1, 10, 1, "-x\n+y\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(3, 2, 3, 2, "-a\n+b\n x\n" + MARK), hunk(10, 1, 10, 1, " c\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(3, 2, 3, 2, "-a\n+b\n x\n" + MARK), hunk(10, 1, 10, 0, "-c\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(3, 2, 3, 2, "-a\n+b\n x\n" + MARK), hunk(10, 0, 10, 1, "+c\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(3, 1, 3, 2, "-a\n" + MARK + "+b\n+c\n"), hunk(10, 1, 11, 1, "-x\n+y\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(3, 1, 3, 2, "+b\n-a\n" + MARK + "+c\n"), hunk(10, 1, 11, 1, "-x\n+y\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(1, 1, 0, 0, "-a\n" + MARK), hunk(5, 1, 4, 1, "-b\n+c\n" + MARK)),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(1, 1, 1, 1, "-a\n+b\n" + MARK), hunk(5, 1, 5, 1, "-b\n+c\n")),
+        "malformed", "marker-placement")
+verdict(sect("a.c", hunk(1, 1, 1, 1, "-a\n" + MARK + "+b\n"), hunk(5, 1, 5, 1, "-b\n+c\n")),
+        "malformed", "marker-placement")
+# markers reset at the next file section and are independent per artifact
+verdict(sect("a.c", hunk(1, 1, 0, 0, "-a\n" + MARK)) + sect("b.c", hunk(5, 1, 5, 1, "-b\n+c\n")), "conformant")
+verdict(sect("a.c", hunk(1, 1, 1, 1, "-a\n+b\n" + MARK)) + sect("a.c", hunk(5, 1, 5, 1, "-b\n+c\n")),
+        "noncanonical", "duplicate-file-section")
+for body in (sect("a.c", hunk(1, 1, 0, 0, "-a\n" + MARK), hunk(5, 1, 4, 1, "-b\n+c\n")),
+             sect("a.c", hunk(3, 2, 3, 2, "-a\n+b\n x\n" + MARK), hunk(10, 1, 10, 1, "-x\n+y\n"))):
+    verdict(envelope(body, footer=FOOT), "malformed", "marker-placement")
+
+SHARED = sect("a.c", hunk(1, 1, 1, 3, "-a\n+b\n+c\n+d\n"), hunk(10, 1, 12, 1, "-x\n+y\n"))
+# independent privacy canaries in every envelope field; admissible opaque values never reach output
+CANARIES = {"from": "CANARY-FROM-9a1", "date": "CANARY-DATE-9a2", "subject": "CANARY-SUBJ-9a3",
+            "fold": "CANARY-FOLD-9a4", "message": "CANARY-MSG-9a5", "stat": "CANARY-STAT-9a6",
+            "mbox": "abcdef0123abcdef0123abcdef0123abcdef0123", "version": "2.77.5"}
+
+
+def canary_envelope(values, body):
+    headers = (f"From: {values['from']} <x@example.invalid>\n {values['fold']}\n",
+               f"Date: {values['date']}\n", f"Subject: [PATCH] {values['subject']}\n")
+    mbox = f"From {values['mbox']} Mon Sep 17 00:00:00 2001\n"
+    stat = f" {values['stat']}.c | 9 +-\n 3 files changed, 8 insertions(+), 7 deletions(-)\n\n"
+    return envelope(body, message=f"{values['message']}\ndiff --git a/{values['message']} b/x\n",
+                    stat=stat, footer=f"-- \n{values['version']}\n", headers=headers, mbox=mbox)
+
+
+def canary_doc(values):
+    texts = [canary_envelope(values, GOOD), canary_envelope(values, SHARED), canary_envelope(values, GOOD),
+             canary_envelope(values, stale)]
+    return K.render_json(K.analysis_document(K.analyze_patch_series(
+        tuple(t.encode() for t in texts), K.patch_profile())))
+
+
+reference = canary_doc(CANARIES)
+text = reference.decode()
+for name, value in CANARIES.items():
+    assert value not in text, name
+assert COMMIT not in text and "author@example" not in text and "x@example" not in text
+mutated_values = {"from": "OTHER-FROM-ZZZ1", "date": "Tue, 2 Feb 2025", "subject": "other subject entirely",
+                  "fold": "OTHER-FOLD-ZZZ4 with\ttab", "message": "OTHER message text",
+                  "stat": "zz/other/path", "mbox": "fedcba9876543210fedcba9876543210fedcba98",
+                  "version": "1.2.3.4"}
+for name, value in mutated_values.items():
+    assert canary_doc({**CANARIES, name: value}) == reference, name
+assert canary_doc(mutated_values) == reference
+parsed = json.loads(reference)
+assert [e["classification"] for e in parsed["patches"]] == ["conformant", "conformant", "conformant", "noncanonical"]
+bare_doc = K.render_json(K.analysis_document(K.analyze_patch_series(
+    tuple(t.encode() for t in (GOOD, SHARED, GOOD, stale)), K.patch_profile())))
+assert bare_doc == reference, "wrapped and bare bodies must produce byte-identical output"
+# failing envelopes carry canaries nowhere either
+failing = canary_envelope(CANARIES, GOOD).replace("---\n ", "---\n x ", 1)
+failing_doc = K.render_json(K.analysis_document(K.analyze_patch_series(
+    tuple(t.encode() for t in (failing, GOOD, GOOD, GOOD)), K.patch_profile()))).decode()
+for value in CANARIES.values():
+    assert value not in failing_doc
+ok("envelope: wrapped bodies equal bare bodies, ending and bounds are exact, rejects are classified, and no envelope value is emitted")
+
+# header-only envelope variant: selected only by a byte-zero 'From: ' first line
+FROM_H, DATE_H, SUBJ_H = HEADERS
+
+
+def honly(diff, headers=(FROM_H, SUBJ_H), message="Body line\n", stat="", footer=""):
+    return "".join(headers) + "\n" + message + "---\n" + stat + diff + footer
+
+
+for body in (GOOD, SHARED, stale):
+    bare = entry_of(body)
+    for hdrs in ((FROM_H, SUBJ_H), (FROM_H, DATE_H, SUBJ_H)):
+        for kwargs in ({}, {"stat": STAT}, {"footer": FOOT}, {"stat": STAT, "footer": FOOT}):
+            assert entry_of(honly(body, hdrs, **kwargs)) == bare, (hdrs, kwargs)
+verdict(honly(GOOD), "conformant")
+verdict(honly(GOOD, (FROM_H, DATE_H, SUBJ_H)), "conformant")
+verdict(honly(stale), "noncanonical", "coordinate-mismatch")
+verdict(honly(stale, (FROM_H, DATE_H, SUBJ_H), stat=STAT, footer=FOOT), "noncanonical", "coordinate-mismatch")
+fold = " continued value\n"
+verdict(honly(GOOD, (FROM_H + fold, SUBJ_H + fold + "\tmore\n")), "conformant")
+verdict(honly(GOOD, (FROM_H + fold, DATE_H + fold, SUBJ_H + fold)), "conformant")
+# rejects: stay in the existing taxonomy, no resync
+verdict(honly(GOOD, (DATE_H, FROM_H, SUBJ_H)), "unsupported", "wrapper-or-prologue")
+verdict(honly(GOOD, (FROM_H, SUBJ_H, DATE_H)), "unsupported", "envelope-header")
+verdict(honly(GOOD, (FROM_H, DATE_H, DATE_H, SUBJ_H)), "unsupported", "envelope-header")
+verdict(honly(GOOD, (FROM_H, FROM_H, SUBJ_H)), "unsupported", "envelope-header")
+verdict(honly(GOOD, (FROM_H, SUBJ_H, SUBJ_H)), "unsupported", "envelope-header")
+verdict(honly(GOOD, (FROM_H, DATE_H, SUBJ_H, "X-Extra: 1\n")), "unsupported", "envelope-header")
+verdict(honly(GOOD, (FROM_H, "X-Extra: 1\n", SUBJ_H)), "unsupported", "envelope-header")
+verdict(honly(GOOD, (FROM_H, "MIME-Version: 1.0\n", SUBJ_H)), "unsupported", "mime-encoding")
+verdict(honly(GOOD, (FROM_H,)), "malformed", "bad-envelope")
+verdict(honly(GOOD, (FROM_H, DATE_H)), "malformed", "bad-envelope")
+verdict("".join((FROM_H, SUBJ_H)), "malformed", "truncated")
+verdict(honly(GOOD, ("From: \n", SUBJ_H)), "malformed", "bad-envelope")
+for near in ("From:x\n", "from: x\n", "FROM: x\n", " From: x\n", "From :x\n", "Date: x\n", "Subject: x\n"):
+    verdict(near + SUBJ_H + "\n---\n" + GOOD, "unsupported", "wrapper-or-prologue")
+# no resync: a later 'From: ' block after a bad first line is never selected
+verdict("junk\n" + honly(GOOD), "unsupported", "wrapper-or-prologue")
+# the mbox variant still needs all three headers
+verdict(envelope(GOOD, headers=(FROM_H, SUBJ_H)), "unsupported", "envelope-header")
+# a mbox line stays mbox: header-only never starts after it
+verdict(MBOX + honly(GOOD), "unsupported", "envelope-header")
+# header values never reach output
+canary = honly(GOOD, ("From: CANARY-HO-FROM\n", "Date: CANARY-HO-DATE\n", "Subject: CANARY-HO-SUBJ\n"),
+               message="CANARY-HO-MSG\n")
+ho_doc = K.render_json(K.analysis_document(K.analyze_patch_series(
+    tuple(t.encode() for t in (canary, canary, canary, canary)), K.patch_profile()))).decode()
+assert "CANARY-HO" not in ho_doc
+ok("header-only envelope: From[+Date]+Subject accepted and output-equal to bare, Date optional only there, rejects stay in the taxonomy")
+
+# series: reset across artifacts, grouping, no carried state
+shared = sect("drivers/shared.c", hunk(1, 1, 1, 3, "-a\n+b\n+c\n+d\n"), hunk(10, 1, 12, 1, "-x\n+y\n"))
+series = tuple(s.encode() for s in (shared, shared, sect("only/a.c"), shared))
+result = K.analyze_patch_series(series, K.patch_profile())
+assert result["structural_profile_matched"] is True
+assert [e["classification"] for e in result["patches"]] == ["conformant"] * 4
+assert [e["repeated_file_group_count"] for e in result["patches"]] == [1, 1, 0, 1]
+assert [e["patch_index"] for e in result["patches"]] == [1, 2, 3, 4]
+assert [(e["file_count"], e["hunk_count"]) for e in result["patches"]] == [(1, 2), (1, 2), (1, 1), (1, 2)]
+# a later artifact never inherits the first artifact's cumulative delta
+independent = sect("drivers/shared.c", hunk(10, 1, 10, 1, "-x\n+y\n"))
+result = K.analyze_patch_series(tuple(s.encode() for s in (shared, independent, GOOD, GOOD)),
+                                K.patch_profile())
+assert [e["classification"] for e in result["patches"]] == ["conformant"] * 4
+stale_two = tuple(s.encode() for s in (shared, sect("drivers/shared.c", two[0], hunk(10, 1, 10, 1, "-x\n+y\n")),
+                                        GOOD, GOOD))
+result = K.analyze_patch_series(stale_two, K.patch_profile())
+assert result["structural_profile_matched"] is False
+assert [e["classification"] for e in result["patches"]] == ["conformant", "noncanonical", "conformant", "conformant"]
+assert result["patches"][1]["reason_codes"] == ["coordinate-mismatch"]
+# one unparsed artifact: grouping is withheld everywhere, counts are null
+broken = tuple(s.encode() for s in (shared, "From x\n" + shared, shared, GOOD))
+result = K.analyze_patch_series(broken, K.patch_profile())
+assert result["structural_profile_matched"] is False
+assert all("repeated_file_group_count" not in e for e in result["patches"])
+assert result["patches"][1] == {"patch_index": 2, "classification": "unsupported", "parse_complete": False,
+                                "file_count": None, "hunk_count": None, "reason_codes": ["wrapper-or-prologue"]}
+# a noncanonical artifact still has parsed every path, so grouping stays
+result = K.analyze_patch_series(stale_two, K.patch_profile())
+assert all("repeated_file_group_count" in e for e in result["patches"])
+for bad in ([], list(series), series[:3], series + (b"x",), (b"x", b"x", b"x", "str"), (b"a", b"b", b"c", bytearray())):
+    expect("patch-series", K.analyze_patch_series, bad, K.patch_profile())
+ok("series analysis resets coordinates per artifact, reports grouping only when every path parsed, and nulls incomplete counts")
+
+# output invariance under consistent safe renaming; only grouping may change
+def doc_for(texts):
+    return K.render_json(K.analysis_document(K.analyze_patch_series(
+        tuple(t.encode() for t in texts), K.patch_profile())))
+
+
+def rename(text, old, new):
+    return text.replace(old, new)
+
+
+texts = (shared, shared.replace("drivers/shared.c", "x/other.c"), sect("only/a.c"), shared)
+renamed = tuple(rename(rename(rename(t, "drivers/shared.c", "very/different/place.c"), "only/a.c", "zz.c"),
+                       "x/other.c", "q.c") for t in texts)
+assert doc_for(texts) == doc_for(renamed)
+swapped = tuple(rename(t, "drivers/shared.c", "unique/n%d.c" % i) for i, t in enumerate(texts))
+base_doc = json.loads(doc_for(texts))
+other_doc = json.loads(doc_for(swapped))
+assert [e["repeated_file_group_count"] for e in base_doc["patches"]] == [1, 0, 0, 1]
+assert [e["repeated_file_group_count"] for e in other_doc["patches"]] == [0, 0, 0, 0]
+for left, right in zip(base_doc["patches"], other_doc["patches"]):
+    left, right = dict(left), dict(right)
+    left.pop("repeated_file_group_count"), right.pop("repeated_file_group_count")
+    assert left == right
+base_doc["patches"] = other_doc["patches"] = None
+assert base_doc == other_doc
+# privacy canaries in metadata and payload never reach the output
+canary = ("diff --git a/SENTINEL-PATH/x.c b/SENTINEL-PATH/x.c\nindex deadbee..cafebab 100644\n"
+          "--- a/SENTINEL-PATH/x.c\n+++ b/SENTINEL-PATH/x.c\n"
+          "@@ -3,2 +3,2 @@ SENTINEL-FUNCTION author@SENTINEL.example\n-SENTINEL-OLD\n+SENTINEL-NEW\n"
+          " SENTINEL-CONTEXT\n \\ No newline at end of file\n")
+canary_texts = (canary, canary, canary.replace("SENTINEL-PATH", "p"), "Subject: SENTINEL-SUBJECT\n" + canary)
+rendered = doc_for(canary_texts)
+for forbidden_word in (b"SENTINEL", b"deadbee", b"cafebab", b"author@", b"Subject", b"x.c", b"@@", b"-3,2"):
+    assert forbidden_word not in rendered, forbidden_word
+assert len(rendered) <= 65536
+# validator refuses stray keys, values, types and inconsistent claims
+good_document = K.analysis_document(K.analyze_patch_series(series, K.patch_profile()))
+K.validate_analysis_document(good_document, K.patch_profile())
+incomplete_document = K.analysis_document(K.analyze_patch_series(broken, K.patch_profile()))
+K.validate_analysis_document(incomplete_document, K.patch_profile())
+
+
+def mutated(document, mutate):
+    value = copy.deepcopy(document)
+    mutate(value)
+    expect("analysis-invalid", K.validate_analysis_document, value, K.patch_profile())
+
+
+for mutate in (lambda v: v.update(extra="SENTINEL"), lambda v: v.pop("scope"),
+               lambda v: v.update(scope="other"), lambda v: v.update(application_performed=True),
+               lambda v: v["authority"].update(patch_applicability=True),
+               lambda v: v["authority"].update(extra=False),
+               lambda v: v["activation"].update(mode="enabled"),
+               lambda v: v["patches"][0].update(path="drivers/shared.c"),
+               lambda v: v["patches"][0].update(classification="other"),
+               lambda v: v["patches"][0].update(reason_codes=["coordinate-mismatch"]),
+               lambda v: v["patches"][0].update(reason_codes=["SENTINEL"]),
+               lambda v: v["patches"][0].update(file_count=17),
+               lambda v: v["patches"][0].update(file_count=True),
+               lambda v: v["patches"][0].update(hunk_count=None),
+               lambda v: v["patches"][0].update(patch_index=2),
+               lambda v: v["patches"][0].update(parse_complete=False),
+               lambda v: v["patches"][0].update(repeated_file_group_count=-1),
+               lambda v: v["patches"][1].pop("repeated_file_group_count"),
+               lambda v: v["patches"].pop(),
+               lambda v: v.update(structural_profile_matched=False),
+               lambda v: v.update(structural_profile_matched=1),
+               lambda v: v.update(bundle_identity="unmatched"),
+               lambda v: v.update(unverified=[]), lambda v: v.update(version="0.1.0")):
+    mutated(good_document, mutate)
+for mutate in (lambda v: v["patches"][1].update(file_count=1),
+               lambda v: v["patches"][1].update(reason_codes=[]),
+               lambda v: v["patches"][1].update(reason_codes=["truncated"]),
+               lambda v: v["patches"][1].update(repeated_file_group_count=0),
+               lambda v: v["patches"][0].update(repeated_file_group_count=0)):
+    mutated(incomplete_document, mutate)
+ok("invariance under safe renaming, privacy canaries, and the strict output allowlist hold")
+
+# ---------------------------------------------------------------- command-level behavior
+def patch_set(*texts):
+    names = list(SYN_NAMES)
+    contents = default_contents()
+    for name, text in zip(names, texts):
+        contents["patches/" + name] = text.encode() if isinstance(text, str) else text
+    return contents
+
+
+def run_cli(arguments, spec_override=None):
+    saved_spec = K.production_spec
+    if spec_override is not None:
+        K.production_spec = lambda environment: spec_override
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+    sys.stderr = io.StringIO()
+    try:
+        status = K.main(arguments)
+        sys.stdout.flush()
+        return status, sys.stdout.buffer.getvalue(), sys.stderr.getvalue()
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        K.production_spec = saved_spec
+
+
+good_bundle, good_spec = build(patch_set(GOOD, shared))
+status, out, err = run_cli(["analyze-patches", "--root", good_bundle], good_spec)
+assert (status, err) == (0, ""), (status, err)
+parsed = json.loads(out)
+assert parsed["structural_profile_matched"] is True and parsed["bundle_identity"] == "matched"
+assert parsed["kind"] == "myron-kernel-source-patch-analysis" and parsed["version"] == "0.2.0"
+assert parsed["scope"] == "patch-structure-only" and parsed["application_performed"] is False
+assert parsed["profile"] == "myron-patch-structure-v3"
+assert all(v is False for v in parsed["authority"].values()) and len(parsed["authority"]) == 8
+assert parsed["activation"] == {"mode": "disabled", "blocker": "unchanged"}
+assert "patch-applicability" in parsed["unverified"]
+assert [e["classification"] for e in parsed["patches"]] == ["conformant", "conformant"]
+assert good_bundle.encode() not in out and b"SENTINEL" not in out and b"drivers" not in out
+assert run_cli(["analyze-patches", "--root", good_bundle], good_spec) == (status, out, err)
+# the same bodies inside the named envelope give a byte-identical document through the CLI
+env_bundle, env_spec = build(patch_set(envelope(GOOD, stat=STAT, footer=FOOT), envelope(shared, footer=FOOT)))
+assert run_cli(["analyze-patches", "--root", env_bundle], env_spec) == (status, out, err)
+env_bad, env_bad_spec = build(patch_set(envelope(GOOD, footer="-- \nCANARY-CUSTOM\n"), envelope(shared)))
+env_status, env_out, env_err = run_cli(["analyze-patches", "--root", env_bad], env_bad_spec)
+assert (env_status, env_err) == (3, "") and b"CANARY" not in env_out
+assert [e["reason_codes"] for e in json.loads(env_out)["patches"]] == [["unknown-footer"], []]
+
+# identity matched, one patch malformed/noncanonical: verify exits 0, analyze exits 3 with full JSON
+for texts, classes in (((GOOD, GOOD[:-1]), ["conformant", "malformed"]),
+                       ((sect("a.c", two[0], hunk(10, 1, 10, 1, "-x\n+y\n")), GOOD),
+                        ["noncanonical", "conformant"]),
+                       (("From x\n" + GOOD, GOOD), ["unsupported", "conformant"]),
+                       ((GOOD, sect("p" * 257)), ["conformant", "limit-exceeded"])):
+    bad_bundle, bad_spec = build(patch_set(*texts))
+    K.check_bundle(bad_bundle, bad_spec)
+    status, out, err = run_cli(["verify", "--root", bad_bundle], bad_spec)
+    assert (status, err) == (0, "") and json.loads(out)["result"] == "private-bundle-identity-matched"
+    assert json.loads(out)["scope"] == "identity-closure-lock-manifest-and-patch-order-only"
+    status, out, err = run_cli(["analyze-patches", "--root", bad_bundle], bad_spec)
+    assert (status, err) == (3, ""), (status, err)
+    parsed = json.loads(out)
+    assert parsed["structural_profile_matched"] is False
+    assert [e["classification"] for e in parsed["patches"]] == classes
+    assert out.endswith(b"\n") and len(out) <= 65536
+    for entry in parsed["patches"]:
+        if not entry["parse_complete"]:
+            assert entry["file_count"] is None and entry["hunk_count"] is None
+            assert "repeated_file_group_count" not in entry
+ok("verify succeeds for an identity-matched bad patch; analyze-patches exits 3 with complete JSON and empty stderr")
+
+# no analysis before identity: every identity failure refuses before the analyzer runs
+calls = []
+real_analyze = K.analyze_patch_series
+K.analyze_patch_series = lambda *a, **k: calls.append(a) or real_analyze(*a, **k)
+try:
+    for mutate in (lambda b, s: (b / "vt.fragment").write_bytes(b"x"),
+                   lambda b, s: os.chmod(b / "patches" / SYN_NAMES[0], 0o644),
+                   lambda b, s: (b / "extra").write_bytes(b""),
+                   lambda b, s: s.update(patch_names=tuple(reversed(SYN_NAMES))),
+                   lambda b, s: os.chmod(b, 0o755)):
+        bundle, bundle_spec = build(patch_set(GOOD, GOOD))
+        mutate(Path(bundle), bundle_spec)
+        status, out, err = run_cli(["analyze-patches", "--root", bundle], bundle_spec)
+        assert (status, out, err) == (1, b"", "myron-kernel-source: E_REFUSED\n"), (status, out, err)
+    for bad_root in ("relative", "/nonexistent/x"):
+        assert run_cli(["analyze-patches", "--root", bad_root], good_spec)[0] == 1
+    assert not calls, "analysis ran before identity was established"
+    run_cli(["verify", "--root", good_bundle], good_spec)
+    assert not calls, "verify analyzed patch bodies"
+finally:
+    K.analyze_patch_series = real_analyze
+
+# same buffers, no extra reads, no I/O inside the analyzer
+bundle, bundle_spec = build(patch_set(GOOD, shared))
+captured_buffers, seen_by_analyzer, opened = [], [], []
+real_capture, real_open = K.capture_file, os.open
+in_analyzer = [False]
+
+
+def recording_capture(directory, name, size, mount, budget, path):
+    data = real_capture(directory, name, size, mount, budget, path)
+    captured_buffers.append((path, data))
+    return data
+
+
+def guarded_open(path, *args, **kwargs):
+    assert not in_analyzer[0], "analyzer opened a file"
+    if str(path).endswith(".patch"):
+        opened.append(str(path))
+    return real_open(path, *args, **kwargs)
+
+
+def watching_analyze(patches, profile):
+    seen_by_analyzer.extend(patches)
+    in_analyzer[0] = True
+    try:
+        return real_analyze(patches, profile)
+    finally:
+        in_analyzer[0] = False
+
+
+guarded = {"read": os.read, "scandir": os.scandir, "lstat": os.lstat, "fstat": os.fstat}
+
+
+def forbid_io(name):
+    def refuse_io(*_a, **_k):
+        raise AssertionError(f"analyzer used os.{name}")
+    return refuse_io
+
+
+K.capture_file, os.open, K.analyze_patch_series = recording_capture, guarded_open, watching_analyze
+
+
+def pure_analyze(patches, profile):
+    for name in guarded:
+        setattr(os, name, forbid_io(name))
+    try:
+        return watching_analyze(patches, profile)
+    finally:
+        for name, function in guarded.items():
+            setattr(os, name, function)
+
+
+K.analyze_patch_series = pure_analyze
+try:
+    status, out, err = run_cli(["analyze-patches", "--root", bundle], bundle_spec)
+finally:
+    K.capture_file, os.open, K.analyze_patch_series = real_capture, real_open, real_analyze
+assert status == 0, (status, err)
+assert len(captured_buffers) == 5 and len(seen_by_analyzer) == 2
+patch_buffers = [data for path, data in captured_buffers if path.startswith("patches/")]
+assert all(a is b for a, b in zip(seen_by_analyzer, patch_buffers)), "analyzer did not get the captured buffers"
+assert sorted(opened) == sorted(SYN_NAMES), opened
+ok("analysis receives the same captured buffers, never reopens patch files, and does no I/O")
+
+# unexpected exceptions and failed output validation exit 1 with nothing on stdout
+for target, replacement in (
+        ("analyze_patch_series", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("SENTINEL"))),
+        ("analyze_artifact", lambda *a, **k: (_ for _ in ()).throw(KeyError("SENTINEL"))),
+        ("analysis_document", lambda analysis: {**real_doc(analysis), "extra": "SENTINEL"}),
+        ("render_json", lambda value: (_ for _ in ()).throw(ValueError("SENTINEL")))):
+    real_doc = K.analysis_document
+    saved_target = getattr(K, target)
+    setattr(K, target, replacement)
+    try:
+        status, out, err = run_cli(["analyze-patches", "--root", good_bundle], good_spec)
+    finally:
+        setattr(K, target, saved_target)
+    assert (status, out, err) == (1, b"", "myron-kernel-source: E_REFUSED\n"), (target, status, out, err)
+assert run_cli(["analyze-patches", "--root", good_bundle], good_spec)[0] == 0
+for arguments in (["analyze-patches"], ["analyze-patches", "--root"], ["analyze-patches", "/x"],
+                  ["analyze-patches", "--root", "/x", "y"], ["analyze-patches", "--root=/x"],
+                  ["analyze", "--root", "/x"]):
+    assert run_cli(arguments, good_spec) == (2, b"", "myron-kernel-source: E_USAGE\n")
+ok("unexpected errors exit 1 and misuse exits 2 with empty stdout and a fixed stderr line")
+
+# no subprocess, network, write or bytecode while analyzing
+bundle, bundle_spec = build(patch_set(GOOD, GOOD[:-1]))
+before_tree = tree_state(bundle)
+saved_facilities = (subprocess.Popen, socket.socket.connect, os.system, os.fork)
+subprocess.Popen = socket.socket.connect = os.system = os.fork = forbidden
+try:
+    assert run_cli(["analyze-patches", "--root", bundle], bundle_spec)[0] == 3
+finally:
+    subprocess.Popen, socket.socket.connect, os.system, os.fork = saved_facilities
+assert tree_state(bundle) == before_tree, "analysis changed the bundle"
+assert not list((repo / "tools").rglob("*kernel-source*.pyc"))
+cli = subprocess.run([str(repo / "tools/myron-kernel-source"), "analyze-patches", "--root", bundle],
+                     capture_output=True, cwd="/")
+assert (cli.returncode, cli.stdout, cli.stderr) == (1, b"", b"myron-kernel-source: E_REFUSED\n")
+ok("analysis uses no subprocess, network, write or bytecode cache; production pins refuse synthetic bundles")
 PY
-pass "Phase 2.17 kernel-source verifier tests"
+pass "Phase 2.17 and 2.18 kernel-source verifier tests"

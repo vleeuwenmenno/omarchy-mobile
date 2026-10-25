@@ -132,12 +132,28 @@ board id, revision and source. R4 stays deferred as `hardware-witness-required`
 blockers stay missing. See
 [R4-SELECTION-GATE.md](../../docs/myron/R4-SELECTION-GATE.md).
 
-Phase 2.17 adds `kernel-source-contract.json` and `tools/myron-kernel-source` 0.1.0, an
-identity-and-structure check of an external private source bundle (no bytes distributed;
+Phase 2.17 adds `kernel-source-contract.json` and `tools/myron-kernel-source` (0.1.0 then), an
+identity, closure, lock and manifest check of an external private source bundle (no bytes distributed;
 publication and licensing unresolved; nothing about source availability, ancestry,
 applicability, fragment use, toolchain or build output is verified; activation stays
 disabled). See
 [KERNEL-SOURCE-GATE.md](../../docs/myron/KERNEL-SOURCE-GATE.md).
+
+Phase 2.18 raises `tools/myron-kernel-source` and its contract to 0.2.0 and adds
+`analyze-patches --root`: a bounded structural analysis of the four pinned patch
+buffers the identity check already captured, against the versioned
+`patch_structure_profile` (`myron-patch-structure-v3`: a bare git modification diff or
+one of two narrow envelopes (mbox or header-only), coordinate policy `cumulative-boundary-v1`). Exit 0 means every patch matches that profile, 3 means the
+identity matched and one does not; output carries counts and fixed reason codes only,
+never a path, coordinate, payload or hash. It claims `patch_structure_admission` only:
+applicability, source availability and build correctness stay unverified, nothing is
+applied, authority stays all false and activation stays disabled. `verify` still
+checks closure, lock, manifest and pinned order and does not read patch bodies.
+
+The preserved private bundle passed identity verification. Structural analysis found
+patches 1, 3 and 4 conformant and patch 2 parse-complete but noncanonical with
+`coordinate-mismatch`; no private content was retained or emitted. This does not prove
+applicability or permit a build or deployment.
 
 Phase 2.16 readiness is documentation only: the synthetic parser work is complete, and
 actual read-only layout discovery is the next approval boundary. It is a staged

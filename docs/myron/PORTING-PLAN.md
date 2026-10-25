@@ -197,13 +197,29 @@ a required successor gate: the R4 selection-source qualification (a concrete
 selected-index source, an actual Myron witness and contract cross-checks; parsing
 a DTBO or FDT does not prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
 
-Phase 2.17 (laptop-only, identity gate): `tools/myron-kernel-source` 0.1.0 verifies an
+Phase 2.17 (laptop-only, identity gate): `tools/myron-kernel-source` (0.1.0 then) verifies an
 external private kernel-source bundle against `device/myron/kernel-source-contract.json`,
 which binds the unchanged kernel contract. It checks hashes, exact closure and the
 lock/manifest structure only; no bytes are distributed, publication and licensing are
 unresolved, and availability, ancestry, applicability, fragment use, toolchain and
 build output stay unverified with activation disabled. See
 [KERNEL-SOURCE-GATE.md](KERNEL-SOURCE-GATE.md).
+
+Phase 2.18 (laptop-only, structure of the pinned patches): `tools/myron-kernel-source`
+0.2.0 adds `analyze-patches --root`, which runs after the identity check on the same
+captured buffers and classifies each of the four patches against the named
+`patch_structure_profile` (conformant, noncanonical, malformed, unsupported or
+limit-exceeded). Exit 0 is a profile match for all four, exit 3 an identity match with a
+non-match. A match is structural admission only: it does not show that any patch applies,
+that the source exists or that anything builds. `verify` is unchanged in what it checks.
+Authority stays all false and activation disabled. See
+[KERNEL-SOURCE-GATE.md](KERNEL-SOURCE-GATE.md).
+
+The preserved private bundle has been analyzed: patches 1, 3 and 4 match the profile;
+patch 2 is parse-complete but noncanonical because its cumulative coordinates do not
+match. No private content was retained or reported. Phase 2.18 therefore closes the
+offline parser mechanism, not patch applicability or kernel-build readiness; the
+pinned series failed this structural profile and applicability remains unverified.
 
 Phase 2.16 readiness (documentation only): the synthetic parser work is complete.
 Actual read-only layout discovery is the next approval boundary and is a staged

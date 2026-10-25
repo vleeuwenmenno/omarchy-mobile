@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "kind": "myron-kernel-source-contract",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kernel_contract": {
     "path": "device/myron/kernel-contract.json",
     "sha256": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193",
@@ -112,6 +112,155 @@
     "patch_bytes": 65536,
     "json_depth": 8,
     "output_bytes": 65536
+  },
+  "patch_structure_profile": {
+    "id": "myron-patch-structure-v3",
+    "artifacts": 4,
+    "file_sections": {
+      "min": 1,
+      "max": 16
+    },
+    "hunks": {
+      "min": 1,
+      "max": 64,
+      "modifying_per_section_min": 1
+    },
+    "artifact_bytes": 65536,
+    "line_bytes_max": 8192,
+    "path_bytes_max": 256,
+    "numeric": {
+      "digits_max": 10,
+      "value_max": 2147483647,
+      "leading_zeros": false
+    },
+    "encoding": "ascii-lf-no-nul-no-cr",
+    "format": "bare-or-named-envelope-git-unified-diff-modification-only",
+    "envelope": {
+      "selection": "only at byte zero: the exact mbox line selects the mbox variant, a first line starting exactly 'From: ' selects the header-only variant; never searched for, resynchronized or backtracked to a later diff or separator",
+      "prelude_bytes_max": 16384,
+      "prelude_lines_max": 256,
+      "header_lines_max": 32,
+      "stat_rows_max": 16,
+      "values": "framing and bounds only; author, address, date, subject, message and commit id are not interpreted, decoded, retained, hashed or emitted",
+      "acceptance": "a named framing match only; not authorship, authenticity, provenance, Git generation, message, diffstat or applicability"
+    },
+    "grammar": [
+      "artifact := bare-diff EOF | envelope diff-sections ending",
+      "bare-diff := file-section{1..16}; nothing before, between or after",
+      "envelope := mbox-envelope | header-only-envelope",
+      "mbox-envelope := mbox-line headers LF message '---' LF [stat-block]",
+      "header-only-envelope := from-field [date-field] subject-field LF message '---' LF [stat-block]; selected only when the first line starts 'From: '",
+      "mbox-line := 'From ' HEX{40} ' Mon Sep 17 00:00:00 2001' LF",
+      "headers := from-field date-field subject-field, in that order, once each",
+      "from-field := 'From: ' OPAQUE LF continuation*; date-field := 'Date: ' OPAQUE LF continuation*; subject-field := 'Subject: ' OPAQUE LF continuation*; continuation := (SP | HTAB) OPAQUE LF; Date is optional only in the header-only variant",
+      "OPAQUE := nonempty printable ASCII and HTAB",
+      "message := (printable ASCII, HTAB or empty) LF lines up to the first exact '---' line; the separator is never retried; a diff-looking line before it is message text",
+      "separator := '---' LF immediately followed by 'diff --git' or by a stat-block immediately followed by 'diff --git'",
+      "stat-block := row{1..16} summary LF; row := ' REL' SP+ '|' SP+ COUNT [' ' [+-]+] LF; summary := ' N file[s] changed' [', N insertion[s](+)'] [', N deletion[s](-)'] LF; framing only, no agreement with hunks",
+      "ending := EOF | '-- ' LF VERSION LF EOF, after at least one complete file section; VERSION := N(.N){1..3}, N of 1..3 digits",
+      "file-section := 'diff --git a/REL b/REL' LF [index-line] '--- a/REL' LF '+++ b/REL' LF hunk+",
+      "index-line := 'index HEX{4,40}..HEX{4,40}' [' 100644' | ' 100755'] LF",
+      "hunk := '@@ -S[,C] +S[,C] @@' [' ' TEXT] LF body",
+      "body := lines prefixed ' ', '-' or '+', consumed by the declared old and new counts, each optionally followed by '\\ No newline at end of file' LF",
+      "REL := ASCII 0x21-0x7e without double quote or backslash, components not empty, '.', '..' or '.git'; the same in all four places of a section"
+    ],
+    "coordinate_policy": {
+      "name": "cumulative-boundary-v1",
+      "boundary": "start - 1 if count > 0 else start",
+      "expected_new_boundary": "old boundary + sum of prior (new_count - old_count)",
+      "order": "old side and new side monotonic and non-overlapping within a file section",
+      "reset": "every file section and every artifact; nothing carries across the series",
+      "shared_paths": "repeated-file participation only; no dependency, order or applicability claim"
+    },
+    "excluded": [
+      "any mail framing other than the named envelope and ending",
+      "unknown, extra, duplicate or reordered headers; MIME or transfer encodings",
+      "cover letter without a diff; PGP; unknown stat block or signature",
+      "new, deleted, renamed or copied file",
+      "binary or combined diff",
+      "mode change or mode-only section",
+      "symlink or submodule mode",
+      "quoted, escaped or control-character path",
+      "any other extended header",
+      "any unconsumed text"
+    ],
+    "classifications": [
+      "conformant",
+      "noncanonical",
+      "malformed",
+      "unsupported",
+      "limit-exceeded"
+    ],
+    "reason_codes": {
+      "conformant": [],
+      "noncanonical": [
+        "coordinate-mismatch",
+        "hunk-order",
+        "duplicate-file-section",
+        "no-modifying-hunk"
+      ],
+      "malformed": [
+        "truncated",
+        "bad-diff-header",
+        "missing-file-header",
+        "path-mismatch",
+        "no-hunks",
+        "bad-hunk-header",
+        "count-mismatch",
+        "marker-placement",
+        "bad-index-line",
+        "bad-envelope",
+        "missing-separator",
+        "bad-stat-block",
+        "bad-footer"
+      ],
+      "unsupported": [
+        "wrapper-or-prologue",
+        "trailing-text",
+        "non-ascii",
+        "nul-byte",
+        "carriage-return",
+        "extended-header",
+        "mode-change",
+        "new-or-deleted-file",
+        "rename-or-copy",
+        "binary-patch",
+        "combined-diff",
+        "symlink-or-submodule-mode",
+        "file-mode",
+        "unsafe-path",
+        "envelope-header",
+        "mime-encoding",
+        "pgp-signature",
+        "no-diff-envelope",
+        "unknown-stat",
+        "unknown-footer"
+      ],
+      "limit-exceeded": [
+        "artifact-bytes",
+        "line-length",
+        "path-length",
+        "numeric-digits",
+        "numeric-value",
+        "file-section-limit",
+        "hunk-limit",
+        "envelope-bytes",
+        "envelope-lines",
+        "header-lines",
+        "stat-rows"
+      ]
+    },
+    "exit_codes": {
+      "0": "every patch matches the structural profile",
+      "3": "bundle identity matched and at least one patch does not match the profile",
+      "1": "identity or security prerequisite failed, or unexpected internal error",
+      "2": "command-line misuse"
+    },
+    "claims": [
+      "patch_structure_admission"
+    ],
+    "patch_applicability": false,
+    "application_performed": false
   },
   "bytes_distributed": false,
   "authority": {

@@ -203,13 +203,27 @@ order and deployment blocker remain unverified; no real archive/symvers set has
 been bound.
 
 Phase 2.17 adds `device/myron/kernel-source-contract.json` and the laptop-only
-`tools/myron-kernel-source` 0.1.0 (`show`, `plan`, `verify --root`). It verifies the
+`tools/myron-kernel-source` (`show`, `plan`, `verify --root`; 0.1.0 at that phase). It verifies the
 identity and structure of an external private source bundle (lock, manifest, one
 fragment and patches `0001`, `0002`, `0003`, `0007`; `0004`-`0006` stay excluded)
 against hashes derived from this kernel contract. No bundle bytes are distributed,
 publication and licensing are unresolved, and source availability, ancestry, patch
 applicability, fragment use, toolchain and build output stay unverified. Activation
 stays disabled ([KERNEL-SOURCE-GATE.md](KERNEL-SOURCE-GATE.md)).
+
+Phase 2.18 bumps the tool and contract to 0.2.0 and adds `analyze-patches --root`: a
+structural analysis of the four pinned patch buffers (counts and fixed reason codes
+only) against the contract's `patch_structure_profile`. Its only claim is
+`patch_structure_admission`; patch applicability, source availability and build output
+stay unverified, no patch is applied, and activation stays disabled. `verify`'s
+"structure" means closure, source-lock, manifest and pinned patch order, never the patch
+body. The kernel contract is unchanged.
+
+The preserved private bundle has now been checked with that command: patches 1, 3
+and 4 are `conformant`; patch 2 is parse-complete but `noncanonical` with
+`coordinate-mismatch`. This is value-free structural evidence only. It does not
+establish applicability, source provenance, ordering or build correctness, and it
+clears no deployment blocker.
 
 The Phase 2 package follows that rule: it installs only a Python verifier,
 contract JSON, documentation, license, and version. It has no systemd unit,

@@ -7,7 +7,7 @@
 # allowlist and the USB product string, bin/omamobile's boot-image layouts
 # and flash against a fake fastboot, omamobile-firstboot's own tests, and the
 # smoke test of the newest root image in out/ if there is one, the Myron
-# deployment/snapshot/preflight refusal gates, the collector's fixture checks, the synthetic session rehearsal, the synthetic GPT-to-R2 parser, the synthetic boot, vendor boot and DT table image-to-R3 parser, the synthetic device tree and DT table R4 count and index-membership parser, the external kernel-source bundle identity verifier, and the felix and myron packages' tests.
+# deployment/snapshot/preflight refusal gates, the collector's fixture checks, the synthetic session rehearsal, the synthetic GPT-to-R2 parser, the synthetic boot, vendor boot and DT table image-to-R3 parser, the synthetic device tree and DT table R4 count and index-membership parser, the external kernel-source bundle identity verifier and patch structure analyzer, and the felix and myron packages' tests.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 for f in tools/install-phone tools/phone-provision tools/build-rootfs tools/build-packages tools/make-bundle tools/verify-myron-kernel-contract tools/verify-myron-gpu-profile \
