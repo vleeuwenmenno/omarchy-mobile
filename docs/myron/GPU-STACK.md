@@ -149,19 +149,18 @@ payload and searches enumerated standard activation paths for the private
 prefix and inert profile. Installing either package remains insufficient to
 select the stack; the scan does not claim coverage of arbitrary custom paths.
 
-Source is now `0.1.2`: its bounded activation scan accepts a missing target
+Source and the unsigned development artifact are now `0.1.2-1`: its bounded activation scan accepts a missing target
 only for a relative link below `/etc/skel` that normalizes below
 `/etc/skel/.local/state/omarchy`; every target ancestor that exists must be a
-real directory. Scan limits are 16,384 entries and 128 MiB. The `0.1.1-1`
-artifact below is superseded and no longer matches the deployment contract;
-the rebuilt `0.1.2-1` SHA-256 will replace it after validation.
+real directory. Scan limits are 16,384 entries and 128 MiB. Exact unsigned
+development artifact:
 
 The standalone package check and an extracted-root test with the Mesa artifact
-passed. Superseded unsigned development artifact:
+passed.
 
 ```text
-omamobile-myron-gpu-profile-0.1.1-1-any.pkg.tar.zst
-SHA-256 6f02c0ac292888d6be619c228afdca04d04db64e5ddf644533846d0a00641784
+omamobile-myron-gpu-profile-0.1.2-1-any.pkg.tar.zst
+SHA-256 f81d78feca3475851e20ac3861025f45baf1582c5101add0f074b2815cca986b
 ```
 
 ## Equivalence test ladder
