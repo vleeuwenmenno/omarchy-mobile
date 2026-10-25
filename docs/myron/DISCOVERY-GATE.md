@@ -7,6 +7,11 @@ transport or code is added by it. All nine authority flags stay `false`, all sev
 blockers stay `missing`, and nothing here permits an SSH, ADB, fastboot or block
 device read.
 
+Phase 2.19 adds an offline, synthetic Stage 1 planning contract and a pure plan
+validator ([DISCOVERY-CONTRACT.md](DISCOVERY-CONTRACT.md)). It checks structure only,
+creates no request, approval, transport, capture, provenance or ledger, and leaves
+Stage 0 unresolved and Stages 2 to 4 documentation-only.
+
 ## Why a discovery session comes next
 
 The synthetic work is complete: the R2 GPT parser, the R3 boot, vendor boot and DT

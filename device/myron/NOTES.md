@@ -161,6 +161,13 @@ session that is not approved and not executed, with no acquisition code added an
 hardware readiness claimed. See
 [DISCOVERY-GATE.md](../../docs/myron/DISCOVERY-GATE.md).
 
+Phase 2.19 adds `device/myron/discovery-contract.json` and `tools/myron-discovery`
+(`show`, `check-plan --stdin`): an offline validator for a synthetic Stage 1 discovery
+plan. It emits one fixed value-free document and refuses with a fixed line; a pass is
+structural only and creates no request, approval, transport or capture. Stage 0 stays
+unresolved, Stages 2 to 4 stay documentation-only, authority stays all false. See
+[DISCOVERY-CONTRACT.md](../../docs/myron/DISCOVERY-CONTRACT.md).
+
 Phase 2.15B moves the bootchain to 0.3.0 and adds `plan-images`, `parse-images`
 and `verify-images`: synthetic Android boot v0-v4, vendor boot v3/v4 and DT table
 v0 images (a flat fixture bound to a validated R2 operation) parse into the

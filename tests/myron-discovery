@@ -1,0 +1,856 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the Myron synthetic discovery-plan validator (Phase 2.19).
+# Everything is synthetic: no request, approval, transport, capture, phone or network.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+tool=tools/myron-discovery
+impl=tools/lib/myron-discovery-impl.py
+contract=device/myron/discovery-contract.json
+python3 -B -m py_compile "$tool" "$impl" 2>/dev/null || python3 -c 'import ast,sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]' "$tool" "$impl" || fail "tool parses"
+for f in "$tool" "$impl"; do
+  grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http|ctypes|ssl|requests|zipfile|tarfile|gzip|zlib|lzma|bz2|pty|signal|tempfile|argparse|traceback)|os\.(system|popen|exec|spawn|fork|mkdir|makedirs|rename|replace|unlink|remove|rmdir|chmod|chown|write|symlink|link)\(|posix_spawn' "$f" \
+    && fail "$f references process, network, archive, or write facilities"
+  grep -Eqi '\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b' "$f" && fail "$f names a live transport command"
+  grep -Eq 'os\.environ|getenv|traceback' "$f" && fail "$f reads the environment or prints tracebacks"
+done
+[[ $(wc -l < "$tool") -le 90 ]] || fail "the trusted loader grew past 90 lines"
+[[ -x $tool ]] || fail "tool is not executable"
+pass "loader and implementation parse and have no process, network, environment, or write facility"
+
+[[ $("$tool" --version) == 0.1.0 ]] || fail "version"
+"$tool" show > "$tmp/show.json" || fail "show failed"
+cmp -s "$tmp/show.json" "$contract" || fail "show differs from the committed contract"
+(cd / && "$OLDPWD/$tool" show | cmp -s - "$tmp/show.json") || fail "show depends on the working directory"
+pass "show emits the exact committed contract from any working directory"
+
+set +e
+for args in "" "bogus" "show extra" "check-plan" "check-plan --stdin extra" "check-plan stdin" "check-plan --stdin=1" "--version x" "show --stdin" "check-plan /x"; do
+  # shellcheck disable=SC2086
+  echo '{}' | "$tool" $args > "$tmp/out" 2> "$tmp/err"; rc=$?
+  [[ $rc -eq 2 && ! -s $tmp/out && $(cat "$tmp/err") == "myron-discovery: E_USAGE" ]] || fail "misuse '$args' rc=$rc"
+done
+echo '{}' | "$tool" check-plan --stdin > "$tmp/out" 2> "$tmp/err"; rc=$?
+[[ $rc -eq 1 && ! -s $tmp/out && $(cat "$tmp/err") == "myron-discovery: E_REFUSED" ]] || fail "refusal rc=$rc"
+set -e
+pass "misuse exits 2 and refusal exits 1 with empty stdout and one fixed stderr line"
+
+mkdir "$tmp/fixture"
+MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" 2>&1 \
+  || { cat "$tmp/snapshot-suite.log" >&2; fail "snapshot fixture export"; }
+
+python3 -B - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib, copy, hashlib, importlib.machinery, importlib.util, inspect, io, json, os
+import re, shutil, socket, subprocess, sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+M = load("discovery_test", repo / "tools/myron-discovery")
+sha = lambda data: hashlib.sha256(data).hexdigest()
+TOOL = str(repo / "tools/myron-discovery")
+
+
+def ok(message):
+    print(f"ok - {message}")
+
+
+def expect(reason, function, *args):
+    try:
+        function(*args)
+    except M.Refusal as error:
+        assert error.reason == reason, (reason, error.reason)
+        return
+    raise AssertionError(f"expected refusal {reason}")
+
+
+contract_bytes = (repo / "device/myron/discovery-contract.json").read_bytes()
+contract = json.loads(contract_bytes)
+env = M.load_environment()
+actual = env["actual"]
+assert actual["contract_sha256"] == sha(contract_bytes)
+assert actual["implementation_sha256"] == M.CAPTURED_IMPLEMENTATION_SHA256 == \
+    sha((repo / "tools/lib/myron-discovery-impl.py").read_bytes())
+
+
+def good_plan():
+    return {
+        "schema": "myron-discovery-plan/1",
+        "kind": "myron-discovery-plan",
+        "domain": "synthetic-discovery-plan",
+        "stage": 1,
+        "bindings": {
+            "contract_sha256": actual["contract_sha256"],
+            "implementation_sha256": actual["implementation_sha256"],
+            "synthetic_review_context_sha256": contract["review_context_sha256"],
+        },
+        "target_ref": "synthetic-target-ref-1",
+        "trust_ref": "synthetic-trust-ref-1",
+        "output_ref": "synthetic-output-ref-1",
+        "recovery_ref": "synthetic-recovery-ref-1",
+        "sources": [
+            {"source_ref": "synthetic-source-ref-1", "metadata_profile_id": "synthetic-profile-identity"},
+            {"source_ref": "synthetic-source-ref-2", "metadata_profile_id": "synthetic-profile-topology"},
+            {"source_ref": "synthetic-source-ref-3", "metadata_profile_id": "synthetic-profile-topology"},
+        ],
+        "operations": [
+            {"sequence": 1, "source_ref": "synthetic-source-ref-1",
+             "command_id": "synthetic-command-identity", "max_returned_bytes": 1024, "timeout_ms": 2000},
+            {"sequence": 2, "source_ref": "synthetic-source-ref-2",
+             "command_id": "synthetic-command-topology", "max_returned_bytes": 4096, "timeout_ms": 5000},
+            {"sequence": 3, "source_ref": "synthetic-source-ref-2",
+             "command_id": "synthetic-command-geometry", "max_returned_bytes": 1024, "timeout_ms": 2000},
+            {"sequence": 4, "source_ref": "synthetic-source-ref-3",
+             "command_id": "synthetic-command-topology", "max_returned_bytes": 4096, "timeout_ms": 5000},
+            {"sequence": 5, "source_ref": "synthetic-source-ref-3",
+             "command_id": "synthetic-command-geometry", "max_returned_bytes": 1024, "timeout_ms": 2000},
+        ],
+        "limits": {"max_calls": 5, "max_returned_bytes": 11264, "max_elapsed_ms": 16000},
+        "stop_policy_id": "synthetic-stop-on-first-anomaly",
+    }
+
+
+def check(plan, reason=None, contract_value=None, actual_value=None):
+    c = contract_value or contract
+    a = actual_value or actual
+    if reason is None:
+        M.validate_plan(plan, c, a)
+    else:
+        expect(reason, M.validate_plan, plan, c, a)
+
+
+def mutate(reason, function, **kwargs):
+    plan = good_plan()
+    function(plan)
+    check(plan, reason, **kwargs)
+
+
+def raw_check(data, reason=None):
+    try:
+        M.check_plan(data, env)
+    except M.Refusal as error:
+        assert reason is not None and error.reason == reason, (reason, error.reason)
+        return
+    assert reason is None, f"expected refusal {reason}"
+
+
+# ---------------------------------------------------------------- contract
+assert contract_bytes == M.render_json(M.expected_contract())
+assert contract["schema"] == "myron-discovery-contract/1" and contract["version"] == "0.1.0"
+assert contract["domain"] == "synthetic-discovery-plan"
+for other in ("capture-contract", "session-contract", "bootchain-contract", "preflight-contract",
+              "snapshot-contract", "deployment-contract", "kernel-source-contract"):
+    other_schema = json.loads((repo / f"device/myron/{other}.json").read_bytes()).get("schema")
+    assert other_schema != contract["schema"], other
+assert not contract["schema"].startswith("myron-capture") and not contract["schema"].startswith("myron-fixture")
+assert contract["stages"]["supported"] == [1]
+assert [(s["stage"], s["status"]) for s in contract["stages"]["unsupported_deferred"]] == [
+    (2, "unsupported-documentation-only"), (3, "unsupported-documentation-only"),
+    (4, "unsupported-documentation-only")]
+assert "profiles" not in contract["stages"] and "executable" not in json.dumps(contract["stages"])
+assert contract["authority"] == dict.fromkeys(sorted(contract["authority"]), False)
+assert sorted(contract["authority"]) == sorted([
+    "atomic_snapshot_proof", "atomicity_proven", "bootable", "deployment_authorized",
+    "flashable", "hardware_qualified", "hardware_read_authorized", "image_ready",
+    "rollback_proven"]) and len(contract["authority"]) == 9
+other_blockers = json.loads((repo / "device/myron/capture-contract.json").read_bytes())["blockers"]
+assert contract["blockers"] == other_blockers and len(other_blockers) == 7
+assert contract["stage0"]["status"] == "unresolved" and contract["stage0"]["waived"] is False
+assert contract["stage0"]["prerequisites_satisfied"] is False and len(contract["stage0"]["prerequisites"]) == 7
+assert contract["binding"]["loader_excluded"] is True and contract["binding"]["covers_runtime_dependencies"] is False
+text = contract_bytes.decode()
+assert "sha256" not in json.dumps({k: v for k, v in contract.items()
+                                   if k not in ("binding", "review_context_sha256", "plan")}).replace("sha256-of", "")
+assert contract["review_context_sha256"] == sha(M.canonical_json(contract["review_context"]))
+assert not re.search(r"[0-9a-f]{64}", re.sub(r'"review_context_sha256": "[0-9a-f]{64}"', "", text)), \
+    "contract carries a digest of itself, the implementation or a private input"
+assert not re.search(r"(?i)https?://|ssh-|/dev/|/sys/|/proc/|/home/|\\.\\./|\\bsda\\b|ufs|[0-9a-f]{2}(:[0-9a-f]{2}){5}", text)
+assert contract["non_goals"] == list(M.NON_GOALS) and "converter-to-capture-fixtures" in contract["non_goals"]
+ok("contract is canonical, namespace-distinct, Stage 1 only, all authority false, blockers and Stage 0 unchanged")
+
+ctx = contract["review_context"]
+refs = [r for key in ("target_refs", "trust_refs", "output_refs", "recovery_refs", "stop_policy_ids") for r in ctx[key]]
+refs += [s["source_ref"] for s in ctx["sources"]] + [c["command_id"] for c in ctx["commands"]]
+refs += [p["metadata_profile_id"] for p in ctx["metadata_profiles"]]
+assert all(r.startswith("synthetic-") and re.fullmatch(r"[a-z0-9-]+", r) for r in refs)
+assert len(refs) == len(set(refs))
+assert {c for p in ctx["metadata_profiles"] for c in p["command_ids"]} == {c["command_id"] for c in ctx["commands"]}
+assert all(s["metadata_profile_id"] in {p["metadata_profile_id"] for p in ctx["metadata_profiles"]} for s in ctx["sources"])
+assert all(not re.search(r"[/\\ *$;&|<>:.]", c["command_id"]) for c in ctx["commands"])
+required = ctx["stage1_required_operations"]
+assert [r["phase"] for r in required][0] == "identity-trust-check"
+assert [(r["source_ref"], r["command_id"]) for r in required] == [
+    ("synthetic-source-ref-1", "synthetic-command-identity"),
+    ("synthetic-source-ref-2", "synthetic-command-topology"),
+    ("synthetic-source-ref-2", "synthetic-command-geometry"),
+    ("synthetic-source-ref-3", "synthetic-command-topology"),
+    ("synthetic-source-ref-3", "synthetic-command-geometry")]
+assert [s["source_ref"] for s in ctx["sources"]] == [r["source_ref"] for r in required][0:1] + ["synthetic-source-ref-2", "synthetic-source-ref-3"]
+assert ctx["min_distinct_topology_sources"] == 2 and ctx["topology_command_id"] == "synthetic-command-topology"
+assert len({r["source_ref"] for r in required if r["command_id"] == ctx["topology_command_id"]}) >= 2
+assert len(set(map(lambda r: (r["source_ref"], r["command_id"]), required))) == len(required)
+ok("review context is finite, dummy-only, and every command id is an inert identifier")
+ok("the contract encodes required Stage 1 coverage in order with two distinct topology sources")
+
+# ---------------------------------------------------------------- accept
+check(good_plan())
+raw_check(json.dumps(good_plan()).encode())
+raw_check(json.dumps(good_plan(), indent=4, sort_keys=True).encode())
+result = M.check_plan(json.dumps(good_plan()).encode(), env)
+assert result == M.render_json(M.check_result_document())
+doc = json.loads(result)
+assert doc == contract["check_result"]
+assert [doc[k] for k in ("hardware_read_authorized", "execution_supported", "approval_issued",
+                         "evidence_collected", "blockers_cleared", "stage0_prerequisites_satisfied")] == [False] * 6
+other = good_plan()
+for operation in other["operations"]:
+    operation["max_returned_bytes"], operation["timeout_ms"] = 1, 1
+other["limits"] = {"max_calls": 5, "max_returned_bytes": 5, "max_elapsed_ms": 5}
+assert M.check_plan(json.dumps(other).encode(), env) == result, "success document depends on the input"
+other = good_plan()
+for operation in other["operations"]:
+    operation["max_returned_bytes"], operation["timeout_ms"] = 512, 500
+other["limits"] = {"max_calls": 5, "max_returned_bytes": 2560, "max_elapsed_ms": 2500}
+assert M.check_plan(json.dumps(other).encode(), env) == result, "success document depends on the input"
+ok("a valid plan yields one fixed success document that claims nothing")
+
+# ---------------------------------------------------------------- bindings
+for name in M.BINDING_KEYS:
+    mutate("binding", lambda p, n=name: p["bindings"].__setitem__(n, "0" * 64))
+    mutate("binding", lambda p, n=name: p["bindings"].__setitem__(n, p["bindings"][n].upper()))
+    mutate("binding", lambda p, n=name: p["bindings"].__setitem__(n, p["bindings"][n][:-1]))
+    mutate("binding", lambda p, n=name: p["bindings"].__setitem__(n, 7))
+    mutate("keys", lambda p, n=name: p["bindings"].pop(n))
+mutate("keys", lambda p: p["bindings"].__setitem__("extra", "x"))
+mutate("keys", lambda p: p.__setitem__("bindings", {**p["bindings"], "binding_loader_sha256": "a" * 64}), )
+check(good_plan(), "binding", actual_value={**actual, "contract_sha256": "1" * 64})
+check(good_plan(), "binding", actual_value={**actual, "implementation_sha256": "2" * 64})
+changed = copy.deepcopy(contract)
+changed["review_context"]["target_refs"].append("synthetic-target-ref-2")
+check(good_plan(), "binding", contract_value=changed)
+ok("each binding is exact and a changed contract, implementation or review context breaks the plan")
+
+# ---------------------------------------------------------------- scoped fields
+mutate("schema", lambda p: p.__setitem__("schema", "myron-discovery-plan/2"))
+mutate("schema", lambda p: p.__setitem__("schema", "myron-capture-fixture/1"))
+mutate("kind", lambda p: p.__setitem__("kind", "myron-precaptured-fixture"))
+mutate("keys", lambda p: p.pop("schema"))
+for name in ("target_ref", "trust_ref", "output_ref", "recovery_ref", "stop_policy_id"):
+    mutate("reference", lambda p, n=name: p.__setitem__(n, "unknown-id"))
+    mutate("reference", lambda p, n=name: p.__setitem__(n, ""))
+    mutate("reference", lambda p, n=name: p.__setitem__(n, p[n] + " "))
+    mutate("reference", lambda p, n=name: p.__setitem__(n, p[n].upper()))
+    mutate("reference", lambda p, n=name: p.__setitem__(n, None))
+    mutate("reference", lambda p, n=name: p.__setitem__(n, [p[n]]))
+    mutate("keys", lambda p, n=name: p.pop(n))
+mutate("reference", lambda p: p.__setitem__("target_ref", "synthetic-trust-ref-1"))
+mutate("reference", lambda p: p.__setitem__("output_ref", "synthetic-recovery-ref-1"))
+for sentinel in ("ssh-ed25519", "/dev/sda", "https://example.invalid/x", "sda", "$(id)", "*", "../x"):
+    mutate("reference", lambda p, s=sentinel: p.__setitem__("target_ref", s))
+    mutate("dangling-source", lambda p, s=sentinel: p["operations"][0].__setitem__("source_ref", s))
+    mutate("command", lambda p, s=sentinel: p["operations"][0].__setitem__("command_id", s))
+ok("every reference resolves only inside the review context and each field mutation refuses")
+
+mutate("stage-unsupported", lambda p: p.__setitem__("stage", 2))
+mutate("stage-unsupported", lambda p: p.__setitem__("stage", 3))
+mutate("stage-unsupported", lambda p: p.__setitem__("stage", 4))
+mutate("stage-unsupported", lambda p: p.__setitem__("stage", 0))
+mutate("stage", lambda p: p.__setitem__("stage", True))
+mutate("stage", lambda p: p.__setitem__("stage", "1"))
+mutate("stage", lambda p: p.__setitem__("stage", None))
+for domain in ("fixture", "hardware", "live", "myron-precaptured-fixture", "hardware-discovery",
+               "synthetic-discovery-plan ", "Synthetic-Discovery-Plan", "", None, 1):
+    mutate("domain", lambda p, d=domain: p.__setitem__("domain", d))
+ok("stages 2-4 and every foreign domain are refused")
+
+mutate("sources", lambda p: p.__setitem__("sources", []))
+mutate("sources", lambda p: p.__setitem__("sources", {}))
+mutate("keys", lambda p: p["sources"][0].__setitem__("x", 1))
+mutate("keys", lambda p: p["sources"][0].pop("metadata_profile_id"))
+mutate("source-profile", lambda p: p["sources"][0].__setitem__("metadata_profile_id", "synthetic-profile-topology"))
+mutate("source-profile", lambda p: p["sources"][0].__setitem__("metadata_profile_id", "unknown"))
+mutate("reference", lambda p: p["sources"][1].__setitem__("source_ref", "synthetic-source-ref-9"))
+mutate("source-duplicate", lambda p: p["sources"].append(dict(p["sources"][1])))
+mutate("source-order", lambda p: p["sources"].reverse())
+mutate("command-profile", lambda p: p["operations"][0].__setitem__("source_ref", "synthetic-source-ref-3"))
+mutate("dangling-source", lambda p: p["operations"][0].__setitem__("source_ref", "synthetic-source-ref-9"))
+mutate("operations", lambda p: p.__setitem__("operations", []))
+mutate("operations", lambda p: p.__setitem__("operations", None))
+mutate("forbidden-field", lambda p: p["operations"][0].__setitem__("retry", 1))
+mutate("keys", lambda p: p["operations"][0].pop("timeout_ms"))
+mutate("command", lambda p: p["operations"][0].__setitem__("command_id", "unknown-command"))
+mutate("command-profile", lambda p: p["operations"][0].__setitem__("command_id", "synthetic-command-topology"))
+mutate("command-profile", lambda p: p["operations"][1].__setitem__("command_id", "synthetic-command-identity"))
+mutate("operation-duplicate", lambda p: p["operations"][2].__setitem__("command_id", "synthetic-command-topology"))
+mutate("sequence", lambda p: p["operations"].reverse())
+mutate("sequence", lambda p: p["operations"][1].__setitem__("sequence", 3))
+mutate("sequence", lambda p: p["operations"][0].__setitem__("sequence", 0))
+mutate("sequence", lambda p: p["operations"][0].__setitem__("sequence", 2))
+mutate("sequence", lambda p: p["operations"][0].__setitem__("sequence", True))
+mutate("sequence", lambda p: p["operations"][0].__setitem__("sequence", "1"))
+mutate("sequence", lambda p: p["operations"][2].__setitem__("sequence", 4))
+mutate("sequence", lambda p: p["operations"][1].__setitem__("sequence", 1))
+ok("unknown ids, dangling or unused sources, duplicates, and noncontiguous or reordered sequences refuse")
+
+# ---------------------------------------------------------------- required Stage 1 coverage
+def renumber(plan):
+    for index, operation in enumerate(plan["operations"], 1):
+        operation["sequence"] = index
+    plan["limits"]["max_calls"] = len(plan["operations"])
+
+
+def keep_sources(plan, *numbers):
+    plan["sources"] = [s for s in plan["sources"] if s["source_ref"][-1] in numbers]
+
+
+def only(plan, *pairs):
+    plan["operations"] = [o for o in plan["operations"] if (o["source_ref"][-1], o["command_id"][18:]) in pairs]
+    renumber(plan)
+
+
+def identity_only(p):
+    keep_sources(p, "1"); only(p, ("1", "identity"))
+def topology_only(p):
+    keep_sources(p, "2", "3"); only(p, ("2", "topology"), ("3", "topology"))
+def geometry_only(p):
+    keep_sources(p, "2", "3"); only(p, ("2", "geometry"), ("3", "geometry"))
+def topology_source_omitted(p):
+    keep_sources(p, "1", "2"); only(p, ("1", "identity"), ("2", "topology"), ("2", "geometry"))
+def identity_missing_with_source(p):
+    only(p, ("2", "topology"), ("2", "geometry"), ("3", "topology"), ("3", "geometry"))
+def geometry_missing(p):
+    only(p, ("1", "identity"), ("2", "topology"), ("2", "geometry"), ("3", "topology"))
+def topology_missing(p):
+    only(p, ("1", "identity"), ("2", "geometry"), ("3", "topology"), ("3", "geometry"))
+def identity_last(p):
+    p["operations"].append(p["operations"].pop(0)); renumber(p)
+def commands_swapped(p):
+    p["operations"][1], p["operations"][2] = p["operations"][2], p["operations"][1]; renumber(p)
+def sources_swapped(p):
+    ops = p["operations"]; ops[1:3], ops[3:5] = ops[3:5], ops[1:3]; renumber(p)
+def topology_first(p):
+    ops = p["operations"]; ops[0], ops[1] = ops[1], ops[0]; renumber(p)
+
+for name, reason, function in (
+        ("identity-only", "required-sources", identity_only),
+        ("topology-only", "required-sources", topology_only),
+        ("geometry-only", "required-sources", geometry_only),
+        ("topology source omitted", "required-sources", topology_source_omitted),
+        ("identity operation missing", "source-unused", identity_missing_with_source),
+        ("geometry operation missing", "required-coverage", geometry_missing),
+        ("topology operation missing", "required-coverage", topology_missing),
+        ("identity last", "required-order", identity_last),
+        ("topology before geometry swapped", "required-order", commands_swapped),
+        ("topology sources swapped", "required-order", sources_swapped),
+        ("identity not first", "required-order", topology_first)):
+    mutate(reason, function)
+# every omitted source or command is refused, whatever the other operations are
+for omitted in range(5):
+    plan = good_plan(); del plan["operations"][omitted]; renumber(plan)
+    try:
+        check(plan)
+    except M.Refusal as error:
+        assert error.reason in ("source-unused", "required-coverage"), error.reason
+    else:
+        raise AssertionError("an omitted required operation was accepted")
+# the minimum number of distinct topology sources is enforced from the contract
+changed = copy.deepcopy(contract)
+changed["review_context"]["min_distinct_topology_sources"] = 3
+plan = good_plan()
+plan["bindings"]["synthetic_review_context_sha256"] = sha(M.canonical_json(changed["review_context"]))
+check(plan, "topology-sources", contract_value=changed)
+# lower positive budgets stay valid; the required list may not move
+plan = good_plan()
+for operation in plan["operations"]:
+    operation["max_returned_bytes"], operation["timeout_ms"] = 1, 1
+plan["limits"] = {"max_calls": 5, "max_returned_bytes": 5, "max_elapsed_ms": 5}
+check(plan)
+ok("required sources and commands cannot be omitted, added or reordered; lower budgets stay valid")
+
+# ---------------------------------------------------------------- budgets: exact ceilings and +1
+for key in ("max_returned_bytes", "timeout_ms"):
+    for bad in (0, -1, True, False, "1", None, 1.5, [1]):
+        if isinstance(bad, float):
+            continue
+        mutate("budget-type", lambda p, k=key, b=bad: p["operations"][0].__setitem__(k, b))
+mutate("operation-bytes", lambda p: p["operations"][0].__setitem__("max_returned_bytes", 1025))
+mutate("operation-timeout", lambda p: p["operations"][0].__setitem__("timeout_ms", 2001))
+mutate("operation-bytes", lambda p: p["operations"][1].__setitem__("max_returned_bytes", 4097))
+mutate("operation-timeout", lambda p: p["operations"][1].__setitem__("timeout_ms", 5001))
+for command in ctx["commands"]:
+    index = [o["command_id"] for o in good_plan()["operations"]].index(command["command_id"])
+    def at_ceiling(p, i=index, c=command):
+        p["operations"][i]["max_returned_bytes"] = c["max_returned_bytes"]
+        p["operations"][i]["timeout_ms"] = c["max_timeout_ms"]
+        p["limits"]["max_returned_bytes"] = 11264
+        p["limits"]["max_elapsed_ms"] = 16000
+    plan = good_plan(); at_ceiling(plan); check(plan)
+for bad in (0, -1, True, "1", None):
+    for key in M.LIMIT_KEYS:
+        mutate("budget-type", lambda p, k=key, b=bad: p["limits"].__setitem__(k, b))
+mutate("keys", lambda p: p["limits"].pop("max_calls"))
+mutate("forbidden-field", lambda p: p["limits"].__setitem__("max_retries", 0))
+mutate("forbidden-field", lambda p: p["limits"].__setitem__("concurrency", 1))
+# aggregate bytes: exact, then +1
+plan = good_plan(); plan["limits"]["max_returned_bytes"] = 11264; check(plan)
+plan["limits"]["max_returned_bytes"] = 11263; check(plan, "aggregate-bytes")
+# serial elapsed: exact, then -1
+plan = good_plan(); plan["limits"]["max_elapsed_ms"] = 16000; check(plan)
+plan["limits"]["max_elapsed_ms"] = 15999; check(plan, "elapsed")
+plan = good_plan(); plan["limits"]["max_elapsed_ms"] = 1999; check(plan, "elapsed")
+# call count is exact, both directions
+plan = good_plan(); plan["limits"]["max_calls"] = 4; check(plan, "calls")
+plan["limits"]["max_calls"] = 6; check(plan, "calls")
+# stage ceilings: exact, then +1 (aggregate overflow against the ceiling)
+ceiling = contract["stage1_synthetic_limits"]
+assert ceiling == {"max_calls": 6, "max_returned_bytes": 16384, "max_elapsed_ms": 30000}
+plan = good_plan(); plan["limits"]["max_returned_bytes"] = ceiling["max_returned_bytes"]; check(plan)
+plan["limits"]["max_returned_bytes"] += 1; check(plan, "limits-ceiling")
+plan = good_plan(); plan["limits"]["max_elapsed_ms"] = ceiling["max_elapsed_ms"]; check(plan)
+plan["limits"]["max_elapsed_ms"] += 1; check(plan, "limits-ceiling")
+# a sixth operation is a duplicate pair, whatever max_calls says
+seven = good_plan()
+seven["operations"].append({"sequence": 6, "source_ref": "synthetic-source-ref-3",
+                            "command_id": "synthetic-command-geometry", "max_returned_bytes": 1, "timeout_ms": 1})
+seven["limits"]["max_calls"] = 6; check(seven, "operation-duplicate")
+seven["limits"]["max_calls"] = 7; check(seven, "operation-duplicate")
+over = good_plan(); over["limits"]["max_calls"] = 7; check(over, "limits-ceiling")
+ok("exact ceilings pass, one past refuses, aggregates and serial timeouts are bounded, call count is exact")
+
+# ---------------------------------------------------------------- forbidden capabilities
+for key in ("retries", "retry", "max_retries", "concurrency", "parallel", "approval", "approved",
+            "approval_id", "execution", "execute", "executable", "evidence", "evidence_sha256", "ledger",
+            "provenance", "transport", "shell", "argv", "command_line", "path", "url", "offset", "lba",
+            "range", "block_range", "partition", "partition_payload", "glob", "wildcard", "host_key",
+            "endpoint", "capture", "fixture", "hardware_read_authorized", "live", "request",
+            "extension", "extra", "x-note", "interpolate"):
+    mutate("forbidden-field" if any(f in key.lower() for f in M.FORBIDDEN_KEY_FRAGMENTS) else "keys",
+           lambda p, k=key: p.__setitem__(k, "x"))
+    mutate("forbidden-field" if any(f in key.lower() for f in M.FORBIDDEN_KEY_FRAGMENTS) else "keys",
+           lambda p, k=key: p["operations"][0].__setitem__(k, 1))
+    mutate("forbidden-field" if any(f in key.lower() for f in M.FORBIDDEN_KEY_FRAGMENTS) else "keys",
+           lambda p, k=key: p["limits"].__setitem__(k, 1))
+allowed_keys = set(M.PLAN_KEYS + M.BINDING_KEYS + M.SOURCE_KEYS + M.OPERATION_KEYS + M.LIMIT_KEYS)
+assert not [k for k in allowed_keys if any(f in k for f in M.FORBIDDEN_KEY_FRAGMENTS)], "the schema names a forbidden capability"
+ok("retries, concurrency, approval, evidence, execution, transport and range fields are refused")
+
+# ---------------------------------------------------------------- strict JSON
+good = json.dumps(good_plan())
+raw_check(good.encode())
+raw_check(b"\xef\xbb\xbf" + good.encode(), "json-utf8")
+raw_check(good.encode() + b"\xff", "json-utf8")
+raw_check(b'{"a": "\xc3\x28"}', "json-utf8")
+raw_check(b"", "json-syntax")
+raw_check(b"[]", "json-type")
+raw_check(b"null", "json-type")
+raw_check(b"{", "json-syntax")
+raw_check((good + " x").encode(), "json-syntax")
+raw_check(good.replace('"stage": 1', '"stage": 1.0').encode(), "json-float")
+raw_check(good.replace('"stage": 1', '"stage": 1e0').encode(), "json-float")
+raw_check(good.replace('"stage": 1', '"stage": NaN').encode(), "json-nonfinite")
+raw_check(good.replace('"stage": 1', '"stage": Infinity').encode(), "json-nonfinite")
+raw_check(good.replace('"stage": 1', '"stage": -Infinity').encode(), "json-nonfinite")
+raw_check(good.replace('"stage": 1', '"stage": true').encode(), "stage")
+raw_check(good.replace('"stage": 1', '"stage": 01').encode(), "json-syntax")
+raw_check(good.replace('"stage": 1', '"stage": 1, "stage": 1').encode(), "json-duplicate-key")
+raw_check(good.replace('"kind"', '"kind": "x", "kind"', 1).encode(), "json-duplicate-key")
+raw_check(good.replace('"timeout_ms": 2000}', '"timeout_ms": 2000, "timeout_ms": 2000}', 1).encode(), "json-duplicate-key")
+raw_check(good.replace('"sequence"', '"seq\\u0075ence": 1, "sequence"', 1).encode(), "json-duplicate-key")
+raw_check(good.replace("synthetic-target-ref-1", "synthetic-target-ref-\\u00e9").encode(), "json-string")
+raw_check(good.replace("synthetic-target-ref-1", "x" * 65).encode(), "json-string")
+raw_check(good.replace("synthetic-target-ref-1", "a\\u0000b").encode(), "json-string")
+raw_check(good.replace("synthetic-target-ref-1", "\\ud800").encode(), "json-string")
+raw_check(("[" * 5 + "]" * 5).encode(), "json-depth")
+raw_check(('{"a":' * 5 + "1" + "}" * 5).encode(), "json-depth")
+raw_check(("[" * 50000).encode(), "json-depth")
+many = {"k%d" % i: 1 for i in range(17)}
+raw_check(json.dumps(many).encode(), "json-bound")
+raw_check(json.dumps({"a": list(range(17))}).encode(), "json-bound")
+wide = good_plan(); wide["operations"] = [good_plan()["operations"][0]] * 17
+raw_check(json.dumps(wide).encode(), "json-bound")
+raw_check(("{\"stage\": " + "9" * 5000 + "}").encode(), "json-syntax")
+raw_check(good.encode().ljust(M.PLAN_MAX_BYTES, b" ")[:M.PLAN_MAX_BYTES])
+ok("duplicate keys, bad UTF-8, nonfinite, floats, booleans-as-integers, depth, size and node bounds refuse")
+
+# stdin bound: exactly PLAN_MAX_BYTES passes the read, one more refuses
+r, w = os.pipe()
+os.write(w, b"x" * M.PLAN_MAX_BYTES); os.close(w)
+assert len(M.read_stdin(M.PLAN_MAX_BYTES, r)) == M.PLAN_MAX_BYTES; os.close(r)
+r, w = os.pipe()
+os.write(w, b"x" * (M.PLAN_MAX_BYTES + 1)); os.close(w)
+expect("stdin-bound", M.read_stdin, M.PLAN_MAX_BYTES, r); os.close(r)
+ok("stdin read is bounded at the exact ceiling")
+
+# ---------------------------------------------------------------- cross-domain isolation
+for name in ("capture-contract", "session-contract", "bootchain-contract", "preflight-contract",
+             "snapshot-contract", "deployment-contract", "kernel-source-contract", "kernel-contract",
+             "discovery-contract"):
+    data = (repo / f"device/myron/{name}.json").read_bytes()
+    try:
+        raw_check(data, "keys")
+    except (M.Refusal, AssertionError):
+        pass
+    cli = subprocess.run([TOOL, "check-plan", "--stdin"], input=data, capture_output=True, cwd="/")
+    assert (cli.returncode, cli.stdout, cli.stderr) == (1, b"", b"myron-discovery: E_REFUSED\n"), name
+fixture_like = good_plan()
+fixture_like.update({"kind": "myron-precaptured-fixture", "domain": "external-precaptured-fixture",
+                     "transport": "external-precaptured-fixture"})
+cli = subprocess.run([TOOL, "check-plan", "--stdin"], input=json.dumps(fixture_like).encode(), capture_output=True)
+assert (cli.returncode, cli.stdout) == (1, b"")
+ok("the discovery validator refuses every repository contract and a fixture-shaped plan")
+
+# The existing fixture collector refuses discovery-shaped content, unweakened. A real
+# preflight request is built by the pinned tools; the discovery-shaped capture lives in a
+# separate, non-overlapping path with a closed tree and safe modes, so the refusal below
+# must come from content, not from path overlap, unsafe modes, a missing file or a bad tree.
+C = load("collect_tool_test", repo / "tools/myron-collect")
+P, D = C.preflight(), C.preflight().deploy()
+S = P.snapshot()
+paths = {key: Path(value) for key, value in json.loads((work / "fixture/paths.json").read_text()).items()}
+contracts_root = paths["contracts_root"]
+contracts = D.load_contracts(contracts_root)
+_, _, snapshot_contract_sha256 = S.load_snapshot_contract(contracts_root, contracts)
+preflight_bytes = D.render_json(P.expected_preflight_contract(contracts, snapshot_contract_sha256))
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).parent.mkdir(parents=True, exist_ok=True)
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes)
+(contracts_root / C.CAPTURE_CONTRACT_PATH).write_bytes(D.render_json(
+    C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts)))
+collector_before = (repo / "tools/lib/myron-collect-impl.py").read_bytes()
+collector_loader_before = (repo / "tools/myron-collect").read_bytes()
+
+
+def collector(*arguments):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = C.main([str(a) for a in arguments], contracts_root=contracts_root)
+    return code, out.getvalue(), err.getvalue()
+
+
+request_dir = work / "collector-request"
+with contextlib.redirect_stdout(io.StringIO()):
+    code = P.main(["assess", "--kit", str(paths["kit"]), "--snapshot", str(paths["snapshot"]),
+                   "--rootfs-stage", str(paths["rootfs"]), "--rootfs-manifest", str(paths["manifest"]),
+                   "--assets", str(paths["archive"]), "--runtime-assets", "none",
+                   "--vmlinux-symvers", "none", "--module-symvers", "none", "--out", str(request_dir)],
+                  contracts_root=contracts_root)
+assert code == 0
+request_sha256 = sha((request_dir / "SHA256SUMS").read_bytes())
+operation_ids = [row["id"] for row in json.loads((request_dir / "request.json").read_text())["requested_reads"]]
+discovery_bytes = D.render_json(good_plan())
+STRUCTURAL = ("overlap", "capture tree differs", "executable", "not owned", "writable", "symlink",
+              "aliases", "No such file", "mode", "permission")
+CONTENT = ("capture.json contains an identifier-shaped value", "capture.json differs from its operations or bindings")
+
+
+def discovery_capture(path, canonical=True):
+    """Closed, safe, collector-shaped tree whose every file carries a discovery plan."""
+    (path / "operations").mkdir(parents=True)
+    files = {}
+    for operation_id in operation_ids:
+        name = f"operations/{operation_id}.json"
+        files[name] = discovery_bytes
+        (path / name).write_bytes(discovery_bytes)
+        (path / name).chmod(0o644)
+    (path / "capture.json").write_bytes(discovery_bytes if canonical else discovery_bytes + b" ")
+    (path / "capture.json").chmod(0o644)
+    (path / "operations").chmod(0o755)
+    path.chmod(0o755)
+    return files
+
+
+reached = []
+real_reject = C.reject_identifiers
+C.reject_identifiers = lambda *a, **k: (reached.append(a[1]), real_reject(*a, **k))[1]
+try:
+    capture_dir = work / "collector-capture" / "capture"
+    discovery_capture(capture_dir)
+    for a, b in ((request_dir, capture_dir), (capture_dir, request_dir)):
+        assert not D.paths_overlap(str(a), str(b)), "test paths must not overlap"
+    out_dir = work / "collector-out"
+    code, out, err = collector("collect", "--request", request_dir, "--capture", capture_dir, "--out", out_dir)
+    assert code != 0 and out == "" and not out_dir.exists(), (code, err)
+    assert reached[:1] == ["capture.json"], "the collector did not reach capture content validation"
+    assert any(text in err for text in CONTENT), err  # reached only after tree, mode and canonical checks
+    assert not any(text in err for text in STRUCTURAL), err
+    # controls: the same tree with a structural defect reports a structural reason instead
+    broken = work / "collector-capture-broken" / "capture"
+    discovery_capture(broken)
+    (broken / "operations" / "extra.json").write_bytes(b"{}\n")
+    (broken / "operations" / "extra.json").chmod(0o644)
+    reached.clear()
+    code, _, err = collector("collect", "--request", request_dir, "--capture", broken, "--out", work / "collector-out2")
+    assert code != 0 and "capture tree differs" in err and not reached, err
+    executable = work / "collector-capture-exec" / "capture"
+    discovery_capture(executable)
+    (executable / "capture.json").chmod(0o755)
+    code, _, err = collector("collect", "--request", request_dir, "--capture", executable, "--out", work / "collector-out3")
+    assert code != 0 and "executable" in err and not reached, err
+    # a discovery plan as the plan file of a valid request is refused at plan content
+    plan_text = collector("plan", "--request", request_dir)
+    assert plan_text[0] == 0
+    plan_file = work / "collector-plan" / "plan.json"
+    plan_file.parent.mkdir()
+    plan_file.write_bytes(D.render_json(json.loads(plan_text[1])))
+    code, _, err = collector("verify-plan", "--request", request_dir, "--plan", plan_file)
+    assert code == 0, err
+    plan_file.write_bytes(discovery_bytes)
+    plan_file.chmod(0o644)
+    code, out, err = collector("verify-plan", "--request", request_dir, "--plan", plan_file)
+    assert code != 0 and out == "" and "capture plan differs from the request" in err, err
+    # a discovery plan in place of request.json of an otherwise valid request is refused
+    forged = work / "collector-forged-request"
+    shutil.copytree(request_dir, forged)
+    (forged / "request.json").write_bytes(discovery_bytes)
+    code, out, err = collector("plan", "--request", forged)
+    assert code != 0 and out == "" and "ERROR:" in err and "overlap" not in err, err
+    assert collector("plan", "--request", request_dir)[0] == 0, "the valid request control must still pass"
+finally:
+    C.reject_identifiers = real_reject
+assert (repo / "tools/lib/myron-collect-impl.py").read_bytes() == collector_before
+assert (repo / "tools/myron-collect").read_bytes() == collector_loader_before
+for line in (collector_before.decode() + collector_loader_before.decode()).splitlines():
+    assert "discovery" not in line.lower(), "the collector was changed to know about discovery"
+ok("collect refuses discovery content after reaching capture validation; verify-plan and plan refuse discovery documents; collector unmodified")
+
+# ---------------------------------------------------------------- privacy: nothing input-derived leaks
+sentinels = ["SENTINEL-HOSTKEY-ssh-ed25519-AAAA", "/dev/sda12", "10.99.88.77", "https://leak.invalid/p",
+             "private-serial-ABC123", "a" * 63 + "f"]
+for sentinel in sentinels:
+    for variant in ("target_ref", "source", "operation", "binding", "extra-key", "domain"):
+        plan = good_plan()
+        if variant == "target_ref": plan["target_ref"] = sentinel
+        elif variant == "source": plan["sources"][0]["source_ref"] = sentinel
+        elif variant == "operation": plan["operations"][0]["command_id"] = sentinel
+        elif variant == "binding": plan["bindings"]["contract_sha256"] = sentinel
+        elif variant == "extra-key": plan[sentinel] = 1
+        else: plan["domain"] = sentinel
+        text = json.dumps(plan).encode()
+        for payload in (text, text + b"\xff", b"{" + sentinel.encode() + b"}"):
+            cli = subprocess.run([TOOL, "check-plan", "--stdin"], input=payload, capture_output=True, cwd="/")
+            assert (cli.returncode, cli.stdout, cli.stderr) == (1, b"", b"myron-discovery: E_REFUSED\n"), (variant, sentinel)
+            assert sentinel.encode() not in cli.stdout + cli.stderr
+cli = subprocess.run([TOOL, "check-plan", "--stdin"], input=json.dumps(good_plan()).encode(), capture_output=True, cwd="/")
+assert cli.returncode == 0 and cli.stderr == b"" and cli.stdout == M.render_json(M.check_result_document())
+for value in (actual["contract_sha256"], actual["implementation_sha256"], contract["review_context_sha256"],
+              "synthetic-source-ref", "synthetic-target", "11264", "16000"):
+    assert value.encode() not in cli.stdout, "success output echoes plan-derived data"
+assert not re.search(rb"[0-9a-f]{64}", cli.stdout)
+for size in (0, M.PLAN_MAX_BYTES + 1):
+    cli = subprocess.run([TOOL, "check-plan", "--stdin"], input=b"y" * size, capture_output=True, cwd="/")
+    assert (cli.returncode, cli.stdout, cli.stderr) == (1, b"", b"myron-discovery: E_REFUSED\n")
+ok("privacy sentinels never reach stdout or stderr; success output has no plan-derived value")
+
+# ---------------------------------------------------------------- the validation core is pure
+core = ("validate_plan", "parse_json_object", "expected_contract", "check_result_document", "_scan_forbidden",
+        "_exact_keys", "_positive_int", "_reference", "_walk_bounds", "_check_string", "canonical_json")
+for name in core:
+    source = inspect.getsource(getattr(M, name))
+    assert not re.search(r"\bos\b|\bsys\b|\bopen\(|subprocess|socket|environ|print\(|write", source), name
+saved = (subprocess.Popen, socket.socket.connect, os.system, os.fork, os.open, os.write)
+def forbidden(*a, **k): raise AssertionError("forbidden facility used by the validation core")
+subprocess.Popen = socket.socket.connect = os.system = os.fork = os.open = os.write = forbidden
+try:
+    check(good_plan())
+    check(good_plan(), "binding", actual_value={**actual, "contract_sha256": "1" * 64})
+    M.parse_json_object(good.encode(), M.PLAN_PARSER)
+finally:
+    subprocess.Popen, socket.socket.connect, os.system, os.fork, os.open, os.write = saved
+sentinel_file = work / "created"
+M.validate_plan(good_plan(), contract, actual)
+assert not sentinel_file.exists()
+ok("the validation core touches no process, network, file or environment facility")
+
+# ---------------------------------------------------------------- loader and capture integrity
+loader_text = (repo / "tools/myron-discovery").read_text()
+assert 'IMPLEMENTATION_PATH = "tools/lib/myron-discovery-impl.py"' in loader_text
+assert "O_NOFOLLOW" in loader_text and "CAPTURED_IMPLEMENTATION_SHA256" in loader_text
+captured = M.capture_implementation(str(repo))
+assert sha(captured) == M.CAPTURED_IMPLEMENTATION_SHA256
+mini = work / "mini"
+(mini / "tools/lib").mkdir(parents=True)
+(mini / "tools/lib/myron-discovery-impl.py").write_bytes(captured)
+os.chmod(mini / "tools/lib/myron-discovery-impl.py", 0o644)
+assert M.capture_implementation(str(mini)) == captured
+os.chmod(mini / "tools/lib/myron-discovery-impl.py", 0o666)
+try:
+    M.capture_implementation(str(mini)); raise AssertionError("writable implementation accepted")
+except ImportError:
+    pass
+os.chmod(mini / "tools/lib/myron-discovery-impl.py", 0o644)
+(mini / "tools/lib/myron-discovery-impl.py").unlink()
+os.symlink(repo / "tools/lib/myron-discovery-impl.py", mini / "tools/lib/myron-discovery-impl.py")
+try:
+    M.capture_implementation(str(mini)); raise AssertionError("symlinked implementation accepted")
+except OSError:
+    pass
+(mini / "tools/lib/myron-discovery-impl.py").unlink()
+(mini / "tools/lib/myron-discovery-impl.py").write_bytes(b"x" * (M.IMPLEMENTATION_MAX_BYTES + 1))
+os.chmod(mini / "tools/lib/myron-discovery-impl.py", 0o644)
+try:
+    M.capture_implementation(str(mini)); raise AssertionError("oversized implementation accepted")
+except ImportError:
+    pass
+# the plan binds the implementation bytes that run: a different implementation digest refuses
+check(good_plan(), "binding", actual_value={**actual, "implementation_sha256": sha(captured + b"\n")})
+# a contract file that differs by one byte is refused by the real loader path
+orig = M.read_repo_file
+M.read_repo_file = lambda relative, limit: orig(relative, limit) + b" "
+expect("contract-mismatch", M.load_environment)
+M.read_repo_file = lambda relative, limit: orig(relative, limit)[:-1]
+expect("contract-mismatch", M.load_environment)
+M.read_repo_file = lambda relative, limit: json.dumps(json.loads(orig(relative, limit))).encode()
+expect("contract-mismatch", M.load_environment)
+M.read_repo_file = orig
+expect("repository-read", M.read_repo_file, "device/myron/missing.json", 100)
+expect("repository-size", M.read_repo_file, "device/myron/discovery-contract.json", 10)
+assert not list((repo / "tools").rglob("*discovery*.pyc"))
+
+# stable own-file reads: every change during the read refuses and closes the descriptor.
+# All mutations hit isolated copies; the hook runs on the Nth os.read call.
+isolated = work / "stable"
+(isolated / "tools/lib").mkdir(parents=True)
+(isolated / "device/myron").mkdir(parents=True)
+impl_copy = isolated / "tools/lib/myron-discovery-impl.py"
+contract_copy = isolated / "device/myron/discovery-contract.json"
+real_read, real_repo_root = os.read, M.repo_root
+M.repo_root = lambda: str(isolated)
+
+
+def fresh_copies():
+    for path, data in ((impl_copy, captured), (contract_copy, contract_bytes)):
+        if path.exists():
+            path.unlink()
+        path.write_bytes(data)
+        os.chmod(path, 0o644)
+
+
+def read_impl():
+    return M.capture_implementation(str(isolated))
+
+
+def read_contract():
+    try:
+        return M.read_repo_file("device/myron/discovery-contract.json", 64 * 1024)
+    except M.Refusal as error:
+        raise ImportError(error.reason)
+
+
+def shift_times(path):
+    info = path.stat()
+    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 7_000_000_000))
+
+
+ACTIONS = {
+    "truncation": (1, lambda p: os.truncate(p, p.stat().st_size - 5)),
+    "growth": (1, lambda p: p.open("ab").write(b"x")),
+    "same-size rewrite": (2, lambda p: (p.write_bytes(bytes(reversed(p.read_bytes()))), shift_times(p))),
+    "chmod": (2, lambda p: os.chmod(p, 0o600)),
+    "metadata change": (2, lambda p: shift_times(p)),
+    "extra link": (2, lambda p: os.link(p, p.with_name(p.name + ".alias"))),
+    "truncate after read": (2, lambda p: os.truncate(p, 3)),
+}
+for function in (read_impl, read_contract):
+    fresh_copies()
+    target = impl_copy if function is read_impl else contract_copy
+    assert function() == (captured if function is read_impl else contract_bytes)
+    for name, (at, action) in ACTIONS.items():
+        fresh_copies()
+        for alias in isolated.rglob("*.alias"):
+            alias.unlink()
+        calls = [0]
+        def hooked(fd, count, at=at, action=action, target=target):
+            calls[0] += 1
+            if calls[0] == at:
+                action(target)
+            return real_read(fd, count)
+        before = sorted(os.listdir("/proc/self/fd"))
+        os.read = hooked
+        try:
+            function()
+            raise AssertionError(f"{function.__name__}: {name} accepted")
+        except ImportError:
+            pass
+        finally:
+            os.read = real_read
+        assert sorted(os.listdir("/proc/self/fd")) == before, f"{function.__name__}: {name} leaked a descriptor"
+fresh_copies()
+for alias in isolated.rglob("*.alias"):
+    alias.unlink()
+# an initial hard link, a size over the bound and an unsafe mode refuse before any read
+os.link(impl_copy, impl_copy.with_name("second-name"))
+try:
+    read_impl(); raise AssertionError("multiply linked implementation accepted")
+except ImportError:
+    pass
+impl_copy.with_name("second-name").unlink()
+os.link(contract_copy, contract_copy.with_name("second-name"))
+expect("repository-unsafe", M.read_repo_file, "device/myron/discovery-contract.json", 64 * 1024)
+contract_copy.with_name("second-name").unlink()
+os.chmod(contract_copy, 0o666)
+expect("repository-unsafe", M.read_repo_file, "device/myron/discovery-contract.json", 64 * 1024)
+os.chmod(contract_copy, 0o644)
+assert read_contract() == contract_bytes and read_impl() == captured
+M.repo_root = real_repo_root
+assert (repo / "tools/lib/myron-discovery-impl.py").read_bytes() == captured
+assert (repo / "device/myron/discovery-contract.json").read_bytes() == contract_bytes
+ok("own-file reads refuse truncation, growth, same-size rewrite, chmod, link and metadata changes and close descriptors")
+ok("capture is no-follow and bounded, the implementation digest is of the captured bytes, and the contract must be canonical")
+
+# ---------------------------------------------------------------- unexpected errors stay value-free
+saved_parse = M.check_plan
+M.check_plan = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("SENTINEL"))
+buffer = io.StringIO()
+with contextlib.redirect_stderr(buffer), contextlib.redirect_stdout(io.StringIO()):
+    stdin_r, stdin_w = os.pipe()
+    os.write(stdin_w, b"{}"); os.close(stdin_w)
+    saved_fd = os.dup(0); os.dup2(stdin_r, 0)
+    try:
+        status = M.main(["check-plan", "--stdin"])
+    finally:
+        os.dup2(saved_fd, 0); os.close(saved_fd); os.close(stdin_r)
+M.check_plan = saved_parse
+assert status == 1 and buffer.getvalue() == "myron-discovery: E_REFUSED\n"
+ok("unexpected exceptions exit 1 with the fixed line only")
+
+# ---------------------------------------------------------------- authorities and blockers unchanged
+seen_authority = 0
+for other in sorted((repo / "device/myron").glob("*-contract.json")):
+    value = json.loads(other.read_bytes())
+    if other.name == "discovery-contract.json" or "authority" not in value or "blockers" not in value:
+        continue
+    seen_authority += 1
+    assert all(v is False for v in value["authority"].values()) and len(value["blockers"]) == 7, other.name
+    assert value["blockers"] == contract["blockers"], other.name
+    assert "myron-discovery" not in json.dumps(value), other.name
+assert seen_authority >= 3
+assert contract["authority"]["hardware_read_authorized"] is False
+ok("authorities stay false and the seven blockers stay unchanged in every contract")
+PY
+pass "authority and blocker flags are unchanged in the device configuration"
+grep -Eq '^BOOT_METHOD=external-android$' device/myron/device.conf || fail "device.conf boot method changed"
+grep -Eq '^BOOT_IMAGES=""$' device/myron/device.conf || fail "device.conf BOOT_IMAGES is not empty"
+grep -Eq '^UFS_RW=""$' device/myron/device.conf || fail "device.conf UFS_RW is not empty"
+
+grep -Eq 'tests/myron-discovery' tests/all || fail "tests/all does not run tests/myron-discovery"
+[[ ! -e out/discovery ]] || fail "unexpected discovery artifact"
+git ls-files --others --exclude-standard | grep -Eq '^(device/myron/discovery-(request|approval|ledger)|.*provenance)' && fail "request, approval, ledger or provenance artifact present"
+pass "Phase 2.19 discovery-plan validator tests"

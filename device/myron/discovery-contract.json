@@ -1,0 +1,265 @@
+{
+  "authority": {
+    "atomic_snapshot_proof": false,
+    "atomicity_proven": false,
+    "bootable": false,
+    "deployment_authorized": false,
+    "flashable": false,
+    "hardware_qualified": false,
+    "hardware_read_authorized": false,
+    "image_ready": false,
+    "rollback_proven": false
+  },
+  "binding": {
+    "contract": "sha256-of-exact-contract-file-bytes",
+    "covers_runtime_dependencies": false,
+    "graph": "plan binds contract, implementation and review context; the contract carries no digest of itself or of the implementation",
+    "implementation": "sha256-of-captured-implementation-bytes",
+    "loader_excluded": true,
+    "synthetic_review_context": "sha256-of-canonical-json-of-review_context"
+  },
+  "blockers": [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization"
+  ],
+  "check_result": {
+    "approval_issued": false,
+    "blockers_cleared": false,
+    "evidence_collected": false,
+    "execution_supported": false,
+    "hardware_read_authorized": false,
+    "kind": "myron-discovery-check-result",
+    "meaning": "structure-only",
+    "schema": "myron-discovery-check-result/1",
+    "stage": 1,
+    "stage0_prerequisites_satisfied": false,
+    "status": "synthetic-plan-structurally-valid"
+  },
+  "domain": "synthetic-discovery-plan",
+  "exit_codes": {
+    "0": "show done or plan structurally valid",
+    "1": "refused",
+    "2": "usage"
+  },
+  "kind": "myron-discovery-planning-contract",
+  "non_goals": [
+    "real-request",
+    "acquisition-schema",
+    "producer",
+    "transport",
+    "capture",
+    "hardware-bytes",
+    "parser-adapter",
+    "approval-issuance",
+    "deployment-readiness",
+    "converter-to-capture-fixtures"
+  ],
+  "parser_ceilings": {
+    "contract_max_bytes": 65536,
+    "plan_max_bytes": 16384,
+    "plan_max_depth": 4,
+    "plan_max_items": 16,
+    "plan_max_nodes": 256,
+    "plan_max_string": 64
+  },
+  "plan": {
+    "binding_keys": [
+      "contract_sha256",
+      "implementation_sha256",
+      "synthetic_review_context_sha256"
+    ],
+    "domain": "synthetic-discovery-plan",
+    "keys": [
+      "schema",
+      "kind",
+      "domain",
+      "stage",
+      "bindings",
+      "target_ref",
+      "trust_ref",
+      "output_ref",
+      "recovery_ref",
+      "sources",
+      "operations",
+      "limits",
+      "stop_policy_id"
+    ],
+    "kind": "myron-discovery-plan",
+    "limit_keys": [
+      "max_calls",
+      "max_returned_bytes",
+      "max_elapsed_ms"
+    ],
+    "operation_keys": [
+      "sequence",
+      "source_ref",
+      "command_id",
+      "max_returned_bytes",
+      "timeout_ms"
+    ],
+    "rules": [
+      "closed exact key sets, exact types, no booleans as integers",
+      "references resolve only inside the review context",
+      "sources are unique, in review-context order, and are exactly all review-context sources",
+      "operations are serial, sequence is 1..n in list order",
+      "one operation per source and command pair; the command belongs to the source profile",
+      "operations are exactly the review context's stage1_required_operations in that order: identity and trust check first, then each topology source's topology and geometry commands; none omitted, added or reordered",
+      "at least min_distinct_topology_sources distinct sources carry the topology command",
+      "plans may lower per-operation budgets to positive values below the command ceilings",
+      "max_calls equals the operation count",
+      "operation bytes and timeouts are at most the command ceilings",
+      "aggregate operation bytes at most limits.max_returned_bytes",
+      "serial timeout sum at most limits.max_elapsed_ms",
+      "limits at most the synthetic Stage 1 ceilings"
+    ],
+    "schema": "myron-discovery-plan/1",
+    "source_keys": [
+      "source_ref",
+      "metadata_profile_id"
+    ],
+    "stage": 1
+  },
+  "purpose": "offline synthetic Stage 1 discovery planning; structural mechanism only",
+  "review_context": {
+    "commands": [
+      {
+        "command_id": "synthetic-command-identity",
+        "max_returned_bytes": 1024,
+        "max_timeout_ms": 2000
+      },
+      {
+        "command_id": "synthetic-command-topology",
+        "max_returned_bytes": 4096,
+        "max_timeout_ms": 5000
+      },
+      {
+        "command_id": "synthetic-command-geometry",
+        "max_returned_bytes": 1024,
+        "max_timeout_ms": 2000
+      }
+    ],
+    "metadata_profiles": [
+      {
+        "command_ids": [
+          "synthetic-command-identity"
+        ],
+        "metadata_profile_id": "synthetic-profile-identity"
+      },
+      {
+        "command_ids": [
+          "synthetic-command-topology",
+          "synthetic-command-geometry"
+        ],
+        "metadata_profile_id": "synthetic-profile-topology"
+      }
+    ],
+    "min_distinct_topology_sources": 2,
+    "output_refs": [
+      "synthetic-output-ref-1"
+    ],
+    "recovery_refs": [
+      "synthetic-recovery-ref-1"
+    ],
+    "sources": [
+      {
+        "metadata_profile_id": "synthetic-profile-identity",
+        "source_ref": "synthetic-source-ref-1"
+      },
+      {
+        "metadata_profile_id": "synthetic-profile-topology",
+        "source_ref": "synthetic-source-ref-2"
+      },
+      {
+        "metadata_profile_id": "synthetic-profile-topology",
+        "source_ref": "synthetic-source-ref-3"
+      }
+    ],
+    "stage1_required_operations": [
+      {
+        "command_id": "synthetic-command-identity",
+        "phase": "identity-trust-check",
+        "source_ref": "synthetic-source-ref-1"
+      },
+      {
+        "command_id": "synthetic-command-topology",
+        "phase": "topology-source-a",
+        "source_ref": "synthetic-source-ref-2"
+      },
+      {
+        "command_id": "synthetic-command-geometry",
+        "phase": "topology-source-a",
+        "source_ref": "synthetic-source-ref-2"
+      },
+      {
+        "command_id": "synthetic-command-topology",
+        "phase": "topology-source-b",
+        "source_ref": "synthetic-source-ref-3"
+      },
+      {
+        "command_id": "synthetic-command-geometry",
+        "phase": "topology-source-b",
+        "source_ref": "synthetic-source-ref-3"
+      }
+    ],
+    "stop_policy_ids": [
+      "synthetic-stop-on-first-anomaly"
+    ],
+    "target_refs": [
+      "synthetic-target-ref-1"
+    ],
+    "topology_command_id": "synthetic-command-topology",
+    "trust_refs": [
+      "synthetic-trust-ref-1"
+    ]
+  },
+  "review_context_sha256": "c592ba47b3e11ea66a98112780f15923c87d2058ed3c2b44b57bba3285d0e823",
+  "schema": "myron-discovery-contract/1",
+  "stage0": {
+    "prerequisites": [
+      "verified-real-kit-snapshot-and-preflight-request",
+      "bound-hashes-of-code-contract-and-request",
+      "target-identity-and-independent-host-identity-source",
+      "exact-stage1-metadata-sources",
+      "byte-call-and-time-limits",
+      "private-no-overwrite-output-location",
+      "operator-confirmed-recovery-and-access-path"
+    ],
+    "prerequisites_satisfied": false,
+    "status": "unresolved",
+    "waived": false
+  },
+  "stage1_synthetic_limits": {
+    "max_calls": 6,
+    "max_elapsed_ms": 30000,
+    "max_returned_bytes": 16384
+  },
+  "stage1_synthetic_limits_note": "hypothetical planning ceilings, not reviewed Stage 0 limits",
+  "stages": {
+    "supported": [
+      1
+    ],
+    "unsupported_deferred": [
+      {
+        "name": "exact-gpt-ranges-per-approved-source",
+        "stage": 2,
+        "status": "unsupported-documentation-only"
+      },
+      {
+        "name": "image-discriminator-header-and-table-ranges",
+        "stage": 3,
+        "status": "unsupported-documentation-only"
+      },
+      {
+        "name": "r4-base-dtb-source-and-selection-witness",
+        "stage": 4,
+        "status": "unsupported-documentation-only"
+      }
+    ]
+  },
+  "version": "0.1.0"
+}

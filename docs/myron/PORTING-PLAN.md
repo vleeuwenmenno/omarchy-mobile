@@ -226,6 +226,14 @@ Actual read-only layout discovery is the next approval boundary and is a staged
 session described in [DISCOVERY-GATE.md](DISCOVERY-GATE.md). It is not approved, not
 executed, adds no acquisition code, and claims no hardware readiness.
 
+Phase 2.19 (laptop-only, synthetic planning validator): `device/myron/discovery-contract.json`
+and `tools/myron-discovery` (`show`, `check-plan --stdin`) validate a synthetic Stage 1
+discovery plan against a finite public review context (scope, binding, budget and domain
+invariants). A pass is structural only: no request, approval, transport, capture, ledger
+or hardware parser adapter exists, Stages 2 to 4 stay documentation-only, Stage 0
+prerequisites stay unresolved, authority stays all false and the seven blockers are
+unchanged. See [DISCOVERY-CONTRACT.md](DISCOVERY-CONTRACT.md).
+
 Phase 2.15B (laptop-only, synthetic R3 parsers done): bootchain 0.3.0 adds
 `plan-images`, `parse-images` and `verify-images`, which parse a flat fixture of
 synthetic Android boot v0-v4, vendor boot v3/v4 and DT table v0 images, bound to
