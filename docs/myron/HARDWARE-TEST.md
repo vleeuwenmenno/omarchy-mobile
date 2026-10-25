@@ -67,10 +67,11 @@ does not start a remote processor or service.
 For this temporary test only, two disabled units bridge to exact
 checksum-pinned copies of the known-good scripts in the mounted postmarketOS
 root. The radio bridge consumes a per-boot marker asserting that a fresh
-read-only calibration backup was verified. The audio bridge has a separate
-one-shot marker and stops at ALSA-card/raw-microphone readiness. It never
-opens speaker playback. Neither unit has an install target, and ModemManager
-stays masked in the composed image.
+read-only calibration backup was verified. Before consuming that marker, it
+also verifies the complete three-module `radio-base` closure. The audio bridge
+has a separate one-shot marker and stops at ALSA-card/raw-microphone readiness.
+It never opens speaker playback. Neither unit has an install target, and
+ModemManager stays masked in the composed image.
 
 ## Rebuilt offline artifacts
 
@@ -80,6 +81,7 @@ Private, untracked artifacts produced after those fixes:
 8d9c8f5c583204ba0e8ea68cc1a3f7817e79e7b48e8e12cecc95a485cdfe73a1  myron-omarchy-hardware-test-20261025.img
 7a107847f72f08dc8e2825260fb2b258228679fc795b33fde93694a064e862c5  init_boot_a-myron-omarchy-hardware-test-20261025.img
 6f0d8512147096294688ddecd56a928fdc3ebf887355f795f43aee749fc0044c  myron-omarchy-hardware-test-20261025-r3.img
+561bcc8f5bd01e6d9c5c3a37160fbe3263394f7bbbdb731bb26359e4a148b6b2  myron-omarchy-hardware-test-20261025-r3b.img
 ```
 
 The `r3` image was composed from the real unsigned Arch stage after all new
@@ -88,6 +90,8 @@ Qualcomm userspace packages resolved. `e2fsck`, image-content checks,
 ShellCheck was rerun with a temporary pinned `shellcheck@0.11.0`. The current
 init_boot candidate is hash-bound to the earlier payload, so `r3` cannot be
 substituted without rebuilding init_boot through the existing guarded tool.
+`r3b` adds the pre-arm radio-base checksum gate discovered by the first live
+radio attempt and is the current clean candidate.
 
 The init_boot candidate embeds a 900-second watchdog and the exact known-good
 postmarketOS rollback image hash
@@ -109,3 +113,13 @@ independent recovery timer. Start only `myron-reference-radio.service`, then
 verify `wlan0`, MSS, QRTR and USB SSH before touching ModemManager. The audio
 foundation is a later, separate boot change. Speaker routing, carrier data,
 SMS, calls and GNSS fixes remain separate approval gates.
+
+The first attended radio start on 2026-10-25 stopped before MSS activation:
+the already running hot image predated the `radio-base` closure and lacked
+`rmnet_mem.ko`, `gsim.ko` and `ipam.ko`. MSS remained `offline`, the ready
+marker was absent, USB SSH stayed available, and the kernel logged no panic,
+oops, UFS error handler or I/O error. The recovery timer was cancelled after
+a fresh SSH check. The three verified modules are staged for the next boot,
+but the one-shot arm was consumed and the test must not be retried before a
+normal reboot. The bridge now checks all three hashes before consuming future
+arm markers.

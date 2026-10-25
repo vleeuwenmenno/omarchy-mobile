@@ -121,6 +121,12 @@ audio=$overlay/usr/local/sbin/myron-reference-audio-start
 devnodes=$overlay/usr/local/sbin/myron-audio-devnodes
 grep -Fq 'a66a7b7ec66873301fc9f4d994b7fca7148e1dbc7862f49a687f8d5d1dde8271' "$radio" ||
   fail 'radio bridge does not pin the proven postmarketOS script'
+for hash in \
+  45cb69314b667f2e7980464f2ad1baec18070bf02eb0e2f50ae4cfc05890a7d5 \
+  3b3b276ee395f5872b6cdd40d6d3db17e79f2153ed4e7c9d5338e2053de1e918 \
+  b7bee9eca09a826e9837aa3ebd0be487a6f97f1fe0a29365f0c44b8136eac512; do
+  grep -Fq "$hash" "$radio" || fail 'radio bridge does not pin the complete radio-base module closure'
+done
 grep -Fq '44002cfc132dd1d826b8cd770fa8b29611a15555f7dde138d9d12dcf4c7cb74b' "$audio" ||
   fail 'audio bridge does not pin the proven postmarketOS script'
 grep -Fq 'f6bd910ace05a094b2286debc32e35d059d553671f521270bb1efecf087c8d3c' "$devnodes" ||
