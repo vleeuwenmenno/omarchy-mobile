@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=audioreach-conf
+pkgver=1.0.git20260731
+pkgrel=1
+pkgdesc="Qualcomm AudioReach configuration headers and reference data"
+arch=(any)
+url="https://github.com/AudioReach/audioreach-conf"
+license=(BSD-3-Clause)
+makedepends=(autoconf automake libtool)
+_commit=a1ad7d6fcabcba00bd0db3abe435abef36342bee
+source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('184bf70f37c637ea21bd300764fd64d77984d2ac891be1324cef1aa70add7019')
+
+prepare() {
+  cd "$srcdir/audioreach-conf-$_commit"
+  autoreconf -fi
+}
+
+build() {
+  cd "$srcdir/audioreach-conf-$_commit"
+  ./configure --prefix=/usr --sysconfdir=/etc --with-qcom
+}
+
+package() {
+  cd "$srcdir/audioreach-conf-$_commit"
+  make DESTDIR="$pkgdir" install
+}

@@ -3,3 +3,8 @@ KERNEL=="kgsl-3d0", GROUP="video", MODE="0660"
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", GROUP="video", MODE="0660"
 SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", GROUP="render", MODE="0666"
 SUBSYSTEM=="input", KERNEL=="event*", GROUP="input", MODE="0660"
+# Downstream PON keys do not advertise enough metadata for systemd's generic
+# input rules.  Without these properties libinput/Hyprland never opens the
+# physical power key or resin-backed Volume Down key.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pmic_pwrkey", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pmic_resin", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1"

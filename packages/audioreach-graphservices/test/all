@@ -1,0 +1,8 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+bash -n PKGBUILD
+grep -Fq -- '--with-audio-dma-support' PKGBUILD
+grep -Fq '4ce3037f99c4dff402bd9f09f279d82941b3a431' PKGBUILD
+printf '%s\n' 'ok - pinned AudioReach graphservices package parses'

@@ -490,7 +490,9 @@ trap 'chmod -R u+rwx "$t" 2>/dev/null || true; rm -rf "$t"' EXIT
 for p in modemmanager libqmi geoclue pipewire wireplumber chrony bluez bluez-utils; do
   grep -qx "$p" rootfs/packages.base.myron || fail "Myron base profile misses $p"
 done
-for p in omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland; do
+for p in omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland \
+  qrtr rmtfs tqftpserv tinyalsa audioreach-graphservices audioreach-conf \
+  audioreach-graphmgr fastrpc; do
   grep -qx "$p" rootfs/packages.omamobile.myron || fail "Myron mobile profile misses $p"
 done
 if grep -Eq '^(omamobile-apps|vulkan-panfrost|omacam|libcamera|libcamera-ipa|pipewire-libcamera|gst-plugin-libcamera|libfprint|neard)$' \

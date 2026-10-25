@@ -302,12 +302,12 @@ closure_check() {
     check_myron_package_closure /fixture
   ') >"$t/log" 2>&1
 }
-required='omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile'
+required='omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile qrtr rmtfs tqftpserv tinyalsa audioreach-graphservices audioreach-conf audioreach-graphmgr fastrpc'
 closure_check "$required" || fail "the exact Myron provider set is rejected"
 [[ ! -s $t/log ]] || fail "the successful closure check writes output"
 if closure_check "$required omamobile-apps"; then fail "the exact forbidden package is accepted"; fi
 grep -q 'resolved forbidden packages: omamobile-apps' "$t/log" || fail "the forbidden package is rejected for the wrong reason"
-if closure_check 'mesa-myron-zink-turnip omamobile-myron-gpu-profile'; then fail "a missing required provider is accepted"; fi
+if closure_check 'mesa-myron-zink-turnip omamobile-myron-gpu-profile qrtr rmtfs tqftpserv tinyalsa audioreach-graphservices audioreach-conf audioreach-graphmgr fastrpc'; then fail "a missing required provider is accepted"; fi
 grep -q 'misses required packages: omamobile-apps-myron' "$t/log" || fail "the missing provider is rejected for the wrong reason"
 if closure_check ''; then fail "an empty installed-package listing is accepted"; fi
 grep -q 'misses required packages:' "$t/log" || fail "the empty package listing is rejected for the wrong reason"

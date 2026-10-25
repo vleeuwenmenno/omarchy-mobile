@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=audioreach-graphmgr
+pkgver=0.git20260728
+pkgrel=1
+pkgdesc="Qualcomm AudioReach graph manager and tools"
+arch=(aarch64)
+url="https://github.com/AudioReach/audioreach-graphmgr"
+license=(BSD-3-Clause)
+depends=(alsa-lib audioreach-conf audioreach-graphservices expat glib2 tinyalsa)
+makedepends=(autoconf automake libtool)
+_commit=a39867a172b29754df9acca038cc28edcbec7a57
+source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz"
+        0001-agmplay-configure-group-before-connect.patch)
+sha256sums=('65a04feebb1c8b27461fbee6a728383c24881dbd34288d3e892f0f73d57a5465'
+            '30b82cde307e260632f279af8c38bc5cfd8cef222ad092b71b016eaac943525d')
+
+prepare() {
+  cd "$srcdir/audioreach-graphmgr-$_commit"
+  patch -Np1 -i "$srcdir/0001-agmplay-configure-group-before-connect.patch"
+  autoreconf -fi
+}
+
+build() {
+  cd "$srcdir/audioreach-graphmgr-$_commit"
+  ./configure --prefix=/usr --with-glib --with-syslog --with-no-ipc \
+    --with-use-default-acdb-path --enable-alsalib
+  make
+}
+
+package() {
+  cd "$srcdir/audioreach-graphmgr-$_commit"
+  make DESTDIR="$pkgdir" install
+}

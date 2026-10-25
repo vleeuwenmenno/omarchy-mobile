@@ -7,10 +7,17 @@ set -euo pipefail
 
 /usr/bin/omamobile-setup-user
 
+# The desktop default is too shallow on Myron's tall 20:9 panel.  Keep this
+# user setting instead of changing global GTK scaling, which would also make
+# applications and the shell oversized.
+gsettings set sm.puri.Squeekboard scale-in-vertical-screen-orientation 1.8
+
 if omarchy-done ensure myron-hardware-test-monitors; then
   cat >>"$HOME/.config/hypr/monitors.lua" <<'LUA'
 
 -- Myron hardware test: downstream DRM exposes unusable zero-size outputs.
+-- The desktop-generated 3.2 scale leaves too little usable phone workspace.
+hl.monitor({ output = "DSI-1", mode = "preferred", position = "auto", scale = 2.0 })
 hl.monitor({ output = "Virtual-1", disabled = true })
 hl.monitor({ output = "Virtual-2", disabled = true })
 LUA

@@ -18,6 +18,9 @@ done
 for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/bin/myron-omarchy-setup-user" \
   "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
+  "$overlay/usr/local/sbin/myron-reference-radio-start" \
+  "$overlay/usr/local/sbin/myron-reference-audio-start" \
+  "$overlay/usr/local/sbin/myron-audio-devnodes" \
   "$overlay/usr/local/sbin/myron-omarchy-prepare" \
   "$overlay/usr/local/sbin/myron-omarchy-qualify"; do
   sh -n "$script" || fail "$script parses"
@@ -57,6 +60,10 @@ for required in card0-DSI-1 /dev/dri/card0 /dev/dri/renderD128 /dev/kgsl-3d0 \
 done
 grep -Fq 'printf '\''%s\n'\'' 0 >"$touch_raw_control"' "$prepare" ||
   fail 'prepare does not disable Xiaomi THP raw mode'
+for key in pmic_pwrkey pmic_resin; do
+  grep -Fq "classify_key $key" "$prepare" ||
+    fail "prepare does not persist runtime input classification for $key"
+done
 grep -Eq 'stable_seconds=90$' "$qualify" || fail 'qualification window is not 90 seconds'
 grep -Fq 'llvmpipe|swrast' "$qualify" || fail 'software renderer rejection is absent'
 grep -Fq 'hyprland.lock' "$qualify" ||
@@ -96,7 +103,39 @@ for output in Virtual-1 Virtual-2; do
     "$overlay/usr/local/bin/myron-omarchy-setup-user" ||
     fail "mobile setup does not disable zero-size $output"
 done
+grep -Fq 'hl.monitor({ output = "DSI-1", mode = "preferred", position = "auto", scale = 2.0 })' \
+  "$overlay/usr/local/bin/myron-omarchy-setup-user" ||
+  fail 'mobile setup does not apply the attended Myron display scale'
+grep -Fq 'scale-in-vertical-screen-orientation 1.8' \
+  "$overlay/usr/local/bin/myron-omarchy-setup-user" ||
+  fail 'mobile setup does not enlarge the portrait on-screen keyboard'
+for key in pmic_pwrkey pmic_resin; do
+  grep -Fq "ATTRS{name}==\"$key\", ENV{ID_INPUT}=\"1\", ENV{ID_INPUT_KEY}=\"1\"" \
+    "$overlay/etc/udev/rules.d/70-myron-hardware-test.rules" ||
+    fail "udev rules do not classify $key for Hyprland"
+done
 pass 'services require explicit arm marker and preserve USB rescue address'
+
+radio=$overlay/usr/local/sbin/myron-reference-radio-start
+audio=$overlay/usr/local/sbin/myron-reference-audio-start
+devnodes=$overlay/usr/local/sbin/myron-audio-devnodes
+grep -Fq 'a66a7b7ec66873301fc9f4d994b7fca7148e1dbc7862f49a687f8d5d1dde8271' "$radio" ||
+  fail 'radio bridge does not pin the proven postmarketOS script'
+grep -Fq '44002cfc132dd1d826b8cd770fa8b29611a15555f7dde138d9d12dcf4c7cb74b' "$audio" ||
+  fail 'audio bridge does not pin the proven postmarketOS script'
+grep -Fq 'f6bd910ace05a094b2286debc32e35d059d553671f521270bb1efecf087c8d3c' "$devnodes" ||
+  fail 'audio bridge does not pin the proven devnode helper'
+grep -Fq 'mv "$arm" "$consumed"' "$radio" || fail 'radio arm is not one-shot'
+grep -Fq 'mv "$arm" "$consumed"' "$audio" || fail 'audio arm is not one-shot'
+for unit in myron-reference-radio.service myron-reference-audio-foundation.service; do
+  path=$overlay/usr/lib/systemd/system/$unit
+  grep -Fq 'ConditionPathExists=/run/omamobile-myron/' "$path" ||
+    fail "$unit is not marker gated"
+  ! grep -Fxq '[Install]' "$path" || fail "$unit can be enabled persistently"
+done
+! grep -Eq '^[^#].*(amixer|aplay|pw-play)' "$audio" ||
+  fail 'audio foundation bridge includes speaker activation'
+pass 'radio and raw-audio bridges are checksum-pinned, one-shot and disabled'
 
 if grep -REq '(^|[[:space:]/])(fastboot|dd|sgdisk|parted|mkfs|wipefs)([[:space:]]|$)' \
     "$overlay"; then

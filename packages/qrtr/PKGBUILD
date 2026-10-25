@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=qrtr
+pkgver=1.2
+pkgrel=1
+pkgdesc="Userspace reference tools and library for Linux QRTR"
+arch=(aarch64)
+url="https://github.com/linux-msm/qrtr"
+license=(BSD-3-Clause)
+depends=(glibc)
+makedepends=(meson systemd)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('7a82bf80246fe71287b13c66c0466208822e8337fcd4aaf302eee6c5fcb48a52')
+
+build() {
+  arch-meson "$srcdir/qrtr-$pkgver" build -Dqrtr-ns=disabled -Dsystemd-service=disabled
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

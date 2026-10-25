@@ -20,7 +20,9 @@ Usage: tools/myron-dev-image-compose \
 
 Writes a new private ext4 payload. It never contacts a phone and never writes a
 partition. The input must be the unsigned development payload from
-tools/build-rootfs --dev-payload-image. Runtime scope is GPU, Wi-Fi and touch.
+tools/build-rootfs --dev-payload-image. Runtime scope is GPU, Wi-Fi, touch,
+radio-base and AudioReach microphone bring-up. Hardware activation remains
+disabled until an attended, separately gated test.
 EOF
 }
 
@@ -60,7 +62,7 @@ packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify verif
   --root "$modules" >/dev/null
 packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify verify-runtime \
   --manifest /home/menno/Work/myron-postmarketos/config/myron-runtime-assets.tsv \
-  --root "$runtime" --features gpu,wifi,touch >/dev/null
+  --root "$runtime" --features gpu,wifi,touch,radio-base,audio-microphone >/dev/null
 grep -Fxq 'USERNAME=menno' "$firstboot" || die 'firstboot config must create menno'
 grep -Eq '^PASSWORD_HASH=\$6\$' "$firstboot" || die 'firstboot config lacks a SHA-512 password hash'
 [[ $(grep -c '^SSH_KEY=' "$firstboot") == 1 ]] || die 'firstboot config must have exactly one SSH key'
@@ -125,12 +127,15 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/lib/myron-gpu" \
       "$root/usr/local/lib/myron-stock-modules" \
       "$root/usr/local/lib/myron-touch" \
-      "$root/usr/local/lib/myron-wireless"
+      "$root/usr/local/lib/myron-wireless" \
+      "$root/usr/local/lib/myron-audio"
     find "$root/usr/local/lib/myron-gpu" "$root/usr/local/lib/myron-stock-modules" \
       "$root/usr/local/lib/myron-touch" "$root/usr/local/lib/myron-wireless" \
+      "$root/usr/local/lib/myron-audio" \
       -type d -exec chmod 0755 {} +
     find "$root/usr/local/lib/myron-gpu" "$root/usr/local/lib/myron-stock-modules" \
       "$root/usr/local/lib/myron-touch" "$root/usr/local/lib/myron-wireless" \
+      "$root/usr/local/lib/myron-audio" \
       -type f -exec chmod 0644 {} +
     chown -R 0:0 "$root/usr/local/sbin/myron-attempt79-module-dir"
     chmod 0755 "$root/usr/local/sbin/myron-attempt79-module-dir"
@@ -141,6 +146,9 @@ docker run --rm --privileged --platform linux/arm64 \
     chmod 0755 "$root/usr/local/bin/myron-start-omarchy" \
       "$root/usr/local/bin/myron-omarchy-setup-user" \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
+      "$root/usr/local/sbin/myron-reference-radio-start" \
+      "$root/usr/local/sbin/myron-reference-audio-start" \
+      "$root/usr/local/sbin/myron-audio-devnodes" \
       "$root/usr/local/sbin/myron-omarchy-prepare" \
       "$root/usr/local/sbin/myron-omarchy-qualify"
     systemctl --root="$root" enable myron-hardware-watchdog.service \
@@ -160,7 +168,8 @@ e2fsck -fn "$out" >/dev/null
 for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot.conf \
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
   /usr/local/sbin/myron-omarchy-prepare \
-  /usr/local/lib/myron-gpu/modules/msm_kgsl.ko; do
+  /usr/local/lib/myron-gpu/modules/msm_kgsl.ko \
+  /usr/local/lib/myron-audio; do
   debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
     die "root ownership missing: $path"
 done

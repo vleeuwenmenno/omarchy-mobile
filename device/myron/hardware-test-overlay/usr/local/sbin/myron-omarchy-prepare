@@ -31,6 +31,36 @@ node_from_class() {
   chgrp "$group" "$target"
   chmod "$mode" "$target"
 }
+classify_key() {
+  name=$1
+  event=
+  for candidate in /sys/class/input/event*; do
+    [ -r "$candidate/device/name" ] || continue
+    [ "$(cat "$candidate/device/name")" = "$name" ] || continue
+    event=$candidate
+    break
+  done
+  [ -n "$event" ] || die "input key missing: $name"
+  properties=$(udevadm info -q property -p "$event" 2>/dev/null || true)
+  if ! printf '%s\n' "$properties" | grep -Fqx ID_INPUT=1 ||
+     ! printf '%s\n' "$properties" | grep -Fqx ID_INPUT_KEY=1; then
+    numbers=$(cat "$event/dev")
+    case "$numbers" in *[!0-9:]*|:*|*::*) die "invalid input numbers: $numbers" ;; esac
+    database=/run/udev/data/c$numbers
+    [ -f "$database" ] || die "input udev record missing: $name"
+    temporary=$(mktemp /run/udev/data/.myron-input.XXXXXX)
+    awk '$0 != "E:ID_INPUT=1" && $0 != "E:ID_INPUT_KEY=1"' "$database" >"$temporary"
+    printf '%s\n' E:ID_INPUT=1 E:ID_INPUT_KEY=1 >>"$temporary"
+    chmod 0644 "$temporary"
+    chown root:root "$temporary"
+    mv -f "$temporary" "$database"
+  fi
+  udevadm info -q property -p "$event" | grep -Fqx ID_INPUT=1 ||
+    die "input key is not classified: $name"
+  udevadm info -q property -p "$event" | grep -Fqx ID_INPUT_KEY=1 ||
+    die "input key is not a keyboard: $name"
+  say "input=$name state=classified"
+}
 
 [ "$(id -u)" = 0 ] || die 'must run as root'
 : >"$log"
@@ -68,8 +98,11 @@ done
 [ -w "$touch_raw_control" ] || die 'touch raw-mode control missing'
 printf '%s\n' 0 >"$touch_raw_control"
 [ "$(cat "$touch_raw_control")" = 0 ] || die 'touch raw mode remains enabled'
+udevadm control --reload
 udevadm trigger --action=add --subsystem-match=input >>"$log" 2>&1 || true
 udevadm settle --timeout=20 >>"$log" 2>&1 || die 'input udev settle failed'
+classify_key pmic_pwrkey
+classify_key pmic_resin
 touch_event=
 for event in /sys/class/input/event*; do
   [ -r "$event/device/name" ] || continue

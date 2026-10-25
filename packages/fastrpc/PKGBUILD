@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=fastrpc
+pkgver=0.git20260911
+pkgrel=2
+pkgdesc="Qualcomm FastRPC userspace libraries and daemons"
+arch=(aarch64)
+url="https://github.com/qualcomm/fastrpc"
+license=(BSD-3-Clause)
+depends=(libbsd libyaml)
+makedepends=(autoconf automake libtool)
+_commit=d247519650fe5cb16de6c78edaa95bcc4be25073
+source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('acd46c04481151ce143834c17d76e7243475c0a3d9cd562e92b924ffe180e19a')
+
+prepare() {
+  cd "$srcdir/fastrpc-$_commit"
+  autoreconf -fi
+}
+
+build() {
+  cd "$srcdir/fastrpc-$_commit"
+  ./configure --prefix=/usr --sbindir=/usr/bin \
+    --with-config-base-dir=/usr/share/qcom \
+    --with-systemdsystemunitdir=/usr/lib/systemd/system \
+    --with-udevrulesdir=/usr/lib/udev/rules.d \
+    --with-sysusersdir=/usr/lib/sysusers.d
+  make
+}
+
+package() {
+  cd "$srcdir/fastrpc-$_commit"
+  make DESTDIR="$pkgdir" install
+  rm -rf "$pkgdir/usr/lib/fastrpc_test" "$pkgdir/usr/share/fastrpc_test"
+  rm -f "$pkgdir/usr/bin/fastrpc_test" "$pkgdir/usr/bin/fastrpc-healthcheck" \
+    "$pkgdir/usr/share/man/man1/fastrpc-healthcheck.1"
+}

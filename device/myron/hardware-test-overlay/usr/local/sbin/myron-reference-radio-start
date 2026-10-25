@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Temporary bridge to the checksum-pinned, known-good postmarketOS radio/Wi-Fi
+# bring-up. This hardware test always retains the postmarketOS root at
+# /run/myron-host; a future standalone image must package a translated script.
+set -eu
+
+readonly source_script=/run/myron-host/usr/local/sbin/myron-wireless-start
+readonly source_sha=a66a7b7ec66873301fc9f4d994b7fca7148e1dbc7862f49a687f8d5d1dde8271
+readonly arm=/run/omamobile-myron/radio-backup-verified
+readonly consumed=/run/omamobile-myron/radio-backup-verified.consumed
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'radio bridge must run as root'
+[ -f "$arm" ] && [ ! -L "$arm" ] || fail 'fresh calibration-backup verification is not armed'
+[ "$(cat "$arm")" = 'verified-read-only-backup' ] || fail 'invalid backup-verification marker'
+[ -f "$source_script" ] && [ ! -L "$source_script" ] || fail 'postmarketOS radio reference is unavailable'
+[ "$(sha256sum "$source_script" | awk '{print $1}')" = "$source_sha" ] ||
+	fail 'postmarketOS radio reference checksum mismatch'
+[ -x /usr/local/sbin/myron-attempt79-module-dir ] || fail 'GKI module selector is unavailable'
+[ -d /usr/local/lib/myron-wireless ] || fail 'wireless assets are unavailable'
+[ -d /usr/local/lib/myron-stock-modules ] || fail 'stock module closure is unavailable'
+[ ! -e /run/myron-wireless-ready ] || fail 'radio/Wi-Fi foundation already started this boot'
+
+# Consume the per-boot arm before the first module or remoteproc operation.
+mv "$arm" "$consumed"
+exec /bin/sh "$source_script"

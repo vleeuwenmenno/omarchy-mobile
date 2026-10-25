@@ -1,0 +1,10 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+bash -n PKGBUILD
+grep -Fq 'd247519650fe5cb16de6c78edaa95bcc4be25073' PKGBUILD
+grep -Fq -- '--with-systemdsystemunitdir=/usr/lib/systemd/system' PKGBUILD
+grep -Fq -- '--sbindir=/usr/bin' PKGBUILD
+! grep -Fq -- '--sbindir=/usr/sbin' PKGBUILD
+printf '%s\n' 'ok - pinned FastRPC package parses'

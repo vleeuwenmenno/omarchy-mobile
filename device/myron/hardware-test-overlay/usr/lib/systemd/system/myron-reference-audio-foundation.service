@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Attended Myron AudioReach ALSA-card foundation test
+ConditionPathExists=/run/omamobile-myron/audio-foundation.armed
+Requires=myron-reference-radio.service
+After=myron-reference-radio.service systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-reference-audio-start
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+# Deliberately no [Install] section. Speaker routing is a separate safety gate.

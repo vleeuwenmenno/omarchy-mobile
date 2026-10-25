@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=tinyalsa
+pkgver=2.0.0.git20260727
+pkgrel=1
+pkgdesc="TinyALSA with plugin support for Myron AudioReach"
+arch=(aarch64)
+url="https://github.com/tinyalsa/tinyalsa"
+license=(BSD-3-Clause)
+depends=(glibc)
+makedepends=(doxygen graphviz)
+_commit=9fab97ca07184371ecad81154d1dadb09d0fa7cf
+source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('a8691e0ee8f8cf0eeef9ec62d49186ccf0c1e52f3fbd0300784acd499006f0f6')
+
+build() {
+  cd "$srcdir/tinyalsa-$_commit"
+  make CPPFLAGS="${CPPFLAGS:-} -DTINYALSA_USES_PLUGINS"
+}
+
+package() {
+  cd "$srcdir/tinyalsa-$_commit"
+  make DESTDIR="$pkgdir" PREFIX=/usr install
+}

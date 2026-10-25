@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Attended Myron radio and Wi-Fi foundation test
+ConditionPathExists=/run/omamobile-myron/radio-backup-verified
+After=local-fs.target systemd-udevd.service
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-reference-radio-start
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+# Deliberately no [Install] section. Start only from attended test runbook.

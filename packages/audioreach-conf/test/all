@@ -1,0 +1,8 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+bash -n PKGBUILD
+grep -Fq 'a1ad7d6fcabcba00bd0db3abe435abef36342bee' PKGBUILD
+grep -Fq -- '--with-qcom' PKGBUILD
+printf '%s\n' 'ok - pinned AudioReach configuration package parses'

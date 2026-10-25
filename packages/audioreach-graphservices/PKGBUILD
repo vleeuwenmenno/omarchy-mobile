@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=audioreach-graphservices
+pkgver=0.git20260730
+pkgrel=1
+pkgdesc="Qualcomm AudioReach graph service libraries"
+arch=(aarch64)
+url="https://github.com/AudioReach/audioreach-graphservices"
+license=(BSD-3-Clause)
+depends=(glib2 glibc)
+makedepends=(audioreach-kernel-headers autoconf automake libtool)
+_commit=4ce3037f99c4dff402bd9f09f279d82941b3a431
+source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('ffbaee9b6fa4d810d1fc59d5fff79f4d65a8c8590bffa55f115d7cc43842837c')
+
+prepare() {
+  cd "$srcdir/audioreach-graphservices-$_commit"
+  autoreconf -fi
+}
+
+build() {
+  cd "$srcdir/audioreach-graphservices-$_commit"
+  ./configure --prefix=/usr --with-qcom --with-syslog --with-glib \
+    --without-cutils --without-ats-transport-tcp-ip \
+    --without-ats-data-logging --with-audio-dma-support
+  make
+}
+
+package() {
+  cd "$srcdir/audioreach-graphservices-$_commit"
+  make DESTDIR="$pkgdir" install
+}

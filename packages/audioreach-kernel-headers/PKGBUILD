@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=audioreach-kernel-headers
+pkgver=0.git20260731
+pkgrel=1
+pkgdesc="AudioReach kernel userspace API headers"
+arch=(any)
+url="https://github.com/AudioReach/audioreach-kernel"
+license=(GPL-2.0-only)
+_commit=9fd751c962e0a56c35cc765386722226b3cacc36
+source=("$pkgname-$_commit.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('e916adaf8ed941ec3617ed7f85032d47814f8b387052c1a3601cd0325b2ebdd6')
+
+package() {
+  install -Dm644 "$srcdir/audioreach-kernel-$_commit/include/uapi/linux/msm_audio.h" \
+    "$pkgdir/usr/include/linux/msm_audio.h"
+}

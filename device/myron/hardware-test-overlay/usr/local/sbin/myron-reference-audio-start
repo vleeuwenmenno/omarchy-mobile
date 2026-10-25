@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Temporary bridge to the checksum-pinned postmarketOS AudioReach foundation.
+# It creates the ALSA card and raw microphone path; it does not start speakers.
+set -eu
+
+readonly source_script=/run/myron-host/usr/local/sbin/myron-audio-start
+readonly source_sha=44002cfc132dd1d826b8cd770fa8b29611a15555f7dde138d9d12dcf4c7cb74b
+readonly arm=/run/omamobile-myron/audio-foundation.armed
+readonly consumed=/run/omamobile-myron/audio-foundation.armed.consumed
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'audio bridge must run as root'
+[ -f "$arm" ] && [ ! -L "$arm" ] || fail 'audio foundation is not armed'
+[ "$(cat "$arm")" = 'verified-audio-foundation' ] || fail 'invalid audio arm marker'
+[ -s /run/myron-wireless-ready ] || fail 'radio/Wi-Fi firmware foundation is not ready'
+[ -d /usr/local/lib/myron-audio ] || fail 'AudioReach runtime assets are unavailable'
+[ -f "$source_script" ] && [ ! -L "$source_script" ] || fail 'postmarketOS audio reference is unavailable'
+[ "$(sha256sum "$source_script" | awk '{print $1}')" = "$source_sha" ] ||
+	fail 'postmarketOS audio reference checksum mismatch'
+
+# Starting ADSP and replacing the unbound mapper are one-shot for this boot.
+mv "$arm" "$consumed"
+exec /bin/sh "$source_script"

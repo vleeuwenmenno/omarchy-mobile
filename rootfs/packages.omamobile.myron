@@ -11,3 +11,13 @@ omamobile-mirror
 mesa-myron-zink-turnip
 omamobile-myron-gpu-profile
 hyprland
+# Qualcomm service foundations. They install userspace only; the temporary
+# hardware-test image keeps modem/radio/audio activation disabled by default.
+qrtr
+rmtfs
+tqftpserv
+tinyalsa
+audioreach-graphservices
+audioreach-conf
+audioreach-graphmgr
+fastrpc

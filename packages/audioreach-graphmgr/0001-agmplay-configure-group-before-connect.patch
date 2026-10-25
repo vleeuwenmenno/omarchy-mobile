@@ -1,0 +1,54 @@
+From 8d8c569e919ef55b87d46c39d98864710ee7abbb Mon Sep 17 00:00:00 2001
+From: Omarchy Mobile contributors <noreply@example.invalid>
+Date: Fri, 11 Sep 2026 02:45:00 +0200
+Subject: [PATCH] agmplay: configure groups before connecting interfaces
+
+Virtual interfaces use their parent group's media configuration while the
+physical PCM is opened. Configure that group before connecting the stream.
+---
+ plugins/tinyalsa/test/agmplay.c | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/plugins/tinyalsa/test/agmplay.c b/plugins/tinyalsa/test/agmplay.c
+index fcfe728..a84f46c 100644
+--- a/plugins/tinyalsa/test/agmplay.c
++++ b/plugins/tinyalsa/test/agmplay.c
+@@ -426,6 +426,16 @@ void play_sample(FILE *file, unsigned int card, unsigned int device, unsigned in
+-
++
+         }
+-
++
++        if (strstr(intf_name[index], "VIRT-")) {
++            if (get_group_device_info(BACKEND_CONF_FILE, intf_name[index], &grp_config[index]))
++                goto err_close_mixer;
++
++            if (set_agm_group_device_config(mixer, intf_name[index], &grp_config[index])) {
++                printf("Failed to set grp device config\n");
++                goto err_close_mixer;
++            }
++        }
++
+         /* connect pcm stream to audio intf */
+         if (connect_agm_audio_intf_to_stream(mixer, device, intf_name[index], STREAM_PCM, true)) {
+             printf("Failed to connect pcm to audio interface\n");
+@@ -455,15 +465,7 @@ void play_sample(FILE *file, unsigned int card, unsigned int device, unsigned in
+             }
+         }
+-
++
+-        if (strstr(intf_name[index], "VIRT-")) {
+-            if (get_group_device_info(BACKEND_CONF_FILE, intf_name[index], &grp_config[index]))
+-                goto err_close_mixer;
+-
+-            if (set_agm_group_device_config(mixer, intf_name[index], &grp_config[index])) {
+-                printf("Failed to set grp device config\n");
+-                goto err_close_mixer;
+-            }
+-        } else if(strstr(intf_name[index], "DISPLAY_PORT-RX")) {
++        if(strstr(intf_name[index], "DISPLAY_PORT-RX")) {
+             ret = agm_mixer_get_miid(mixer, device, intf_name[index], STREAM_PCM, DEVICE_HW_ENDPOINT_RX, &miid);
+             if (ret) {
+                 printf("Get %s Device EP module failed\n", intf_name[index]);
+--
+2.51.0

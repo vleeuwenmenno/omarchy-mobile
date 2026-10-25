@@ -7,7 +7,9 @@
 
 check_myron_package_closure() { # ROOT
   local root=$1 output name package
-  local -a required=(omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile)
+  local -a required=(omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile
+                     qrtr rmtfs tqftpserv tinyalsa audioreach-graphservices
+                     audioreach-conf audioreach-graphmgr fastrpc)
   local -a forbidden=(omamobile-apps omacam neard libcamera libcamera-ipa pipewire-libcamera
                       gst-plugin-libcamera libfprint vulkan-panfrost)
   local -a absent=() present=()

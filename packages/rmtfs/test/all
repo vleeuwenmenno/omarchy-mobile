@@ -1,0 +1,8 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+bash -n PKGBUILD
+grep -Fq 'RMTFS_EFS_PATH=/var/lib/rmtfs' PKGBUILD
+grep -Fq "pkgver=1.3" PKGBUILD
+printf '%s\n' 'ok - RMTFS package uses persistent service path'

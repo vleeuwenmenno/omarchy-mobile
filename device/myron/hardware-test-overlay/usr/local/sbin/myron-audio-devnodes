@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+readonly source_script=/run/myron-host/usr/local/sbin/myron-audio-devnodes
+readonly source_sha=f6bd910ace05a094b2286debc32e35d059d553671f521270bb1efecf087c8d3c
+[ -f "$source_script" ] && [ ! -L "$source_script" ] || {
+	printf '%s\n' 'ERROR: postmarketOS audio devnode helper is unavailable' >&2
+	exit 1
+}
+[ "$(sha256sum "$source_script" | awk '{print $1}')" = "$source_sha" ] || {
+	printf '%s\n' 'ERROR: postmarketOS audio devnode helper checksum mismatch' >&2
+	exit 1
+}
+exec /bin/sh "$source_script"

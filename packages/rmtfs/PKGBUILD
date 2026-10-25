@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=rmtfs
+pkgver=1.3
+pkgrel=1
+pkgdesc="Qualcomm Remote Filesystem Service implementation"
+arch=(aarch64)
+url="https://github.com/linux-msm/rmtfs"
+license=(BSD-3-Clause)
+depends=(glibc qrtr systemd-libs)
+makedepends=(systemd)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('4b6c398806a1046e2256a685d592833de0f37b7245b8adc4797e1791f0e117ee')
+
+build() {
+  cd "$srcdir/rmtfs-$pkgver"
+  make prefix=/usr RMTFS_EFS_PATH=/var/lib/rmtfs
+}
+
+package() {
+  cd "$srcdir/rmtfs-$pkgver"
+  make DESTDIR="$pkgdir" prefix=/usr RMTFS_EFS_PATH=/var/lib/rmtfs install
+}

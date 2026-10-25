@@ -1,0 +1,8 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+bash -n PKGBUILD
+grep -Fq -- '-DTINYALSA_USES_PLUGINS' PKGBUILD
+grep -Fq '9fab97ca07184371ecad81154d1dadb09d0fa7cf' PKGBUILD
+printf '%s\n' 'ok - pinned TinyALSA plugin package parses'
