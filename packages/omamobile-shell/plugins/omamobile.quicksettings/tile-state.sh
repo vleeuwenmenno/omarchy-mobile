@@ -94,3 +94,12 @@ print("data_status=" + " ".join(words))
 else
   echo "data=none"
 fi
+
+# Optional device bridge for a built-in microphone that PipeWire cannot open
+# through its generic ALSA profile. The command is a privacy switch: the raw
+# capture graph exists only while it reports on.
+if have omamobile-microphone; then
+  echo "mic_bridge=$(t omamobile-microphone status || echo off)"
+else
+  echo "mic_bridge=none"
+fi

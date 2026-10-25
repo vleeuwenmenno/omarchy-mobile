@@ -49,7 +49,7 @@ echo '{"enabled":false,"temperature":6500}' >"$tmp/state/night"
 
 out=$(run "$dir/tile-state.sh")
 for line in airplane=off hotspot=off powerprofile=balanced theme_mode=dark theme_name=tokyo-night \
-            nightlight=off stayawake=off record=none data=none; do
+            nightlight=off stayawake=off record=none data=none mic_bridge=none; do
   grep -cx "$line" <<<"$out" >/dev/null || fail "tile-state.sh prints $line (got: $(tr '\n' ' ' <<<"$out"))"
 done
 pass "tile-state.sh reads every probed tile"
@@ -91,6 +91,13 @@ for line in "powerprofiles autodetect power-saver" "idle allow-idle" "sit data o
   grep -cxF "$line" "$log" >/dev/null || fail "tile-action.sh runs: $line"
 done
 pass "tile-action.sh drives battery saver, stay awake, mobile data and hotspot"
+
+stub omamobile-microphone 'echo "microphone $*" >>'"$log"'; if [ "$1" = status ]; then echo off; fi; exit 0'
+grep -cx 'mic_bridge=off' <<<"$(run "$dir/tile-state.sh")" >/dev/null ||
+  fail "tile-state.sh reads the optional microphone bridge"
+run "$dir/tile-action.sh" mic on
+grep -cxF 'microphone on' "$log" >/dev/null || fail "microphone tile starts its privacy-gated bridge"
+pass "microphone tile controls the optional device bridge"
 
 if run "$dir/tile-action.sh" wifi on 2>/dev/null; then fail "unknown tiles are refused"; fi
 if run "$dir/tile-action.sh" airplane maybe 2>/dev/null; then fail "only on and off are accepted"; fi

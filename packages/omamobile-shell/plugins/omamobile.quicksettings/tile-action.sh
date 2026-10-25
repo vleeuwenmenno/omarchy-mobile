@@ -88,6 +88,9 @@ case $tile in
   mobile-data)
     exec omamobile-sit data "$want"
     ;;
+  mic)
+    exec omamobile-microphone "$want"
+    ;;
   *)
     echo "tile-action.sh: unknown tile $tile" >&2
     exit 2

@@ -55,6 +55,12 @@ fi
 sh -n plugins/omamobile.quicksettings/tile-state.sh || fail "tile-state.sh parses"
 sh -n plugins/omamobile.quicksettings/tile-action.sh || fail "tile-action.sh parses"
 bash test/tile-scripts.sh || fail "quick-settings tile scripts"
+grep -Fq 'for d in amber:flash-2 white:torch white:flash-1' plugins/omamobile.quicksettings/QuickSettings.qml \
+  || fail "torch does not prefer Myron's physically verified LED"
+grep -Fq 'visible: torch.available && torch.enabled' plugins/omamobile.quicksettings/QuickSettings.qml \
+  || fail "enabled torch lacks its intensity slider"
+grep -Fq 'onMoved: function(value) { torch.set(value) }' plugins/omamobile.quicksettings/QuickSettings.qml \
+  || fail "torch intensity slider is not connected"
 
 # The Bluetooth pairing helper parses, and its pure parts work without D-Bus.
 python3 -B -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' bin/omamobile-bt-agent || fail "omamobile-bt-agent parses"
@@ -192,6 +198,8 @@ grep -c '"omamobile-launch", "url", uri' bin/omamobile-nfc-open >/dev/null || fa
 grep -c '"omamobile-launch", "empty"' bin/omamobile-widget >/dev/null || fail "the widget agent's terminal gets an empty workspace"
 grep -c '"omamobile-launch", "show-with"' plugins/omamobile.switcher/Switcher.qml >/dev/null || fail "the switcher shows apps together"
 grep -c '"omamobile-launch", "own-screen"' plugins/omamobile.switcher/Switcher.qml >/dev/null || fail "the switcher moves apps to their own screen"
+grep -Fq 'live: false' plugins/omamobile.switcher/Switcher.qml \
+  || fail "the switcher continuously captures recents previews"
 if command -v node >/dev/null; then
   node -e '
 const L = require("./plugins/omamobile.launcher/LauncherModel.js")

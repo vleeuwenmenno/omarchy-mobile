@@ -420,11 +420,20 @@ Item {
   QtObject {
     id: mic
     readonly property var source: Pipewire.defaultAudioSource
-    readonly property bool available: !!source && !!source.audio
-    readonly property bool enabled: available && !source.audio.muted
+    readonly property bool bridgeAvailable: root.probedHas("mic_bridge")
+    readonly property bool available: bridgeAvailable || (!!source && !!source.audio)
+    readonly property bool enabled: bridgeAvailable
+      ? root.probedOn("mic", "mic_bridge")
+      : available && !source.audio.muted
     readonly property string icon: enabled ? "󰍬" : "󰍭"
-    readonly property string status: !available ? "No microphone" : enabled ? "On" : "Muted"
-    function toggle() { if (available) source.audio.muted = !source.audio.muted }
+    readonly property string status: !available ? "No microphone"
+      : bridgeAvailable ? (enabled ? "On" : "Off")
+      : enabled ? "On" : "Muted"
+    function toggle() {
+      if (!available) return
+      if (bridgeAvailable) root.runTileAction("mic", !enabled)
+      else source.audio.muted = !source.audio.muted
+    }
   }
 
   PwObjectTracker { objects: mic.source ? [mic.source] : [] }
@@ -912,6 +921,9 @@ Item {
 
     property bool available: false
     property bool enabled: false
+    property string device: ""
+    property int percent: 25
+    property int pendingPercent: -1
     readonly property string icon: "󰉄"
     readonly property string status: !available ? "No flash LED" : enabled ? "On" : "Off"
 
@@ -920,31 +932,61 @@ Item {
     }
 
     function toggle() {
-      if (!available || torchWrite.running) return
-      torchWrite.command = ["brightnessctl", "--device=white:torch", "--quiet", "set", enabled ? "0" : "100%"]
+      if (!available || !device || torchWrite.running) return
+      writePercent(enabled ? 0 : percent)
+    }
+
+    function set(fraction) {
+      percent = Math.max(1, Math.round(fraction * 100))
+      pendingPercent = percent
+      if (!torchWrite.running) flush()
+    }
+
+    function writePercent(value) {
+      torchWrite.command = ["brightnessctl", "--device=" + device, "--quiet", "set", value + "%"]
       torchWrite.running = true
+    }
+
+    function flush() {
+      if (pendingPercent < 0 || !available || !device) return
+      var value = pendingPercent
+      pendingPercent = -1
+      writePercent(value)
     }
   }
 
   Process {
     id: torchRead
-    command: ["brightnessctl", "--device=white:torch", "--machine-readable", "info"]
+    // Myron's physically verified rear torch is amber:flash-2. Keep generic
+    // names as fallbacks for other supported devices.
+    command: ["sh", "-c", "for d in amber:flash-2 white:torch white:flash-1; do brightnessctl --device=\"$d\" --machine-readable info 2>/dev/null && exit 0; done; exit 1"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         // device,class,current,percent%,max
         var parts = String(text || "").trim().split(",")
         var current = parts.length >= 3 ? parseInt(parts[2], 10) : NaN
+        torch.device = isFinite(current) ? parts[0] : ""
         torch.available = isFinite(current)
         torch.enabled = isFinite(current) && current > 0
+        var value = parts.length >= 4 ? parseInt(parts[3], 10) : NaN
+        if (torch.enabled && isFinite(value)) torch.percent = Math.max(1, value)
       }
     }
-    onExited: function(exitCode) { if (exitCode !== 0) torch.available = false }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        torch.device = ""
+        torch.available = false
+      }
+    }
   }
 
   Process {
     id: torchWrite
-    onExited: torch.refresh()
+    onExited: {
+      torch.refresh()
+      torch.flush()
+    }
   }
 
   // ---------------------------------------------------------------- brightness
@@ -1492,6 +1534,16 @@ Item {
             available: brightness.available
             unavailableText: "No backlight"
             onMoved: function(value) { brightness.set(value) }
+          }
+
+          SliderRow {
+            visible: torch.available && torch.enabled
+            width: parent.width
+            icon: "󰉄"
+            value: torch.percent / 100
+            available: torch.available
+            unavailableText: "No flash LED"
+            onMoved: function(value) { torch.set(value) }
           }
 
           SliderRow {

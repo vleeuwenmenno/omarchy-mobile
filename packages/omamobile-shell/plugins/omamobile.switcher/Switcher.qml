@@ -259,7 +259,11 @@ Item {
             anchors.fill: parent
             anchors.margins: card.border.width
             captureSource: root.opened ? slot.modelData : null
-            live: true
+            // A still preview is enough for recents. Continuously copying and
+            // scaling every open surface makes the software Qt Quick fallback
+            // unusably slow on devices whose shell cannot use a GPU scenegraph.
+            // Rebinding captureSource on every open takes a fresh snapshot.
+            live: false
           }
 
           // Tap to switch; hold for "Show with…" and "Move to its own screen".
