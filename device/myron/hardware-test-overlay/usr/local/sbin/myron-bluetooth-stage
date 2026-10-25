@@ -9,6 +9,7 @@ readonly probe=/usr/local/sbin/myron-bluetooth-qca-probe
 readonly probe_sha=4a9d4da29c7ef46f4dcb08385e4c5ff85b16344884d4239c40b53923c5258608
 readonly btpower=/usr/local/lib/myron-audio/modules/btpower.ko
 readonly btpower_sha=3280aab7f8f07f6f7b4ec032c68852951d0d76b73ed25b799728cdc55ccdb39a
+readonly btpower_vermagic='6.12.23-android16-5-maybe-dirty-4k SMP preempt mod_unload modversions aarch64'
 readonly patch_sha=6631fe3562dbb329e2be19f157c55ae8600e24643de3dd8feb2524e21af77b0a
 readonly nvm_sha=669b8a7e03660fad976b48a58871759a8e5188f2b3b32e73419fd170710af763
 readonly runtime_dir=/run/myron-bluetooth
@@ -148,6 +149,8 @@ require_common() {
 		fail 'AudioReach must not run in the Bluetooth boot'
 	check_hash "$probe" "$probe_sha"
 	check_hash "$btpower" "$btpower_sha"
+	[ "$(modinfo -F vermagic "$btpower")" = "$btpower_vermagic" ] ||
+		fail 'stock btpower module metadata mismatch'
 	select_modules
 }
 
@@ -286,8 +289,9 @@ start_test() {
 		[ -d "/sys/module/$prerequisite" ] || fail "missing btpower prerequisite: $prerequisite"
 	done
 	if [ ! -d /sys/module/btpower ]; then
-		[ "$(modinfo -F vermagic "$btpower" | awk '{print $1}')" = "$expected_kernel" ] ||
-			fail 'btpower module/kernel release mismatch'
+		check_hash "$btpower" "$btpower_sha"
+		[ "$(modinfo -F vermagic "$btpower")" = "$btpower_vermagic" ] ||
+			fail 'stock btpower module metadata mismatch'
 		persist 'stage=start module=btpower.ko action=insmod'
 		insmod "$btpower" || fail 'btpower module insertion failed'
 		persist 'stage=start module=btpower.ko result=loaded'

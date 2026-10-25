@@ -246,6 +246,7 @@ pass 'radio and checkpointed raw-audio bridges are pinned, silent and crash-audi
 for required in \
   '4a9d4da29c7ef46f4dcb08385e4c5ff85b16344884d4239c40b53923c5258608' \
   '3280aab7f8f07f6f7b4ec032c68852951d0d76b73ed25b799728cdc55ccdb39a' \
+  '6.12.23-android16-5-maybe-dirty-4k SMP preempt mod_unload modversions aarch64' \
   '6631fe3562dbb329e2be19f157c55ae8600e24643de3dd8feb2524e21af77b0a' \
   '669b8a7e03660fad976b48a58871759a8e5188f2b3b32e73419fd170710af763' \
   'mount -t vfat -o ro,nosuid,nodev,noexec' \
@@ -262,6 +263,10 @@ for required in \
   grep -Fq "$required" "$bluetooth_stage" ||
     fail "checkpointed Bluetooth runner lacks: $required"
 done
+grep -Fq 'stock btpower module metadata mismatch' "$bluetooth_stage" ||
+  fail 'Bluetooth runner does not verify exact stock btpower metadata'
+! grep -Fq "modinfo -F vermagic \"\$btpower\" | awk '{print \$1}'" "$bluetooth_stage" ||
+  fail 'Bluetooth runner incorrectly requires stock btpower release token to equal GKI uname'
 grep -Fxq 'umask 077' "$bluetooth_stage" ||
   fail 'Bluetooth runner does not protect transient controller and scan logs'
 for module in rfkill.ko pwrseq-core.ko bluetooth.ko btbcm.ko btqca.ko hci_uart.ko; do

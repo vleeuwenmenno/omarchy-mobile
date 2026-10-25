@@ -244,6 +244,14 @@ size- and hash-verifies board-ID-00 `gngbtfw20.mbn` and `gngbtnv20.bin`.
 Those proprietary files stay on the phone. BlueZ is started with systemd only;
 the Alpine reference probe's OpenRC path is not used.
 
+The stock `btpower.ko` deliberately has the complete vermagic
+`6.12.23-android16-5-maybe-dirty-4k SMP preempt mod_unload modversions
+aarch64`, while the matched candidate kernel reports the same source through
+its Git-describe release token. The GKI loader with modversions accepts this
+known stock module; the stage therefore pins its full stock vermagic and hash
+instead of incorrectly requiring its first token to equal `uname -r`. All
+rebuilt GKI Bluetooth modules still require the exact running release token.
+
 `scan` is bounded to eight seconds. Raw output exists only in `/run`, is mode
 `0600`, and is deleted after counting discovery events, so nearby addresses
 and names never enter persistent logs. Success powers off the controller,
@@ -266,10 +274,18 @@ Emergency cleanup is idempotent:
 sudo myron-bluetooth-stage stop
 ```
 
+The first v9 hardware run reached the Bluetooth start checkpoint at 62.9 C,
+loaded the six exact rebuilt GKI modules, then stopped before inserting
+`btpower.ko`: an over-strict userspace check compared the stock module's
+`maybe-dirty` release token with the candidate kernel's Git-describe token.
+Failure cleanup completed, left `hci0` absent and BlueZ inactive, and the exact
+postmarketOS `init_boot_a` was restored. This is a staging-guard failure, not a
+Bluetooth hardware result.
+
 ## Next attended sequence
 
-1. Build the Bluetooth successor and verify its payload/init-boot hash pair
-   offline.
+1. Build the Bluetooth successor with the corrected stock-module metadata
+   gate and verify its payload/init-boot hash pair offline.
 2. Boot it with ModemManager, GNSS and AudioReach stopped. Qualify DSI/GPU,
    start only the radio foundation, then run the four Bluetooth commands above.
 3. Add attended physical power/volume, visible brightness and haptics probes.

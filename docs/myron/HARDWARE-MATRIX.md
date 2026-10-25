@@ -105,10 +105,12 @@ reference statuses above:
   ModemManager/GNSS caused an immediate hard reboot. A later separate clean
   boot passed the checkpointed mapper, ADSP, codec, microphone and speaker
   path; mixing those subsystem sequences remains forbidden.
-- **Present but unverified on Omarchy:** UPower UI and haptics. The next
-  candidate includes a one-shot, watchdog-supervised WCN786x/BlueZ test, but
-  it has not run on hardware yet. Only two ADC IIO nodes exist, and no
-  camera/media or fingerprint node is exposed.
+- **Present but unverified on Omarchy:** UPower UI and haptics. The first
+  one-shot WCN786x/BlueZ run stopped safely before `btpower.ko` insertion on an
+  over-strict stock-versus-GKI vermagic string check; cleanup passed and this
+  produced no Bluetooth hardware result. A corrected successor is pending.
+  Only two ADC IIO nodes exist, and no camera/media or fingerprint node is
+  exposed.
 - **Not integrated on Omarchy:** SMS, voice calls/call audio, fingerprint and
   camera capture. The current reference boot also exposes no camera/media or
   fingerprint character nodes, and only two ADC IIO devices.
