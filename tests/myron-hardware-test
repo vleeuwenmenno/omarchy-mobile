@@ -114,6 +114,11 @@ for key in pmic_pwrkey pmic_resin; do
     "$overlay/etc/udev/rules.d/70-myron-hardware-test.rules" ||
     fail "udev rules do not classify $key for Hyprland"
 done
+grep -Fq 'KERNEL=="rmnet_ipa0"' "$overlay/etc/udev/rules.d/70-myron-hardware-test.rules" ||
+  fail 'downstream IPA net port classification is missing'
+grep -Fq 'ENV{ID_MM_PHYSDEV_UID}="qcom-soc"' \
+  "$overlay/etc/udev/rules.d/70-myron-hardware-test.rules" ||
+  fail 'downstream IPA net port is not grouped with the QRTR modem'
 pass 'services require explicit arm marker and preserve USB rescue address'
 
 radio=$overlay/usr/local/sbin/myron-reference-radio-start
