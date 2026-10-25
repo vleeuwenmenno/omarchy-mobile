@@ -2967,6 +2967,8 @@ def parse_fdt_blob(component: bytes, base: int) -> dict:
             raise selection_corrupt("the structure block ends without FDT_END")
         token = fdt_u32(component, pointer, stop)
         pointer += 4
+        if not saw_root and token != FDT_BEGIN_NODE:
+            raise selection_corrupt("the structure block does not begin with a root node")
         if token == FDT_BEGIN_NODE:
             if depth == 0 and saw_root:
                 raise selection_corrupt("the structure block holds a second root node")

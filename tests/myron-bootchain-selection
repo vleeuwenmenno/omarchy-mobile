@@ -487,10 +487,11 @@ root_structure = (
     + S.pad4(S.COMPATIBLE + b"\0")
     + S.be32(S.END_NODE) + S.be32(S.END)
 )
-leading_nop = B.parse_fdt_component(
-    S.fdt(compatible=None, struct_raw=S.be32(S.NOP) + root_structure, strings_raw=b"compatible\0")
+fdt_case(
+    "FDT_NOP before the root node",
+    S.fdt(compatible=None, struct_raw=S.be32(S.NOP) + root_structure, strings_raw=b"compatible\0"),
+    "selection-corrupt",
 )
-assert leading_nop[0]["properties"] == 1, "FDT_NOP before the root node is ignored"
 fdt_case("an unknown structure token", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(7) + S.be32(2) + S.be32(9)), "selection-corrupt")
 fdt_case("a missing FDT_END", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(2) + S.be32(4)), "selection-corrupt")
 fdt_case("a structure block ending in a node", S.fdt(struct_raw=S.be32(1) + bytes(4) + S.be32(4) + S.be32(4)), "selection-corrupt")
