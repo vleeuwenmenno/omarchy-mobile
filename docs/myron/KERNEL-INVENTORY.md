@@ -202,6 +202,15 @@ unqualified on real modules and vendor modules `not-verified`. The overlay
 order and deployment blocker remain unverified; no real archive/symvers set has
 been bound.
 
+Phase 2.17 adds `device/myron/kernel-source-contract.json` and the laptop-only
+`tools/myron-kernel-source` 0.1.0 (`show`, `plan`, `verify --root`). It verifies the
+identity and structure of an external private source bundle (lock, manifest, one
+fragment and patches `0001`, `0002`, `0003`, `0007`; `0004`-`0006` stay excluded)
+against hashes derived from this kernel contract. No bundle bytes are distributed,
+publication and licensing are unresolved, and source availability, ancestry, patch
+applicability, fragment use, toolchain and build output stay unverified. Activation
+stays disabled ([KERNEL-SOURCE-GATE.md](KERNEL-SOURCE-GATE.md)).
+
 The Phase 2 package follows that rule: it installs only a Python verifier,
 contract JSON, documentation, license, and version. It has no systemd unit,
 pacman hook, module payload, firmware, Image, DTB/DTBO, or partition writer.

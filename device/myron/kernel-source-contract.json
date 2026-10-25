@@ -1,0 +1,139 @@
+{
+  "schema": 1,
+  "kind": "myron-kernel-source-contract",
+  "version": "0.1.0",
+  "kernel_contract": {
+    "path": "device/myron/kernel-contract.json",
+    "sha256": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193",
+    "size": 2781
+  },
+  "bundle": {
+    "root": "external-private-absolute-path",
+    "directories": [
+      "patches"
+    ],
+    "files": [
+      {
+        "path": "source-lock.json",
+        "role": "source-lock",
+        "size": 10578,
+        "sha256": "fdf5ce28910e227bf8d22f08234d3023283e020542b38c3b9fba694f0d285f91"
+      },
+      {
+        "path": "stamped-manifest.xml",
+        "role": "manifest",
+        "size": 269,
+        "sha256": "a08766933b4082d81e87a48d0f49dc11c47129ce087de9194b84291d80dc9112"
+      },
+      {
+        "path": "vt.fragment",
+        "role": "fragment",
+        "size": 345,
+        "sha256": "2808f002d7eb9ac3a2ed6c0148440c6107f8c1ca29c152a84981d2eac47cc5c0"
+      },
+      {
+        "path": "patches/0001-bluetooth-qca-preinitialized-ibs.patch",
+        "role": "patch",
+        "size": 2192,
+        "sha256": "21eba92d87356b41115b5bbfd90943d1f3ae331fe4c0522d498e1ce7c1bda399"
+      },
+      {
+        "path": "patches/0002-bluetooth-qca-vote-msm-geni-uart-clock.patch",
+        "role": "patch",
+        "size": 3659,
+        "sha256": "b3be02fc2c92c81542e570df02a42777ae1e7ac9bf7d5f6e4f204142ec2d32ac"
+      },
+      {
+        "path": "patches/0003-gki-export-rmnet-module.patch",
+        "role": "patch",
+        "size": 658,
+        "sha256": "4d95dd11c1a002f94a25a36953a1c0303132b4c2c1af57d8291baa0176da5e6c"
+      },
+      {
+        "path": "patches/0007-ipc-export-namespace-symbols.patch",
+        "role": "patch",
+        "size": 1032,
+        "sha256": "7ed11e94e5d242b24e5bec1213810a1b38d31a55817c29c74e8d2709d5ac54ac"
+      }
+    ],
+    "derived_from_kernel_contract": [
+      "source.lock_sha256",
+      "source.manifest_sha256",
+      "source.patches"
+    ],
+    "new_pin": "vt.fragment",
+    "qualification_sha256": "9dffb6b7de667c7b922d451a6a569a998b8e0c8a78c4a004c1165e5dee0983c9",
+    "patch_order": [
+      "0001-bluetooth-qca-preinitialized-ibs.patch",
+      "0002-bluetooth-qca-vote-msm-geni-uart-clock.patch",
+      "0003-gki-export-rmnet-module.patch",
+      "0007-ipc-export-namespace-symbols.patch"
+    ],
+    "patch_target": "common",
+    "patches_not_pinned": [
+      "0004",
+      "0005",
+      "0006"
+    ]
+  },
+  "source_lock_profile": {
+    "schema": 1,
+    "projects": 50,
+    "links": 4,
+    "overrides": [
+      "common",
+      "build/kernel"
+    ],
+    "gki_revision_binding": "kernel.gki_source_revision",
+    "manifest_projects": [
+      {
+        "path": "common",
+        "name": "kernel/common"
+      },
+      {
+        "path": "build/kernel",
+        "name": "kernel/build"
+      }
+    ]
+  },
+  "filesystem": {
+    "root_mode": "0700",
+    "directory_mode": "0700",
+    "file_mode": "0600",
+    "link_count": 1,
+    "mount_check": "fdinfo-mnt_id-fail-closed",
+    "atomic_snapshot": false,
+    "same_user_writer_protection": false
+  },
+  "limits": {
+    "invocation_bytes": 524288,
+    "contract_and_lock_bytes": 65536,
+    "manifest_and_fragment_bytes": 4096,
+    "patch_bytes": 65536,
+    "json_depth": 8,
+    "output_bytes": 65536
+  },
+  "bytes_distributed": false,
+  "authority": {
+    "source_availability": false,
+    "revision_ancestry": false,
+    "patch_applicability": false,
+    "fragment_use": false,
+    "toolchain": false,
+    "build_output": false,
+    "activation": false,
+    "deployment": false
+  },
+  "activation": {
+    "mode": "disabled",
+    "blocker": "unchanged"
+  },
+  "unverified": [
+    "source-availability",
+    "revision-ancestry",
+    "patch-applicability",
+    "fragment-use",
+    "toolchain",
+    "build-output"
+  ]
+}

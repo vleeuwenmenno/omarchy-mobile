@@ -132,6 +132,13 @@ board id, revision and source. R4 stays deferred as `hardware-witness-required`
 blockers stay missing. See
 [R4-SELECTION-GATE.md](../../docs/myron/R4-SELECTION-GATE.md).
 
+Phase 2.17 adds `kernel-source-contract.json` and `tools/myron-kernel-source` 0.1.0, an
+identity-and-structure check of an external private source bundle (no bytes distributed;
+publication and licensing unresolved; nothing about source availability, ancestry,
+applicability, fragment use, toolchain or build output is verified; activation stays
+disabled). See
+[KERNEL-SOURCE-GATE.md](../../docs/myron/KERNEL-SOURCE-GATE.md).
+
 Phase 2.16 readiness is documentation only: the synthetic parser work is complete, and
 actual read-only layout discovery is the next approval boundary. It is a staged
 session that is not approved and not executed, with no acquisition code added and no

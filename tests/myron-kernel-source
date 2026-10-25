@@ -1,0 +1,766 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the Myron external kernel-source bundle verifier (Phase 2.17).
+# Everything is synthetic: no private bundle, no phone, no network, no process.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+tool=tools/myron-kernel-source
+impl=tools/lib/myron-kernel-source-impl.py
+python3 -B -m py_compile "$tool" "$impl" 2>/dev/null || python3 -c 'import ast,sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]' "$tool" "$impl" || fail "tool parses"
+for f in "$tool" "$impl"; do
+  grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http|ctypes|ssl|requests|zipfile|tarfile|gzip|zlib|lzma|bz2|pty|signal|tempfile)|os\.(system|popen|exec|spawn|fork|mkdir|makedirs|rename|replace|unlink|remove|rmdir|chmod|chown|write|symlink|link)\(|posix_spawn' "$f" \
+    && fail "$f references process, network, archive, or write facilities"
+  grep -Eqi '\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b' "$f" && fail "$f names a live transport command"
+  grep -Eq 'os\.environ|getenv|argparse|traceback' "$f" && fail "$f reads the environment or prints tracebacks"
+done
+[[ $(wc -l < "$tool") -le 90 ]] || fail "the trusted loader grew past 90 lines"
+pass "loader and implementation parse and have no process, network, environment, or write facility"
+[[ -x $tool ]] || fail "tool is not executable"
+[[ ! -e device/myron/kernel-source ]] || fail "device/myron/kernel-source exists: no private bytes may live in the repository"
+pass "no bundle bytes in the repository"
+
+[[ $("$tool" --version) == 0.1.0 ]] || fail "version"
+"$tool" show > "$tmp/show.json" || fail "show failed"
+cmp -s "$tmp/show.json" device/myron/kernel-source-contract.json || fail "show differs from the committed contract"
+"$tool" plan > "$tmp/plan.json" || fail "plan failed"
+(cd / && "$OLDPWD/$tool" show | cmp -s - "$tmp/show.json") || fail "show depends on the working directory"
+(cd / && "$OLDPWD/$tool" plan | cmp -s - "$tmp/plan.json") || fail "plan depends on the working directory"
+[[ $(wc -c < "$tmp/plan.json") -le 65536 ]] || fail "plan exceeds 64 KiB"
+pass "production show and plan are deterministic across working directories"
+
+set +e
+for args in "" "bogus" "show extra" "plan extra" "verify" "verify --root" "verify --root a b" "--root /x" "--version x" "verify --root=/x" "verify /x"; do
+  # shellcheck disable=SC2086
+  KERNEL_SOURCE_ROOT=/x "$tool" $args > "$tmp/out" 2> "$tmp/err"; rc=$?
+  [[ $rc -eq 2 && ! -s $tmp/out && $(cat "$tmp/err") == "myron-kernel-source: E_USAGE" ]] || fail "misuse '$args' rc=$rc"
+done
+for root in relative /nonexistent/x /tmp/ /tmp//x /tmp/./x /tmp/../x /; do
+  "$tool" verify --root "$root" > "$tmp/out" 2> "$tmp/err"; rc=$?
+  [[ $rc -eq 1 && ! -s $tmp/out && $(cat "$tmp/err") == "myron-kernel-source: E_REFUSED" ]] || fail "refusal '$root' rc=$rc"
+done
+set -e
+pass "misuse exits 2 and refusals exit 1 with empty stdout and one fixed stderr line"
+
+python3 -B - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib, copy, hashlib, importlib.machinery, importlib.util, json, os, socket, stat
+import subprocess, sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+K = load("kernel_source_test", repo / "tools/myron-kernel-source")
+R = K.Refusal
+sha = lambda data: hashlib.sha256(data).hexdigest()
+
+
+def expect(reason, function, *args, **kwargs):
+    try:
+        function(*args, **kwargs)
+    except R as error:
+        assert error.reason == reason, (reason, error.reason)
+        return
+    raise AssertionError(f"expected refusal {reason}")
+
+
+def ok(message):
+    print(f"ok - {message}")
+
+
+# ---------------------------------------------------------------- production binding
+kernel_bytes = (repo / "device/myron/kernel-contract.json").read_bytes()
+assert sha(kernel_bytes) == "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193"
+assert len(kernel_bytes) == K.KERNEL_CONTRACT_SIZE
+kernel = json.loads(kernel_bytes)
+contract_bytes = (repo / "device/myron/kernel-source-contract.json").read_bytes()
+assert contract_bytes == K.render_json(K.expected_contract())
+contract = json.loads(contract_bytes)
+assert contract["schema"] == 1 and contract["version"] == "0.1.0"
+assert contract["kernel_contract"]["sha256"] == sha(kernel_bytes)
+pins = {f["path"]: f for f in contract["bundle"]["files"]}
+assert [f["path"] for f in contract["bundle"]["files"]] == [
+    "source-lock.json", "stamped-manifest.xml", "vt.fragment",
+    "patches/0001-bluetooth-qca-preinitialized-ibs.patch",
+    "patches/0002-bluetooth-qca-vote-msm-geni-uart-clock.patch",
+    "patches/0003-gki-export-rmnet-module.patch",
+    "patches/0007-ipc-export-namespace-symbols.patch"]
+assert pins["source-lock.json"]["sha256"] == kernel["source"]["lock_sha256"]
+assert pins["stamped-manifest.xml"]["sha256"] == kernel["source"]["manifest_sha256"]
+for name, digest in kernel["source"]["patches"].items():
+    assert pins["patches/" + name]["sha256"] == digest
+assert list(kernel["source"]["patches"]) == list(K.PATCH_NAMES)
+assert not any(n[:4] in ("0004", "0005", "0006") for n in K.PATCH_NAMES)
+assert [(f["size"], f["sha256"]) for f in contract["bundle"]["files"]] == [
+    (10578, "fdf5ce28910e227bf8d22f08234d3023283e020542b38c3b9fba694f0d285f91"),
+    (269, "a08766933b4082d81e87a48d0f49dc11c47129ce087de9194b84291d80dc9112"),
+    (345, "2808f002d7eb9ac3a2ed6c0148440c6107f8c1ca29c152a84981d2eac47cc5c0"),
+    (2192, "21eba92d87356b41115b5bbfd90943d1f3ae331fe4c0522d498e1ce7c1bda399"),
+    (3659, "b3be02fc2c92c81542e570df02a42777ae1e7ac9bf7d5f6e4f204142ec2d32ac"),
+    (658, "4d95dd11c1a002f94a25a36953a1c0303132b4c2c1af57d8291baa0176da5e6c"),
+    (1032, "7ed11e94e5d242b24e5bec1213810a1b38d31a55817c29c74e8d2709d5ac54ac")]
+assert all(v is False for v in contract["authority"].values())
+assert contract["activation"] == {"mode": "disabled", "blocker": "unchanged"}
+assert contract["bytes_distributed"] is False
+assert "device/myron/kernel-source-contract" not in kernel_bytes.decode()
+plan = json.loads((work / "plan.json").read_text())
+assert plan["kind"] == "myron-kernel-source-plan" and "https" not in json.dumps(plan)
+env = K.load_environment()
+assert env["gki_revision"] == kernel["kernel"]["gki_source_revision"]
+ok("contract is canonical, derives six hashes from the bound kernel contract, pins the fragment, and authorizes nothing")
+
+# negative binding: mutated repository copies
+fake = work / "fake-repo"
+(fake / "device/myron").mkdir(parents=True)
+saved = (K.repo_root, K.KERNEL_CONTRACT_SHA256, K.KERNEL_CONTRACT_SIZE)
+
+
+def bind(kernel_data, contract_data):
+    (fake / "device/myron/kernel-contract.json").write_bytes(kernel_data)
+    (fake / "device/myron/kernel-source-contract.json").write_bytes(contract_data)
+    os.chmod(fake / "device/myron/kernel-contract.json", 0o644)
+    os.chmod(fake / "device/myron/kernel-source-contract.json", 0o644)
+
+
+def with_fake(kernel_data, contract_data, rebind=False):
+    if rebind:
+        # keep the contract consistent with the mutated kernel contract so only
+        # the cross-checks against the kernel contract's content can refuse
+        K.KERNEL_CONTRACT_SHA256, K.KERNEL_CONTRACT_SIZE = sha(kernel_data), len(kernel_data)
+        contract_data = K.render_json(K.expected_contract())
+    bind(kernel_data, contract_data)
+    K.repo_root = lambda: str(fake)
+    try:
+        return K.load_environment()
+    finally:
+        K.repo_root, K.KERNEL_CONTRACT_SHA256, K.KERNEL_CONTRACT_SIZE = saved
+
+
+def patched_kernel(mutate):
+    value = copy.deepcopy(kernel)
+    mutate(value)
+    return (json.dumps(value, indent=2) + "\n").encode()
+
+
+with_fake(kernel_bytes, contract_bytes)
+expect("repository-size", with_fake, kernel_bytes + b" ", contract_bytes)
+expect("kernel-contract-hash", with_fake, kernel_bytes.replace(b"6.12", b"6.13"), contract_bytes)
+expect("contract-mismatch", with_fake, kernel_bytes, contract_bytes.replace(b"0.1.0", b"0.1.1"))
+expect("contract-mismatch", with_fake, kernel_bytes, contract_bytes + b"\n")
+expect("contract-mismatch", with_fake, kernel_bytes, contract_bytes.replace(b'"size": 10578', b'"size": 10579'))
+
+
+def swap_patch(v):
+    v["source"]["patches"]["0001-bluetooth-qca-preinitialized-ibs.patch"] = "0" * 64
+
+
+def reorder(v):
+    patches = v["source"]["patches"]
+    v["source"]["patches"] = dict(reversed(list(patches.items())))
+
+
+def extra_patch(v):
+    v["source"]["patches"]["0004-extra.patch"] = "1" * 64
+
+
+for mutate, reason in ((swap_patch, "kernel-patches"), (reorder, "kernel-patches"),
+                       (extra_patch, "kernel-patches"),
+                       (lambda v: v["source"].update(lock_sha256="2" * 64), "kernel-source"),
+                       (lambda v: v["source"].update(manifest_sha256="2" * 64), "kernel-source"),
+                       (lambda v: v["kernel"].update(gki_source_revision="XYZ"), "kernel-revision"),
+                       (lambda v: v["activation"].update(mode="enabled"), "kernel-activation"),
+                       (lambda v: v["activation"].update(source_lock_reproduction="verified"),
+                        "kernel-activation"),
+                       (lambda v: v.pop("source"), "kernel-source")):
+    expect(reason, with_fake, patched_kernel(mutate), contract_bytes, True)
+(fake / "device/myron/kernel-source-contract.json").unlink()
+os.symlink(repo / "device/myron/kernel-source-contract.json", fake / "device/myron/kernel-source-contract.json")
+K.repo_root = lambda: str(fake)
+try:
+    expect("repository-read", K.read_repo_file, "device/myron/kernel-source-contract.json",
+           K.CONTRACT_MAX_BYTES, K.Budget())
+finally:
+    K.repo_root = saved[0]
+ok("contract binding refuses changed kernel contract, contract, patch, hash, revision, activation and symlink")
+
+# ---------------------------------------------------------------- synthetic fixtures
+R1, R2, R3 = "a" * 40, "b" * 40, "c" * 40
+QUAL = "synthetic-qualification-SENTINEL-PRIVATE"
+BASE = "https://android.googlesource.com/"
+SYN_NAMES = ("0001-synthetic-first.patch", "0002-synthetic-second.patch")
+
+
+def synth_lock():
+    return {
+        "schema": 1, "qualification": QUAL, "manifest_revision": "d" * 40,
+        "superproject_revision": "e" * 40,
+        "source_overrides": {"common": R1, "build/kernel": R2},
+        "projects": [
+            {"path": "common", "url": BASE + "kernel/common", "revision": R1},
+            {"path": "build/kernel", "url": BASE + "kernel/build", "revision": R2},
+            {"path": "tools/extra", "url": BASE + "tools/extra", "revision": R3}],
+        "links": [{"path": "link.sh", "target": "build/kernel/x.sh"}],
+    }
+
+
+def jbytes(value):
+    return (json.dumps(value, indent=1) + "\n").encode()
+
+
+def synth_manifest(r1=R1, r2=R2, name2="kernel/build"):
+    return (b'<?xml version="1.0" encoding="UTF-8"?>\n<manifest>\n'
+            + f'  <project path="common" name="kernel/common" revision="{r1}" />\n'.encode()
+            + f'  <project path="build/kernel" name="{name2}" revision="{r2}" />\n'.encode()
+            + b"</manifest>\n")
+
+
+LOCK_KW = dict(qualification_sha256=sha(QUAL.encode()), gki_revision=R1, project_count=3,
+               link_count=1)
+MANIFEST_PROJECTS = K.MANIFEST_PROJECTS
+
+
+def lock_summary(lock=None):
+    return K.validate_source_lock(jbytes(lock or synth_lock()), **LOCK_KW)
+
+
+def make_spec(contents):
+    files = []
+    for path, data in contents.items():
+        role = {"source-lock.json": "source-lock", "stamped-manifest.xml": "manifest",
+                "vt.fragment": "fragment"}.get(path, "patch")
+        cap = 64 * 1024 if role in ("source-lock", "patch") else 4096
+        files.append((path, role, len(data), sha(data), cap))
+    return {"files": files, "directories": ("patches",), "qualification_sha256": sha(QUAL.encode()),
+            "gki_revision": R1, "project_count": 3, "link_count": 1, "patch_names": SYN_NAMES}
+
+
+def default_contents(lock=None, manifest=None, fragment=b"synthetic fragment\n"):
+    return {
+        "source-lock.json": lock if isinstance(lock, bytes) else jbytes(lock or synth_lock()),
+        "stamped-manifest.xml": manifest or synth_manifest(),
+        "vt.fragment": fragment,
+        "patches/" + SYN_NAMES[0]: b"synthetic patch one\n",
+        "patches/" + SYN_NAMES[1]: b"synthetic patch two\n",
+    }
+
+
+counter = [0]
+
+
+def build(contents=None, root_mode=0o700):
+    contents = contents or default_contents()
+    counter[0] += 1
+    root = work / f"bundle{counter[0]}"
+    root.mkdir(mode=0o700)
+    os.chmod(root, root_mode)
+    (root / "patches").mkdir(mode=0o700)
+    os.chmod(root / "patches", 0o700)
+    for path, data in contents.items():
+        target = root / path
+        target.write_bytes(data)
+        os.chmod(target, 0o600)
+    return str(root), make_spec(contents)
+
+
+root, spec = build()
+summary = K.check_bundle(root, spec)
+assert summary == {"files": 5, "directories": 1, "projects": 3, "links": 1, "overrides": 2,
+                   "manifest_projects": 2, "patches": 2}, summary
+document = K.verification_document(summary)
+rendered = K.render_json(document).decode()
+assert document["result"] == "private-bundle-identity-matched"
+assert document["scope"] == "identity-and-structure-only"
+assert all(v is False for v in document["authority"].values())
+assert document["activation"] == {"mode": "disabled", "blocker": "unchanged"}
+assert root not in rendered and "SENTINEL" not in rendered and R1 not in rendered
+assert K.render_json(document) == K.render_json(K.verification_document(K.check_bundle(root, spec)))
+ok("synthetic bundle verifies with recomputed pins; success output is value-free and authorizes nothing")
+
+
+def tree_state(path):
+    state = {}
+    for current, directories, names in os.walk(path):
+        for name in directories + names:
+            full = os.path.join(current, name)
+            info = os.lstat(full)
+            state[full] = (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino)
+    return state
+
+
+# production CLI refuses the synthetic bytes without leaking anything
+for good_root in (root,):
+    result = subprocess.run([str(repo / "tools/myron-kernel-source"), "verify", "--root", good_root],
+                            capture_output=True)
+    assert result.returncode == 1 and result.stdout == b""
+    assert result.stderr == b"myron-kernel-source: E_REFUSED\n"
+    for secret in (b"SENTINEL", good_root.encode(), b"Traceback", R1.encode()):
+        assert secret not in result.stderr
+ok("production CLI refuses synthetic bytes with empty stdout and one fixed stderr line")
+
+# ---------------------------------------------------------------- lock semantics
+def lock_case(reason, mutate, lock=None):
+    value = copy.deepcopy(lock or synth_lock())
+    mutate(value)
+    expect(reason, K.validate_source_lock, jbytes(value), **LOCK_KW)
+
+
+def drop(key):
+    return lambda v: v.pop(key)
+
+
+lock_summary()
+lock_case("lock-keys", lambda v: v.update(extra=1))
+for key in ("schema", "qualification", "manifest_revision", "superproject_revision",
+            "source_overrides", "projects", "links"):
+    lock_case("lock-keys", drop(key))
+lock_case("lock-schema", lambda v: v.update(schema=True))
+lock_case("lock-schema", lambda v: v.update(schema=2))
+lock_case("lock-schema", lambda v: v.update(schema="1"))
+lock_case("lock-qualification", lambda v: v.update(qualification=QUAL + "x"))
+lock_case("lock-qualification", lambda v: v.update(qualification=1))
+lock_case("lock-revision", lambda v: v.update(manifest_revision="D" * 40))
+lock_case("lock-revision", lambda v: v.update(superproject_revision="e" * 39))
+lock_case("lock-overrides", lambda v: v["source_overrides"].update(extra=R1))
+lock_case("lock-overrides", lambda v: v["source_overrides"].pop("common"))
+lock_case("lock-overrides", lambda v: v["source_overrides"].update(common="A" * 40))
+lock_case("lock-override-mismatch", lambda v: v["source_overrides"].update({"build/kernel": R3}))
+lock_case("lock-gki-revision", lambda v: (v["source_overrides"].update(common=R3),
+                                          v["projects"][0].update(revision=R3)))
+lock_case("lock-projects", lambda v: v["projects"].pop())
+lock_case("lock-projects", lambda v: v.update(projects="x"))
+lock_case("lock-project-keys", lambda v: v["projects"][0].update(name="x"))
+lock_case("lock-project-keys", lambda v: v["projects"][0].pop("url"))
+lock_case("lock-project-keys", lambda v: v["projects"].__setitem__(0, "x"))
+for bad_path in ("../x", "/abs", "a//b", "a/", "a/./b", "a/..", "", "a b", "café", "a\\b",
+                 "x" * 257, "a/.git", "-lead", "a/" + "y" * 65, 5):
+    lock_case("lock-project-path", lambda v, p=bad_path: v["projects"][2].update(path=p))
+for bad_url in ("http://android.googlesource.com/x", "https://user@android.googlesource.com/x",
+                "https://android.googlesource.com:443/x", "https://android.googlesource.com/x?a=b",
+                "https://android.googlesource.com/x#f", "https://android.googlesource.com/x%2f",
+                "https://android.googlesource.com/x/", "https://android.googlesource.com/",
+                "https://android.googlesource.com/../x", "https://example.com/x",
+                "https://Android.googlesource.com/x", "https://android.googlesource.com//x",
+                "https://android.googlesource.com/.x", None):
+    lock_case("lock-project-url", lambda v, u=bad_url: v["projects"][2].update(url=u))
+lock_case("lock-project-url-duplicate",
+          lambda v: v["projects"][2].update(url=v["projects"][0]["url"]))
+for bad_revision in ("A" * 40, "a" * 39, "a" * 41, "g" * 40, 7, None):
+    lock_case("lock-project-revision", lambda v, r=bad_revision: v["projects"][2].update(revision=r))
+lock_case("lock-project-overlap", lambda v: v["projects"][2].update(path="common"))
+lock_case("lock-project-overlap", lambda v: v["projects"][2].update(path="common/sub"))
+lock_case("lock-project-overlap", lambda v: v["projects"][2].update(path="build"))
+lock_case("lock-links", lambda v: v["links"].append({"path": "second", "target": "common/y"}))
+lock_case("lock-link-keys", lambda v: v["links"][0].update(extra=1))
+lock_case("lock-link-keys", lambda v: v["links"].__setitem__(0, []))
+lock_case("lock-link-path", lambda v: v["links"][0].update(path="../escape"))
+lock_case("lock-link-path", lambda v: v["links"][0].update(target="/etc/passwd"))
+lock_case("lock-link-path", lambda v: v["links"][0].update(target="build/../common/x"))
+lock_case("lock-link-collision", lambda v: v["links"][0].update(path="common"))
+lock_case("lock-link-collision", lambda v: v["links"][0].update(path="tools"))
+lock_case("lock-link-collision", lambda v: v["links"][0].update(path="common/inside"))
+lock_case("lock-link-target", lambda v: v["links"][0].update(target="outside/file"))
+lock_case("lock-link-target", lambda v: v["links"][0].update(target="build/other"))
+lock_case("lock-link-target", lambda v: v["links"][0].update(target="link.sh/x"))
+two_links = synth_lock()
+two_links["links"].append({"path": "second", "target": "common/y"})
+kw2 = dict(LOCK_KW, link_count=2)
+
+
+def two_case(reason, mutate):
+    value = copy.deepcopy(two_links)
+    mutate(value)
+    expect(reason, K.validate_source_lock, jbytes(value), **kw2)
+
+
+K.validate_source_lock(jbytes(two_links), **kw2)
+two_case("lock-link-duplicate", lambda v: v["links"][1].update(path="link.sh"))
+two_case("lock-link-duplicate", lambda v: v["links"][1].update(target="build/kernel/x.sh"))
+two_case("lock-link-collision", lambda v: v["links"][1].update(path="link.sh/child"))
+two_case("lock-link-collision", lambda v: v["links"][0].update(path="second/x"))
+two_case("lock-link-target", lambda v: v["links"][1].update(target="link.sh"))
+ok("source-lock semantic profile refuses every key, type, path, URL, revision, override and link defect")
+
+# ---------------------------------------------------------------- strict JSON
+base = jbytes(synth_lock())
+text = base.decode()
+cases = {
+    "json-duplicate-key": b'{"schema": 1, "schema": 1}',
+    "json-utf8": b'{"schema": 1, "qualification": "\xff"}',
+    "json-nonfinite": b'{"schema": NaN}',
+    "json-float": b'{"schema": 1.0}',
+    "json-syntax": base + b"x",
+    "json-type": b"[1]",
+    "json-depth": b'{"a":' * 9 + b"1" + b"}" * 9,
+    "json-bound": b'{"a": "' + b"x" * 1100 + b'"}',
+    "json-surrogate": b'{"a": "\\ud800"}',
+}
+for reason, data in cases.items():
+    expect(reason, K.parse_json_object, data)
+expect("json-utf8", K.parse_json_object, b"\xef\xbb\xbf" + base)
+expect("json-syntax", K.parse_json_object, b"")
+expect("json-syntax", K.parse_json_object, b'{"a": 1,}')
+expect("json-bound", K.parse_json_object, b"{" + b",".join(b'"k%d": 1' % i for i in range(65)) + b"}")
+expect("json-bound", K.parse_json_object, b'{"a": [' + b",".join(b"[1]" for _ in range(700)) + b"," + b",".join(b"[1]" for _ in range(700)) + b"]}")
+expect("json-syntax", K.parse_json_object, b'{"a": 1' + b"9" * 5000 + b"}")
+for reason, data in (("json-duplicate-key", text.replace('"schema": 1,', '"schema": 1, "schema": 1,').encode()),
+                     ("json-utf8", base.replace(b"synthetic", b"synth\xe9tic")),
+                     ("json-nonfinite", base.replace(b'"schema": 1', b'"schema": Infinity'))):
+    expect(reason, K.validate_source_lock, data, **LOCK_KW)
+ok("strict bounded JSON refuses duplicates, invalid UTF-8, nonfinite, floats, depth, size and syntax")
+
+# ---------------------------------------------------------------- manifest
+summary_lock = lock_summary()
+assert K.validate_manifest(synth_manifest(), summary_lock) == 2
+head = b'<?xml version="1.0" encoding="UTF-8"?>\n<manifest>\n'
+body = synth_manifest()[len(head):]
+bad_manifests = {
+    "manifest-form": [b"", body, synth_manifest().replace(b"UTF-8", b"utf-8"),
+                      synth_manifest().replace(b"1.0", b"1.1"), synth_manifest()[:-1],
+                      synth_manifest().replace(b"<manifest>", b"<manifest >", 1),
+                      b"\xef\xbb\xbf" + synth_manifest(), synth_manifest() + b"\n",
+                      synth_manifest().replace(b"<manifest>", b"<root>").replace(b"</manifest>", b"</root>")],
+    "manifest-forbidden": [
+        head + b"<!-- c -->\n" + body, head + b"<?pi x?>\n" + body,
+        b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE manifest>\n<manifest>\n' + body,
+        b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE manifest [<!ENTITY e "x">]>\n<manifest>\n' + body,
+        synth_manifest().replace(b"<manifest>", b'<manifest xmlns="u">'),
+        head + b"<include name=\"x\"/>&amp;\n" + body,
+        head + b"<![CDATA[x]]>\n" + body,
+        head + b"  <xi:include href=\"x\"/>\n" + body,
+        synth_manifest().replace(b"  <project", b"\t<project", 1),
+        synth_manifest().replace(b"\n", b"\r\n")],
+    "manifest-text": [head + b"stray\n" + body, synth_manifest().replace(b"</manifest>", b"x</manifest>")],
+    "manifest-children": [head + body.split(b"\n")[0] + b"\n</manifest>\n",
+                          synth_manifest().replace(b"</manifest>", b'  <project path="x" name="y" revision="' + R3.encode() + b'" />\n</manifest>'),
+                          synth_manifest().replace(b"  <project", b"  <remote", 1) .replace(b'path="common" name="kernel/common" revision', b"x y=\"z\" revision")],
+    "manifest-project": [
+        synth_manifest().replace(b"build/kernel", b"build/other", 1),
+        synth_manifest().replace(b'name="kernel/build"', b'name="kernel/other"'),
+        synth_manifest().replace(b'path="common" name="kernel/common"', b'name="kernel/common" path="common"'),
+        synth_manifest().replace(b' />', b' extra="1" />', 1),
+        synth_manifest().replace(b' revision="' + R1.encode() + b'"', b"", 1),
+        head + synth_manifest().split(b"\n")[2] + b"\n" + synth_manifest().split(b"\n")[1] + b"\n</manifest>\n"],
+    "manifest-revision": [synth_manifest(r1=R3), synth_manifest(r2=R3), synth_manifest(r1="A" * 40)],
+    "manifest-syntax": [synth_manifest().replace(b' />', b' >', 1), synth_manifest().replace(b"</manifest>", b"</manifes>"),
+                        synth_manifest().replace(b'path="common"', b'path="common" path="common"')],
+}
+for reason, items in bad_manifests.items():
+    for data in items:
+        try:
+            K.validate_manifest(data, summary_lock)
+        except R as error:
+            assert error.reason.startswith("manifest-"), (reason, error.reason, data[:90])
+        else:
+            raise AssertionError((reason, data))
+mismatched = copy.deepcopy(summary_lock)
+mismatched["urls"]["build/kernel"] = BASE + "kernel/other"
+expect("manifest-url", K.validate_manifest, synth_manifest(), mismatched)
+mismatched = copy.deepcopy(summary_lock)
+mismatched["overrides"]["common"] = R3
+expect("manifest-revision", K.validate_manifest, synth_manifest(), mismatched)
+ok("manifest refuses DTD, entities, includes, namespaces, comments, extras and lock mismatches")
+
+# ---------------------------------------------------------------- bundle closure and bytes
+def file_case(reason, mutate, contents=None):
+    bundle, bundle_spec = build(contents)
+    mutate(Path(bundle), bundle_spec)
+    expect(reason, K.check_bundle, bundle, bundle_spec)
+
+
+files_list = list(default_contents())
+for path in files_list:
+    def flip(spec_, path=path):
+        spec_["files"] = [(p, r, s, "0" * 64 if p == path else d, c) for p, r, s, d, c in spec_["files"]]
+    file_case("file-hash", lambda b, s, f=flip: f(s))
+    def resize(spec_, path=path):
+        spec_["files"] = [(p, r, s + 1 if p == path else s, d, c) for p, r, s, d, c in spec_["files"]]
+    file_case("file-size", lambda b, s, f=resize: f(s))
+    file_case("file-size", lambda b, s, p=path: (b / p).write_bytes((b / p).read_bytes() + b"x") or os.chmod(b / p, 0o600))
+    file_case("directory-membership", lambda b, s, p=path: (b / p).unlink())
+    file_case("file-unsafe", lambda b, s, p=path: os.chmod(b / p, 0o644))
+    file_case("file-unsafe", lambda b, s, p=path: os.chmod(b / p, 0o700))
+    file_case("file-unsafe", lambda b, s, p=path: os.chmod(b / p, 0o400))
+    def hardlink(b, s, p=path):
+        os.link(b / p, work / f"outside-link-{counter[0]}-{p.replace('/', '_')}")
+    file_case("file-unsafe", hardlink)
+    def symlink(b, s, p=path):
+        data = (b / p).read_bytes()
+        (b / p).unlink()
+        elsewhere = work / f"elsewhere-{counter[0]}-{p.replace('/', '_')}"
+        elsewhere.write_bytes(data)
+        os.symlink(elsewhere, b / p)
+    file_case("file-type", symlink)
+    def fifo(b, s, p=path):
+        (b / p).unlink()
+        os.mkfifo(b / p, 0o600)
+    file_case("file-type", fifo)
+    def as_directory(b, s, p=path):
+        (b / p).unlink()
+        os.mkdir(b / p, 0o700)
+    file_case("file-type", as_directory)
+file_case("directory-extra", lambda b, s: (b / "extra.txt").write_bytes(b""))
+file_case("directory-extra", lambda b, s: (b / "patches" / "0004-extra.patch").write_bytes(b""))
+file_case("directory-extra", lambda b, s: os.mkdir(b / "extra-dir"))
+file_case("directory-extra", lambda b, s: os.mkdir(b / "patches" / "extra-dir"))
+file_case("directory-membership", lambda b, s: (b / "patches" / SYN_NAMES[1]).rename(b / "patches" / "renamed.patch"))
+file_case("directory-membership", lambda b, s: ((b / "patches" / SYN_NAMES[0]).unlink(), (b / "patches" / SYN_NAMES[1]).unlink(), os.rmdir(b / "patches")) and None)
+file_case("directory-membership", lambda b, s: (b / "vt.fragment").rename(b / "vt.fragment2"))
+file_case("directory-unsafe", lambda b, s: os.chmod(b / "patches", 0o755))
+file_case("directory-unsafe", lambda b, s: os.chmod(b / "patches", 0o500))
+file_case("directory-unsafe", lambda b, s: os.chmod(b, 0o755))
+file_case("directory-unsafe", lambda b, s: os.chmod(b, 0o750))
+file_case("patch-order", lambda b, s: s.update(patch_names=tuple(reversed(SYN_NAMES))))
+file_case("patch-order", lambda b, s: s.update(patch_names=SYN_NAMES[:1]))
+# the real order: 0007 must come after 0003, and 0004-0006 never enter the closure
+assert [p for p, r, *_ in K.BUNDLE_FILES if r == "patch"] == ["patches/" + n for n in K.PATCH_NAMES]
+for bad in ("0004", "0005", "0006"):
+    assert not any(p.startswith("patches/" + bad) for p, *_ in K.BUNDLE_FILES)
+# semantic failures reached through the filesystem path with consistent recomputed pins
+for mutate, reason in (
+        (lambda v: v.update(schema=2), "lock-schema"),
+        (lambda v: v["projects"][1].update(revision=R3), "lock-override-mismatch"),
+        (lambda v: v["links"][0].update(path="common"), "lock-link-collision")):
+    value = synth_lock()
+    mutate(value)
+    bundle, bundle_spec = build(default_contents(lock=value))
+    expect(reason, K.check_bundle, bundle, bundle_spec)
+bundle, bundle_spec = build(default_contents(manifest=synth_manifest(r1=R3)))
+expect("manifest-revision", K.check_bundle, bundle, bundle_spec)
+bundle, bundle_spec = build(default_contents(lock=b'{"schema": 1, "schema": 1}'))
+expect("json-duplicate-key", K.check_bundle, bundle, bundle_spec)
+# the fragment is pin-only: different bytes with a matching pin verify; a stale pin refuses
+bundle, bundle_spec = build(default_contents(fragment=b"other fragment\n"))
+K.check_bundle(bundle, bundle_spec)
+file_case("file-hash", lambda b, s: (b / "vt.fragment").write_bytes(b"synthetic fragmenX\n"))
+ok("closure refuses every hash, size, type, mode, link, extra, missing, membership and order defect")
+
+# ---------------------------------------------------------------- root and ancestry
+root, spec = build()
+for bad_root in ("relative/path", "", "/", "//x", root + "/", root + "//", "/./" + root[1:],
+                 root + "/.", root + "/../" + Path(root).name, "~", 5, None):
+    expect("root-form", K.check_bundle, bad_root, spec)
+link = work / "link-to-bundle"
+os.symlink(root, link)
+expect("root-open", K.check_bundle, str(link), spec)
+inner = work / "symlinked-parent"
+os.symlink(work, inner)
+expect("root-open", K.check_bundle, str(inner / Path(root).name), spec)
+expect("root-open", K.check_bundle, str(work / "does-not-exist"), spec)
+unsafe = work / "unsafe-parent"
+unsafe.mkdir()
+os.chmod(unsafe, 0o777)
+moved = unsafe / "bundle"
+os.rename(root, moved)
+expect("ancestor-unsafe", K.check_bundle, str(moved), spec)
+os.chmod(unsafe, 0o770)
+expect("ancestor-unsafe", K.check_bundle, str(moved), spec)
+os.chmod(unsafe, 0o700)
+K.check_bundle(str(moved), spec)
+FakeInfo = type("FakeInfo", (), {})
+for uid, mode, reason in ((os.geteuid() + 1, 0o40755, "ancestor-unsafe"), (0, 0o40777, "ancestor-unsafe"),
+                          (os.geteuid(), 0o40775, "ancestor-unsafe"), (os.geteuid(), 0o100700, "ancestor-unsafe")):
+    info = FakeInfo()
+    info.st_uid, info.st_mode = uid, mode
+    expect(reason, K.check_ancestor, info)
+for uid, mode in ((0, 0o41777), (0, 0o40755), (os.geteuid(), 0o40700)):
+    info = FakeInfo()
+    info.st_uid, info.st_mode = uid, mode
+    K.check_ancestor(info)
+foreign = FakeInfo()
+foreign.st_uid, foreign.st_mode = os.geteuid() + 1, 0o40700
+expect("directory-unsafe", K.check_private_directory, foreign, 1, 0)
+ok("root path forms, symlink components, ancestor ownership and modes are enforced")
+
+# ---------------------------------------------------------------- mounts
+root, spec = build()
+fdinfo = K.FDINFO_PATH
+K.FDINFO_PATH = "/nonexistent-fdinfo"
+try:
+    expect("mount-unavailable", K.check_bundle, root, spec)
+finally:
+    K.FDINFO_PATH = fdinfo
+real_mount = K.mount_identifier
+calls = [0]
+
+
+def crossing(descriptor):
+    calls[0] += 1
+    return real_mount(descriptor) + (1 if calls[0] > 1 else 0)
+
+
+K.mount_identifier = crossing
+try:
+    expect("mount-crossing", K.check_bundle, root, spec)
+finally:
+    K.mount_identifier = real_mount
+calls[0] = 0
+
+
+def crossing_file(descriptor):
+    calls[0] += 1
+    return real_mount(descriptor) + (1 if calls[0] > 3 else 0)
+
+
+K.mount_identifier = crossing_file
+try:
+    expect("mount-crossing", K.check_bundle, root, spec)
+finally:
+    K.mount_identifier = real_mount
+K.check_bundle(root, spec)
+ok("mount identifiers fail closed when unavailable and refuse a crossing")
+
+# ---------------------------------------------------------------- enumeration bound
+root, spec = build()
+for index in range(300):
+    (Path(root) / f"extra-{index}").write_bytes(b"")
+yielded = []
+real_scandir = os.scandir
+
+
+class Counting:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __enter__(self):
+        self.inner.__enter__()
+        return self
+
+    def __exit__(self, *arguments):
+        return self.inner.__exit__(*arguments)
+
+    def __iter__(self):
+        for entry in self.inner:
+            yielded.append(entry.name)
+            yield entry
+
+
+os.scandir = lambda descriptor: Counting(real_scandir(descriptor))
+try:
+    expect("directory-extra", K.check_bundle, root, spec)
+finally:
+    os.scandir = real_scandir
+assert len(yielded) <= 4 + 1, len(yielded)
+ok("directory enumeration stops at expected plus one entry")
+
+# ---------------------------------------------------------------- races
+def race(stage, action, reason, expected_path=None):
+    bundle, bundle_spec = build()
+    fired = []
+
+    def hook(name, context):
+        if name == stage and (expected_path is None or context["path"] == expected_path) and not fired:
+            fired.append(True)
+            action(Path(bundle), context)
+
+    K._HOOK = hook
+    try:
+        expect(reason, K.check_bundle, bundle, bundle_spec)
+    finally:
+        K._HOOK = None
+    assert fired, stage
+
+
+first = "patches/" + SYN_NAMES[0]
+
+
+def replace_same_bytes(b, c):
+    data = (b / c["path"]).read_bytes()
+    (b / "swap").write_bytes(data)
+    os.chmod(b / "swap", 0o600)
+    os.rename(b / "swap", b / c["path"])
+
+
+race("file-opened", replace_same_bytes, "file-race", "vt.fragment")
+race("file-opened", replace_same_bytes, "file-race", first)
+race("file-read", replace_same_bytes, "file-race", first)
+race("file-read", lambda b, c: os.chmod(b / c["path"], 0o640), "file-race", "vt.fragment")
+race("file-opened", lambda b, c: os.chmod(b / c["path"], 0o640), "file-race", "source-lock.json")
+race("file-opened", lambda b, c: (b / c["path"]).open("ab").write(b"x"), "file-size", first)
+race("file-read", lambda b, c: (b / c["path"]).open("r+b").write(b"Z"), "file-race", first)
+race("file-read", lambda b, c: os.unlink(b / c["path"]), "file-race", "vt.fragment")
+race("files-read", lambda b, c: (b / "late-extra").write_bytes(b""), "directory-race")
+race("files-read", lambda b, c: (b / "patches" / "late-extra").write_bytes(b""), "directory-race")
+race("files-read", lambda b, c: (b / "vt.fragment").rename(b / "moved"), "directory-race")
+race("files-read", lambda b, c: os.chmod(b / "patches", 0o750), "directory-race")
+race("files-read", lambda b, c: os.chmod(b, 0o750), "directory-race")
+race("directories-enumerated", lambda b, c: os.chmod(b / "patches", 0o750), "directory-race")
+
+
+def swap_directory(b, c):
+    os.rename(b / "patches", b / "patches-old")
+    os.mkdir(b / "patches", 0o700)
+    for name in SYN_NAMES:
+        data = (b / "patches-old" / name).read_bytes()
+        (b / "patches" / name).write_bytes(data)
+        os.chmod(b / "patches" / name, 0o600)
+
+
+race("files-read", swap_directory, "directory-race")
+ok("injected read, replace, chmod, rename and directory races are refused")
+
+# ---------------------------------------------------------------- bounds, output, side effects
+bundle, bundle_spec = build()
+expect("invocation-bound", K.check_bundle, bundle, bundle_spec, K.Budget(20))
+expect("output-bound", K.render_json, {"x": "y" * 70000})
+big_spec = dict(bundle_spec)
+big_spec["files"] = [(p, r, s, d, 1) for p, r, s, d, c in bundle_spec["files"]]
+expect("file-bound", K.check_bundle, bundle, big_spec)
+ok("invocation, per-file and output bounds are enforced")
+
+# no subprocess, network, or writes while verifying and refusing
+bundle, bundle_spec = build()
+before_tree = tree_state(bundle)
+
+
+def forbidden(*_a, **_k):
+    raise AssertionError("forbidden facility used")
+
+
+saved_facilities = (subprocess.Popen, socket.socket.connect, os.system, os.fork)
+subprocess.Popen = forbidden
+socket.socket.connect = forbidden
+os.system = forbidden
+os.fork = forbidden
+try:
+    K.check_bundle(bundle, bundle_spec)
+    for bad in (bundle + "x", "relative"):
+        try:
+            K.check_bundle(bad, bundle_spec)
+        except R:
+            pass
+finally:
+    subprocess.Popen, socket.socket.connect, os.system, os.fork = saved_facilities
+assert tree_state(bundle) == before_tree, "verification changed the bundle"
+assert not list((repo / "tools").rglob("*kernel-source*.pyc"))
+ok("no subprocess, network, write or bytecode cache is used")
+
+# CLI-level failure contract on synthetic and unsafe roots, with stable bytes
+unsafe_root, unsafe_spec = build(root_mode=0o755)
+for argument_root in (unsafe_root, str(work / "missing"), "relative", "/"):
+    result = subprocess.run([str(repo / "tools/myron-kernel-source"), "verify", "--root", argument_root],
+                            capture_output=True, cwd="/")
+    assert (result.returncode, result.stdout, result.stderr) == (1, b"", b"myron-kernel-source: E_REFUSED\n")
+for arguments in ([], ["verify"], ["show", "x"], ["--root", "/x"], ["verify", "--root", "/x", "y"]):
+    result = subprocess.run([str(repo / "tools/myron-kernel-source"), *arguments], capture_output=True,
+                            env={"PATH": os.environ["PATH"], "KERNEL_SOURCE_ROOT": bundle})
+    assert (result.returncode, result.stdout, result.stderr) == (2, b"", b"myron-kernel-source: E_USAGE\n")
+ok("CLI refusals are deterministic, value-free and ignore environment paths")
+PY
+pass "Phase 2.17 kernel-source verifier tests"

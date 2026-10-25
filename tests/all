@@ -7,7 +7,7 @@
 # allowlist and the USB product string, bin/omamobile's boot-image layouts
 # and flash against a fake fastboot, omamobile-firstboot's own tests, and the
 # smoke test of the newest root image in out/ if there is one, the Myron
-# deployment/snapshot/preflight refusal gates, the collector's fixture checks, the synthetic session rehearsal, the synthetic GPT-to-R2 parser, the synthetic boot, vendor boot and DT table image-to-R3 parser, the synthetic device tree and DT table R4 count and index-membership parser, and the felix and myron packages' tests.
+# deployment/snapshot/preflight refusal gates, the collector's fixture checks, the synthetic session rehearsal, the synthetic GPT-to-R2 parser, the synthetic boot, vendor boot and DT table image-to-R3 parser, the synthetic device tree and DT table R4 count and index-membership parser, the external kernel-source bundle identity verifier, and the felix and myron packages' tests.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 for f in tools/install-phone tools/phone-provision tools/build-rootfs tools/build-packages tools/make-bundle tools/verify-myron-kernel-contract tools/verify-myron-gpu-profile \
@@ -20,7 +20,7 @@ sh -n device/flame/initramfs/init
 sh -n device/flame/initramfs/build
 bash -n tools/build-flame-probe
 echo "ok - scripts parse"
-for t in tests/pr-check tests/kernel-pr-check tests/install-phone tests/phone-provision tests/initramfs-grow tests/images-layout tests/device-overlays tests/simplefb-trigger tests/storage-guard tests/usb-product tests/boot-method tests/rootfs-stage tests/kernel-contract tests/myron-deployment tests/myron-snapshot tests/myron-preflight tests/myron-collect tests/myron-session tests/myron-bootchain tests/myron-bootchain-images tests/myron-bootchain-selection tests/flame-probe packages/omamobile-firstboot/test/all packages/omamobile-apps-myron/test/all packages/omamobile-device-felix/test/all packages/omamobile-myron-kernel-contract/test/all packages/omamobile-device-myron/test/all packages/omamobile-myron-gpu-profile/test/all; do
+for t in tests/pr-check tests/kernel-pr-check tests/install-phone tests/phone-provision tests/initramfs-grow tests/images-layout tests/device-overlays tests/simplefb-trigger tests/storage-guard tests/usb-product tests/boot-method tests/rootfs-stage tests/kernel-contract tests/myron-deployment tests/myron-snapshot tests/myron-preflight tests/myron-collect tests/myron-session tests/myron-bootchain tests/myron-bootchain-images tests/myron-bootchain-selection tests/myron-kernel-source tests/flame-probe packages/omamobile-firstboot/test/all packages/omamobile-apps-myron/test/all packages/omamobile-device-felix/test/all packages/omamobile-myron-kernel-contract/test/all packages/omamobile-device-myron/test/all packages/omamobile-myron-gpu-profile/test/all; do
   echo "# $t"
   "$t"
 done

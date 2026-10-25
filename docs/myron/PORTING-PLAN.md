@@ -197,6 +197,14 @@ a required successor gate: the R4 selection-source qualification (a concrete
 selected-index source, an actual Myron witness and contract cross-checks; parsing
 a DTBO or FDT does not prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
 
+Phase 2.17 (laptop-only, identity gate): `tools/myron-kernel-source` 0.1.0 verifies an
+external private kernel-source bundle against `device/myron/kernel-source-contract.json`,
+which binds the unchanged kernel contract. It checks hashes, exact closure and the
+lock/manifest structure only; no bytes are distributed, publication and licensing are
+unresolved, and availability, ancestry, applicability, fragment use, toolchain and
+build output stay unverified with activation disabled. See
+[KERNEL-SOURCE-GATE.md](KERNEL-SOURCE-GATE.md).
+
 Phase 2.16 readiness (documentation only): the synthetic parser work is complete.
 Actual read-only layout discovery is the next approval boundary and is a staged
 session described in [DISCOVERY-GATE.md](DISCOVERY-GATE.md). It is not approved, not
