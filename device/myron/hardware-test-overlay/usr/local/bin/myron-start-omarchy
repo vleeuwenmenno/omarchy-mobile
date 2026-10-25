@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+export LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu
+export LIBGL_DRIVERS_PATH=/usr/lib/omamobile/myron-gpu/dri
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+export VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json
+export HYPRLAND_NO_SD_VARS=1
+# Qt Quick cannot create a Wayland EGL context with the isolated experiment-105
+# stack yet. Keep that workaround shell-only: this directory contains a
+# quickshell wrapper, while Hyprland and ordinary applications retain Zink.
+export PATH=/usr/local/libexec/myron-shell-bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/bin}
+unset WAYLAND_DISPLAY AQ_BACKEND EGL_PLATFORM
+
+exec uwsm start -g -1 -e -D Hyprland hyprland.desktop

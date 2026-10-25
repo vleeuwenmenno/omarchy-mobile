@@ -1,0 +1,110 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Build an 8 MiB temporary slot-A init_boot. No device is contacted.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+base= rollback= payload= out= watchdog_seconds=900
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'EOF'
+Usage: tools/myron-build-test-init-boot \
+  --base-init-boot FILE --rollback-init-boot FILE --payload-image FILE \
+  --out FILE [--watchdog-seconds 900]
+
+Builds only an offline candidate. Base and rollback must both be the exact,
+reviewed systemd release-v3 image. Deployment is a separate recovery-only operation.
+EOF
+}
+while (($#)); do
+  case $1 in
+    --base-init-boot) base=${2:?}; shift 2 ;;
+    --rollback-init-boot) rollback=${2:?}; shift 2 ;;
+    --payload-image) payload=${2:?}; shift 2 ;;
+    --out) out=${2:?}; shift 2 ;;
+    --watchdog-seconds) watchdog_seconds=${2:?}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+for item in base rollback payload out; do [[ -n ${!item} ]] || die "--${item//_/-} is required"; done
+base=$(realpath "$base")
+rollback=$(realpath "$rollback")
+payload=$(realpath "$payload")
+out=$(realpath -m "$out")
+for path in "$base" "$rollback" "$payload"; do
+  [[ -f $path && ! -L $path ]] || die "missing or linked input: $path"
+done
+[[ ! -e $out && ! -L $out ]] || die "refusing to replace $out"
+[[ $watchdog_seconds =~ ^[0-9]+$ ]] && ((watchdog_seconds >= 300 && watchdog_seconds <= 1800)) ||
+  die 'watchdog seconds must be 300..1800'
+
+readonly systemd_release_sha=535d8e2fe0db2b35dc003e329fafc2b76dd82705df70cef63dc74accf653ec24
+base_sha=$(sha256sum "$base" | awk '{print $1}')
+rollback_sha=$(sha256sum "$rollback" | awk '{print $1}')
+[[ $base_sha == "$systemd_release_sha" ]] || die "base is not exact systemd release-v3: $base_sha"
+[[ $rollback_sha == "$systemd_release_sha" ]] || die "rollback is not exact systemd release-v3: $rollback_sha"
+[[ $(stat -c %s "$base") == 8388608 && $(stat -c %s "$rollback") == 8388608 ]] ||
+  die 'base and rollback must be 8 MiB'
+payload_sha=$(sha256sum "$payload" | awk '{print $1}')
+payload_size=$(stat -c %s "$payload")
+[[ $payload_size -ge 8589934592 ]] || die 'payload is unexpectedly small'
+
+for tool in unpack_bootimg lz4 cpio avbtool mkbootimg; do
+  command -v "$tool" >/dev/null || die "missing tool: $tool"
+done
+candidate_builder=../myron-postmarketos/scripts/build-init-boot-candidate.py
+[[ -x $candidate_builder ]] || die "missing candidate builder: $candidate_builder"
+
+tmp=$(mktemp -d /tmp/myron-omarchy-initboot.XXXXXX)
+trap 'rm -rf -- "$tmp"' EXIT
+mkdir -p "$tmp/unpack" "$tmp/root"
+unpack_bootimg --boot_img "$base" --out "$tmp/unpack" >/dev/null
+[[ $(od -An -tx1 -N4 "$tmp/unpack/ramdisk" | tr -d ' \n') == 02214c18 ]] ||
+  die 'base ramdisk is not legacy LZ4'
+(
+  cd "$tmp/root"
+  lz4 -d -l "$tmp/unpack/ramdisk" -c | cpio -idm --quiet
+)
+grep -Fq 'wait_partition pmos_root || fail_boot pmos-root-missing' "$tmp/root/init" ||
+  die 'systemd release-v3 handoff marker missing'
+
+awk '
+  FNR == NR { replacement = replacement $0 ORS; next }
+  /^fail_boot\(\) \{/ { printf "%s", replacement; replacing = 1; next }
+  replacing && /^}/ { replacing = 0; next }
+  replacing { next }
+  /^wait_partition pmos_root \|\| fail_boot pmos-root-missing$/ { exit }
+  { print }
+' device/myron/hardware-test-initramfs/fail-boot.sh "$tmp/root/init" >"$tmp/init.template"
+cat device/myron/hardware-test-initramfs/systemd-stage.sh >>"$tmp/init.template"
+sed \
+  -e "s/@ROLLBACK_SHA256@/$rollback_sha/g" \
+  -e "s/@PAYLOAD_SHA256@/$payload_sha/g" \
+  -e "s/@PAYLOAD_SIZE@/$payload_size/g" \
+  -e "s/@WATCHDOG_SECONDS@/$watchdog_seconds/g" \
+  "$tmp/init.template" >"$tmp/init"
+sed \
+  -e "s/@ROLLBACK_SHA256@/$rollback_sha/g" \
+  -e "s/@WATCHDOG_SECONDS@/$watchdog_seconds/g" \
+  device/myron/hardware-test-initramfs/watchdog.sh >"$tmp/root/watchdog"
+mv "$tmp/init" "$tmp/root/init"
+chmod 0755 "$tmp/root/init" "$tmp/root/watchdog"
+sh -n "$tmp/root/init"
+sh -n "$tmp/root/watchdog"
+find "$tmp/root" -exec touch -h -d '@0' {} +
+ramdisk=$out.ramdisk.lz4
+[[ ! -e $ramdisk ]] || die "refusing to replace $ramdisk"
+mkdir -p "$(dirname -- "$out")"
+(
+  cd "$tmp/root"
+  find . -print0 | LC_ALL=C sort -z |
+    cpio --null -o --format=newc --owner=0:0 --reproducible --quiet |
+    lz4 -l -12 - "$ramdisk"
+)
+"$candidate_builder" "$base" "$ramdisk" "$out"
+candidate_sha=$(sha256sum "$out" | awk '{print $1}')
+printf '%s\n' "$candidate_sha" >"$out.expected-sha256"
+chmod 0600 "$out" "$ramdisk" "$out.expected-sha256"
+printf 'status=built\ncandidate=%s\nsha256=%s\nrollback_sha256=%s\nwatchdog_seconds=%s\n' \
+  "$out" "$candidate_sha" "$rollback_sha" "$watchdog_seconds"

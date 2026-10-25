@@ -1,0 +1,17 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Complete the ordinary mobile profile, then hide zero-size downstream DRM
+# outputs which otherwise become Wayland outputs before DSI-1. Squeekboard
+# binds its layer surface to the first output and Hyprland rejects a 0x0 one.
+set -euo pipefail
+
+/usr/bin/omamobile-setup-user
+
+if omarchy-done ensure myron-hardware-test-monitors; then
+  cat >>"$HOME/.config/hypr/monitors.lua" <<'LUA'
+
+-- Myron hardware test: downstream DRM exposes unusable zero-size outputs.
+hl.monitor({ output = "Virtual-1", disabled = true })
+hl.monitor({ output = "Virtual-2", disabled = true })
+LUA
+fi

@@ -1,0 +1,83 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+log=/var/log/myron-omarchy-hardware-test.log
+host_state=/run/myron-host/var/lib/omarchy-mobile
+stable_seconds=90
+deadline_seconds=600
+
+say() { printf '%s\n' "$*" | tee -a "$log"; }
+die() { say "ERROR: $*" >&2; exit 1; }
+has_fd() {
+  pid=$1 wanted=$2
+  for fd in /proc/"$pid"/fd/*; do
+    [ "$(readlink "$fd" 2>/dev/null || true)" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
+[ -f /run/myron-omarchy-hardware-ready ] || die 'hardware preparation marker missing'
+[ "$(cat /sys/devices/virtual/touch/touch_dev/enable_touch_raw 2>/dev/null || true)" = 0 ] ||
+  die 'touch raw mode is not disabled'
+elapsed=0
+pid=
+while [ "$elapsed" -lt "$deadline_seconds" ]; do
+  candidate=$(pgrep -xo Hyprland 2>/dev/null || true)
+  if [ -n "$candidate" ] && kill -0 "$candidate" 2>/dev/null; then
+    pid=$candidate
+    break
+  fi
+  sleep 2
+  elapsed=$((elapsed + 2))
+done
+[ -n "$pid" ] || die 'Hyprland did not start within 600 seconds'
+say "hyprland_pid=$pid state=observed"
+
+stable=0
+while [ "$stable" -lt "$stable_seconds" ]; do
+  [ "$(pgrep -xo Hyprland 2>/dev/null || true)" = "$pid" ] ||
+    die 'Hyprland exited or restarted during stability window'
+  sleep 5
+  stable=$((stable + 5))
+done
+
+[ "$(cat /sys/class/drm/card0-DSI-1/status 2>/dev/null || true)" = connected ] ||
+  die 'DSI-1 disconnected'
+has_fd "$pid" /dev/dri/card0 || die 'Hyprland lacks DRM card0'
+has_fd "$pid" /dev/dri/renderD128 || die 'Hyprland lacks renderD128'
+has_fd "$pid" /dev/kgsl-3d0 || die 'Hyprland lacks KGSL device'
+grep -Fq '/usr/lib/omamobile/myron-gpu/' "/proc/$pid/maps" ||
+  die 'Hyprland did not map isolated Myron Mesa'
+if grep -Eqi 'llvmpipe|swrast' "/proc/$pid/maps"; then
+  die 'software renderer mapped into Hyprland'
+fi
+
+runtime=$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^XDG_RUNTIME_DIR=//p')
+[ -n "$runtime" ] || die 'Hyprland runtime environment missing'
+signature=
+for instance in "$runtime"/hypr/*; do
+  [ -d "$instance" ] && [ -S "$instance/.socket.sock" ] &&
+    [ "$(sed -n '1p' "$instance/hyprland.lock" 2>/dev/null || true)" = "$pid" ] || continue
+  signature=${instance##*/}
+  break
+done
+[ -n "$signature" ] || die 'Hyprland IPC instance missing'
+monitor_json=$(XDG_RUNTIME_DIR="$runtime" HYPRLAND_INSTANCE_SIGNATURE="$signature" hyprctl -j monitors 2>>"$log") ||
+  die 'hyprctl monitors failed'
+printf '%s\n' "$monitor_json" >>"$log"
+printf '%s\n' "$monitor_json" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"DSI-1"' ||
+  die 'Hyprland did not publish DSI-1'
+devices_json=$(XDG_RUNTIME_DIR="$runtime" HYPRLAND_INSTANCE_SIGNATURE="$signature" hyprctl -j devices 2>>"$log") ||
+  die 'hyprctl devices failed'
+printf '%s\n' "$devices_json" >>"$log"
+printf '%s\n' "$devices_json" | grep -Eq 'focaltech|touch' ||
+  die 'Hyprland did not publish a touch device'
+
+mkdir -p "$host_state"
+printf 'qualified_pid=%s\nstable_seconds=%s\n' "$pid" "$stable_seconds" \
+  >"$host_state/hardware-test.disarm.new"
+chmod 0600 "$host_state/hardware-test.disarm.new"
+mv -f "$host_state/hardware-test.disarm.new" "$host_state/hardware-test.disarm"
+sync "$host_state"
+say "result=qualified dsi=DSI-1 renderer=isolated-zink-turnip stable_seconds=$stable_seconds rollback=disarmed"

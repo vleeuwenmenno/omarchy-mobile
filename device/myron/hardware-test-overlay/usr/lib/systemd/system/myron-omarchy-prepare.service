@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Prepare Myron hardware for temporary Omarchy test
+After=systemd-udevd.service local-fs.target
+Before=display-manager.service
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/myron-omarchy-prepare
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

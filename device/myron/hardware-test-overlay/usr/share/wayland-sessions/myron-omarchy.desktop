@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Omarchy Mobile (Myron hardware test)
+Comment=Native Hyprland with isolated Myron Zink and Turnip
+Exec=/usr/local/bin/myron-start-omarchy
+TryExec=/usr/local/bin/myron-start-omarchy
+DesktopNames=Hyprland
+Type=Application

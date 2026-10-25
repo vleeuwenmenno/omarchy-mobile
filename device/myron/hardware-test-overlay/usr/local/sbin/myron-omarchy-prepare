@@ -1,0 +1,89 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+log=/var/log/myron-omarchy-hardware-test.log
+gpu=/usr/local/lib/myron-gpu
+touch=/usr/local/lib/myron-touch
+expected_notes=8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608
+
+say() { printf '%s\n' "$*" | tee -a "$log"; }
+die() { say "ERROR: $*" >&2; exit 1; }
+load() {
+  name=$1 path=$2
+  if [ -d "/sys/module/$name" ]; then
+    say "module=$name state=already-loaded"
+  else
+    timeout 30 insmod "$path" >>"$log" 2>&1 || die "module failed: $name"
+    say "module=$name state=loaded"
+  fi
+}
+node_from_class() {
+  class_file=$1 target=$2 group=$3 mode=$4
+  numbers=$(cat "$class_file")
+  major=${numbers%:*}
+  minor=${numbers#*:}
+  case "$major:$minor" in *[!0-9:]*) die "invalid device numbers: $numbers" ;; esac
+  if [ ! -c "$target" ]; then
+    rm -f "$target"
+    mknod "$target" c "$major" "$minor"
+  fi
+  chgrp "$group" "$target"
+  chmod "$mode" "$target"
+}
+
+[ "$(id -u)" = 0 ] || die 'must run as root'
+: >"$log"
+notes=$(sha256sum /sys/kernel/notes | awk '{print $1}')
+[ "$notes" = "$expected_notes" ] || die "kernel notes differ: $notes"
+[ "$(cat /sys/class/drm/card0-DSI-1/status 2>/dev/null || true)" = connected ] ||
+  die 'DSI-1 is not connected'
+/usr/bin/omamobile-myron-gpu-verify verify-layout >>"$log" 2>&1 ||
+  die 'isolated Mesa layout verification failed'
+
+for name in gen80200_aqe.fw gen80200_gmu.bin gen80200_sqe.fw gen80200_zap.mbn; do
+  install -Dm0644 "$gpu/firmware/$name" "/usr/lib/firmware/$name"
+done
+load governor_gpubw_mon "$gpu/modules/governor_gpubw_mon.ko"
+load gpu_stats "$gpu/modules/gpu_stats.ko"
+load msm_sysstats "$gpu/modules/msm_sysstats.ko"
+load msm_kgsl "$gpu/modules/msm_kgsl.ko"
+
+attempt=0
+while [ ! -r /sys/class/kgsl/kgsl-3d0/dev ] && [ "$attempt" -lt 100 ]; do
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+[ -r /sys/class/kgsl/kgsl-3d0/dev ] || die 'KGSL class device missing'
+node_from_class /sys/class/kgsl/kgsl-3d0/dev /dev/kgsl-3d0 video 0660
+
+load xiaomi_touch "$touch/xiaomi_touch.ko"
+load focaltech_touch_3683 "$touch/focaltech_touch_3683.ko"
+touch_raw_control=/sys/devices/virtual/touch/touch_dev/enable_touch_raw
+attempt=0
+while [ ! -w "$touch_raw_control" ] && [ "$attempt" -lt 50 ]; do
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+[ -w "$touch_raw_control" ] || die 'touch raw-mode control missing'
+printf '%s\n' 0 >"$touch_raw_control"
+[ "$(cat "$touch_raw_control")" = 0 ] || die 'touch raw mode remains enabled'
+udevadm trigger --action=add --subsystem-match=input >>"$log" 2>&1 || true
+udevadm settle --timeout=20 >>"$log" 2>&1 || die 'input udev settle failed'
+touch_event=
+for event in /sys/class/input/event*; do
+  [ -r "$event/device/name" ] || continue
+  [ "$(cat "$event/device/name")" = focaltech_ts ] || continue
+  touch_event=/dev/input/${event##*/}
+  break
+done
+[ -n "$touch_event" ] && [ -c "$touch_event" ] || die 'FocalTech touch node missing'
+
+if id sddm >/dev/null 2>&1; then
+  usermod -aG video,render,input sddm
+fi
+udevadm control --reload
+udevadm trigger --action=add --subsystem-match=drm >>"$log" 2>&1 || true
+
+touch /run/myron-omarchy-hardware-ready
+say "result=ready notes=$notes dsi=DSI-1 kgsl=/dev/kgsl-3d0 touch=$touch_event raw_mode=disabled"

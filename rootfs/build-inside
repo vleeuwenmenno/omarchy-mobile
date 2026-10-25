@@ -18,6 +18,10 @@
 # stage only) and only the per-run [omamobile] stanza trusts it unsigned.
 # STAGE_ONLY=1 needs external-contract: no /modules, no image, the tree goes to
 # /out/stage and the MANIFEST says it is a non-bootable stage.
+# ROOTFS_DEV_PAYLOAD_IMAGE=1 is a development-only Myron exception: it also
+# creates an ext4 payload from /target before /out is chowned back to the host
+# user. The payload preserves package ownership but still has no boot chain,
+# kernel, modules or private runtime assets.
 set -euo pipefail
 
 T=/target
@@ -25,8 +29,10 @@ say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 list() { sed -e 's/#.*//' -e 's/[[:space:]]//g' "$1" | grep -v '^$'; }
 STAGE_ONLY=${STAGE_ONLY:-0} ROOTFS_INTEGRATION=${ROOTFS_INTEGRATION:-kernel-modules}
+DEV_PAYLOAD_IMAGE=${ROOTFS_DEV_PAYLOAD_IMAGE:-0}
 ROOTFS_PACKAGE_PROFILE=${ROOTFS_PACKAGE_PROFILE:-default}
 [[ $STAGE_ONLY == 0 || $STAGE_ONLY == 1 ]] || die "bad STAGE_ONLY '$STAGE_ONLY'"
+[[ $DEV_PAYLOAD_IMAGE == 0 || $DEV_PAYLOAD_IMAGE == 1 ]] || die "bad ROOTFS_DEV_PAYLOAD_IMAGE '$DEV_PAYLOAD_IMAGE'"
 [[ $ROOTFS_PACKAGE_PROFILE =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
   die "bad ROOTFS_PACKAGE_PROFILE '$ROOTFS_PACKAGE_PROFILE'"
 case $ROOTFS_INTEGRATION in kernel-modules|external-contract) ;; *) die "bad ROOTFS_INTEGRATION '$ROOTFS_INTEGRATION'" ;; esac
@@ -41,6 +47,10 @@ if [[ $STAGE_ONLY == 1 ]]; then
   [[ $ROOTFS_INTEGRATION == external-contract ]] || die "STAGE_ONLY needs ROOTFS_INTEGRATION=external-contract"
 else
   [[ $ROOTFS_INTEGRATION == kernel-modules ]] || die "ROOTFS_INTEGRATION=$ROOTFS_INTEGRATION needs STAGE_ONLY=1"
+fi
+if [[ $DEV_PAYLOAD_IMAGE == 1 ]]; then
+  [[ ${DEVICE:-} == myron && $STAGE_ONLY == 1 && $ROOTFS_INTEGRATION == external-contract && ${ROOTFS_DEV_UNSIGNED:-0} == 1 ]] ||
+    die "ROOTFS_DEV_PAYLOAD_IMAGE=1 needs the unsigned Myron external-contract stage"
 fi
 trap 'chown -R "$OUT_UID:$OUT_GID" /var/cache/pacman/pkg /out 2>/dev/null || true' EXIT
 
@@ -277,6 +287,9 @@ say "MANIFEST"
     echo "rootfs integration: external-contract"
     echo "kernel modules: none (external contract, no module payload)"
     echo "boot payload: none; proprietary payload: none"
+    if [[ $DEV_PAYLOAD_IMAGE == 1 ]]; then
+      echo "development payload image: ownership-preserving ext4; external boot chain required; not deployment-authorized"
+    fi
   else
     echo "kernel modules: $KERNEL_RELEASE (tarball sha256 $MODULES_SHA256)"
   fi
@@ -298,6 +311,16 @@ if [[ $STAGE_ONLY == 1 ]]; then
   rm -rf /out/stage
   mkdir -p /out/stage
   tar -C "$T" --numeric-owner -cf - . | tar -C /out/stage --numeric-owner -xpf -
+  if [[ $DEV_PAYLOAD_IMAGE == 1 ]]; then
+    say "Development ext4 payload (external boot chain required)"
+    used=$(du -sx --block-size=1M "$T" | cut -f1)
+    size=$(( (used * 12 / 10 + 768 + 63) / 64 * 64 ))
+    rm -f /out/rootfs-payload.img
+    truncate -s "${size}M" /out/rootfs-payload.img
+    mkfs.ext4 -q -L myron-oma-dev -m 1 -d "$T" /out/rootfs-payload.img
+    e2fsck -fn /out/rootfs-payload.img >/dev/null
+    echo "    ${used} MiB of files in a ${size} MiB development payload"
+  fi
   echo "    $(du -sx --block-size=1M "$T" | cut -f1) MiB staged as a tree; no image, no filesystem"
   exit 0
 fi

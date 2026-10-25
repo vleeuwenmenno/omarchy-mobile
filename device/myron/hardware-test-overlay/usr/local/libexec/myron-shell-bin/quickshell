@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Temporary Myron hardware-test workaround. Qt Quick's Wayland EGL context is
+# transparent with the isolated experiment-105 Mesa stack. Rasterize only the
+# Omarchy shell; the compositor and applications remain GPU accelerated.
+set -eu
+export QT_QUICK_BACKEND=software
+exec /usr/bin/quickshell "$@"

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Myron temporary Omarchy hardware-test rollback watchdog
+DefaultDependencies=no
+Before=sysinit.target
+ConditionPathExists=/run/myron-watchdog/watchdog
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+
+[Service]
+Type=simple
+ExecStart=/run/myron-watchdog/busybox sh /run/myron-watchdog/watchdog
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/run/myron-host/var/log/myron-omarchy-watchdog.log
+StandardError=inherit
+
+[Install]
+WantedBy=sysinit.target

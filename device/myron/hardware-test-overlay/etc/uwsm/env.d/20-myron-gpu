@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+export LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu
+export LIBGL_DRIVERS_PATH=/usr/lib/omamobile/myron-gpu/dri
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+export VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json
+export HYPRLAND_NO_SD_VARS=1
+unset WAYLAND_DISPLAY AQ_BACKEND EGL_PLATFORM

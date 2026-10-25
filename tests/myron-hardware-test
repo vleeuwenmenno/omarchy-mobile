@@ -1,0 +1,133 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Static safety checks for the temporary, loop-mounted Myron hardware test.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+overlay=device/myron/hardware-test-overlay
+compose=tools/myron-dev-image-compose
+initboot=tools/myron-build-test-init-boot
+initramfs=device/myron/hardware-test-initramfs
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+bash -n "$compose" "$initboot" || fail 'image builders parse'
+for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
+  sh -n "$fragment" || fail "$fragment parses"
+done
+for script in "$overlay/usr/local/bin/myron-start-omarchy" \
+  "$overlay/usr/local/bin/myron-omarchy-setup-user" \
+  "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
+  "$overlay/usr/local/sbin/myron-omarchy-prepare" \
+  "$overlay/usr/local/sbin/myron-omarchy-qualify"; do
+  sh -n "$script" || fail "$script parses"
+  [[ -x $script ]] || fail "$script is executable"
+done
+[[ -x $initboot ]] || fail 'init_boot builder is executable'
+pass 'composer, initramfs and hardware-test scripts parse'
+
+profile=$overlay/etc/uwsm/env.d/20-myron-gpu
+for exact in \
+  'export LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu' \
+  'export LIBGL_DRIVERS_PATH=/usr/lib/omamobile/myron-gpu/dri' \
+  'export MESA_LOADER_DRIVER_OVERRIDE=zink' \
+  'export VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json' \
+  'unset WAYLAND_DISPLAY AQ_BACKEND EGL_PLATFORM'; do
+  grep -Fxq "$exact" "$profile" || fail "native GPU profile lacks: $exact"
+done
+grep -Fq 'exec uwsm start' "$overlay/usr/local/bin/myron-start-omarchy" ||
+  fail 'session wrapper does not enter UWSM'
+grep -Fq 'PATH=/usr/local/libexec/myron-shell-bin:' "$overlay/usr/local/bin/myron-start-omarchy" ||
+  fail 'session does not scope the Myron shell renderer wrapper'
+grep -Fxq 'export QT_QUICK_BACKEND=software' \
+  "$overlay/usr/local/libexec/myron-shell-bin/quickshell" ||
+  fail 'quickshell wrapper does not select the software Qt Quick backend'
+grep -Fxq 'exec /usr/bin/quickshell "$@"' \
+  "$overlay/usr/local/libexec/myron-shell-bin/quickshell" ||
+  fail 'quickshell wrapper does not delegate to the packaged executable'
+pass 'native session keeps exact isolated Zink/Turnip profile'
+
+prepare=$overlay/usr/local/sbin/myron-omarchy-prepare
+qualify=$overlay/usr/local/sbin/myron-omarchy-qualify
+grep -Fq '8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608' "$prepare" ||
+  fail 'prepare does not pin exact kernel notes'
+for required in card0-DSI-1 /dev/dri/card0 /dev/dri/renderD128 /dev/kgsl-3d0 \
+  '/usr/lib/omamobile/myron-gpu/' enable_touch_raw hardware-test.disarm; do
+  grep -Fq "$required" "$qualify" || fail "qualification lacks $required"
+done
+grep -Fq 'printf '\''%s\n'\'' 0 >"$touch_raw_control"' "$prepare" ||
+  fail 'prepare does not disable Xiaomi THP raw mode'
+grep -Eq 'stable_seconds=90$' "$qualify" || fail 'qualification window is not 90 seconds'
+grep -Fq 'llvmpipe|swrast' "$qualify" || fail 'software renderer rejection is absent'
+grep -Fq 'hyprland.lock' "$qualify" ||
+  fail 'qualification does not resolve the runtime IPC instance from Hyprland lock metadata'
+pass 'qualification requires native DSI, GPU nodes, isolated Mesa and stable Hyprland'
+
+grep -Fq 'ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed' \
+  "$overlay/usr/lib/systemd/system/myron-omarchy-prepare.service" ||
+  fail 'prepare unit is not armed by host-root marker'
+grep -Fq 'ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed' \
+  "$overlay/usr/lib/systemd/system/myron-omarchy-qualify.service" ||
+  fail 'qualify unit is not armed by host-root marker'
+grep -Fq 'Address=172.16.42.1/24' "$overlay/etc/systemd/network/10-myron-usb0.network" ||
+  fail 'static USB rescue address is absent'
+grep -Fq 'functions/acm.usb0' "$initramfs/systemd-stage.sh" ||
+  fail 'initramfs ACM rescue console is absent'
+grep -Fq 'Before=sysinit.target' \
+  "$overlay/usr/lib/systemd/system/myron-hardware-watchdog.service" ||
+  fail 'rollback watchdog does not start before sysinit'
+grep -Fq 'enable myron-hardware-watchdog.service' "$compose" ||
+  fail 'rollback watchdog is not enabled in the payload'
+grep -Fq 'mask ModemManager.service systemd-firstboot.service' "$compose" ||
+  fail 'interactive stock firstboot is not masked'
+grep -Fq 'Session=myron-omarchy.desktop' "$overlay/etc/sddm.conf.d/zz-myron-test.conf" ||
+  fail 'late SDDM override does not select the isolated Myron session'
+grep -Fq 'TimeoutStartSec=3min' \
+  "$overlay/etc/systemd/system/omamobile-firstboot.service.d/90-myron-hardware-test.conf" ||
+  fail 'temporary firstboot cannot release the display manager before rollback'
+grep -Fxq 'ConditionPathExists=' \
+  "$overlay/usr/lib/systemd/user/omamobile-setup-user.service.d/90-myron-hardware-test.conf" ||
+  fail 'temporary first login does not run the idempotent mobile profile setup'
+grep -Fxq 'ExecStart=/usr/local/bin/myron-omarchy-setup-user' \
+  "$overlay/usr/lib/systemd/user/omamobile-setup-user.service.d/90-myron-hardware-test.conf" ||
+  fail 'temporary first login does not run the Myron mobile setup wrapper'
+for output in Virtual-1 Virtual-2; do
+  grep -Fq "hl.monitor({ output = \"$output\", disabled = true })" \
+    "$overlay/usr/local/bin/myron-omarchy-setup-user" ||
+    fail "mobile setup does not disable zero-size $output"
+done
+pass 'services require explicit arm marker and preserve USB rescue address'
+
+if grep -REq '(^|[[:space:]/])(fastboot|dd|sgdisk|parted|mkfs|wipefs)([[:space:]]|$)' \
+    "$overlay"; then
+  fail 'hardware-test overlay contains a partition-writing command'
+fi
+grep -Fq 'refusing to replace' "$compose" || fail 'composer can replace an output'
+grep -Fq 'deployment_authorized=false' "$compose" || fail 'composer omits deployment refusal label'
+grep -Fq 'mask ModemManager.service' "$compose" || fail 'first boot can start modem service'
+grep -Fq 'for path in / /usr /usr/local' "$compose" ||
+  fail 'composer does not verify ownership of paths overwritten by input directory metadata'
+grep -Fq 'chmod 0755 "$root$relative"' "$compose" ||
+  fail 'composer does not normalize host-stage directory traversal modes'
+pass 'overlay has no partition writer; composer is output-exclusive and modem-safe'
+
+grep -Fq 'target=/dev/block/by-name/init_boot_a' "$initramfs/watchdog.sh" ||
+  fail 'watchdog target is not slot-A init_boot'
+grep -Fq 'find_partition init_boot_a && target=$found_device' "$initramfs/fail-boot.sh" ||
+  fail 'early rollback does not resolve init_boot_a from sysfs'
+grep -Fq 'readonly systemd_release_sha=535d8e2fe0db2b35dc003e329fafc2b76dd82705df70cef63dc74accf653ec24' \
+  "$initboot" || fail 'builder does not pin exact systemd release-v3 rollback'
+grep -Fq "watchdog_seconds=900" "$initboot" || fail 'default watchdog is not 15 minutes'
+grep -Fq 'refusing to replace' "$initboot" || fail 'init_boot builder can replace an output'
+if grep -REq '/dev/block/by-name/(boot_b|init_boot_b|recovery_b|vendor_boot_b)' "$initramfs"; then
+  fail 'initramfs references a slot-B partition'
+fi
+if grep -REq '(mkfs|wipefs|sgdisk|parted)' "$initramfs"; then
+  fail 'initramfs contains a filesystem or partition-table writer'
+fi
+for required in hardware-test-init-boot.sha256 myron-init_boot_a-rollback-20261025.img \
+  'sha256sum "$target"' 'dd if="$rollback" of="$target"' 'hardware-test.disarm' \
+  myron-omarchy-initramfs-failure.log; do
+  grep -RFq "$required" "$initramfs" || fail "rollback contract lacks $required"
+done
+pass 'watchdog is slot-A-only, hash-guarded and never formats storage'

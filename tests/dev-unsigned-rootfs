@@ -51,10 +51,11 @@ echo "docker $*" >> "$CALLS"
 [[ $1 != run ]] || for argument; do printf 'ARG %s\n' "$argument" >> "$CALLS"; done
 if [[ $1 == volume ]]; then exit 0; fi
 if [[ $1 == run ]]; then
-  previous= output= lock=
+  previous= output= lock= payload=0
   for argument; do
     [[ $previous == -v && $argument == *:/out ]] && output=${argument%:/out}
     [[ $previous == -v && $argument == *:/repo:ro ]] && lock=${argument%:/repo:ro}/.repo.lock
+    [[ $argument == ROOTFS_DEV_PAYLOAD_IMAGE=1 ]] && payload=1
     previous=$argument
   done
   [[ -n $output && -n $lock ]] || exit 91
@@ -65,6 +66,7 @@ if [[ $1 == run ]]; then
   # only this directory owner-writable before its cross-parent rename.
   chmod 0555 "$output/stage"
   printf '# Omarchy Mobile root STAGE (not bootable, not an image)\n' > "$output/MANIFEST"
+  [[ $payload == 0 ]] || truncate -s 1M "$output/rootfs-payload.img"
   exit 0
 fi
 exit 92
@@ -75,6 +77,21 @@ if [ "$1" = rev-parse ]; then echo deadbeef0000; fi
 exit 0
 SH
 chmod +x "$t/bin/docker" "$t/bin/git"
+cat > "$t/bin/zstd" <<'SH'
+#!/bin/bash
+set -e
+source_file= output=
+while (($#)); do
+  case $1 in
+    -o) output=$2; shift 2 ;;
+    -*) shift ;;
+    *) source_file=$1; shift ;;
+  esac
+done
+[[ -n $source_file && -n $output ]]
+cp --sparse=always "$source_file" "$output"
+SH
+chmod +x "$t/bin/zstd"
 export CALLS=$t/calls
 
 new_repo() {
@@ -193,7 +210,31 @@ grep -qx 'LOCK-HELD' "$CALLS" && grep -qx 'SHARED-OK' "$CALLS" || fail "the shar
 ! grep -qx 'LOCK-FREE' "$CALLS" || fail "a writer could take the lock while the container ran"
 pass "the development stage is named dev-unsigned, mounts only out/dev-unsigned, holds the shared lock and passes the exact trust and manifest to the container"
 
+# Explicit development payload: still stage-only and unsigned, but the
+# ownership-preserving ext4 file is published privately and never overwrites.
+new_repo; dev_repo
+rootfs --dev-unsigned --stage-only --dev-payload-image --version p1 || fail "the mocked development payload build fails"
+payload_name=omamobile-rootfs-stage-dev-unsigned-p1-aarch64.payload.img.zst
+payload=$R/out/private/$payload_name
+[[ -f $payload && -f $payload.sha256 ]] || fail "the development payload or checksum is missing"
+[[ $(stat -c %a "$R/out/private") == 700 ]] || fail "the payload directory is not private"
+[[ $(stat -c %a "$payload") == 600 && $(stat -c %a "$payload.sha256") == 600 ]] ||
+  fail "the payload outputs are not private"
+has ROOTFS_DEV_PAYLOAD_IMAGE=1 || fail "the container is not told to create the payload"
+(cd "$(dirname "$payload")" && sha256sum -c "$payload_name.sha256" >/dev/null) ||
+  fail "the payload checksum does not verify"
+pass "the explicit development payload is ownership-preserving, private, hash-pinned and still stage-only"
+
+new_repo; dev_repo
+refuses "a payload without --dev-unsigned" '--dev-payload-image needs DEVICE=myron --dev-unsigned --stage-only' --stage-only --dev-payload-image --version x
+new_repo; dev_repo
+refuses "a payload without --stage-only" 'unsupported BOOT_METHOD=external-android' --dev-unsigned --dev-payload-image --version x
+pass "the development payload cannot escape unsigned Myron stage-only mode"
+
 # No-clobber, and dev/signed names never collide
+new_repo; dev_repo
+rootfs --dev-unsigned --stage-only --version t1 || fail "the mocked development stage rebuild fails"
+name=omamobile-rootfs-stage-dev-unsigned-t1-aarch64
 rm -f "$CALLS"
 echo sentinel > "$R/out/$name/sentinel"; cp "$R/out/$name.MANIFEST" "$t/manifest.keep"
 if rootfs --dev-unsigned --stage-only --version t1; then fail "a same-version development rerun is accepted"; fi
