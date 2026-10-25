@@ -14,6 +14,10 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [ -f "$arm" ] && [ ! -L "$arm" ] || fail 'audio foundation is not armed'
 [ "$(cat "$arm")" = 'verified-audio-foundation' ] || fail 'invalid audio arm marker'
 [ -s /run/myron-wireless-ready ] || fail 'radio/Wi-Fi firmware foundation is not ready'
+systemctl --quiet is-active myron-reference-radio.service ||
+	fail 'audio requires a clean boot with the radio foundation unit active'
+! pgrep -x ModemManager >/dev/null ||
+	fail 'audio requires a separate boot before ModemManager or GNSS starts'
 [ -d /usr/local/lib/myron-audio ] || fail 'AudioReach runtime assets are unavailable'
 [ -f "$source_script" ] && [ ! -L "$source_script" ] || fail 'postmarketOS audio reference is unavailable'
 [ "$(sha256sum "$source_script" | awk '{print $1}')" = "$source_sha" ] ||

@@ -1,125 +1,138 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Myron temporary Omarchy hardware test
 
-Status: live hardware qualified on 2026-10-25; clean rebuilt artifacts are
-offline-only and have not yet been reboot-tested.
+Status: the r4 temporary Arch payload booted and qualified native DSI,
+Hyprland, touch, the isolated GPU stack, Wi-Fi, modem registration and a GNSS
+fix on 2026-10-25. It exposed a missing DMA-heap device node and an unsafe
+audio sequencing assumption. postmarketOS has been restored; r5 fixes are
+implemented offline but have not yet been boot-tested.
 
 This is a reversible development test around the existing downstream Myron
 kernel and extracted runtime assets. It is not the production installer, does
-not authorize deployment, and does not change the device descriptor's
-`external-android` boot method.
+not authorize a general deployment, and does not change the device
+descriptor's `external-android` boot method. Slot B contains the owner's
+Android installation and is never part of this test.
 
-## Live evidence
+## r4 live evidence
 
-The temporary Arch root booted the existing
+The r4 Arch root booted the existing
 `6.12.23-android16-5-g5a0e85dd9db0-dirty-4k` kernel and passed these attended
 checks:
 
-- Hyprland 0.56.2 acquired native DRM/KMS on `DSI-1`, exposing
-  1200x2608 at 60, 90 and 120 Hz.
+- Hyprland 0.56.2 acquired native DRM/KMS on `DSI-1`, exposing 1200x2608 at
+  60, 90 and 120 Hz.
 - Hyprland mapped the isolated Myron `libEGL`, `libgbm`, Gallium and Freedreno
   Vulkan libraries, opened card0, renderD128 and KGSL, and reported Zink on
   `Adreno (TM) 840 (MESA_TURNIP)`. No llvmpipe mapping was present.
-- Touch events reached Hyprland after Xiaomi THP raw mode was disabled.
-- Omarchy's mobile status bar, launcher and app grid rendered on DSI-1.
-  Touch input entered text into the launcher's search field.
-- Squeekboard mapped on DSI-1 after the downstream driver's zero-size
-  `Virtual-1` and `Virtual-2` outputs were disabled.
-- The attended display scale is now `2.0` (600x1304 logical pixels). The
-  portrait Squeekboard height uses an independent `1.8` multiplier.
-- `pmic_pwrkey` and `pmic_resin` are explicitly classified as input keyboards,
-  so Hyprland now registers the power and Volume Down devices alongside the
-  already visible gpio-keys device.
-- USB NCM SSH remained available throughout qualification.
-- The independent 15-minute rollback watchdog found its disarm marker and
-  exited successfully without rebooting.
+- Touch reached Hyprland after Xiaomi THP raw mode was disabled. Omarchy's
+  status bar, launcher, app grid and Squeekboard rendered on DSI-1.
+- The attended display scale is `2.0` (600x1304 logical pixels), with a
+  separate `1.8` portrait keyboard multiplier.
+- USB NCM SSH remained available. The independent 15-minute watchdog found
+  its disarm marker after the 90-second compositor stability window.
 
-The qualifier recorded:
+The r4 qualifier recorded:
 
 ```text
 result=qualified dsi=DSI-1 renderer=isolated-zink-turnip stable_seconds=90 rollback=disarmed
 ```
 
-## Findings incorporated into the overlay
+Radio qualification then used the disabled, marker-gated reference bridge:
 
-The full first-run provisioner can block on network-dependent Mise work after
-it has created the user. The hardware-test image bounds that unit, and the
-user-level `omamobile-setup-user` service is allowed to seed the idempotent
-phone profile on the first graphical login.
+- MSS reached `running`; QRTR and `rmnet_ipa0` appeared without kernel warnings.
+- The kernel's `wlan0` was renamed to `wlp1s0` by Arch. Renaming it back and
+  restarting NetworkManager allowed a scan of 12 access points, Wi-Fi
+  association, IPv4 connectivity and DNS resolution. r5 carries an exact
+  systemd link rule for the downstream CNSS PCIe function so the proven
+  `wlan0` contract is preserved before NetworkManager starts.
+- The packaged patched ModemManager discovered the modem within five seconds.
+  It registered on the home network, reported packet attachment, LTE plus 5G
+  NR and 55% signal. No bearer, carrier-data, SMS or call action was run.
+- The modem advertised raw GPS, NMEA, MSA A-GPS and MSB A-GPS. A bounded GNSS
+  test obtained a fix after 60 seconds and logged GGA reports using seven
+  satellites. Coordinates were suppressed and GNSS was disabled afterwards.
 
-Qt Quick cannot create usable Wayland EGL surfaces with the isolated
-experiment-105 stack in this image: Quickshell's layers are present but
-transparent and its log reports `Failed to create the decorations EGLContext`.
-The hardware-test session therefore shadows only the `quickshell` executable
-with a wrapper that sets `QT_QUICK_BACKEND=software`. Hyprland and ordinary
-applications retain the isolated accelerated stack.
+## r4 application failure and r5 GPU gate
 
-Squeekboard initially selected the first advertised output, `Virtual-1`, whose
-mode is 0x0. Hyprland rejected its layer surface with
-`y == 0 but anchor doesn't have top and bottom`. The Myron user-setup wrapper
-adds explicit disabled monitor rules for both zero-size virtual outputs.
+The compositor-only GPU qualifier was insufficient. Nautilus reached Wayland,
+but Turnip reported that neither `/dev/dma_heap/system` nor `/dev/ion` could be
+opened, then failed `ION_IOC_ALLOC` and swapchain allocation with
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`. This explains applications that opened
+inconsistently even while Hyprland itself remained accelerated.
 
-The Arch stage now packages QRTR, RMTFS, TQFTP, TinyALSA, AudioReach graph
-services/configuration/manager and FastRPC. The private composer requires the
-verified `radio-base` and `audio-microphone` runtime closures. Package install
-does not start a remote processor or service.
+r5 creates `/dev/dma_heap/system` and `/dev/dri/dmaheap-sys` from the exact
+`/sys/class/dma_heap/system/dev` major/minor pair, with the proven video-group
+permissions. The qualifier now verifies both nodes, verifies access as the
+Hyprland user, and runs a separate native Wayland `eglinfo -B` client. Rollback
+is not disarmed unless that client reports Adreno 840 Turnip and no llvmpipe or
+swrast. `mesa-utils`, `vulkan-tools` and `rtkit` are included in the Myron
+profile for this qualification and the PipeWire real-time service.
 
-For this temporary test only, two disabled units bridge to exact
-checksum-pinned copies of the known-good scripts in the mounted postmarketOS
-root. The radio bridge consumes a per-boot marker asserting that a fresh
-read-only calibration backup was verified. Before consuming that marker, it
-also verifies the complete three-module `radio-base` closure. The audio bridge
-has a separate one-shot marker and stops at ALSA-card/raw-microphone readiness.
-It never opens speaker playback. Neither unit has an install target, and
-ModemManager stays masked in the composed image.
+Qt Quick still cannot create usable Wayland EGL surfaces with the isolated
+experiment-105 stack in this image. The test session therefore shadows only
+the `quickshell` executable with `QT_QUICK_BACKEND=software`; Hyprland and
+ordinary applications retain the isolated accelerated stack.
 
-## Rebuilt offline artifacts
+## First boot and mobile shell fixes
 
-Private, untracked artifacts produced after those fixes:
+The temporary first boot no longer waits on unsupported nftables/UFW setup.
+It records that the firewall is deferred instead of claiming protection is
+active. It also defers Omarchy's network-only Mise/developer-tool provisioning
+until Wi-Fi exists, while still applying the packaged mobile shell profile.
+No completion marker is forged, so the full user provisioner can be run later.
+
+The r5 overlay supplies the `omamobile-gnss` command expected by the Location
+quick-setting tile. It uses the qualified Qualcomm ModemManager raw, NMEA,
+MSA and MSB location sources rather than installing the Pixel-specific
+Broadcom GNSS package.
+
+## Audio incident and hard sequencing rule
+
+Audio was incorrectly started after ModemManager and GNSS activity in the r4
+boot. Starting the reference AudioReach foundation immediately dropped USB
+SSH and rebooted the phone to fastboot before any speaker playback. No pstore
+record survived. Repeated boots then exhausted slot A's retry metadata; setting
+slot A active again restored its retry count without switching slots. The
+known-good postmarketOS `init_boot_a` image was restored and booted. Slot B was
+not read or written.
+
+The bridge now refuses audio unless `myron-reference-radio.service` completed
+cleanly in the same boot and no ModemManager process exists. Audio must be
+qualified on a separate fresh boot, before ModemManager or GNSS, with each
+mapper/module/ADSP step observed individually. Speaker output is not part of
+the foundation start and remains a separate low-volume safety test.
+
+## Artifact record
+
+The exact r4 pair that produced the evidence above is private and untracked:
 
 ```text
-8d9c8f5c583204ba0e8ea68cc1a3f7817e79e7b48e8e12cecc95a485cdfe73a1  myron-omarchy-hardware-test-20261025.img
-7a107847f72f08dc8e2825260fb2b258228679fc795b33fde93694a064e862c5  init_boot_a-myron-omarchy-hardware-test-20261025.img
-6f0d8512147096294688ddecd56a928fdc3ebf887355f795f43aee749fc0044c  myron-omarchy-hardware-test-20261025-r3.img
-561bcc8f5bd01e6d9c5c3a37160fbe3263394f7bbbdb731bb26359e4a148b6b2  myron-omarchy-hardware-test-20261025-r3b.img
+09a8127d1febd82c2b9dc04081899a371f07b93a7eb3038f1a415bb4e8c766ff  myron-omarchy-hardware-test-20261025-r4.img
+a29dafecfe3236e83fd09141536cc93f1aeafb95cd3daeef1047f4c035c83312  init_boot_a-myron-omarchy-hardware-test-20261025-r4-v1.img
 ```
 
-The `r3` image was composed from the real unsigned Arch stage after all new
-Qualcomm userspace packages resolved. `e2fsck`, image-content checks,
-`tests/all`, and every package suite passed; the one package suite requiring
-ShellCheck was rerun with a temporary pinned `shellcheck@0.11.0`. The current
-init_boot candidate is hash-bound to the earlier payload, so `r3` cannot be
-substituted without rebuilding init_boot through the existing guarded tool.
-`r3b` adds the pre-arm radio-base checksum gate discovered by the first live
-radio attempt and is the current clean candidate.
+The exact known-good postmarketOS rollback image is:
 
-The init_boot candidate embeds a 900-second watchdog and the exact known-good
-postmarketOS rollback image hash
-`535d8e2fe0db2b35dc003e329fafc2b76dd82705df70cef63dc74accf653ec24`.
-Slot B is the owner's Android/recovery installation and is outside this test.
+```text
+535d8e2fe0db2b35dc003e329fafc2b76dd82705df70cef63dc74accf653ec24  init_boot_a.img
+```
 
-`tests/myron-hardware-test` and the complete `tests/all` suite passed after the
-fixes. The rebuilt pair still needs one clean attended boot before the live
-hotfixes can be called reproducible.
+The r5 payload and init_boot pair must be rebuilt together after the current
+offline tests pass. The initramfs watchdog remains 900 seconds, writes only
+`init_boot_a`, checks both candidate and rollback hashes, and never references
+a slot-B partition.
 
-## Current hardware-test boundary
+## Next attended sequence
 
-The live temporary Arch root has the userspace foundations and private audio
-closure staged, but ADSP and modem MSS remain offline. ModemManager is
-inactive. Therefore audio, modem and GNSS are still unverified in Omarchy.
+1. Boot r5 and qualify DSI, touch, DMA-heap access, Adreno client EGL, shell,
+   launcher, Nautilus, brightness, battery reporting and physical buttons.
+2. Arm and start only the radio bridge. Verify `wlan0`, Wi-Fi and WLAN SSH.
+3. Start patched ModemManager, verify registration, then run one bounded GNSS
+   fix. Do not create a cellular bearer or run telephony actions.
+4. Restore postmarketOS. On a separate clean r5 boot, qualify audio foundation
+   step by step before ModemManager/GNSS, then test microphone and a guarded
+   low-volume speaker route.
 
-Before the first radio start, stream the kernel log to the laptop and arm an
-independent recovery timer. Start only `myron-reference-radio.service`, then
-verify `wlan0`, MSS, QRTR and USB SSH before touching ModemManager. The audio
-foundation is a later, separate boot change. Speaker routing, carrier data,
-SMS, calls and GNSS fixes remain separate approval gates.
-
-The first attended radio start on 2026-10-25 stopped before MSS activation:
-the already running hot image predated the `radio-base` closure and lacked
-`rmnet_mem.ko`, `gsim.ko` and `ipam.ko`. MSS remained `offline`, the ready
-marker was absent, USB SSH stayed available, and the kernel logged no panic,
-oops, UFS error handler or I/O error. The recovery timer was cancelled after
-a fresh SSH check. The three verified modules are staged for the next boot,
-but the one-shot arm was consumed and the test must not be retried before a
-normal reboot. The bridge now checks all three hashes before consuming future
-arm markers.
+Bluetooth discovery/audio, sensors and rotation, telephony, fingerprint and
+camera capture remain required later phases; none may be inferred from the
+successful graphical or radio tests.

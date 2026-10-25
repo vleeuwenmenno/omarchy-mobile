@@ -121,7 +121,8 @@ pass "values are data, never executed"
 # --- a whole run against fakes ------------------------------------------------
 F=$t/fakes; mkdir -p "$F"; CALLS=$t/calls; : > "$CALLS"
 fake() { printf '#!/bin/bash\n%s\n' "$2" > "$F/$1"; chmod +x "$F/$1"; }
-for cmd in pacman-key systemctl ufw chown hostname nmcli usermod omamobile-setup-system; do
+for cmd in pacman-key systemctl ufw chown hostname nmcli usermod omamobile-setup-system \
+  omamobile-setup-user; do
   fake "$cmd" 'echo "$(basename "$0") $*" >> "$CALLS"'
 done
 fake useradd 'echo "useradd $*" >> "$CALLS"; u=${@: -1}; echo "$u:x:1000:1000::/home/$u:/bin/bash" >> "$R/etc/passwd"; mkdir -p "$R/home/$u"'
@@ -130,6 +131,15 @@ fake id 'echo 1000'
 fake runuser 'echo "runuser $*" >> "$CALLS"; shift 3; [[ $1 == env ]] && { shift; while [[ $1 == -i || $1 == *=* ]]; do shift; done; }; case $1 in mkdir|touch|sh) "$@" ;; esac'
 export CALLS R
 run() { OMAMOBILE_FIRSTBOOT_ROOT=$R OMARCHY_PATH=$t/no-omarchy PATH="$F:$PATH" bin/omamobile-firstboot > "$t/run.out" 2>&1; }
+run_no_firewall() {
+  OMAMOBILE_FIRSTBOOT_ROOT=$R OMAMOBILE_FIRSTBOOT_SKIP_FIREWALL=1 \
+    OMARCHY_PATH=$t/no-omarchy PATH="$F:$PATH" bin/omamobile-firstboot > "$t/run.out" 2>&1
+}
+run_deferred_provision() {
+  OMAMOBILE_FIRSTBOOT_ROOT=$R OMAMOBILE_FIRSTBOOT_SKIP_FIREWALL=1 \
+    OMAMOBILE_FIRSTBOOT_DEFER_OMARCHY_PROVISION=1 \
+    OMARCHY_PATH=$t/no-omarchy PATH="$F:$PATH" bin/omamobile-firstboot > "$t/run.out" 2>&1
+}
 
 good > "$R/etc/omamobile/firstboot.conf"
 run || { cat "$t/run.out"; fail "a run with a good conf succeeds"; }
@@ -158,6 +168,28 @@ grep -qx pin "$R/home/alice/.config/omamobile/credential" || fail "the credentia
 grep -qF "$PSK" "$R/var/log/omamobile/firstboot.log" "$t/run.out" && fail "the log never has the passphrase"
 grep -qF "$HASH" "$R/var/log/omamobile/firstboot.log" "$t/run.out" && fail "the log never has the hash"
 pass "a run sets everything up and deletes the conf"
+
+: > "$CALLS"
+echo 'ENABLED=yes' > "$R/etc/ufw/ufw.conf"
+good | sed '/^WIFI_/d' > "$R/etc/omamobile/firstboot.conf"
+run_no_firewall || { cat "$t/run.out"; fail "device policy cannot defer an unavailable firewall"; }
+! grep -q '^ufw ' "$CALLS" || fail "deferred firewall policy still invokes ufw"
+! grep -q '^systemctl enable ufw.service$' "$CALLS" || fail "deferred firewall policy enables ufw"
+grep -q '^systemctl disable ufw.service$' "$CALLS" || fail "deferred firewall policy does not disable ufw"
+grep -qx 'ENABLED=no' "$R/etc/ufw/ufw.conf" || fail "deferred firewall policy leaves ufw enabled"
+grep -q 'firewall deferred by device policy' "$t/run.out" || fail "deferred firewall policy is not reported"
+pass "device policy can defer an unavailable firewall without weakening the default"
+
+: > "$CALLS"
+good | sed '/^WIFI_/d' > "$R/etc/omamobile/firstboot.conf"
+run_deferred_provision || { cat "$t/run.out"; fail "device policy cannot defer online user provisioning"; }
+! grep -q 'omarchy-provision-user' "$CALLS" || fail "deferred policy still runs Omarchy online provisioning"
+grep -q 'omamobile-setup-user' "$CALLS" || fail "deferred policy skips packaged mobile setup"
+[[ -f $R/var/lib/omamobile/firstboot/omarchy-user-provision-deferred ]] ||
+  fail "deferred policy is not recorded"
+grep -q 'online user provisioning deferred by device policy' "$t/run.out" ||
+  fail "deferred online provisioning is not reported"
+pass "device policy can defer online desktop tooling while applying the mobile profile"
 
 : > "$CALLS"
 run || fail "without a conf, nothing to do"

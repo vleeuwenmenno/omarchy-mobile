@@ -487,7 +487,8 @@ fi
 t=$(mktemp -d)
 # Some mutations remove permissions: restore them so cleanup always works
 trap 'chmod -R u+rwx "$t" 2>/dev/null || true; rm -rf "$t"' EXIT
-for p in modemmanager libqmi geoclue pipewire wireplumber chrony bluez bluez-utils; do
+for p in modemmanager libqmi geoclue pipewire wireplumber rtkit chrony bluez bluez-utils \
+  mesa-utils vulkan-tools; do
   grep -qx "$p" rootfs/packages.base.myron || fail "Myron base profile misses $p"
 done
 for p in omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland \

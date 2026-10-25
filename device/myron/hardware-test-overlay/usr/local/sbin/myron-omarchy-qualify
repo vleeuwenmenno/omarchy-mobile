@@ -18,6 +18,12 @@ has_fd() {
 }
 
 [ -f /run/myron-omarchy-hardware-ready ] || die 'hardware preparation marker missing'
+[ -c /dev/dma_heap/system ] || die 'canonical system DMA-heap node missing'
+[ -c /dev/dri/dmaheap-sys ] || die 'system DMA-heap DRI alias missing'
+[ "$(stat -c '%t:%T' /dev/dma_heap/system)" = "$(stat -c '%t:%T' /dev/dri/dmaheap-sys)" ] ||
+  die 'system DMA-heap nodes refer to different devices'
+[ "$(stat -c '%a:%G' /dev/dma_heap/system)" = 660:video ] ||
+  die 'canonical system DMA-heap permissions differ'
 [ "$(cat /sys/devices/virtual/touch/touch_dev/enable_touch_raw 2>/dev/null || true)" = 0 ] ||
   die 'touch raw mode is not disabled'
 elapsed=0
@@ -33,6 +39,11 @@ while [ "$elapsed" -lt "$deadline_seconds" ]; do
 done
 [ -n "$pid" ] || die 'Hyprland did not start within 600 seconds'
 say "hyprland_pid=$pid state=observed"
+owner=$(stat -c %U "/proc/$pid")
+runuser -u "$owner" -- test -r /dev/dma_heap/system ||
+  die 'Hyprland user cannot read the system DMA heap'
+runuser -u "$owner" -- test -w /dev/dma_heap/system ||
+  die 'Hyprland user cannot write the system DMA heap'
 
 stable=0
 while [ "$stable" -lt "$stable_seconds" ]; do
@@ -63,6 +74,9 @@ for instance in "$runtime"/hypr/*; do
   break
 done
 [ -n "$signature" ] || die 'Hyprland IPC instance missing'
+wayland=$(sed -n '2p' "$runtime/hypr/$signature/hyprland.lock" 2>/dev/null || true)
+case "$wayland" in wayland-[0-9]*) ;; *) die 'Hyprland Wayland socket metadata missing' ;; esac
+[ -S "$runtime/$wayland" ] || die 'Hyprland Wayland socket missing'
 monitor_json=$(XDG_RUNTIME_DIR="$runtime" HYPRLAND_INSTANCE_SIGNATURE="$signature" hyprctl -j monitors 2>>"$log") ||
   die 'hyprctl monitors failed'
 printf '%s\n' "$monitor_json" >>"$log"
@@ -74,10 +88,33 @@ printf '%s\n' "$devices_json" >>"$log"
 printf '%s\n' "$devices_json" | grep -Eq 'focaltech|touch' ||
   die 'Hyprland did not publish a touch device'
 
+# The compositor itself could render in r4 while native applications failed:
+# Turnip had no DMA-heap node and every client swapchain allocation failed.
+# Prove a separate Wayland EGL client selects the isolated Adreno stack before
+# disarming rollback. Keep detailed output bounded in /run and only append the
+# renderer lines to the persistent diagnostic log.
+client_log=/run/myron-eglinfo.log
+if ! timeout 60 runuser -u "$owner" -- env \
+  LD_LIBRARY_PATH=/usr/lib/omamobile/myron-gpu \
+  LIBGL_DRIVERS_PATH=/usr/lib/omamobile/myron-gpu/dri \
+  MESA_LOADER_DRIVER_OVERRIDE=zink \
+  VK_DRIVER_FILES=/usr/lib/omamobile/myron-gpu/freedreno-kgsl.json \
+  XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="$wayland" EGL_PLATFORM=wayland \
+  /usr/bin/eglinfo -B >"$client_log" 2>&1; then
+  tail -n 80 "$client_log" >>"$log"
+  die 'native Wayland EGL client probe failed'
+fi
+grep -Ei 'renderer|device|version' "$client_log" | tail -n 40 >>"$log" || true
+grep -Eq 'Adreno.*840.*MESA_TURNIP|MESA_TURNIP.*Adreno.*840' "$client_log" ||
+  die 'native Wayland EGL client did not report Adreno 840 Turnip'
+if grep -Eqi 'llvmpipe|swrast' "$client_log"; then
+  die 'native Wayland EGL client selected software rendering'
+fi
+
 mkdir -p "$host_state"
 printf 'qualified_pid=%s\nstable_seconds=%s\n' "$pid" "$stable_seconds" \
   >"$host_state/hardware-test.disarm.new"
 chmod 0600 "$host_state/hardware-test.disarm.new"
 mv -f "$host_state/hardware-test.disarm.new" "$host_state/hardware-test.disarm"
 sync "$host_state"
-say "result=qualified dsi=DSI-1 renderer=isolated-zink-turnip stable_seconds=$stable_seconds rollback=disarmed"
+say "result=qualified dsi=DSI-1 renderer=isolated-zink-turnip client_egl=adreno840 dma_heap=ready stable_seconds=$stable_seconds rollback=disarmed"

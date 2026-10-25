@@ -39,12 +39,13 @@ Only the flag `--dev-unsigned` selects the mode. `DEV_UNSIGNED`,
 ## The command
 
 One machine without `keys/fingerprint` and `keys/gnupg` (the tools refuse if
-either exists, or is a link, even a dangling one). Build the twenty-one
+either exists, or is a link, even a dangling one). Build the twenty-three
 packages the Myron stage needs, in this order, then stage:
 
 ```sh
 tools/build-packages --dev-unsigned \
-  packages/omamobile-keyring packages/qrtr packages/rmtfs packages/tqftpserv \
+  packages/omamobile-keyring packages/qrtr packages/libqmi packages/modemmanager \
+  packages/rmtfs packages/tqftpserv \
   packages/audioreach-kernel-headers packages/tinyalsa packages/audioreach-graphservices \
   packages/audioreach-conf packages/audioreach-graphmgr packages/fastrpc \
   packages/omamobile-firstboot packages/omamobile-omarchy \

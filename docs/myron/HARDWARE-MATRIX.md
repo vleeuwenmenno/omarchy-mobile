@@ -85,6 +85,28 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | RTC / time | PARTIAL | PMIC RTC counter exists; counter-offset bootstrap plus Chrony works, writable wall-clock RTC does not. |
 | Lock authentication | BROKEN | PIN submission currently waits indefinitely despite compositor stability. |
 
+## Temporary Omarchy r4 delta (2026-10-25)
+
+These results describe the temporary Arch payload, not the postmarketOS
+reference statuses above:
+
+- **Verified on Omarchy:** native DSI/Hyprland, isolated Zink/Turnip compositor
+  rendering, touch, USB SSH, Wi-Fi scan/association/IPv4/DNS after a live
+  interface rename, modem discovery and home LTE/5G registration, and a
+  bounded seven-satellite GNSS fix.
+- **Fixed for r5, not yet boot-verified:** persistent `wlan0` naming,
+  `/dev/dma_heap/system` plus its DRI alias, native client EGL qualification,
+  the Qualcomm-backed Location tile, RTKit, finite firewall-deferred first
+  boot, and deferred network-only Omarchy user provisioning.
+- **Failed on Omarchy:** starting the AudioReach foundation after
+  ModemManager/GNSS caused an immediate hard reboot. Speaker and microphone
+  remain unverified; audio must use a separate clean boot and staged bring-up.
+- **Present but unverified on Omarchy:** brightness control, torch activation,
+  physical power/volume actions, UPower UI, Bluetooth, haptics and sensors.
+- **Not integrated on Omarchy:** SMS, voice calls/call audio, fingerprint and
+  camera capture. The current reference boot also exposes no camera/media or
+  fingerprint character nodes, and only two ADC IIO devices.
+
 ## Evidence sources
 
 - `../myron-postmarketos/README.md`
@@ -94,6 +116,6 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 - `../myron-postmarketos/experiments/systemd-native-hyprland/experiment.md`
 - read-only live audit on 2026-10-24
 
-Arch status for every row remains `UNKNOWN` until a built rootfs or booted
-system passes the same probe. A graphical boot alone cannot advance unrelated
-hardware rows.
+Permanent Arch integration remains unqualified until a reproducible built
+rootfs passes each probe. The temporary r4 evidence advances only the features
+listed in its delta; a graphical boot cannot advance unrelated hardware rows.

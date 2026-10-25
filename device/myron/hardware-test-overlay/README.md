@@ -10,11 +10,21 @@ session, prepares the already qualified KGSL and touch modules, preserves a
 static USB rescue address, and qualifies a native Hyprland session before it
 disarms the initramfs rollback watchdog. It never writes a partition.
 
+The qualifier also creates the canonical system DMA-heap node and its DRI
+alias from the kernel's exact sysfs device number. It disarms rollback only
+after a separate Wayland EGL client, running as the graphical user, reports
+Adreno 840 Turnip without llvmpipe or swrast.
+
 First graphical login also runs the idempotent mobile user setup. A
 PATH-scoped `quickshell` wrapper selects Qt Quick's software renderer because
 experiment 105 currently produces transparent Qt Quick Wayland surfaces. This
 does not change Hyprland or application rendering: they remain on isolated
 Zink/Turnip.
+
+For this temporary image, first boot records the downstream nftables firewall
+as deferred and skips Omarchy's network-only Mise/developer-tool downloads.
+The packaged mobile profile still runs; full Omarchy user provisioning remains
+unmarked and can be run once Wi-Fi is available.
 
 That setup disables the downstream driver's zero-size `Virtual-1` and
 `Virtual-2` outputs. Without this Myron-only rule, squeekboard binds to a 0x0
@@ -32,6 +42,10 @@ runtime asset closure plus their userspace packages. Modem, remoteproc and
 audio activation remain disabled; installing the files alone must not start
 hardware or ModemManager.
 
+The overlay provides a Myron-specific `omamobile-gnss` command for the shell's
+Location tile. It controls the qualified raw/NMEA/MSA/MSB sources through
+ModemManager and does not install the Pixel-specific Broadcom GNSS package.
+
 Two disabled, marker-gated units bridge to exact checksum-pinned copies of the
 known-good postmarketOS scripts while that root remains mounted:
 `myron-reference-radio.service` and
@@ -39,3 +53,7 @@ known-good postmarketOS scripts while that root remains mounted:
 section. The audio unit stops at ALSA-card/raw-microphone readiness; speaker
 routing remains a separate safety gate. These bridges are temporary hardware
 qualification tools, not the final standalone Arch implementation.
+
+Audio additionally refuses to start unless the radio bridge completed cleanly
+and no ModemManager process exists. Its qualification therefore requires a
+fresh, separate boot before modem or GNSS testing.

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# The checksum-pinned downstream bring-up script and Android-derived userspace
+# contract use wlan0.  Arch's default path policy otherwise renames this one
+# PCIe CNSS interface to wlp1s0 after the driver has registered it.
+[Match]
+OriginalName=wlan*
+Path=platform-1c00000.pcie-pci-0000:01:00.0
+
+[Link]
+Name=wlan0
+

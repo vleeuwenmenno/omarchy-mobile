@@ -306,13 +306,23 @@ s_omarchy_system() {
 s_services() {
   local unit
   for unit in NetworkManager.service systemd-networkd.service systemd-resolved.service sshd.service \
-              sddm.service bluetooth.service systemd-timesyncd.service ufw.service; do
+              sddm.service bluetooth.service systemd-timesyncd.service; do
     systemctl enable "$unit" || echo "    could not enable $unit"
   done
   systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service || true
   if [[ ! -L $ROOT/etc/resolv.conf ]]; then
     ln -sfn /run/systemd/resolve/stub-resolv.conf "$ROOT/etc/resolv.conf"
   fi
+  if [[ ${OMAMOBILE_FIRSTBOOT_SKIP_FIREWALL:-0} == 1 ]]; then
+    # A device-specific development image may reuse a downstream kernel whose
+    # nftables closure is not packaged yet. Keep firstboot finite without
+    # pretending the firewall works; release images never set this variable.
+    systemctl disable ufw.service >/dev/null 2>&1 || true
+    sed -i 's/^ENABLED=.*/ENABLED=no/' "$ROOT/etc/ufw/ufw.conf"
+    echo "    firewall deferred by device policy"
+    return 0
+  fi
+  systemctl enable ufw.service || echo "    could not enable ufw.service"
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow 53317/udp
@@ -407,7 +417,16 @@ s_user_setup() {
   local uid home toggles failed=0
   uid=$(id -u "$U") home=$ROOT$(home_of "$U")
   systemctl start "user@$uid.service" || echo "    no user manager; continuing without it"
-  as_user omarchy-provision-user --force --first-install || { echo "    omarchy-provision-user failed"; failed=1; }
+  if [[ ${OMAMOBILE_FIRSTBOOT_DEFER_OMARCHY_PROVISION:-0} == 1 ]]; then
+    # Temporary device bring-up may boot before its radio is enabled. Omarchy's
+    # desktop provisioner downloads optional developer tools through Mise;
+    # defer that network work while still applying the packaged mobile shell.
+    # No completion marker is forged, so it can be run normally after Wi-Fi.
+    touch "$STATE/omarchy-user-provision-deferred"
+    echo "    Omarchy online user provisioning deferred by device policy"
+  else
+    as_user omarchy-provision-user --force --first-install || { echo "    omarchy-provision-user failed"; failed=1; }
+  fi
   if command -v omamobile-setup-user >/dev/null; then
     as_user omamobile-setup-user || { echo "    omamobile-setup-user failed"; failed=1; }
   fi

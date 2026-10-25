@@ -1,0 +1,71 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Myron hardware-test Location switch backed by the qualified Qualcomm modem.
+set -eu
+
+mmcli=${OMAMOBILE_MYRON_MMCLI:-/usr/bin/mmcli}
+modem=${OMAMOBILE_MYRON_MODEM:-any}
+
+usage() {
+  printf '%s\n' 'usage: omamobile-gnss on|off|force|unforce|status [--json]' >&2
+  exit 2
+}
+
+status_data() {
+  if ! pgrep -x ModemManager >/dev/null 2>&1; then
+    return 1
+  fi
+  "$mmcli" -m "$modem" --location-status --output-keyvalue 2>/dev/null
+}
+
+status() {
+  data=$(status_data || true)
+  installed=false
+  enabled=no
+  if printf '%s\n' "$data" | grep -Fq ': gps-raw' &&
+     printf '%s\n' "$data" | grep -Fq ': gps-nmea'; then
+    installed=true
+  fi
+  if printf '%s\n' "$data" | grep -Eq '^modem\.location\.enabled\.value\[[0-9]+\][[:space:]]*:[[:space:]]*gps-(raw|nmea)$'; then
+    enabled=yes
+  fi
+  location=off
+  [ "$enabled" = no ] || location=on
+  if [ "${1:-}" = --json ]; then
+    printf '{"location":"%s","running":"%s","forced":"no","powered":"%s","agent":"on","lto_age_hours":"unknown","installed":%s}\n' \
+      "$location" "$enabled" "$enabled" "$installed"
+  else
+    printf 'location: %s\nreceiver running: %s\nchip powered: %s\nbackend: ModemManager Qualcomm LOC\n' \
+      "$location" "$enabled" "$enabled"
+  fi
+}
+
+enable() {
+  pgrep -x ModemManager >/dev/null 2>&1 || {
+    printf '%s\n' 'omamobile-gnss: ModemManager is not running' >&2
+    exit 1
+  }
+  "$mmcli" -m "$modem" \
+    --location-enable-gps-raw \
+    --location-enable-gps-nmea \
+    --location-enable-agps-msa \
+    --location-enable-agps-msb \
+    --location-set-enable-signal
+}
+
+disable() {
+  pgrep -x ModemManager >/dev/null 2>&1 || exit 0
+  "$mmcli" -m "$modem" \
+    --location-disable-gps-nmea \
+    --location-disable-gps-raw \
+    --location-disable-agps-msa \
+    --location-disable-agps-msb \
+    --location-set-disable-signal
+}
+
+case ${1:-} in
+  on|force) enable ;;
+  off|unforce) disable ;;
+  status) status "${2:-}" ;;
+  *) usage ;;
+esac

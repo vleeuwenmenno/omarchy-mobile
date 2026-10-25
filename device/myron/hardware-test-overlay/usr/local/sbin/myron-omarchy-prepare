@@ -20,14 +20,28 @@ load() {
 }
 node_from_class() {
   class_file=$1 target=$2 group=$3 mode=$4
+  [ -r "$class_file" ] || die "device class file missing: $class_file"
   numbers=$(cat "$class_file")
+  case "$numbers" in *:*) ;; *) die "invalid device numbers: $numbers" ;; esac
   major=${numbers%:*}
   minor=${numbers#*:}
-  case "$major:$minor" in *[!0-9:]*) die "invalid device numbers: $numbers" ;; esac
+  case "$major:$minor" in
+    *[!0-9:]*|:|*:*:*) die "invalid device numbers: $numbers" ;;
+  esac
+  target_dir=$(dirname -- "$target")
+  mkdir -p "$target_dir"
+  [ ! -L "$target_dir" ] && [ -d "$target_dir" ] ||
+    die "device path is not a directory: $target_dir"
+  if [ -e "$target" ] && [ ! -c "$target" ]; then
+    die "device path exists but is not a character device: $target"
+  fi
   if [ ! -c "$target" ]; then
-    rm -f "$target"
     mknod "$target" c "$major" "$minor"
   fi
+  actual=$(stat -c '%t:%T' "$target")
+  expected=$(printf '%x:%x' "$major" "$minor")
+  [ "$actual" = "$expected" ] ||
+    die "device numbers differ for $target: $actual, expected $expected"
   chgrp "$group" "$target"
   chmod "$mode" "$target"
 }
@@ -87,6 +101,21 @@ done
 [ -r /sys/class/kgsl/kgsl-3d0/dev ] || die 'KGSL class device missing'
 node_from_class /sys/class/kgsl/kgsl-3d0/dev /dev/kgsl-3d0 video 0660
 
+# This downstream kernel publishes the generic DMA heap in sysfs but does not
+# create either userspace node under Arch.  Turnip/Zink needs the canonical
+# node; libcamera and some Vulkan clients also use the historical DRI alias.
+# Keep both nodes bound to the exact same kernel class device, matching the
+# reference postmarketOS helper without loading or changing any kernel module.
+attempt=0
+while [ ! -r /sys/class/dma_heap/system/dev ] && [ "$attempt" -lt 100 ]; do
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+[ -r /sys/class/dma_heap/system/dev ] || die 'system DMA-heap class device missing'
+install -d -m0755 /dev/dma_heap
+node_from_class /sys/class/dma_heap/system/dev /dev/dma_heap/system video 0660
+node_from_class /sys/class/dma_heap/system/dev /dev/dri/dmaheap-sys video 0660
+
 load xiaomi_touch "$touch/xiaomi_touch.ko"
 load focaltech_touch_3683 "$touch/focaltech_touch_3683.ko"
 touch_raw_control=/sys/devices/virtual/touch/touch_dev/enable_touch_raw
@@ -119,4 +148,4 @@ udevadm control --reload
 udevadm trigger --action=add --subsystem-match=drm >>"$log" 2>&1 || true
 
 touch /run/myron-omarchy-hardware-ready
-say "result=ready notes=$notes dsi=DSI-1 kgsl=/dev/kgsl-3d0 touch=$touch_event raw_mode=disabled"
+say "result=ready notes=$notes dsi=DSI-1 kgsl=/dev/kgsl-3d0 dma_heap=/dev/dma_heap/system touch=$touch_event raw_mode=disabled"

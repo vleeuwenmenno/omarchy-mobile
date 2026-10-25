@@ -11,6 +11,7 @@ libqmi
 geoclue
 pipewire
 wireplumber
+rtkit
 alsa-utils
 upower
 iio-sensor-proxy
@@ -26,6 +27,8 @@ python
 polkit
 pciutils
 usbutils
+mesa-utils
+vulkan-tools
 less
 wireless-regdb
 archlinuxarm-keyring
