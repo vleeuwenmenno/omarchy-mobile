@@ -190,12 +190,17 @@ seven-item blocker list. The gate reports `abi_status`, `abi_scope`,
 
 - **Rootfs**: equivalent to `tests/rootfs-stage` (required files, stage marker
   and manifest lines, firmware allowlist, `/lib` alias, empty `usr/lib/modules`,
-  no vendor/activation paths, no kernel/module/boot payload names anywhere) plus
-  GPU checks performed from bytes and hashes captured by the same bounded tree
-  pass that produces the rootfs digest, plus byte-identity of the installed kernel
-  reference, stage contract and GPU reference with the contract. Symlinks are
-  allowed there only as recorded, never-followed entries; hardlinks are
-  rejected.
+  an absent or empty real `/boot`, no vendor/activation paths, and no known
+  kernel/module/boot payload names anywhere). Files whose names begin with
+  `Image` are admitted only when their race-checked first 64 bytes do not carry
+  the arm64 `ARMd` magic at offset 56; symlinks with those names are rejected.
+  GPU checks use bytes and hashes captured by the same bounded tree pass that
+  produces the rootfs digest. A missing
+  symlink target is allowed only for a relative link below `/etc/skel` whose
+  normalized target is below `/etc/skel/.local/state/omarchy`; all target
+  ancestors that exist must be real directories. Installed kernel, stage and
+  GPU references must be byte-identical to the contract. Other symlinks are
+  recorded and never followed; hardlinks are rejected.
 - **Module stage and kit**: exact closure; symlinks, hardlinks and special files
   rejected; modes exact; selector equals the qualified candidate selector;
   modules carry the exact release marker.

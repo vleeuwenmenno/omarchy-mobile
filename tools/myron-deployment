@@ -113,9 +113,11 @@ ROOTFS_ABSENT = [
     "etc/vulkan/icd.d/myron-kgsl.json",
 ]
 ROOTFS_PAYLOAD_NAMES = [
-    ".omamobile-tarball", "modules.dep*", "*.ko", "*.ko.*", "vmlinu[xz]*", "Image",
-    "Image.*", "*.dtb", "*.dtbo", "boot.img", "init_boot.img", "vendor_boot.img",
-    "initramfs*", "*.img", "*.img.zst",
+    ".omamobile-tarball", "modules.dep", "modules.dep.bin", "*.ko", "*.ko.gz",
+    "*.ko.xz", "*.ko.zst", "vmlinu[xz]*", "zImage", "Image-dtb", "Image.bz2",
+    "Image.gz", "Image.gz-dtb", "Image.lz4", "Image.lz4-dtb", "Image.lzma",
+    "Image.lzo", "Image.xz", "Image.zst", "*.dtb", "*.dtbo", "initramfs*",
+    "*.img", "*.img.gz", "*.img.xz", "*.img.lz4", "*.img.zst",
 ]
 RUNTIME_FEATURES = ["gpu", "wifi", "touch"]
 REFERENCE_MODULE_ORDER = [
@@ -997,8 +999,6 @@ def validate_gpu_snapshot(tree: Tree, index: dict, contracts: Contracts) -> None
                 raise DeploymentError("global activation snapshot exceeds depth safety limit")
             continue
         if entry.kind == "file":
-            if entry.size > g.MAX_FILE_BYTES:
-                raise DeploymentError(f"global activation candidate is too large: /{entry.path}")
             body = tree.data.get(entry.path)
             if body is None or len(body) != entry.size:
                 raise DeploymentError(f"global activation candidate lacks snapshot bytes: /{entry.path}")
@@ -1015,7 +1015,25 @@ def validate_gpu_snapshot(tree: Tree, index: dict, contracts: Contracts) -> None
             target = g.normalize_symlink_target(link, entry.target)
             if target != Path("dev/null"):
                 target_name = target.as_posix()
-                if target == link or not g.in_activation_scope(target) or target_name not in index:
+                missing_skeleton_state = False
+                if (
+                    target_name not in index
+                    and g.missing_skeleton_state_target(link, entry.target, target)
+                ):
+                    missing_skeleton_state = True
+                    for number in range(1, len(target.parts)):
+                        ancestor = "/".join(target.parts[:number])
+                        parent = index.get(ancestor)
+                        if parent is None:
+                            break
+                        if parent.kind != "dir":
+                            missing_skeleton_state = False
+                            break
+                if (
+                    target == link
+                    or not g.in_activation_scope(target)
+                    or (target_name not in index and not missing_skeleton_state)
+                ):
                     raise DeploymentError(f"unsafe global activation symlink: /{entry.path}")
         if total > g.MAX_SCAN_BYTES:
             raise DeploymentError("global activation snapshot exceeds byte safety limit")
@@ -1038,6 +1056,8 @@ def check_rootfs(root: str, manifest_path: str, contracts: Contracts) -> tuple[d
     def capture(path: str, size: int) -> int | None:
         if path in gpu_full_paths or g.in_activation_scope(Path(path)):
             return size
+        if Path(path).name.startswith("Image"):
+            return min(size, 64)
         if path.startswith(g.MESA_PREFIX.as_posix() + "/"):
             return min(size, 20)
         return None
@@ -1121,10 +1141,25 @@ def check_rootfs(root: str, manifest_path: str, contracts: Contracts) -> tuple[d
             raise DeploymentError("kernel modules path is not a real directory: usr/lib/modules")
         if any(entry.path.startswith("usr/lib/modules/") for entry in tree.entries):
             raise DeploymentError("kernel modules in the stage")
+    boot = index.get("boot")
+    if boot is not None:
+        if boot.kind != "dir":
+            raise DeploymentError("boot path is not a real directory: boot")
+        if any(entry.path.startswith("boot/") for entry in tree.entries):
+            raise DeploymentError("kernel, module, or boot payload: boot")
     for relative in ROOTFS_ABSENT:
         rootfs_absent(index, relative)
     for entry in tree.entries:
         name = entry.path.rsplit("/", 1)[-1]
+        if name.startswith("Image") and entry.kind == "symlink":
+            raise DeploymentError(f"kernel, module, or boot payload: {entry.path}")
+        if name.startswith("Image") and entry.kind == "file":
+            captured = tree.data.get(entry.path)
+            if captured is None or len(captured) < min(entry.size, 64):
+                raise DeploymentError(f"kernel Image lacks snapshot bytes: {entry.path}")
+            header = captured[:64]
+            if len(header) >= 60 and header[56:60] == b"ARMd":
+                raise DeploymentError(f"kernel, module, or boot payload: {entry.path}")
         if entry.path != "." and any(fnmatch.fnmatchcase(name, pattern) for pattern in ROOTFS_PAYLOAD_NAMES):
             raise DeploymentError(f"kernel, module, or boot payload: {entry.path}")
 

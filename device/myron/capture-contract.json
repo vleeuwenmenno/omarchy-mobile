@@ -33,7 +33,7 @@
   "components": {
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "31abcfe10bff616834c8ca7eda3047f92a164dc117ca65f036754f6a826aef5b"
+      "sha256": "85490c5165c2f4d70c8923dd76694c0a59f33e4e63c273161e44cb37c293e2a0"
     }
   },
   "evidence": {

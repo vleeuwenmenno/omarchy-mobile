@@ -703,6 +703,27 @@ def write(path, data=b""):
     path.write_bytes(data)
 
 
+near_tree, near_manifest = make_rootfs(fx)
+for relative in (
+    "usr/include/example/Image.h",
+    "usr/include/example/Image.hpp",
+    "usr/include/example/Image",
+    "usr/share/doc/example/Image.html",
+    "usr/share/doc/example/Image.png",
+    "usr/share/man/man5/modules.dep.5.gz",
+    "usr/lib/systemd/catalog/systemd.ko.catalog",
+):
+    write(near_tree / relative)
+write(near_tree / "etc/skel/.config/example/Image", b"\0" * 128)
+generated_link = near_tree / "etc/skel/.config/nvim/lua/plugins/theme.lua"
+generated_link.parent.mkdir(parents=True)
+generated_link.symlink_to("../../../../.local/state/omarchy/current/theme/neovim.lua")
+near_kit = near_tree.parent / "kit-near-names"
+expect_ok(root, "assemble", "--rootfs-stage", near_tree, "--rootfs-manifest", near_manifest,
+          "--module-stage", stage_a, "--out", near_kit)
+ok("source and documentation names resembling payloads are accepted")
+
+
 rootfs_case("a bootable manifest", "non-bootable stage marker", lambda t: None,
             lambda text: text.replace("# Omarchy Mobile root STAGE", "# Omarchy Mobile root image", 1))
 rootfs_case("a manifest lacking a line", "MANIFEST lacks", lambda t: None, lambda text: text.replace("rootfs package profile: myron\n", ""))
@@ -731,7 +752,36 @@ rootfs_case("a rootfs GPU profile reference that differs", "differs from the dep
             lambda t: (t / "usr/share/omamobile/myron-gpu-profile/reference.json").write_bytes(b"{}\n"))
 rootfs_case("a kernel module payload", "kernel modules in the stage", lambda t: write(t / "usr/lib/modules/6.12/x"))
 rootfs_case("a kernel module file", "boot payload", lambda t: write(t / "opt/x.ko.zst"))
-rootfs_case("a boot image", "boot payload", lambda t: write(t / "boot/boot.img"))
+rootfs_case("a boot image", "boot payload", lambda t: write(t / "opt/boot.img"))
+rootfs_case("a compressed generic image", "boot payload", lambda t: write(t / "opt/x.img.lz4"))
+rootfs_case("a compressed arm64 kernel image", "boot payload", lambda t: write(t / "opt/Image.gz"))
+rootfs_case("an uncompressed arm64 kernel image", "boot payload",
+            lambda t: write(t / "opt/Image", b"\0" * 56 + b"ARMd" + b"\0" * 4))
+rootfs_case("an unusually named arm64 kernel image", "boot payload",
+            lambda t: write(t / "opt/Image.raw", b"\0" * 56 + b"ARMd" + b"\0" * 4))
+rootfs_case("a non-payload file in boot", "kernel, module, or boot payload: boot",
+            lambda t: write(t / "boot/readme"))
+rootfs_case("a boot symlink", "boot path is not a real directory", lambda t: (t / "boot").symlink_to("/nonexistent-x"))
+
+rootfs_case("a GPU marker in an skel link", "private GPU stack is selected",
+            lambda t: ((t / "etc/skel").mkdir(parents=True),
+                       (t / "etc/skel/marker-link").symlink_to("/usr/lib/omamobile/myron-gpu")))
+rootfs_case("an skel link outside generated state", "unsafe global activation symlink",
+            lambda t: ((t / "etc/skel").mkdir(parents=True),
+                       (t / "etc/skel/outside-link").symlink_to("../profile.d/missing")))
+rootfs_case("an absolute skel link", "unsafe global activation symlink",
+            lambda t: ((t / "etc/skel").mkdir(parents=True),
+                       (t / "etc/skel/absolute-link").symlink_to("/etc/skel/.local/state/omarchy/missing")))
+rootfs_case("a generated-state target from outside skel", "unsafe global activation symlink",
+            lambda t: ((t / "etc/profile.d").mkdir(parents=True),
+                       (t / "etc/profile.d/outside-skeleton.sh").symlink_to("../skel/.local/state/omarchy/missing")))
+rootfs_case("an skel link through a file ancestor", "unsafe global activation symlink",
+            lambda t: (write(t / "etc/skel/.local/state", b"not a directory\n"),
+                       (t / "etc/skel/non-directory-link").symlink_to(".local/state/omarchy/missing")))
+rootfs_case("an skel link through a symlink ancestor", "unsafe global activation symlink",
+            lambda t: ((t / "etc/skel/.local/state/omarchy").mkdir(parents=True),
+                       (t / "etc/skel/.local/state/omarchy/current").symlink_to("/nonexistent-x"),
+                       (t / "etc/skel/symlink-ancestor-link").symlink_to(".local/state/omarchy/current/missing")))
 rootfs_case("a vendor path", "vendor or activation path", lambda t: (t / "vendor").mkdir())
 rootfs_case("a dangling vendor symlink", "vendor or activation path", lambda t: (t / "vendor").symlink_to("/nonexistent-x"))
 rootfs_case("a runtime asset directory", "vendor or activation path", lambda t: write(t / "var/lib/omamobile/myron-assets/x"))

@@ -234,6 +234,33 @@ if modules is not None:
     finally:
         os.close(descriptor)
 
+# The generic rootfs owns no boot payload. Arch creates /boot, so accept only
+# an empty real directory; a symlink or any child is unverified boot state.
+boot = lstat_beneath("boot")
+if boot is not None:
+    if not stat.S_ISDIR(boot.st_mode):
+        fail("boot path is not a real directory: boot")
+    root_descriptor = open_root()
+    try:
+        descriptor = os.open(
+            "boot",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_descriptor,
+        )
+    except OSError as error:
+        traversal_failed("boot", error)
+    finally:
+        os.close(root_descriptor)
+    try:
+        try:
+            entries = os.listdir(descriptor)
+        except OSError as error:
+            traversal_failed("boot", error)
+        if entries:
+            fail("kernel, module, or boot payload boot")
+    finally:
+        os.close(descriptor)
+
 # Repository mode: the marker inside the staged repository, the MANIFEST line
 # and (for a named stage) the directory name must all tell the same story.
 DEV_MARKER = "var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned"
@@ -327,9 +354,11 @@ for path in (
         fail(f"custom GPU/session activation {path}")
 
 PAYLOAD_NAMES = (
-    ".omamobile-tarball", "modules.dep*", "*.ko", "*.ko.*", "vmlinu[xz]*", "Image",
-    "Image.*", "*.dtb", "*.dtbo", "boot.img", "init_boot.img", "vendor_boot.img",
-    "initramfs*", "*.img", "*.img.zst",
+    ".omamobile-tarball", "modules.dep", "modules.dep.bin", "*.ko", "*.ko.gz",
+    "*.ko.xz", "*.ko.zst", "vmlinu[xz]*", "zImage", "Image-dtb", "Image.bz2",
+    "Image.gz", "Image.gz-dtb", "Image.lz4", "Image.lz4-dtb", "Image.lzma",
+    "Image.lzo", "Image.xz", "Image.zst", "*.dtb", "*.dtbo", "initramfs*",
+    "*.img", "*.img.gz", "*.img.xz", "*.img.lz4", "*.img.zst",
 )
 
 QEMU_NAMES = ("qemu-*-static", "qemu-aarch64*", "qemu-user*")
@@ -350,6 +379,34 @@ def scan(directory, relative, depth):
             fail(f"kernel, module, or boot payload {path}")
         try:
             metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if name.startswith("Image") and stat.S_ISLNK(metadata.st_mode):
+                fail(f"kernel, module, or boot payload {path}")
+            if name.startswith("Image") and stat.S_ISREG(metadata.st_mode):
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                    dir_fd=directory,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    before = (
+                        opened.st_dev, opened.st_ino, opened.st_size,
+                        opened.st_mtime_ns, opened.st_ctime_ns,
+                    )
+                    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        fail(f"stage traversal failed at {path}: changed while being opened")
+                    header = os.read(descriptor, 64)
+                    closed = os.fstat(descriptor)
+                    after = (
+                        closed.st_dev, closed.st_ino, closed.st_size,
+                        closed.st_mtime_ns, closed.st_ctime_ns,
+                    )
+                    if before != after:
+                        fail(f"stage traversal failed at {path}: changed while being read")
+                finally:
+                    os.close(descriptor)
+                if len(header) >= 60 and header[56:60] == b"ARMd":
+                    fail(f"kernel, module, or boot payload {path}")
             if stat.S_ISDIR(metadata.st_mode):
                 child = os.open(
                     name,
@@ -444,6 +501,27 @@ pass "Myron package profile selects required services and isolated GPU packages"
 
 synthetic "$t"
 if msg=$(check_stage "$t/tree" "$t/MANIFEST"); then pass "synthetic stage tree is accepted"; else fail "synthetic stage: $msg"; fi
+
+# Source headers, API names, docs and systemd catalogs are not kernel payloads.
+# Keep these near-misses accepted while exact payload names stay rejected below.
+mkdir -p "$t/tree/usr/include/example" "$t/tree/usr/share/doc/example" \
+         "$t/tree/usr/share/man/man5" "$t/tree/usr/lib/systemd/catalog"
+: > "$t/tree/usr/include/example/Image.h"
+: > "$t/tree/usr/include/example/Image.hpp"
+: > "$t/tree/usr/include/example/Image"
+: > "$t/tree/usr/share/doc/example/Image.html"
+: > "$t/tree/usr/share/doc/example/Image.png"
+: > "$t/tree/usr/share/man/man5/modules.dep.5.gz"
+: > "$t/tree/usr/lib/systemd/catalog/systemd.ko.catalog"
+mkdir -p "$t/tree/etc/skel/.config/example" "$t/tree/etc/skel/.config/nvim/lua/plugins"
+head -c 128 /dev/zero > "$t/tree/etc/skel/.config/example/Image"
+ln -s ../../../../.local/state/omarchy/current/theme/neovim.lua \
+  "$t/tree/etc/skel/.config/nvim/lua/plugins/theme.lua"
+if msg=$(check_stage "$t/tree" "$t/MANIFEST"); then
+  pass "source and documentation names resembling payloads are accepted"
+else
+  fail "payload-name near-misses: $msg"
+fi
 mv "$t/tree" "$t/omamobile-rootfs-stage-synthetic-aarch64"
 mv "$t/MANIFEST" "$t/omamobile-rootfs-stage-synthetic-aarch64.MANIFEST"
 relative=$(realpath --relative-to="$PWD" "$t/omamobile-rootfs-stage-synthetic-aarch64")
@@ -467,7 +545,13 @@ reject "a device-node symlink" "not a regular file" bash -c 'rm tree/usr/share/o
 reject "a bootable manifest" "non-bootable stage marker" sed -i '1s/.*/# Omarchy Mobile root image/' MANIFEST
 reject "a module payload" "kernel modules in the stage" bash -c 'mkdir -p tree/usr/lib/modules/6.12 && : > tree/usr/lib/modules/6.12/x'
 reject "a kernel module file" "boot payload" bash -c 'mkdir -p tree/opt && : > tree/opt/x.ko.zst'
-reject "a boot image" "boot payload" bash -c 'mkdir -p tree/boot && : > tree/boot/boot.img'
+reject "a boot image" "boot payload" bash -c 'mkdir -p tree/opt && : > tree/opt/boot.img'
+reject "a compressed generic image" "boot payload" bash -c 'mkdir -p tree/opt && : > tree/opt/x.img.lz4'
+reject "a compressed arm64 kernel image" "boot payload" bash -c 'mkdir -p tree/opt && : > tree/opt/Image.gz'
+reject "an uncompressed arm64 kernel image" "boot payload" python3 -c 'from pathlib import Path; p=Path("tree/opt/Image"); p.parent.mkdir(parents=True); p.write_bytes(b"\0" * 56 + b"ARMd" + b"\0" * 4)'
+reject "an unusually named arm64 kernel image" "boot payload" python3 -c 'from pathlib import Path; p=Path("tree/opt/Image.raw"); p.parent.mkdir(parents=True); p.write_bytes(b"\0" * 56 + b"ARMd" + b"\0" * 4)'
+reject "a non-payload file in boot" "kernel, module, or boot payload boot" bash -c 'mkdir -p tree/boot && : > tree/boot/readme'
+reject "a boot symlink" "boot path is not a real directory" bash -c 'ln -s /nonexistent-omamobile tree/boot'
 reject "a vendor path" "proprietary or vendor path" mkdir tree/vendor
 reject "firmware" "firmware entry is not a regular file" bash -c 'mkdir -p tree/usr/lib/firmware/qcom'
 reject "a regulatory symlink" "firmware entry is not a regular file" bash -c 'rm tree/usr/lib/firmware/regulatory.db; ln -s /dev/null tree/usr/lib/firmware/regulatory.db'

@@ -14,7 +14,7 @@
   "components": {
     "deployment_contract": {
       "path": "device/myron/deployment-contract.json",
-      "sha256": "77aeb784326943ce9bcfa76de599d04502370a333d234561b477f269d9ebaee9"
+      "sha256": "af07b24b3dc7983c3de35104bd18148d19c2826b7b2c4a7907cd2bf47c6e6a5d"
     }
   },
   "deployment_authorized": false,

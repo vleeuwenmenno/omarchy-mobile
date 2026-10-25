@@ -17,8 +17,8 @@ import sys
 DEFAULT_REFERENCE = Path("usr/share/omamobile/myron-gpu-profile/reference.json")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_MESA_FILE_BYTES = 256 * 1024 * 1024
-MAX_SCAN_BYTES = 32 * 1024 * 1024
-MAX_SCAN_FILES = 4096
+MAX_SCAN_BYTES = 128 * 1024 * 1024
+MAX_SCAN_FILES = 16384
 MAX_SCAN_DEPTH = 64
 HEX256 = re.compile(r"[0-9a-f]{64}")
 MESA_PREFIX = Path("usr/lib/omamobile/myron-gpu")
@@ -314,7 +314,7 @@ def validate_reference(data: bytes) -> dict:
         raise ProfileError("profile reference fields or schema differ")
     if reference.get("package") != {
         "name": "omamobile-myron-gpu-profile",
-        "version": "0.1.1",
+        "version": "0.1.2",
     }:
         raise ProfileError("profile package identity differs")
     if reference.get("mesa") != {
@@ -614,6 +614,17 @@ def in_activation_scope(relative: Path) -> bool:
     )
 
 
+def missing_skeleton_state_target(link: Path, target_text: str, relative: Path) -> bool:
+    """Allow only Omarchy's not-yet-generated per-user state below /etc/skel."""
+    skeleton = Path("etc/skel")
+    generated_state = skeleton / ".local/state/omarchy"
+    return (
+        not PurePosixPath(target_text).is_absolute()
+        and skeleton in link.parents
+        and (relative == generated_state or generated_state in relative.parents)
+    )
+
+
 def symlink_selects_private(
     root_descriptor: int, link: Path, target_text: str
 ) -> bool:
@@ -627,6 +638,11 @@ def symlink_selects_private(
     try:
         descriptor = open_beneath(root_descriptor, relative, "global activation symlink")
     except ProfileError as error:
+        if (
+            isinstance(error.__cause__, FileNotFoundError)
+            and missing_skeleton_state_target(link, target_text, relative)
+        ):
+            return False
         raise ProfileError(f"global activation symlink is broken: {link}") from error
     os.close(descriptor)
     return False
@@ -695,8 +711,6 @@ def scan_global_activation(root_descriptor: int) -> list[str]:
             return
         if not stat.S_ISREG(metadata.st_mode):
             raise ProfileError(f"global activation candidate is not a file: /{relative}")
-        if metadata.st_size > MAX_FILE_BYTES:
-            raise ProfileError(f"global activation candidate is too large: /{relative}")
         remaining = MAX_SCAN_BYTES - total
         if metadata.st_size > remaining:
             raise ProfileError("global activation scan exceeds byte safety limit")
@@ -704,9 +718,7 @@ def scan_global_activation(root_descriptor: int) -> list[str]:
             descriptor, "global activation candidate", "/" + str(relative)
         )
         with os.fdopen(data_descriptor, "rb") as stream:
-            data = stream.read(min(MAX_FILE_BYTES, remaining) + 1)
-        if len(data) > MAX_FILE_BYTES:
-            raise ProfileError(f"global activation candidate is too large: /{relative}")
+            data = stream.read(remaining + 1)
         if len(data) > remaining:
             raise ProfileError("global activation scan exceeds byte safety limit")
         account_bytes(len(data))

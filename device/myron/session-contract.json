@@ -22,7 +22,7 @@
   "bound_contracts": {
     "deployment_contract": {
       "path": "device/myron/deployment-contract.json",
-      "sha256": "77aeb784326943ce9bcfa76de599d04502370a333d234561b477f269d9ebaee9"
+      "sha256": "af07b24b3dc7983c3de35104bd18148d19c2826b7b2c4a7907cd2bf47c6e6a5d"
     },
     "kernel_reference": {
       "path": "device/myron/kernel-contract.json",
@@ -30,7 +30,7 @@
     },
     "snapshot_contract": {
       "path": "device/myron/snapshot-contract.json",
-      "sha256": "4dc53614992922b50cbfe7b59bfc10c473088c9d98058a9abec0933d345257ea"
+      "sha256": "497c0df79e18941d1fc0310fa3271dce8fdfd789337354c3ace09bdb76236ee4"
     }
   },
   "capture": {
@@ -48,11 +48,11 @@
   "components": {
     "capture_contract": {
       "path": "device/myron/capture-contract.json",
-      "sha256": "0d9bcbe04e11b813e765149dc2265ce689d3755ab3445fb2c4f4feb5f5a769f1"
+      "sha256": "fa23bf1b3fcc96bfd7928ae5d29b981c92d183916f8e2f5ab4982e063a390e02"
     },
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
-      "sha256": "31abcfe10bff616834c8ca7eda3047f92a164dc117ca65f036754f6a826aef5b"
+      "sha256": "85490c5165c2f4d70c8923dd76694c0a59f33e4e63c273161e44cb37c293e2a0"
     }
   },
   "coverage": {

@@ -12,7 +12,7 @@
   "components": {
     "gpu_profile_reference": {
       "path": "packages/omamobile-myron-gpu-profile/reference.json",
-      "sha256": "b9039c75d535411e60ff65d4295b5fbf00fa8e3dd42f0a996245ed867ce1be7b"
+      "sha256": "5bd96fa9e09023b5d615a893a63b1f7cee339fa6f6be70af05a491d276057347"
     },
     "kernel_reference": {
       "path": "device/myron/kernel-contract.json",
@@ -56,7 +56,7 @@
   },
   "rootfs": {
     "bound_files": {
-      "usr/share/omamobile/myron-gpu-profile/reference.json": "b9039c75d535411e60ff65d4295b5fbf00fa8e3dd42f0a996245ed867ce1be7b",
+      "usr/share/omamobile/myron-gpu-profile/reference.json": "5bd96fa9e09023b5d615a893a63b1f7cee339fa6f6be70af05a491d276057347",
       "usr/share/omamobile/myron-kernel-contract/reference.json": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193",
       "usr/share/omamobile/myron-kernel-contract/stage-contract.json": "2baee9e393ffac17da7b21f61dacbc153dfb0e29d7dc5df46671f5f473f9826e"
     },

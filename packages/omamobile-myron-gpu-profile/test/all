@@ -218,6 +218,71 @@ rm "$tmp/root/etc/profile.d/70-systemd-shell-extra.sh" \
   "$tmp/root/etc/xdg/systemd/user" \
   "$tmp/root/usr/lib/systemd/profile.d/70-systemd-shell-extra.sh"
 
+mkdir -p "$tmp/root/etc/skel/.config/nvim/lua/plugins"
+ln -s ../../../../.local/state/omarchy/current/theme/neovim.lua \
+  "$tmp/root/etc/skel/.config/nvim/lua/plugins/theme.lua"
+"$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static --root "$tmp/root" \
+  >/dev/null || fail "inert generated-state link in /etc/skel was rejected"
+rm -rf "$tmp/root/etc/skel"
+
+mkdir -p "$tmp/root/etc/skel"
+ln -s /usr/lib/omamobile/myron-gpu "$tmp/root/etc/skel/marker-link"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "GPU marker in an /etc/skel link target was accepted"
+fi
+rm -rf "$tmp/root/etc/skel"
+
+mkdir -p "$tmp/root/etc/skel"
+ln -s ../profile.d/missing-safe-file "$tmp/root/etc/skel/outside-link"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "missing /etc/skel link target outside generated state was accepted"
+fi
+rm -rf "$tmp/root/etc/skel"
+
+mkdir -p "$tmp/root/etc/skel"
+ln -s /etc/skel/.local/state/omarchy/missing "$tmp/root/etc/skel/absolute-link"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "absolute generated-state /etc/skel link target was accepted"
+fi
+rm -rf "$tmp/root/etc/skel"
+
+ln -s ../skel/.local/state/omarchy/missing \
+  "$tmp/root/etc/profile.d/outside-skeleton.sh"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "generated-state target from outside /etc/skel was accepted"
+fi
+rm "$tmp/root/etc/profile.d/outside-skeleton.sh"
+
+mkdir -p "$tmp/root/etc/skel/.local"
+printf 'not a directory\n' > "$tmp/root/etc/skel/.local/state"
+ln -s .local/state/omarchy/missing "$tmp/root/etc/skel/non-directory-link"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "missing /etc/skel link through a non-directory was accepted"
+fi
+rm -rf "$tmp/root/etc/skel"
+
+mkdir -p "$tmp/root/etc/skel/.local/state/omarchy"
+ln -s /nonexistent-x "$tmp/root/etc/skel/.local/state/omarchy/current"
+ln -s .local/state/omarchy/current/missing \
+  "$tmp/root/etc/skel/symlink-ancestor-link"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "missing /etc/skel link through a symlink ancestor was accepted"
+fi
+rm -rf "$tmp/root/etc/skel"
+
+ln -s missing-safe-file "$tmp/root/etc/profile.d/broken.sh"
+if "$tmp/root/usr/bin/omamobile-myron-gpu-profile" verify-static \
+    --root "$tmp/root" >/dev/null 2>&1; then
+  fail "broken global activation link outside /etc/skel was accepted"
+fi
+rm "$tmp/root/etc/profile.d/broken.sh"
+
 sentinel="$tmp/staged-verifier-ran"
 printf '#!/bin/sh\ntouch %s\n' "$sentinel" \
   > "$tmp/root/usr/bin/omamobile-myron-gpu-verify"
@@ -406,7 +471,7 @@ else:
 finally:
     os.close(root_descriptor)
 
-module.MAX_SCAN_FILES = 4096
+module.MAX_SCAN_FILES = 16384
 module.MAX_SCAN_BYTES = 1
 root_descriptor = module.open_root(scan_root)
 try:
@@ -422,7 +487,7 @@ growth_root = work / "scan-growth"
 (growth_root / "etc/profile.d").mkdir(parents=True)
 growth_file = growth_root / "etc/profile.d/growing"
 growth_file.write_bytes(b"")
-module.MAX_SCAN_FILES = 4096
+module.MAX_SCAN_FILES = 16384
 module.MAX_SCAN_BYTES = 1
 real_reopen = module.reopen_regular
 grown = False
@@ -446,7 +511,7 @@ finally:
 
 deep_root = work / "scan-depth"
 (deep_root / "etc/profile.d/a/b").mkdir(parents=True)
-module.MAX_SCAN_BYTES = 32 * 1024 * 1024
+module.MAX_SCAN_BYTES = 128 * 1024 * 1024
 module.MAX_SCAN_DEPTH = 1
 root_descriptor = module.open_root(deep_root)
 try:
