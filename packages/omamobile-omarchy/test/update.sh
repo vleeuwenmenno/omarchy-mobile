@@ -20,6 +20,9 @@ export OMAMOBILE_CHECKUPDATES=$fake/checkupdates OMAMOBILE_PACMAN=$fake/pacman O
 export OMAMOBILE_PACMAN_CONF=$t/pacman.conf OMAMOBILE_POWER_SUPPLY=$t/power OMAMOBILE_PATCH_STATUS=$t/patch-status.json
 export OMAMOBILE_REAL_BIN=$t/real OMAMOBILE_MODULES_DIR=$t/modules OMAMOBILE_NOTIFY=$fake/notify
 export OMARCHY_PATH=$t/omarchy CHECKUPDATES_DB=$t/checkup-db
+# util-linux script uses $SHELL for its command.  A developer's interactive
+# shell startup files may replace test overrides such as OMARCHY_PATH.
+export SHELL=/bin/sh
 export PATH=$fake:/usr/bin:/bin
 calls=$t/calls
 
