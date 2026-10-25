@@ -176,15 +176,46 @@ detects a second candidate boot with an armed test and no disarm marker; that
 path restores postmarketOS immediately instead of consuming slot retry counts
 after a hard reset.
 
+The r5-v4 pair used for the isolated audio qualification was:
+
+```text
+cf6183e84dfdf69cb74f780122c40ba105c973b72c265148c801f09ee6f41552  myron-omarchy-hardware-test-20261025-r5-v4.img
+2f8819377008ef6bbf4e8543bc831c4a58db955b64825768095310c762691e5a  init_boot_a-myron-omarchy-hardware-test-20261025-r5-v4.img
+```
+
+Boot `c4f228e9-0695-4357-9e3e-20a68b90648a` qualified native DSI and
+Adreno 840/Turnip again. With ModemManager and GNSS stopped, the checkpointed
+audio path passed mapper replacement, ten transport modules, ADSP/Q6 startup,
+the codec/amplifier/machine closure, ALSA device nodes, FastRPC, and read-only
+`dsp_b` speaker dependency staging. The raw built-in microphone captured
+48,128 frames at 48 kHz, including 41,615 nonzero samples, then discarded the
+recording and restored its mixer controls. The physical three-channel TDM
+speaker graph first passed for 250 ms with TFA in Powerdown, then completed one
+250 ms 440 Hz probe at approximately -45 dBFS. PMIC temperature remained below
+49 C and all three amplifiers returned to Powerdown.
+
+That run exposed three packaging gaps rather than driver failures: the Canoe
+ACDB file and current `backend_conf.xml`/`card-defs.xml` were isolated in the
+runtime stage but absent or stale at their canonical `/etc` paths, and the
+speaker graph needed `CFCM.so.1` plus `SAPlusCmnModule.so.1` from `dsp_b`.
+The composer now publishes the verified configs. The new `speaker-dsp` stage
+mounts exactly one size-checked `dsp_b` read-only and copies only those two
+hash-pinned files; proprietary bytes remain outside this repository. Rebuild
+the payload after these committed fixes before treating the pair as the next
+reproducible candidate.
+
 ## Next attended sequence
 
 1. Restore postmarketOS, rebuild the r5 successor with both live fixes, and
    verify its payload/init-boot hash pair offline.
 2. On a separate clean boot, keep ModemManager/GNSS stopped, run
    `myron-audio-stage arm`, then advance one command at a time through
-   `mapper`, `transport`, `adsp`, `codecs`, `devnodes`, and `fastrpc`. Inspect
-   `status` after every step. Test microphone only after all stages pass, then
-   use the guarded low-volume speaker probe.
+   `mapper`, `transport`, `adsp`, `codecs`, `devnodes`, `fastrpc`, and
+   `speaker-dsp`. The final stage mounts the exact `dsp_b` partition read-only
+   and publishes only two hash-pinned dependencies; the repository commits no
+   proprietary bytes. Inspect `status` after every step. Test microphone only
+   after FastRPC passes, then use the guarded low-volume speaker probe after
+   `speaker-dsp`.
 3. Add attended physical power/volume, visible brightness and haptics probes.
 4. Bring up Bluetooth, sensors, telephony, fingerprint and camera as isolated
    subsystem phases; none is implied by the successful graphical/radio boot.

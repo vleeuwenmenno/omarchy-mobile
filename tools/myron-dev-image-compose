@@ -137,6 +137,15 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/lib/myron-touch" "$root/usr/local/lib/myron-wireless" \
       "$root/usr/local/lib/myron-audio" \
       -type f -exec chmod 0644 {} +
+    # AudioReach tools use the canonical system ACDB path. The runtime stage
+    # keeps the exact reference calibration under its isolated asset root;
+    # publish that verified file without replacing the other base configs.
+    install -Dm0644 "$root/usr/local/lib/myron-audio/config/acdb_cal.acdb" \
+      "$root/etc/acdbdata/acdb_cal.acdb"
+    install -m0644 "$root/usr/local/lib/myron-audio/config/backend_conf.xml" \
+      "$root/etc/backend_conf.xml"
+    install -m0644 "$root/usr/local/lib/myron-audio/config/card-defs.xml" \
+      "$root/etc/card-defs.xml"
     chown -R 0:0 "$root/usr/local/sbin/myron-attempt79-module-dir"
     chmod 0755 "$root/usr/local/sbin/myron-attempt79-module-dir"
     install -Dm0600 /firstboot.conf "$root/etc/omamobile/firstboot.conf"
@@ -148,6 +157,8 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
       "$root/usr/local/sbin/myron-reference-radio-start" \
       "$root/usr/local/sbin/myron-reference-audio-start" \
+      "$root/usr/local/sbin/myron-audio-stage" \
+      "$root/usr/local/sbin/myron-speaker-dsp-stage" \
       "$root/usr/local/sbin/myron-audio-devnodes" \
       "$root/usr/local/sbin/myron-omarchy-prepare" \
       "$root/usr/local/sbin/myron-omarchy-qualify"
@@ -169,7 +180,8 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
   /usr/local/sbin/myron-omarchy-prepare \
   /usr/local/lib/myron-gpu/modules/msm_kgsl.ko \
-  /usr/local/lib/myron-audio; do
+  /usr/local/lib/myron-audio /etc/acdbdata/acdb_cal.acdb \
+  /etc/backend_conf.xml /etc/card-defs.xml; do
   debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
     die "root ownership missing: $path"
 done

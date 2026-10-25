@@ -22,6 +22,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
   "$overlay/usr/local/sbin/myron-audio-stage" \
+  "$overlay/usr/local/sbin/myron-speaker-dsp-stage" \
   "$overlay/usr/local/sbin/myron-audio-devnodes" \
   "$overlay/usr/local/sbin/myron-omarchy-prepare" \
   "$overlay/usr/local/sbin/myron-omarchy-qualify"; do
@@ -172,6 +173,7 @@ pass 'Location tile uses the qualified Qualcomm ModemManager GNSS path'
 radio=$overlay/usr/local/sbin/myron-reference-radio-start
 audio=$overlay/usr/local/sbin/myron-reference-audio-start
 audio_stage=$overlay/usr/local/sbin/myron-audio-stage
+speaker_dsp=$overlay/usr/local/sbin/myron-speaker-dsp-stage
 devnodes=$overlay/usr/local/sbin/myron-audio-devnodes
 grep -Fq 'a66a7b7ec66873301fc9f4d994b7fca7148e1dbc7862f49a687f8d5d1dde8271' "$radio" ||
   fail 'radio bridge does not pin the proven postmarketOS script'
@@ -207,6 +209,19 @@ for required in \
   grep -Fq "$required" "$audio_stage" ||
     fail "checkpointed audio stage runner lacks: $required"
 done
+grep -Fq 'speaker-dsp) require_common; run_speaker_dsp' "$audio_stage" ||
+  fail 'audio stage runner does not sequence speaker DSP dependencies after FastRPC'
+for required in \
+  'PARTNAME=//p' 'dsp_b' 'expected_size=77594624' \
+  'faa3014c6e7a121dea3a1c5897b5afe77f2ca8d0733e6cc86f2332d69a7223bd' \
+  '6f1232f2c9a5c99db3d9f021cf2d03c0fa6285363d0b9f5ce129a8766b29e2f8' \
+  'mount -o ro,nosuid,nodev,noexec' 'findmnt -n -o OPTIONS' \
+  'could not unmount read-only dsp_b' '/usr/lib/rfsa/adsp'; do
+  grep -Fq "$required" "$speaker_dsp" ||
+    fail "speaker DSP staging lacks: $required"
+done
+! grep -Eq '^[^#].*(amixer|aplay|agmplay|pw-play)' "$speaker_dsp" ||
+  fail 'speaker DSP staging can activate an audio stream or amplifier'
 if grep -Fq 'restart myron-hardware-watchdog.service' "$audio_stage"; then
   fail 'audio staging restarts the independent rollback supervisor'
 fi
@@ -237,6 +252,16 @@ grep -Fq 'for path in / /usr /usr/local' "$compose" ||
   fail 'composer does not verify ownership of paths overwritten by input directory metadata'
 grep -Fq 'chmod 0755 "$root$relative"' "$compose" ||
   fail 'composer does not normalize host-stage directory traversal modes'
+grep -Fq 'install -Dm0644 "$root/usr/local/lib/myron-audio/config/acdb_cal.acdb"' "$compose" ||
+  fail 'composer does not publish the verified Canoe ACDB at the AudioReach system path'
+for name in backend_conf.xml card-defs.xml; do
+  grep -Fq "install -m0644 \"\$root/usr/local/lib/myron-audio/config/$name\"" "$compose" ||
+    fail "composer does not publish the verified AudioReach $name"
+done
+grep -Fq '"$root/usr/local/sbin/myron-audio-stage"' "$compose" ||
+  fail 'composer does not explicitly install the checkpointed audio runner as executable'
+grep -Fq '"$root/usr/local/sbin/myron-speaker-dsp-stage"' "$compose" ||
+  fail 'composer does not explicitly install speaker DSP staging as executable'
 pass 'overlay has no partition writer; composer is output-exclusive and modem-safe'
 
 grep -Fq 'target=/dev/block/by-name/init_boot_a' "$initramfs/watchdog.sh" ||

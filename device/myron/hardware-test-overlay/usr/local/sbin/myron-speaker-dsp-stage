@@ -1,0 +1,83 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stage two hash-pinned speaker DSP dependencies from Myron's read-only dsp_b.
+set -eu
+
+readonly expected_size=77594624
+readonly cfcm_sha=faa3014c6e7a121dea3a1c5897b5afe77f2ca8d0733e6cc86f2332d69a7223bd
+readonly saplus_sha=6f1232f2c9a5c99db3d9f021cf2d03c0fa6285363d0b9f5ce129a8766b29e2f8
+readonly mountpoint=/run/myron-speaker-dsp
+readonly destination=/usr/lib/rfsa/adsp
+mounted=0
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+cleanup() {
+	if [ "$mounted" -eq 1 ]; then
+		umount "$mountpoint" 2>/dev/null || true
+	fi
+	rmdir "$mountpoint" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+check_hash() {
+	path=$1
+	expected=$2
+	[ -f "$path" ] && [ ! -L "$path" ] || fail "speaker DSP dependency is unavailable: $path"
+	[ "$(sha256sum "$path" | awk '{print $1}')" = "$expected" ] ||
+		fail "speaker DSP dependency checksum mismatch: $path"
+}
+
+[ "$(id -u)" = 0 ] || fail 'speaker DSP staging must run as root'
+[ -r /proc/asound/cards ] && grep -q canoe-mtp-snd-card /proc/asound/cards ||
+	fail 'Canoe ALSA card must be ready before speaker DSP staging'
+[ -d /sys/module/frpc_adsprpc ] || fail 'FastRPC must be ready before speaker DSP staging'
+
+device=
+matches=0
+for uevent in /sys/class/block/*/uevent; do
+	[ -r "$uevent" ] || continue
+	[ "$(sed -n 's/^PARTNAME=//p' "$uevent")" = dsp_b ] || continue
+	devname=$(sed -n 's/^DEVNAME=//p' "$uevent")
+	[ -n "$devname" ] || fail 'dsp_b has no device name'
+	device=/dev/$devname
+	matches=$((matches + 1))
+done
+[ "$matches" -eq 1 ] || fail "expected exactly one dsp_b partition, found $matches"
+[ -b "$device" ] || fail 'dsp_b block device is unavailable'
+[ "$(blockdev --getsize64 "$device")" = "$expected_size" ] || fail 'dsp_b size mismatch'
+[ ! -e "$mountpoint" ] && [ ! -L "$mountpoint" ] || fail 'speaker DSP mountpoint already exists'
+mkdir -m 0700 "$mountpoint"
+mount -o ro,nosuid,nodev,noexec "$device" "$mountpoint"
+mounted=1
+options=$(findmnt -n -o OPTIONS --target "$mountpoint")
+for required in ro nosuid nodev noexec; do
+	case ",$options," in
+		*,"$required",*) ;;
+		*) fail "dsp_b mount lacks required option: $required" ;;
+	esac
+done
+check_hash "$mountpoint/adsp/CFCM.so.1" "$cfcm_sha"
+check_hash "$mountpoint/adsp/SAPlusCmnModule.so.1" "$saplus_sha"
+
+[ ! -L /usr/lib/rfsa ] && [ ! -L "$destination" ] || fail 'speaker DSP destination is linked'
+install -d -m 0755 "$destination"
+for name in CFCM.so.1 SAPlusCmnModule.so.1; do
+	case "$name" in
+		CFCM.so.1) expected=$cfcm_sha ;;
+		SAPlusCmnModule.so.1) expected=$saplus_sha ;;
+	esac
+	target=$destination/$name
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		check_hash "$target" "$expected"
+		continue
+	fi
+	install -m 0644 "$mountpoint/adsp/$name" "$target"
+	check_hash "$target" "$expected"
+done
+sync -f "$destination/CFCM.so.1" "$destination/SAPlusCmnModule.so.1" 2>/dev/null || sync
+umount "$mountpoint" || fail 'could not unmount read-only dsp_b'
+mounted=0
+rmdir "$mountpoint" || fail 'could not remove speaker DSP mountpoint'
+trap - EXIT HUP INT TERM
+printf '%s\n' 'speaker_dsp_dependencies=ready source=dsp_b mount=read-only'

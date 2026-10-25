@@ -288,6 +288,13 @@ run_fastrpc() {
 	finish_stage fastrpc
 }
 
+run_speaker_dsp() {
+	begin_stage speaker-dsp done:fastrpc
+	persist 'stage=speaker-dsp action=read-only-partition-stage'
+	/usr/local/sbin/myron-speaker-dsp-stage || fail 'speaker DSP dependency staging failed'
+	finish_stage speaker-dsp
+}
+
 show_status() {
 	printf 'boot_id=%s\n' "$boot_id"
 	printf 'state=%s\n' "$(read_state)"
@@ -310,5 +317,6 @@ case "$command" in
 	codecs) require_common; run_codecs ;;
 	devnodes) require_common; run_devnodes ;;
 	fastrpc) require_common; run_fastrpc ;;
-	*) fail 'usage: myron-audio-stage {status|arm|mapper|transport|adsp|codecs|devnodes|fastrpc}' ;;
+	speaker-dsp) require_common; run_speaker_dsp ;;
+	*) fail 'usage: myron-audio-stage {status|arm|mapper|transport|adsp|codecs|devnodes|fastrpc|speaker-dsp}' ;;
 esac

@@ -47,13 +47,13 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 
 | Feature | Status | Evidence and Arch acceptance |
 | --- | --- | --- |
-| Speaker output | PARTIAL | Regular PulseAudio clients played through built-in speakers for 42 seconds after reboot; clean-rootfs and safety qualification remain. |
+| Speaker output | VERIFIED_WORKING | Omarchy opened the physical three-channel TDM graph with the amplifiers off, then completed one 250 ms 440 Hz probe at -45 dBFS. All three TFA amplifiers reached ready state, returned to Powerdown, and stayed below 49 C. |
 | Earpiece | UNKNOWN | No verified call/earpiece route. |
-| Microphones | PARTIAL | Raw built-in capture produced nonzero samples twice; PipeWire app path and quality remain open. |
+| Microphones | PARTIAL | Omarchy AudioReach captured one second at 48 kHz with 41,615 nonzero samples, discarded the recording, and restored mixer state. PipeWire app path and quality remain open. |
 | Headphones / USB audio | PRESENT_UNTESTED | No attended route test recorded. |
 | Bluetooth audio | BROKEN | Bluetooth pairing is not working. |
 | Audio routing | EXPERIMENTAL | Pulse bridge and speaker graph work on the live reference; transitions, mute, suspend/resume, and clean build remain open. |
-| Qualcomm DSP / AudioReach | EXPERIMENTAL | Audio service active; AudioReach configs, graph manager/services, DSP modules, firmware, and calibration are required. |
+| Qualcomm DSP / AudioReach | PARTIAL | Checkpointed Omarchy bring-up passed mapper, transport, ADSP/Q6, codecs, ALSA devnodes and FastRPC. Canoe ACDB system-path packaging was fixed; suspend/restart stability remains open. |
 | PipeWire / WirePlumber | PARTIAL | Installed, but SSH `wpctl` showed no sink/source in that remote context; application playback evidence comes from dedicated tests. |
 
 ## Power
