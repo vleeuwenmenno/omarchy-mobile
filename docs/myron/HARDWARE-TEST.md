@@ -133,9 +133,15 @@ not read or written.
 
 The bridge now refuses audio unless `myron-reference-radio.service` completed
 cleanly in the same boot and no ModemManager process exists. Audio must be
-qualified on a separate fresh boot, before ModemManager or GNSS, with each
-mapper/module/ADSP step observed individually. Speaker output is not part of
-the foundation start and remains a separate low-volume safety test.
+qualified on a separate fresh boot, before ModemManager or GNSS. The
+`myron-audio-stage` runner advances only through `arm`, `mapper`, `transport`,
+`adsp`, `codecs`, `devnodes`, and `fastrpc`. It syncs the current stage and each
+module insertion to the postmarketOS root before acting. `arm` removes the
+graphical disarm marker and restarts the 900-second rollback watchdog. A hard
+reset therefore restores postmarketOS on the next boot, while the persistent
+log identifies the last attempted operation. Do not retry a failed stage in
+the same boot. Speaker output is not part of these stages and remains a
+separate low-volume safety test.
 
 ## Artifact record
 
@@ -172,9 +178,11 @@ after a hard reset.
 
 1. Restore postmarketOS, rebuild the r5 successor with both live fixes, and
    verify its payload/init-boot hash pair offline.
-2. On a separate clean boot, qualify the audio foundation step by step before
-   ModemManager/GNSS, then test microphone and a guarded low-volume speaker
-   route.
+2. On a separate clean boot, keep ModemManager/GNSS stopped, run
+   `myron-audio-stage arm`, then advance one command at a time through
+   `mapper`, `transport`, `adsp`, `codecs`, `devnodes`, and `fastrpc`. Inspect
+   `status` after every step. Test microphone only after all stages pass, then
+   use the guarded low-volume speaker probe.
 3. Add attended physical power/volume, visible brightness and haptics probes.
 4. Bring up Bluetooth, sensors, telephony, fingerprint and camera as isolated
    subsystem phases; none is implied by the successful graphical/radio boot.

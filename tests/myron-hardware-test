@@ -21,6 +21,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
+  "$overlay/usr/local/sbin/myron-audio-stage" \
   "$overlay/usr/local/sbin/myron-audio-devnodes" \
   "$overlay/usr/local/sbin/myron-omarchy-prepare" \
   "$overlay/usr/local/sbin/myron-omarchy-qualify"; do
@@ -170,6 +171,7 @@ pass 'Location tile uses the qualified Qualcomm ModemManager GNSS path'
 
 radio=$overlay/usr/local/sbin/myron-reference-radio-start
 audio=$overlay/usr/local/sbin/myron-reference-audio-start
+audio_stage=$overlay/usr/local/sbin/myron-audio-stage
 devnodes=$overlay/usr/local/sbin/myron-audio-devnodes
 grep -Fq 'a66a7b7ec66873301fc9f4d994b7fca7148e1dbc7862f49a687f8d5d1dde8271' "$radio" ||
   fail 'radio bridge does not pin the proven postmarketOS script'
@@ -189,15 +191,35 @@ grep -Fq 'is-active myron-reference-radio.service' "$audio" ||
   fail 'audio does not require the clean radio foundation service'
 grep -Fq 'pgrep -x ModemManager' "$audio" ||
   fail 'audio does not reject a boot where modem or GNSS userspace is active'
+for required in \
+  'audio-stage.state' 'myron-omarchy-audio-stage.log' \
+  'systemctl restart myron-hardware-watchdog.service' \
+  'stage=arm result=complete watchdog=rearmed' \
+  'Do not retry audio in this boot' \
+  'mapper) require_common; run_mapper' \
+  'transport) require_common; run_transport' \
+  'adsp) require_common; run_adsp' \
+  'codecs) require_common; run_codecs' \
+  'devnodes) require_common; run_devnodes' \
+  'fastrpc) require_common; run_fastrpc'; do
+  grep -Fq "$required" "$audio_stage" ||
+    fail "checkpointed audio stage runner lacks: $required"
+done
+grep -Fq 'pgrep -x ModemManager' "$audio_stage" ||
+  fail 'checkpointed audio stages do not reject modem/GNSS userspace'
+grep -Fq 'sync -f "$log"' "$audio_stage" ||
+  fail 'audio crash checkpoint log is not synced before risky operations'
+grep -Fq 'module=$file action=insmod' "$audio_stage" ||
+  fail 'audio stage runner does not persist the next module before insertion'
 for unit in myron-reference-radio.service myron-reference-audio-foundation.service; do
   path=$overlay/usr/lib/systemd/system/$unit
   grep -Fq 'ConditionPathExists=/run/omamobile-myron/' "$path" ||
     fail "$unit is not marker gated"
   ! grep -Fxq '[Install]' "$path" || fail "$unit can be enabled persistently"
 done
-! grep -Eq '^[^#].*(amixer|aplay|pw-play)' "$audio" ||
+! grep -Eq '^[^#].*(amixer|aplay|pw-play|agmplay)' "$audio" "$audio_stage" ||
   fail 'audio foundation bridge includes speaker activation'
-pass 'radio and raw-audio bridges are checksum-pinned, one-shot and disabled'
+pass 'radio and checkpointed raw-audio bridges are pinned, silent and crash-auditable'
 
 if grep -REq '(^|[[:space:]/])(fastboot|dd|sgdisk|parted|mkfs|wipefs)([[:space:]]|$)' \
     "$overlay"; then

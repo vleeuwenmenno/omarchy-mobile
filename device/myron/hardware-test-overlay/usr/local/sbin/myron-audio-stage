@@ -1,0 +1,304 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Checkpointed, silent AudioReach bring-up for the temporary Myron test boot.
+set -eu
+
+readonly expected_kernel=6.12.23-android16-5-g5a0e85dd9db0-dirty-4k
+readonly source_script=/run/myron-host/usr/local/sbin/myron-audio-start
+readonly source_sha=44002cfc132dd1d826b8cd770fa8b29611a15555f7dde138d9d12dcf4c7cb74b
+readonly asset_dir=/usr/local/lib/myron-audio
+readonly module_dir=$asset_dir/modules
+readonly firmware_dir=$asset_dir/firmware
+readonly mapper_sha=3d74f0f4d69478e7df89977b89d39811fe95702339174f8c24a23c69f78b43d3
+readonly fastrpc_sha=b203840bde826ffd0069b23fb8c742ec25b165a4d016a15a96d30a483eb2dd8a
+readonly tfa_sha=8fe107ad4eb2e9d7d745a0e357a6f21ef227424b4f0c3aaac3ef629933f03ed1
+readonly runtime_dir=/run/omamobile-myron
+readonly arm=$runtime_dir/audio-stage.armed
+readonly state=/run/myron-host/var/lib/omarchy-mobile/audio-stage.state
+readonly log=/run/myron-host/var/log/myron-omarchy-audio-stage.log
+readonly disarm=/run/myron-host/var/lib/omarchy-mobile/hardware-test.disarm
+boot_id=
+adsp=
+
+fail() {
+	persist "result=failed message=$*"
+	printf 'ERROR: %s\n' "$*" >&2
+	printf '%s\n' 'Do not retry audio in this boot. Restore postmarketOS or reboot once.' >&2
+	exit 1
+}
+
+persist() {
+	mkdir -p "$(dirname "$log")"
+	printf '%s boot_id=%s %s\n' "$(date -u +%FT%TZ)" "${boot_id:-unknown}" "$*" >> "$log"
+	sync -f "$log" 2>/dev/null || sync
+}
+
+write_state() {
+	value=$1
+	tmp=$state.tmp.$$
+	printf '%s\n' "$value" > "$tmp"
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$state"
+	sync -f "$state" 2>/dev/null || sync
+}
+
+read_state() {
+	cat "$state" 2>/dev/null || true
+}
+
+check_hash() {
+	path=$1
+	expected=$2
+	[ -f "$path" ] && [ ! -L "$path" ] && [ -s "$path" ] || fail "missing regular asset: $path"
+	actual=$(sha256sum "$path" | awk '{print $1}')
+	[ "$actual" = "$expected" ] || fail "asset checksum mismatch: $path"
+}
+
+find_adsp() {
+	adsp=
+	for name_file in /sys/class/remoteproc/remoteproc*/name; do
+		[ -r "$name_file" ] || continue
+		grep -q remoteproc-adsp "$name_file" || continue
+		adsp=${name_file%/name}
+		break
+	done
+	[ -n "$adsp" ] || fail 'ADSP remote processor was not found'
+}
+
+mapper_is_bound() {
+	find /sys/bus/auxiliary/drivers/qcom_pd_mapper.qcom-pdm-mapper \
+		-maxdepth 1 -name 'rproc_qcom_common.pd-mapper.*' 2>/dev/null | grep -q .
+}
+
+load_module() {
+	file=$1
+	module_name=${2:-}
+	path=$module_dir/$file
+	name=${module_name:-$(basename "$file" .ko | tr '-' '_')}
+	[ -s "$path" ] || fail "missing audio module: $file"
+	if [ -d "/sys/module/$name" ]; then
+		persist "stage=$(stage_name) module=$file result=already-loaded"
+		return 0
+	fi
+	persist "stage=$(stage_name) module=$file action=insmod"
+	insmod "$path" || fail "module insertion failed: $file"
+	persist "stage=$(stage_name) module=$file result=loaded"
+}
+
+stage_name() {
+	current=$(read_state)
+	printf '%s\n' "$current" | sed -n 's/^enter:\([^:]*\):.*$/\1/p'
+}
+
+require_common() {
+	[ "$(id -u)" = 0 ] || fail 'audio stage runner must run as root'
+	[ "$(uname -r)" = "$expected_kernel" ] || fail "unexpected kernel release: $(uname -r)"
+	[ -d /run/myron-host/var/lib/omarchy-mobile ] || fail 'postmarketOS host state is unavailable'
+	[ -s /run/myron-wireless-ready ] || fail 'radio/Wi-Fi firmware foundation is not ready'
+	systemctl --quiet is-active myron-reference-radio.service ||
+		fail 'radio foundation service is not active'
+	! pgrep -x ModemManager >/dev/null ||
+		fail 'ModemManager or GNSS must not run in the audio boot'
+	[ "$(cat /sys/module/firmware_class/parameters/path 2>/dev/null || true)" = \
+		'/run/myron-wireless/firmware/' ] || fail 'Myron firmware view is not active'
+	check_hash "$source_script" "$source_sha"
+	check_hash "$module_dir/qcom_pd_mapper-canoe.ko" "$mapper_sha"
+	check_hash "$module_dir/frpc-adsprpc.ko" "$fastrpc_sha"
+	check_hash "$firmware_dir/tfa98xx.cnt" "$tfa_sha"
+	for firmware in adsp.mdt adsp_dtb.mdt; do
+		[ -s "/run/myron-wireless/firmware/$firmware" ] || fail "missing ADSP firmware: $firmware"
+	done
+}
+
+require_transition() {
+	expected=$1
+	actual=$(read_state)
+	[ "$actual" = "$expected:$boot_id" ] ||
+		fail "expected state $expected for this boot, found ${actual:-none}"
+}
+
+begin_stage() {
+	name=$1
+	previous=$2
+	require_transition "$previous"
+	write_state "enter:$name:$boot_id"
+	persist "stage=$name result=entered"
+}
+
+finish_stage() {
+	name=$1
+	write_state "done:$name:$boot_id"
+	persist "stage=$name result=complete"
+	printf 'stage=%s result=complete\n' "$name"
+}
+
+arm_test() {
+	find_adsp
+	[ "$(cat "$adsp/state")" = offline ] || fail 'ADSP must be offline on a clean boot'
+	previous=$(read_state)
+	case "$previous" in
+		'') ;;
+		*:"$boot_id") fail 'audio test was already armed or started in this boot' ;;
+		armed:*|enter:*:*|done:*:*) persist "stage=arm previous_state=$previous" ;;
+		*) fail 'invalid persistent audio state' ;;
+	esac
+	mkdir -p "$runtime_dir"
+	printf 'checkpointed-audio-stage\n' > "$arm"
+	chmod 0600 "$arm"
+	write_state "armed:$boot_id"
+	persist 'stage=arm result=complete watchdog=rearmed'
+	rm -f "$disarm"
+	systemctl restart myron-hardware-watchdog.service || fail 'could not re-arm rollback watchdog'
+	printf '%s\n' 'stage=arm result=complete watchdog=rearmed'
+}
+
+require_arm() {
+	[ -f "$arm" ] && [ ! -L "$arm" ] || fail 'audio stage test is not armed'
+	[ "$(cat "$arm")" = checkpointed-audio-stage ] || fail 'invalid audio stage arm marker'
+}
+
+run_mapper() {
+	require_arm
+	begin_stage mapper armed
+	find_adsp
+	[ "$(cat "$adsp/state")" = offline ] || fail 'ADSP started before mapper stage'
+	install -m 0644 "$firmware_dir/tfa98xx.cnt" /run/myron-wireless/firmware/tfa98xx.cnt
+	if [ -d /sys/module/qcom_pd_mapper ] && ! mapper_is_bound; then
+		refcount=$(awk '$1 == "qcom_pd_mapper" { print $3 }' /proc/modules)
+		[ "$refcount" = 0 ] || fail "unbound stock mapper is in use (refcount $refcount)"
+		persist 'stage=mapper module=qcom_pd_mapper action=rmmod-stock'
+		rmmod qcom_pd_mapper || fail 'could not remove unbound stock mapper'
+		persist 'stage=mapper module=qcom_pd_mapper result=removed-stock'
+	fi
+	mapper_is_bound || load_module qcom_pd_mapper-canoe.ko qcom_pd_mapper
+	elapsed=0
+	while [ "$elapsed" -lt 10 ] && ! mapper_is_bound; do
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	mapper_is_bound || fail 'Canoe PD mapper did not bind'
+	finish_stage mapper
+}
+
+run_transport() {
+	begin_stage transport done:mapper
+	for module in \
+		q6_pdr_dlkm.ko q6_notifier_dlkm.ko snd_event_dlkm.ko \
+		gpr_dlkm.ko spf_core_dlkm.ko audpkt_ion_dlkm.ko audio_pkt_dlkm.ko \
+		q6_dlkm.ko adsp_loader_dlkm.ko audio_prm_dlkm.ko; do
+		load_module "$module"
+	done
+	finish_stage transport
+}
+
+run_adsp() {
+	begin_stage adsp done:transport
+	find_adsp
+	case "$(cat "$adsp/state")" in
+		offline)
+			persist 'stage=adsp action=start-remoteproc'
+			printf '%s' start > "$adsp/state"
+			;;
+		running) persist 'stage=adsp result=already-running' ;;
+		*) fail "unexpected ADSP state: $(cat "$adsp/state")" ;;
+	esac
+	elapsed=0
+	while [ "$elapsed" -lt 30 ] && [ "$(cat "$adsp/state")" != running ]; do
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	[ "$(cat "$adsp/state")" = running ] || fail 'ADSP did not reach running state'
+	elapsed=0
+	while [ "$elapsed" -lt 20 ] && ! dmesg | grep -Fq 'gpr_adsp_up: Q6 is Up'; do
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	dmesg | grep -Fq 'gpr_adsp_up: Q6 is Up' || fail 'AudioReach transport did not report Q6 UP'
+	finish_stage adsp
+}
+
+run_codecs() {
+	begin_stage codecs done:adsp
+	for module in \
+		pinctrl_lpi_dlkm.ko swr_dlkm.ko swr_ctrl_dlkm.ko \
+		wcd_core_dlkm.ko mbhc_dlkm.ko sdca_registers_dlkm.ko wcd9xxx_dlkm.ko \
+		stub_dlkm.ko wcd939x_slave_dlkm.ko wcd9378_slave_dlkm.ko \
+		wcd938x_slave_dlkm.ko wcd939x_dlkm.ko wcd9378_dlkm.ko wcd938x_dlkm.ko \
+		lpass_cdc_dlkm.ko lpass_cdc_wsa2_macro_dlkm.ko \
+		lpass_cdc_wsa_macro_dlkm.ko lpass_cdc_va_macro_dlkm.ko \
+		lpass_cdc_rx_macro_dlkm.ko lpass_cdc_tx_macro_dlkm.ko \
+		wsa884x_dlkm.ko wsa883x_dlkm.ko tfa98xx_dlkm.ko \
+		swr_dmic_dlkm.ko swr_haptics_dlkm.ko hdmi_dlkm.ko \
+		lpass_bt_swr_dlkm.ko btpower.ko btfmcodec.ko bt_fm_swr.ko \
+		qmp_dlkm.ko simple_amp_dlkm.ko machine_dlkm.ko; do
+		load_module "$module"
+	done
+	finish_stage codecs
+}
+
+run_devnodes() {
+	begin_stage devnodes done:codecs
+	elapsed=0
+	while [ "$elapsed" -lt 30 ] && ! grep -q canoe-mtp-snd-card /proc/asound/cards 2>/dev/null; do
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	grep -q canoe-mtp-snd-card /proc/asound/cards 2>/dev/null || fail 'Canoe ALSA card did not appear'
+	persist 'stage=devnodes action=create'
+	/usr/local/sbin/myron-audio-devnodes || fail 'could not create ALSA device nodes'
+	finish_stage devnodes
+}
+
+run_fastrpc() {
+	begin_stage fastrpc done:devnodes
+	for dependency in qcom_scm mem_buf_dev pdr_interface qcom_glink; do
+		[ -d "/sys/module/$dependency" ] || fail "stock FastRPC dependency is missing: $dependency"
+	done
+	load_module frpc-adsprpc.ko frpc_adsprpc
+	elapsed=0
+	while [ "$elapsed" -lt 8 ] &&
+		! find /sys/class/misc -maxdepth 1 -name 'fastrpc-*' 2>/dev/null | grep -q .; do
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	found=0
+	for sysdev in /sys/class/misc/fastrpc-*; do
+		[ -r "$sysdev/dev" ] || continue
+		found=1
+		devname=${sysdev##*/}
+		devpath=/dev/$devname
+		if [ ! -e "$devpath" ]; then
+			major_minor=$(cat "$sysdev/dev")
+			mknod "$devpath" c "${major_minor%:*}" "${major_minor#*:}"
+			chmod 0600 "$devpath"
+		fi
+		[ -c "$devpath" ] || fail "FastRPC node is invalid: $devpath"
+	done
+	[ "$found" -eq 1 ] || fail 'stock FastRPC registered no device'
+	finish_stage fastrpc
+}
+
+show_status() {
+	printf 'boot_id=%s\n' "$boot_id"
+	printf 'state=%s\n' "$(read_state)"
+	find_adsp
+	printf 'adsp=%s\n' "$(cat "$adsp/state")"
+	printf '%s\n' 'cards:'
+	cat /proc/asound/cards 2>/dev/null || true
+	printf 'watchdog=%s\n' "$(systemctl is-active myron-hardware-watchdog.service 2>/dev/null || true)"
+	tail -n 12 "$log" 2>/dev/null || true
+}
+
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+command=${1:-status}
+case "$command" in
+	status) show_status ;;
+	arm) require_common; arm_test ;;
+	mapper) require_common; run_mapper ;;
+	transport) require_common; run_transport ;;
+	adsp) require_common; run_adsp ;;
+	codecs) require_common; run_codecs ;;
+	devnodes) require_common; run_devnodes ;;
+	fastrpc) require_common; run_fastrpc ;;
+	*) fail 'usage: myron-audio-stage {status|arm|mapper|transport|adsp|codecs|devnodes|fastrpc}' ;;
+esac
