@@ -61,6 +61,9 @@ if [[ $1 == run ]]; then
   if flock -n -x "$lock" true 2>/dev/null; then echo "LOCK-FREE" >> "$CALLS"; else echo "LOCK-HELD" >> "$CALLS"; fi
   if flock -n -s "$lock" true 2>/dev/null; then echo "SHARED-OK" >> "$CALLS"; fi
   mkdir -p "$output/stage"
+  # Match the real ALARM tree's read-only root. The host publisher must make
+  # only this directory owner-writable before its cross-parent rename.
+  chmod 0555 "$output/stage"
   printf '# Omarchy Mobile root STAGE (not bootable, not an image)\n' > "$output/MANIFEST"
   exit 0
 fi
@@ -172,6 +175,7 @@ new_repo; dev_repo
 rootfs --dev-unsigned --stage-only --version t1 || fail "the mocked development stage fails"
 name=omamobile-rootfs-stage-dev-unsigned-t1-aarch64
 [[ -d $R/out/$name && -f $R/out/$name.MANIFEST ]] || fail "the development stage has the wrong name"
+[[ $(stat -c %a "$R/out/$name") == 755 ]] || fail "the published stage root is not owner-writable"
 [[ -z $(find "$R/out" -maxdepth 1 -name 'omamobile-rootfs-stage-t1-*') ]] || fail "a signed-named output appeared"
 [[ ! -e $R/out/repo ]] || fail "the development build created out/repo"
 grep -q '^alarm_fetch rootfs$' "$CALLS" || fail "the rootfs build did not ask for the rootfs binfmt mode"

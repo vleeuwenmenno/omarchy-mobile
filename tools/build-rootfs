@@ -251,6 +251,14 @@ if ((STAGE_ONLY)); then
   candidate_manifest=$candidate.MANIFEST
   mv -- "$work/stage" "$candidate"
   cp "$work/MANIFEST" "$candidate_manifest"
+  # The ALARM tree currently gives / mode 0555. Moving a directory between
+  # parents updates its `..` entry, which Linux refuses when the directory
+  # itself is not owner-writable. A staged root is mutable build output, so
+  # normalize only its root before validation and no-clobber publication.
+  [[ -d $candidate && ! -L $candidate ]] ||
+    alarm_die "no real stage tree produced in $work"
+  chmod u+w -- "$candidate" ||
+    alarm_die "cannot make the stage root publishable; the candidate stays in $work"
   tests/rootfs-stage "$candidate"
   # Publish a new generation only: no earlier stage or manifest is removed or
   # replaced. Manifest first (a hard link fails if the name exists), the
