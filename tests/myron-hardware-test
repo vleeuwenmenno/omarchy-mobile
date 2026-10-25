@@ -278,12 +278,15 @@ grep -Fq 'systemctl start bluetooth.service' "$bluetooth_stage" ||
 for cleanup in \
   'timeout 3 bluetoothctl scan off' \
   'timeout 3 bluetoothctl power off' \
+  'systemctl mask --runtime bluetooth.service' \
   'timeout 10 systemctl stop bluetooth.service' \
   'timeout 5 "$probe" --set-power off' \
   'timeout 5 umount'; do
   grep -Fq "$cleanup" "$bluetooth_stage" ||
     fail "Bluetooth cleanup is not bounded: $cleanup"
 done
+grep -Fq 'if systemctl --quiet is-active bluetooth.service; then cleanup_ok=0; fi' "$bluetooth_stage" ||
+  fail 'Bluetooth cleanup does not verify that BlueZ stayed stopped'
 if grep -Fq 'rc-service' "$bluetooth_stage"; then
   fail 'Bluetooth runner contains an Alpine/OpenRC service command'
 fi

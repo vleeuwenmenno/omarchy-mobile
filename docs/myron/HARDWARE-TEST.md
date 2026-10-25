@@ -259,6 +259,12 @@ stops BlueZ and `btattach`, unmounts `bluetooth_b`, and recreates the rollback
 disarm marker. Any failed start or scan also attempts full power-off cleanup;
 the watchdog remains armed if qualification fails.
 
+The successful v10 scan exposed one cleanup race: after the controller was
+powered off and `hci0` disappeared, the desktop D-Bus-activated a new
+controller-less BlueZ daemon. Cleanup now runtime-masks `bluetooth.service`
+before stopping it and verifies that it stays inactive. The mask lives only in
+`/run` and vanishes on reboot.
+
 Run only after the normal DSI/GPU qualification and attended radio start:
 
 ```text
@@ -282,14 +288,20 @@ Failure cleanup completed, left `hci0` absent and BlueZ inactive, and the exact
 postmarketOS `init_boot_a` was restored. This is a staging-guard failure, not a
 Bluetooth hardware result.
 
+The corrected v10 run loaded all six rebuilt GKI modules and the exact stock
+`btpower.ko`, initialized WCN786x from the hash-pinned board-ID-00 firmware and
+NVM, created `hci0`, and reached a powered BlueZ controller. Its bounded scan
+recorded one discovery event while persisting no nearby identity. Cleanup
+removed `hci0`, unmounted `bluetooth_b`, powered the controller off and
+disarmed rollback. The exact postmarketOS `init_boot_a` was then restored;
+Plasma, Wi-Fi and the cellular interface returned.
+
 ## Next attended sequence
 
-1. Build the Bluetooth successor with the corrected stock-module metadata
-   gate and verify its payload/init-boot hash pair offline.
-2. Boot it with ModemManager, GNSS and AudioReach stopped. Qualify DSI/GPU,
-   start only the radio foundation, then run the four Bluetooth commands above.
-3. Add attended physical power/volume, visible brightness and haptics probes.
-4. Audit sensors, telephony, fingerprint and camera as isolated subsystem
+1. Promote the qualified controller/scan sequence into a device-owned package
+   without copying proprietary firmware.
+2. Add attended physical power/volume, visible brightness and haptics probes.
+3. Audit sensors, telephony, fingerprint and camera as isolated subsystem
    phases; none is implied by successful Bluetooth or graphical testing.
 
 Bluetooth discovery/audio, sensors and rotation, telephony, fingerprint and

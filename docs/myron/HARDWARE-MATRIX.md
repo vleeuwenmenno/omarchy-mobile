@@ -94,9 +94,10 @@ reference statuses above:
   and native Wayland application rendering, touch, both DMA-heap names, USB
   and WLAN SSH, persistent managed `wlan0`, Wi-Fi scan/association/IPv4/DNS,
   modem discovery and home LTE/5G registration, and a bounded six-satellite
-  GNSS fix, raw built-in microphone capture and a guarded low-volume physical
-  speaker graph. Nautilus and GNOME Maps mapped without the r4 swapchain
-  failure.
+  GNSS fix, raw built-in microphone capture, a guarded low-volume physical
+  speaker graph, and WCN786x firmware/NVM initialization with a powered BlueZ
+  controller and bounded discovery. Nautilus and GNOME Maps mapped without
+  the r4 swapchain failure.
 - **Partially verified on Omarchy:** battery and USB-PD reporting; backlight
   writes with a broken zero `actual_brightness` readback; low-intensity torch
   activation; power/volume input nodes and shell bindings without attended
@@ -105,12 +106,8 @@ reference statuses above:
   ModemManager/GNSS caused an immediate hard reboot. A later separate clean
   boot passed the checkpointed mapper, ADSP, codec, microphone and speaker
   path; mixing those subsystem sequences remains forbidden.
-- **Present but unverified on Omarchy:** UPower UI and haptics. The first
-  one-shot WCN786x/BlueZ run stopped safely before `btpower.ko` insertion on an
-  over-strict stock-versus-GKI vermagic string check; cleanup passed and this
-  produced no Bluetooth hardware result. A corrected successor is pending.
-  Only two ADC IIO nodes exist, and no camera/media or fingerprint node is
-  exposed.
+- **Present but unverified on Omarchy:** UPower UI and haptics. Only two ADC
+  IIO nodes exist, and no camera/media or fingerprint node is exposed.
 - **Not integrated on Omarchy:** SMS, voice calls/call audio, fingerprint and
   camera capture. The current reference boot also exposes no camera/media or
   fingerprint character nodes, and only two ADC IIO devices.
