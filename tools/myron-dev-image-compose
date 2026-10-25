@@ -14,6 +14,7 @@ Usage: tools/myron-dev-image-compose \
   --base-image ABSOLUTE_RAW_EXT4 \
   --module-stage ABSOLUTE_DIR \
   --runtime-stage ABSOLUTE_DIR \
+  --bluetooth-probe ABSOLUTE_FILE \
   --firstboot-conf ABSOLUTE_FILE \
   --ssh-key ABSOLUTE_PUBLIC_KEY \
   --out ABSOLUTE_RAW_EXT4
@@ -26,12 +27,13 @@ disabled until an attended, separately gated test.
 EOF
 }
 
-base= modules= runtime= firstboot= ssh_key= out=
+base= modules= runtime= bluetooth_probe= firstboot= ssh_key= out=
 while (($#)); do
   case $1 in
     --base-image) base=${2:?}; shift 2 ;;
     --module-stage) modules=${2:?}; shift 2 ;;
     --runtime-stage) runtime=${2:?}; shift 2 ;;
+    --bluetooth-probe) bluetooth_probe=${2:?}; shift 2 ;;
     --firstboot-conf) firstboot=${2:?}; shift 2 ;;
     --ssh-key) ssh_key=${2:?}; shift 2 ;;
     --out) out=${2:?}; shift 2 ;;
@@ -39,15 +41,16 @@ while (($#)); do
     *) die "unknown argument: $1" ;;
   esac
 done
-for value in base modules runtime firstboot ssh_key out; do
+for value in base modules runtime bluetooth_probe firstboot ssh_key out; do
   [[ -n ${!value} ]] || die "--${value//_/-} is required"
 done
-for path in "$base" "$modules" "$runtime" "$firstboot" "$ssh_key"; do
+for path in "$base" "$modules" "$runtime" "$bluetooth_probe" "$firstboot" "$ssh_key"; do
   [[ $path == /* && $path != *'/../'* && $path != */.. && $path != *'/./'* ]] ||
     die "input paths must be canonical absolute paths: $path"
   [[ -e $path && ! -L $path ]] || die "missing or linked input: $path"
 done
-[[ -f $base && -f $firstboot && -f $ssh_key ]] || die 'base image, firstboot config and SSH key must be regular files'
+[[ -f $base && -f $bluetooth_probe && -f $firstboot && -f $ssh_key ]] ||
+  die 'base image, Bluetooth probe, firstboot config and SSH key must be regular files'
 [[ -d $modules && -d $runtime ]] || die 'module and runtime stages must be directories'
 [[ $out == /* && $out != / && $out != *'/../'* && $out != */.. && $out != *'/./'* ]] ||
   die '--out must be a canonical absolute path'
@@ -63,6 +66,11 @@ packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify verif
 packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify verify-runtime \
   --manifest /home/menno/Work/myron-postmarketos/config/myron-runtime-assets.tsv \
   --root "$runtime" --features gpu,wifi,touch,radio-base,audio-microphone >/dev/null
+[[ $(sha256sum <"$bluetooth_probe" | cut -d' ' -f1) == \
+  4a9d4da29c7ef46f4dcb08385e4c5ff85b16344884d4239c40b53923c5258608 ]] ||
+  die 'Bluetooth probe is not the reviewed Attempt 71 source'
+grep -Fq -- '--prepare-qca-ibs-after-nvm' "$bluetooth_probe" ||
+  die 'Bluetooth probe lacks the reviewed QCA IBS preparation mode'
 grep -Fxq 'USERNAME=menno' "$firstboot" || die 'firstboot config must create menno'
 grep -Eq '^PASSWORD_HASH=\$6\$' "$firstboot" || die 'firstboot config lacks a SHA-512 password hash'
 [[ $(grep -c '^SSH_KEY=' "$firstboot") == 1 ]] || die 'firstboot config must have exactly one SSH key'
@@ -88,6 +96,7 @@ docker run --rm --privileged --platform linux/arm64 \
   -v "$out:/payload.img" \
   -v "$modules:/module-stage:ro" \
   -v "$runtime:/runtime-stage:ro" \
+  -v "$bluetooth_probe:/bluetooth-probe.py:ro" \
   -v "$ROOT/device/myron/hardware-test-overlay:/test-overlay:ro" \
   -v "$firstboot:/firstboot.conf:ro" \
   -v "$ssh_key:/owner.pub:ro" \
@@ -146,6 +155,8 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/etc/backend_conf.xml"
     install -m0644 "$root/usr/local/lib/myron-audio/config/card-defs.xml" \
       "$root/etc/card-defs.xml"
+    install -Dm0755 /bluetooth-probe.py \
+      "$root/usr/local/sbin/myron-bluetooth-qca-probe"
     chown -R 0:0 "$root/usr/local/sbin/myron-attempt79-module-dir"
     chmod 0755 "$root/usr/local/sbin/myron-attempt79-module-dir"
     install -Dm0600 /firstboot.conf "$root/etc/omamobile/firstboot.conf"
@@ -159,6 +170,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-reference-audio-start" \
       "$root/usr/local/sbin/myron-audio-stage" \
       "$root/usr/local/sbin/myron-speaker-dsp-stage" \
+      "$root/usr/local/sbin/myron-bluetooth-stage" \
       "$root/usr/local/sbin/myron-audio-devnodes" \
       "$root/usr/local/sbin/myron-omarchy-prepare" \
       "$root/usr/local/sbin/myron-omarchy-qualify"
@@ -181,6 +193,7 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/sbin/myron-omarchy-prepare \
   /usr/local/lib/myron-gpu/modules/msm_kgsl.ko \
   /usr/local/lib/myron-audio /etc/acdbdata/acdb_cal.acdb \
+  /usr/local/sbin/myron-bluetooth-qca-probe \
   /etc/backend_conf.xml /etc/card-defs.xml; do
   debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
     die "root ownership missing: $path"

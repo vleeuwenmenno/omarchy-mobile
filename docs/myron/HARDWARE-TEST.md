@@ -3,9 +3,9 @@
 
 Status: the r5 temporary Arch payload booted and qualified native DSI,
 Hyprland, touch, DMA-heap-backed application rendering, the isolated GPU stack,
-Wi-Fi, modem registration and a GNSS fix on 2026-10-25. Audio remains isolated
-to a separate clean boot because the r4 mixed radio/audio sequence hard-reset
-the phone.
+Wi-Fi, modem registration, a GNSS fix, the built-in microphone and a guarded
+low-volume speaker path on 2026-10-25. Audio remains isolated to a separate
+clean boot because the r4 mixed radio/audio sequence hard-reset the phone.
 
 This is a reversible development test around the existing downstream Myron
 kernel and extracted runtime assets. It is not the production installer, does
@@ -204,21 +204,66 @@ hash-pinned files; proprietary bytes remain outside this repository. Rebuild
 the payload after these committed fixes before treating the pair as the next
 reproducible candidate.
 
+The offline Bluetooth successor is private and untracked:
+
+```text
+1cb4c637c788b4c81b25f79b5d969e1fff74d4d030d7269dc8cca54b9f354ccb  myron-omarchy-hardware-test-20261025-r5-v8.img
+1a47033951c09f18b32c496b9afc2a3344c60e7a3ddd599a551c234472938240  init_boot_a-myron-omarchy-hardware-test-20261025-r5-v8.img
+```
+
+It retains the 900-second slot-A-only rollback image and has not run on the
+phone yet. Earlier v6/v7 builds were superseded before deployment by stronger
+same-boot replay protection, private transient-log permissions and
+signal-triggered cleanup.
+
+## Isolated Bluetooth stage
+
+Bluetooth must use another fresh boot: ModemManager, GNSS and AudioReach are
+all forbidden. `myron-bluetooth-stage` uses the still-running independent
+rollback watchdog and advances through `arm`, `start`, and `scan`. `arm`
+removes the graphical disarm marker, syncs its state to the postmarketOS root,
+and requires 20 seconds of stable radio/Wi-Fi operation. `start` consumes its
+one-shot marker before loading any module.
+
+The runner selects the exact GKI module set from the running kernel notes,
+hash-pins `rfkill`, `pwrseq-core`, `bluetooth`, `btbcm`, `btqca`, patched
+`hci_uart`, stock `btpower`, and the reviewed WCN786x userspace probe. It
+mounts exactly one `bluetooth_b` partition `ro,nosuid,nodev,noexec`, then
+size- and hash-verifies board-ID-00 `gngbtfw20.mbn` and `gngbtnv20.bin`.
+Those proprietary files stay on the phone. BlueZ is started with systemd only;
+the Alpine reference probe's OpenRC path is not used.
+
+`scan` is bounded to eight seconds. Raw output exists only in `/run`, is mode
+`0600`, and is deleted after counting discovery events, so nearby addresses
+and names never enter persistent logs. Success powers off the controller,
+stops BlueZ and `btattach`, unmounts `bluetooth_b`, and recreates the rollback
+disarm marker. Any failed start or scan also attempts full power-off cleanup;
+the watchdog remains armed if qualification fails.
+
+Run only after the normal DSI/GPU qualification and attended radio start:
+
+```text
+sudo myron-bluetooth-stage arm
+sudo myron-bluetooth-stage start
+sudo myron-bluetooth-stage status
+sudo myron-bluetooth-stage scan
+```
+
+Emergency cleanup is idempotent:
+
+```text
+sudo myron-bluetooth-stage stop
+```
+
 ## Next attended sequence
 
-1. Restore postmarketOS, rebuild the r5 successor with both live fixes, and
-   verify its payload/init-boot hash pair offline.
-2. On a separate clean boot, keep ModemManager/GNSS stopped, run
-   `myron-audio-stage arm`, then advance one command at a time through
-   `mapper`, `transport`, `adsp`, `codecs`, `devnodes`, `fastrpc`, and
-   `speaker-dsp`. The final stage mounts the exact `dsp_b` partition read-only
-   and publishes only two hash-pinned dependencies; the repository commits no
-   proprietary bytes. Inspect `status` after every step. Test microphone only
-   after FastRPC passes, then use the guarded low-volume speaker probe after
-   `speaker-dsp`.
+1. Build the Bluetooth successor and verify its payload/init-boot hash pair
+   offline.
+2. Boot it with ModemManager, GNSS and AudioReach stopped. Qualify DSI/GPU,
+   start only the radio foundation, then run the four Bluetooth commands above.
 3. Add attended physical power/volume, visible brightness and haptics probes.
-4. Bring up Bluetooth, sensors, telephony, fingerprint and camera as isolated
-   subsystem phases; none is implied by the successful graphical/radio boot.
+4. Audit sensors, telephony, fingerprint and camera as isolated subsystem
+   phases; none is implied by successful Bluetooth or graphical testing.
 
 Bluetooth discovery/audio, sensors and rotation, telephony, fingerprint and
 camera capture remain required later phases; none may be inferred from the

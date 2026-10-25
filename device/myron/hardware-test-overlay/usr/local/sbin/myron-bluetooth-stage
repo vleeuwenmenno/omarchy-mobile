@@ -1,0 +1,387 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# One-shot WCN786x bring-up for the temporary Myron hardware-test boot.
+set -eu
+umask 077
+
+readonly expected_kernel=6.12.23-android16-5-g5a0e85dd9db0-dirty-4k
+readonly probe=/usr/local/sbin/myron-bluetooth-qca-probe
+readonly probe_sha=4a9d4da29c7ef46f4dcb08385e4c5ff85b16344884d4239c40b53923c5258608
+readonly btpower=/usr/local/lib/myron-audio/modules/btpower.ko
+readonly btpower_sha=3280aab7f8f07f6f7b4ec032c68852951d0d76b73ed25b799728cdc55ccdb39a
+readonly patch_sha=6631fe3562dbb329e2be19f157c55ae8600e24643de3dd8feb2524e21af77b0a
+readonly nvm_sha=669b8a7e03660fad976b48a58871759a8e5188f2b3b32e73419fd170710af763
+readonly runtime_dir=/run/myron-bluetooth
+readonly firmware_mnt=$runtime_dir/firmware
+readonly pidfile=$runtime_dir/btattach.pid
+readonly transport_log=$runtime_dir/btattach.log
+readonly scan_raw=$runtime_dir/scan.raw
+readonly arm=/run/omamobile-myron/bluetooth-stage.armed
+readonly consumed=/run/omamobile-myron/bluetooth-stage.armed.consumed
+readonly state=/run/myron-host/var/lib/omarchy-mobile/bluetooth-stage.state
+readonly log=/run/myron-host/var/log/myron-omarchy-bluetooth-stage.log
+readonly disarm=/run/myron-host/var/lib/omarchy-mobile/hardware-test.disarm
+readonly maximum_safe_temperature_mc=80000
+boot_id=
+module_dir=
+
+persist() {
+	mkdir -p "$(dirname "$log")"
+	if [ -f "$log" ] && [ "$(wc -c <"$log")" -gt 131072 ]; then
+		tail -n 200 "$log" >"$log.new"
+		chmod 0600 "$log.new"
+		mv -f "$log.new" "$log"
+	fi
+	printf '%s boot_id=%s %s\n' "$(date -u +%FT%TZ)" "${boot_id:-unknown}" "$*" >>"$log"
+	sync -f "$log" 2>/dev/null || sync
+}
+
+write_state() {
+	value=$1
+	tmp=$state.tmp.$$
+	printf '%s\n' "$value" >"$tmp"
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$state"
+	sync -f "$state" 2>/dev/null || sync
+}
+
+read_state() { cat "$state" 2>/dev/null || true; }
+
+fail() {
+	persist "result=failed message=$*"
+	printf 'ERROR: %s\n' "$*" >&2
+	printf '%s\n' 'Do not retry Bluetooth in this boot. Run myron-bluetooth-stage stop.' >&2
+	exit 1
+}
+
+check_hash() {
+	path=$1 expected=$2
+	[ -f "$path" ] && [ ! -L "$path" ] && [ -s "$path" ] || fail "missing regular asset: $path"
+	[ "$(sha256sum "$path" | awk '{print $1}')" = "$expected" ] ||
+		fail "asset checksum mismatch: $path"
+}
+
+check_size() {
+	path=$1 expected=$2
+	[ "$(stat -c %s "$path" 2>/dev/null || true)" = "$expected" ] ||
+		fail "asset size mismatch: $path"
+}
+
+hottest_temperature() {
+	hottest=0
+	for file in /sys/class/thermal/thermal_zone*/temp; do
+		[ -r "$file" ] || continue
+		type=$(cat "${file%/temp}/type" 2>/dev/null || printf unknown)
+		case "$type" in *-trip-*) continue ;; esac
+		value=$(cat "$file" 2>/dev/null || printf 0)
+		case "$value" in ''|*[!0-9]*) value=0 ;; esac
+		[ "$value" -le "$hottest" ] || hottest=$value
+	done
+	printf '%s\n' "$hottest"
+}
+
+require_temperature() {
+	value=$(hottest_temperature)
+	persist "stage=temperature maximum_mc=$value"
+	[ "$value" -lt "$maximum_safe_temperature_mc" ] ||
+		fail "temperature safety limit reached: $value mC"
+}
+
+ensure_partition_node() {
+	partname=$1 found= count=0
+	for uevent in /sys/class/block/*/uevent; do
+		[ -r "$uevent" ] || continue
+		grep -qx "PARTNAME=$partname" "$uevent" || continue
+		count=$((count + 1))
+		sysdir=${uevent%/uevent}
+		name=${sysdir##*/}
+		found=/dev/$name
+		dev_numbers=$(cat "$sysdir/dev")
+		[ -b "$found" ] || mknod "$found" b "${dev_numbers%:*}" "${dev_numbers#*:}"
+	done
+	[ "$count" -eq 1 ] || fail "expected one PARTNAME=$partname block device, found $count"
+	printf '%s\n' "$found"
+}
+
+ensure_char_node() {
+	class_path=$1 node=$2 mode=$3 group=$4
+	[ -r "$class_path/dev" ] || fail "missing device numbers: $class_path/dev"
+	dev_numbers=$(cat "$class_path/dev")
+	[ -c "$node" ] || mknod "$node" c "${dev_numbers%:*}" "${dev_numbers#*:}"
+	chown root:"$group" "$node"
+	chmod "$mode" "$node"
+}
+
+select_modules() {
+	[ -x /usr/local/sbin/myron-attempt79-module-dir ] || fail 'GKI module selector is unavailable'
+	module_dir=$(/usr/local/sbin/myron-attempt79-module-dir) || fail 'GKI module selection failed'
+	[ -d "$module_dir" ] && [ ! -L "$module_dir" ] || fail 'selected GKI module directory is invalid'
+}
+
+load_module() {
+	file=$1 name=$2 expected=$3
+	path=$module_dir/$file
+	check_hash "$path" "$expected"
+	[ "$(modinfo -F vermagic "$path" | awk '{print $1}')" = "$expected_kernel" ] ||
+		fail "module/kernel release mismatch: $path"
+	if [ ! -d "/sys/module/$name" ]; then
+		persist "stage=start module=$file action=insmod"
+		insmod "$path" || fail "module insertion failed: $file"
+		persist "stage=start module=$file result=loaded"
+	fi
+}
+
+require_common() {
+	[ "$(id -u)" = 0 ] || fail 'Bluetooth stage must run as root'
+	[ "$(uname -r)" = "$expected_kernel" ] || fail "unexpected kernel release: $(uname -r)"
+	[ -d /run/myron-host/var/lib/omarchy-mobile ] || fail 'postmarketOS host state is unavailable'
+	[ -s /run/myron-wireless-ready ] || fail 'radio/Wi-Fi firmware foundation is not ready'
+	systemctl --quiet is-active myron-reference-radio.service || fail 'radio foundation service is not active'
+	! pgrep -x ModemManager >/dev/null || fail 'ModemManager or GNSS must not run in the Bluetooth boot'
+	! grep -q canoe-mtp-snd-card /proc/asound/cards 2>/dev/null ||
+		fail 'AudioReach must not run in the Bluetooth boot'
+	check_hash "$probe" "$probe_sha"
+	check_hash "$btpower" "$btpower_sha"
+	select_modules
+}
+
+arm_test() {
+	[ ! -e /sys/class/bluetooth/hci0 ] || fail 'an HCI controller is already attached'
+	! pgrep -x btattach >/dev/null || fail 'an unmanaged btattach process is running'
+	! pgrep -x bluetoothd >/dev/null || fail 'an unmanaged BlueZ daemon is running'
+	for module in pwrseq_core bluetooth btbcm btqca hci_uart btpower; do
+		[ ! -d "/sys/module/$module" ] || fail "Bluetooth module was already loaded: $module"
+	done
+	systemctl --quiet is-active myron-hardware-watchdog.service ||
+		fail 'the independent rollback watchdog is no longer active'
+	previous=$(read_state)
+	case "$previous" in
+		'') ;;
+		*:"$boot_id") fail 'Bluetooth test was already armed or started in this boot' ;;
+		armed:*|enter:*:*|started:*|failed:*:*|qualified:*|stopped:*)
+			persist "stage=arm previous_state=$previous"
+			;;
+		*) fail 'invalid persistent Bluetooth state' ;;
+	esac
+	mkdir -p "$(dirname "$arm")"
+	printf '%s\n' checkpointed-bluetooth-stage >"$arm"
+	chmod 0600 "$arm"
+	rm -f "$consumed"
+	write_state "armed:$boot_id"
+	persist 'stage=arm action=remove-graphical-disarm watchdog=continued'
+	rm -f "$disarm"
+	sync
+	[ ! -e "$disarm" ] || fail 'could not re-arm the rollback watchdog'
+	persist 'stage=arm stabilization=radio-begin seconds=20'
+	sleep 20
+	systemctl --quiet is-active myron-reference-radio.service || fail 'radio foundation stopped during stabilization'
+	[ -s /run/myron-wireless-ready ] || fail 'radio readiness disappeared during stabilization'
+	[ -d /sys/class/net/wlan0 ] || fail 'wlan0 did not survive radio stabilization'
+	require_temperature
+	persist 'stage=arm result=complete watchdog=continued radio_stable_seconds=20'
+	printf '%s\n' 'stage=arm result=complete watchdog=continued radio_stable_seconds=20'
+}
+
+mount_firmware() {
+	node=$(ensure_partition_node bluetooth_b)
+	mkdir -p "$firmware_mnt"
+	chmod 0700 "$runtime_dir" "$firmware_mnt"
+	if ! mountpoint -q "$firmware_mnt"; then
+		mount -t vfat -o ro,nosuid,nodev,noexec "$node" "$firmware_mnt"
+	fi
+	[ "$(findmnt -n -o SOURCE --target "$firmware_mnt")" = "$node" ] || fail 'unexpected bluetooth_b mount source'
+	options=$(findmnt -n -o OPTIONS --target "$firmware_mnt")
+	for option in ro nosuid nodev noexec; do
+		printf '%s\n' "$options" | tr ',' '\n' | grep -Fxq "$option" ||
+			fail "bluetooth_b mount lacks $option"
+	done
+	patch=$firmware_mnt/image/gngbtfw20.mbn
+	nvm=$firmware_mnt/image/gngbtnv20.bin
+	check_size "$patch" 294052
+	check_size "$nvm" 14377
+	check_hash "$patch" "$patch_sha"
+	check_hash "$nvm" "$nvm_sha"
+}
+
+stop_internal() {
+	cleanup_ok=1
+	rm -f /run/myron-bluetooth-ready "$scan_raw"
+	bluetoothctl scan off >/dev/null 2>&1 || true
+	bluetoothctl power off >/dev/null 2>&1 || true
+	systemctl stop bluetooth.service >/dev/null 2>&1 || true
+	if [ -s "$pidfile" ]; then
+		pid=$(cat "$pidfile")
+		case "$pid" in ''|*[!0-9]*) pid= ;; esac
+		if [ -n "$pid" ] && [ -r "/proc/$pid/comm" ] && [ "$(cat "/proc/$pid/comm")" = btattach ]; then
+			kill "$pid" 2>/dev/null || true
+			count=0
+			while [ "$count" -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
+				sleep 0.1
+				count=$((count + 1))
+			done
+			kill -9 "$pid" 2>/dev/null || true
+		fi
+	fi
+	rm -f "$pidfile"
+	if [ -e /sys/module/hci_uart/parameters/qca_preinitialized ]; then
+		printf 0 >/sys/module/hci_uart/parameters/qca_preinitialized || true
+	fi
+	if [ -c /dev/btpower ]; then
+		[ -f "$probe" ] && [ ! -L "$probe" ] &&
+			[ "$(sha256sum "$probe" | awk '{print $1}')" = "$probe_sha" ] || cleanup_ok=0
+		if [ "$cleanup_ok" -eq 1 ]; then
+			"$probe" --set-power off >/dev/null 2>&1 || cleanup_ok=0
+		fi
+	fi
+	if mountpoint -q "$firmware_mnt"; then
+		umount "$firmware_mnt" || cleanup_ok=0
+	fi
+	[ "$cleanup_ok" -eq 1 ]
+}
+
+cleanup_failed_start() {
+	status=$?
+	trap - 0 HUP INT TERM
+	[ "$status" -ne 0 ] || return 0
+	stop_internal || true
+	write_state "failed:start:$boot_id"
+	persist 'stage=start result=failed cleanup=controller-powered-off'
+	exit "$status"
+}
+
+cleanup_failed_scan() {
+	status=$?
+	trap - 0 HUP INT TERM
+	[ "$status" -ne 0 ] || return 0
+	stop_internal || true
+	write_state "failed:scan:$boot_id"
+	persist 'stage=scan result=failed cleanup=controller-powered-off'
+	exit "$status"
+}
+
+start_test() {
+	[ "$(read_state)" = "armed:$boot_id" ] || fail 'Bluetooth test is not armed for this boot'
+	[ -f "$arm" ] && [ "$(cat "$arm")" = checkpointed-bluetooth-stage ] || fail 'Bluetooth arm marker is invalid'
+	[ ! -e /sys/class/bluetooth/hci0 ] || fail 'an unmanaged HCI controller is already attached'
+	mv "$arm" "$consumed"
+	write_state "enter:start:$boot_id"
+	persist 'stage=start result=entered'
+	trap cleanup_failed_start 0
+	trap 'exit 130' HUP INT TERM
+	require_temperature
+	load_module rfkill.ko rfkill 9763ae41ffbd54aee4c7ad273c079382a3caebbc9a6e02e400bbf5a67a036ec4
+	load_module pwrseq-core.ko pwrseq_core 07f9444f4428f4c2b4bf5acb6e853cb19449cdf2019e93828401af037db6a037
+	load_module bluetooth.ko bluetooth 873580abdd6070c26bb42611c23d3021880dfe9fe4bdc46efa73ffe9a8c09ec8
+	load_module btbcm.ko btbcm b064c8d29a55c32f499bdb57c45bfb1372df4eda2f8af2529431fe0a8eca1194
+	load_module btqca.ko btqca 0e40983eaaa5e2e5d9a500ecf98bbbde6ad8a304fef44b8a1452c91c9b8c0ad2
+	load_module hci_uart.ko hci_uart 22b406e625966f3d1e1b3986959ad4aec05ca775d8fc29f06e643528e82c3885
+	[ -e /sys/module/hci_uart/parameters/qca_preinitialized ] || fail 'patched hci_uart parameter is absent'
+	for prerequisite in cnss_utils qcom_aoss hwid pinctrl_msm rfkill; do
+		[ -d "/sys/module/$prerequisite" ] || fail "missing btpower prerequisite: $prerequisite"
+	done
+	if [ ! -d /sys/module/btpower ]; then
+		[ "$(modinfo -F vermagic "$btpower" | awk '{print $1}')" = "$expected_kernel" ] ||
+			fail 'btpower module/kernel release mismatch'
+		persist 'stage=start module=btpower.ko action=insmod'
+		insmod "$btpower" || fail 'btpower module insertion failed'
+		persist 'stage=start module=btpower.ko result=loaded'
+	fi
+	ensure_char_node /sys/class/misc/rfkill /dev/rfkill 0660 root
+	ensure_char_node /sys/class/bt-dev/btpower /dev/btpower 0600 root
+	ensure_char_node /sys/class/tty/ttyHS0 /dev/ttyHS0 0600 root
+	mount_firmware
+	patch=$firmware_mnt/image/gngbtfw20.mbn
+	nvm=$firmware_mnt/image/gngbtnv20.bin
+	persist 'stage=start action=initialize-wcn786x'
+	"$probe" --prepare-qca-ibs-after-nvm "$patch" "$nvm" >>"$transport_log" 2>&1 ||
+		fail 'WCN786x firmware/NVM initialization failed'
+	(
+		exec </dev/null >>"$transport_log" 2>&1
+		exec btattach -B /dev/ttyHS0 -P qca -S 115200
+	) &
+	printf '%s\n' "$!" >"$pidfile"
+	count=0
+	while [ "$count" -lt 100 ] && [ ! -e /sys/class/bluetooth/hci0 ]; do
+		pid=$(cat "$pidfile")
+		kill -0 "$pid" 2>/dev/null || fail 'btattach exited before creating hci0'
+		sleep 0.1
+		count=$((count + 1))
+	done
+	[ -e /sys/class/bluetooth/hci0 ] || fail 'btattach did not create hci0 within 10 seconds'
+	printf 0 >/sys/module/hci_uart/parameters/qca_preinitialized
+	systemctl start bluetooth.service || fail 'BlueZ service failed to start'
+	count=0
+	while [ "$count" -lt 25 ]; do
+		timeout 3 bluetoothctl list 2>/dev/null | grep -Fq 'Controller ' && break
+		sleep 0.2
+		count=$((count + 1))
+	done
+	timeout 3 bluetoothctl list 2>/dev/null | grep -Fq 'Controller ' || fail 'BlueZ did not publish hci0'
+	power_attempt=0
+	while [ "$power_attempt" -lt 15 ]; do
+		if timeout 5 bluetoothctl power on >/dev/null 2>&1; then break; fi
+		power_attempt=$((power_attempt + 1))
+		sleep 1
+	done
+	[ "$power_attempt" -lt 15 ] || fail 'BlueZ could not power the controller within 15 seconds'
+	timeout 3 bluetoothctl show | grep -Fq 'Powered: yes' || fail 'BlueZ did not reach powered state'
+	require_temperature
+	printf '%s\n' ready >/run/myron-bluetooth-ready
+	write_state "started:$boot_id"
+	persist 'stage=start result=complete controller=hci0 bluez=powered'
+	trap - 0 HUP INT TERM
+	printf '%s\n' 'stage=start result=complete controller=hci0 bluez=powered'
+}
+
+scan_test() {
+	[ "$(read_state)" = "started:$boot_id" ] || fail 'Bluetooth controller was not started by this boot'
+	trap cleanup_failed_scan 0
+	trap 'exit 130' HUP INT TERM
+	[ -e /sys/class/bluetooth/hci0 ] && [ -s /run/myron-bluetooth-ready ] || fail 'Bluetooth ready marker or hci0 is missing'
+	require_temperature
+	: >"$scan_raw"
+	chmod 0600 "$scan_raw"
+	status=0
+	timeout 15 bluetoothctl --timeout 8 scan on >"$scan_raw" 2>&1 || status=$?
+	bluetoothctl scan off >/dev/null 2>&1 || true
+	[ "$status" -eq 0 ] || fail "bounded Bluetooth scan failed with status $status"
+	count=$(grep -c 'Device ' "$scan_raw" || true)
+	rm -f "$scan_raw"
+	require_temperature
+	stop_internal || fail 'Bluetooth cleanup failed after scan'
+	write_state "qualified:$boot_id"
+	persist "stage=scan result=complete discovery_events=$count identities=not-persisted cleanup=powered-off"
+	tmp=$disarm.new.$$
+	printf 'bluetooth_qualified_boot=%s\ndiscovery_events=%s\n' "$boot_id" "$count" >"$tmp"
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$disarm"
+	sync
+	trap - 0 HUP INT TERM
+	printf 'stage=scan result=complete discovery_events=%s identities=not-persisted cleanup=powered-off rollback=disarmed\n' "$count"
+}
+
+stop_test() {
+	stop_internal || fail 'Bluetooth cleanup failed'
+	write_state "stopped:$boot_id"
+	persist 'stage=stop result=complete controller=powered-off'
+	printf '%s\n' 'stage=stop result=complete controller=powered-off'
+}
+
+show_status() {
+	printf 'boot_id=%s\nstate=%s\n' "$boot_id" "$(read_state)"
+	if [ -e /sys/class/bluetooth/hci0 ]; then printf '%s\n' 'hci0=present'; else printf '%s\n' 'hci0=absent'; fi
+	printf 'bluez=%s\n' "$(systemctl is-active bluetooth.service 2>/dev/null || true)"
+	printf 'watchdog=%s\n' "$(systemctl is-active myron-hardware-watchdog.service 2>/dev/null || true)"
+	tail -n 12 "$log" 2>/dev/null || true
+}
+
+boot_id=$(cat /proc/sys/kernel/random/boot_id)
+command=${1:-status}
+case "$command" in
+	status) show_status ;;
+	arm) require_common; arm_test ;;
+	start) require_common; start_test ;;
+	scan) require_common; scan_test ;;
+	stop) stop_test ;;
+	*) fail 'usage: myron-bluetooth-stage {status|arm|start|scan|stop}' ;;
+esac

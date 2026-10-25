@@ -94,18 +94,21 @@ reference statuses above:
   and native Wayland application rendering, touch, both DMA-heap names, USB
   and WLAN SSH, persistent managed `wlan0`, Wi-Fi scan/association/IPv4/DNS,
   modem discovery and home LTE/5G registration, and a bounded six-satellite
-  GNSS fix. Nautilus and GNOME Maps mapped without the r4 swapchain failure.
+  GNSS fix, raw built-in microphone capture and a guarded low-volume physical
+  speaker graph. Nautilus and GNOME Maps mapped without the r4 swapchain
+  failure.
 - **Partially verified on Omarchy:** battery and USB-PD reporting; backlight
   writes with a broken zero `actual_brightness` readback; low-intensity torch
   activation; power/volume input nodes and shell bindings without attended
   physical key events.
-- **Failed on Omarchy:** starting the AudioReach foundation after
-  ModemManager/GNSS caused an immediate hard reboot. Speaker and microphone
-  remain unverified; audio must use a separate clean boot and staged bring-up.
-- **Present but unverified on Omarchy:** UPower UI and haptics. BlueZ is
-  inactive with no controller, only two ADC IIO nodes exist, no sound card is
-  present before the isolated audio bridge, and no camera/media or fingerprint
-  node is exposed.
+- **Safety constraint on Omarchy:** starting AudioReach after
+  ModemManager/GNSS caused an immediate hard reboot. A later separate clean
+  boot passed the checkpointed mapper, ADSP, codec, microphone and speaker
+  path; mixing those subsystem sequences remains forbidden.
+- **Present but unverified on Omarchy:** UPower UI and haptics. The next
+  candidate includes a one-shot, watchdog-supervised WCN786x/BlueZ test, but
+  it has not run on hardware yet. Only two ADC IIO nodes exist, and no
+  camera/media or fingerprint node is exposed.
 - **Not integrated on Omarchy:** SMS, voice calls/call audio, fingerprint and
   camera capture. The current reference boot also exposes no camera/media or
   fingerprint character nodes, and only two ADC IIO devices.
