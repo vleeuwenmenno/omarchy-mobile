@@ -132,6 +132,12 @@ board id, revision and source. R4 stays deferred as `hardware-witness-required`
 blockers stay missing. See
 [R4-SELECTION-GATE.md](../../docs/myron/R4-SELECTION-GATE.md).
 
+Phase 2.16 readiness is documentation only: the synthetic parser work is complete, and
+actual read-only layout discovery is the next approval boundary. It is a staged
+session that is not approved and not executed, with no acquisition code added and no
+hardware readiness claimed. See
+[DISCOVERY-GATE.md](../../docs/myron/DISCOVERY-GATE.md).
+
 Phase 2.15B moves the bootchain to 0.3.0 and adds `plan-images`, `parse-images`
 and `verify-images`: synthetic Android boot v0-v4, vendor boot v3/v4 and DT table
 v0 images (a flat fixture bound to a validated R2 operation) parse into the

@@ -197,6 +197,11 @@ a required successor gate: the R4 selection-source qualification (a concrete
 selected-index source, an actual Myron witness and contract cross-checks; parsing
 a DTBO or FDT does not prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
 
+Phase 2.16 readiness (documentation only): the synthetic parser work is complete.
+Actual read-only layout discovery is the next approval boundary and is a staged
+session described in [DISCOVERY-GATE.md](DISCOVERY-GATE.md). It is not approved, not
+executed, adds no acquisition code, and claims no hardware readiness.
+
 Phase 2.15B (laptop-only, synthetic R3 parsers done): bootchain 0.3.0 adds
 `plan-images`, `parse-images` and `verify-images`, which parse a flat fixture of
 synthetic Android boot v0-v4, vendor boot v3/v4 and DT table v0 images, bound to
@@ -391,10 +396,12 @@ without parsing any (the R3 binary parsers and the R4 selection-source
 qualification are the required successor gates). Next,
 assemble a **real** kit and snapshot candidate from the owner-supplied qualified
 archive, runtime tree and symvers pair, then generate and independently review
-its preflight request SHA-256. That work stays offline. The following boundary
-is explicit human approval for one bounded read-only recovery/SSH evidence
-session implementing `R1`–`R7`; it is not deployment approval. Source-lock
-reproduction, complete vendor-module ordering, real capture/restore, boot-chain
-design, hardware qualification and independent deployment authorization still
-follow. Do not deploy, activate services, import Attempt105's Alpine binaries,
-or use Pixel `/usr/lib/modules` or installer assumptions.
+its preflight request SHA-256. That work stays offline. The following boundary is
+the staged discovery process in [DISCOVERY-GATE.md](DISCOVERY-GATE.md): Stage 1
+identity and topology metadata first, then separately reviewed and hash-bound
+approvals for GPT, image-header and selection-witness reads. No discovery stage is
+approved yet, and none is deployment approval. Source-lock reproduction, complete
+vendor-module ordering, real capture/restore, boot-chain design, hardware
+qualification and independent deployment authorization still follow. Do not deploy,
+activate services, import Attempt105's Alpine binaries, or use Pixel
+`/usr/lib/modules` or installer assumptions.

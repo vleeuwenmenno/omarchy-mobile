@@ -6,7 +6,8 @@ qualification**. `tools/myron-bootchain` 0.3.0 (0.4.0 since Phase 2.15C, see the
 synthetic Android boot (v0-v4), vendor_boot (v3, v4) and DT table (v0) images
 into the exact, metadata-only R3 operation (`R3-boot-image-headers`, the 18-row
 schema of [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)) that `tools/myron-collect`
-already consumes. The collector validates the result unchanged. The GPT
+already consumes. The collector validates the result unchanged (Phase 2.15B history;
+the current generation is operation schema 3, see the Phase 2.15C note below). The GPT
 commands (`show`, `derive-contract`, `plan`, `parse`, `verify-parse`) keep
 their R2 semantics and emit byte-equivalent R2 operations.
 
@@ -40,9 +41,11 @@ bindings change, so artifacts and manifests of the 0.3.0 generation refuse.
 
 The implementation stays in `tools/lib/myron-bootchain-impl.py` behind the
 trusted loader. The derived contract (`device/myron/bootchain-contract.json`,
-0.3.0) gains an independently versioned `image_parser` contract (1.0.0). The
-collector, preflight, session, snapshot, deployment and device descriptor
-contracts and versions are unchanged. Bootchain 0.2.0 artifacts refuse: the
+0.4.0 now; 0.3.0 in Phase 2.15B) gains an independently versioned `image_parser`
+contract (1.0.0). In Phase 2.15B (history) the collector, preflight, session,
+snapshot, deployment and device descriptor contracts and versions were unchanged;
+Phase 2.15C moved the collector, preflight, session and bootchain; snapshot remains
+0.2.0 (see above). Bootchain 0.2.0 artifacts refuse: the
 manifest binds the contract hash and the artifact carries `format_version`.
 
 Regenerating the contract is deliberate: `tools/myron-bootchain derive-contract`
@@ -162,7 +165,7 @@ may be named, and those lines do not append an image code.
 
 `parse.json` (kind `myron-synthetic-r3-image-parse`, carrying the synthetic
 parser provenance, accounting and the unchanged authority and blockers),
-`SHA256SUMS` and `operations/R3-boot-image-headers.json` (schema 2,
+`SHA256SUMS` and `operations/R3-boot-image-headers.json` (schema 3,
 `read_domain: fixture`, the collector's own transport label, which is not
 provenance). No binary copy is published. Publication is private, atomic,
 no-replace and verified twice, using the same code as the GPT parse.
@@ -177,7 +180,7 @@ gaps, overlaps, duplicates and reorder, DT shared extents; exact and plus-one
 budgets for `S`, `M` and `O` and 16 MiB images; all-absent and all-present
 fixtures; link, mode, special-file, alias and race refusals; privacy canaries;
 forged outputs and bindings; determinism; and GPT command compatibility.
-`tests/myron-bootchain` carries the 0.3.0 contract expectations and the full
+`tests/myron-bootchain` carries the 0.4.0 contract expectations and the full
 GPT matrix.
 
 ## Limitations and next gate

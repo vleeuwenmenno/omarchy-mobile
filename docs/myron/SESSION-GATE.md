@@ -140,7 +140,7 @@ appear.
 | R6 | purpose-specific JSON: GPT name, filesystem, mount options, `block_size`, `allocation_unit_bytes`, `block_count`, `free_block_count` | totals are `block_count * allocation_unit_bytes` and free is `free_block_count * allocation_unit_bytes` (the free-block count, `f_bfree`), each floored to 1 MiB; `ro` with `rw` rejects; sizes above 2^50 or below 1 MiB reject |
 | R7 | one release line, bounded notes bytes, command line, bootconfig | release parsed; notes hashed (the bytes are not kept); the command line is space-separated tokens and the bootconfig is one `key=value` per line; only keys and values the request lists are accepted; quoting, escapes, comments, nesting, unknown or duplicate keys, and unlisted values reject rather than being filtered |
 
-Every operation document uses the collector's current envelope (`schema` 2,
+Every operation document uses the collector's current envelope (`schema` 3,
 `kind`, `id`, `request_sha256`, `transport`, `read_domain` `fixture`,
 `read_only`, `bytes_read`, `data`) and is checked with the collector's
 `validate_operation` and `cross_check` before anything is published. A wrong

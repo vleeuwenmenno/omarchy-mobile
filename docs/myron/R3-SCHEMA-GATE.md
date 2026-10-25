@@ -22,7 +22,7 @@ They recompute the offsets, sizes, header and table hashes and coverage from
 synthetic image bytes and publish an R3 operation this schema accepts unchanged
 (the schema, the collector and its three R3 limits are not modified). They carry
 no captured provenance. This document describes the schema as of Phase A; the
-bootchain row below is the Phase A state.
+table below is the Phase A (2.15A) state, kept as history.
 
 | Tool | Version | Change |
 | --- | --- | --- |
@@ -162,24 +162,27 @@ session and bootchain accounting policies name that requirement.
 
 ## Operation envelope (all of R1-R7)
 
-Every operation document is now
+Every operation document is (current generation, operation schema 3 since Phase 2.15C;
+Phase 2.15A introduced the envelope at schema 2)
 
 ```json
-{"schema": 2, "kind": "myron-precaptured-operation", "id": "...",
+{"schema": 3, "kind": "myron-precaptured-operation", "id": "...",
  "request_sha256": "...", "transport": "external-precaptured-fixture",
  "read_domain": "fixture", "read_only": true, "bytes_read": 4096, "data": {}}
 ```
 
-`schema` must be the integer 2 and `read_domain` must be `fixture`. The capture
-contract publishes `operation_schema: 2`, the read domain and
-`legacy_generations: reject-no-adapters`. The capture schema string moved to
-`myron-capture-evidence-v2`, so a v1 manifest is refused too.
+`schema` must be the integer 3 and `read_domain` must be `fixture`. The capture
+contract publishes `operation_schema: 3`, the read domain and
+`legacy_generations: reject-no-adapters`. The capture schema string is
+`myron-capture-evidence-v3` (it was `-v2` in Phase 2.15A), so a v1 or v2 manifest is
+refused too.
 
 ## Migration and refusal
 
 There are no adapters. The collector rejects, with no output:
 
-- an operation with `schema` 1 (or 3, a boolean, a float, a string);
+- an operation with `schema` 1 or 2 (or any other non-3 value, a boolean, a float, a
+  string);
 - a hybrid capture in which any operation is at the old generation, or lacks
   `read_domain`, or names a domain other than `fixture`;
 - the previous R3 parallel-array rows (`absent`, `header_version`,

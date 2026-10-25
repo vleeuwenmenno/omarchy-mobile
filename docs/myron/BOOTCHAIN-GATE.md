@@ -232,7 +232,7 @@ no occupied entry is refused as unsupported.
 | `bootable_flag` | the literal GPT attributes **bit 2** |
 
 Rows are emitted sorted by `partition_name`. The operation document uses the
-collector's envelope (`schema` 2, `kind`, `id`, `request_sha256`, `transport`,
+collector's current envelope (`schema` 3, `kind`, `id`, `request_sha256`, `transport`,
 `read_domain` `fixture`, `read_only`, `bytes_read`, `data`). `bytes_read` is the
 fixture payload only; no hardware transport exists, and a future one must count
 the actual returned bytes, rereads and overreads separately (the accounting

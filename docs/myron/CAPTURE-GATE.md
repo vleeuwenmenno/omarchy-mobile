@@ -81,7 +81,7 @@ operations/R7-kernel-identity-revalidation.json
 
 `capture.json` binds the capture contract hash, the request hash, the
 transport, `live: false`, and each operation file's SHA-256 and size.
-Each operation file binds the integer `schema` 2, the request hash, the
+Each operation file binds the integer `schema` 3, the request hash, the
 transport, `read_domain: "fixture"`, `read_only: true`, `bytes_read`, and one
 `data` object whose leaf fields are the request's `emits` list for that
 operation (nested R3 fields are dotted paths; the collector recomputes them from
@@ -94,8 +94,8 @@ Bounds and rejections:
   coverage within `max_hardware_read_bytes` (the three are exact and separate,
   see [R3-SCHEMA-GATE.md](R3-SCHEMA-GATE.md)); each file stays within 1 MiB and
   the whole tree within 4 MiB;
-- schema 1 operations, a missing or non-`fixture` `read_domain`, and any
-  capture mixing generations are refused;
+- schema 1 and schema 2 operations, any non-3 `schema`, a missing or non-`fixture`
+  `read_domain`, and any capture mixing generations are refused;
 - no extra, missing, nested, symlinked, hard-linked, FIFO/special, executable,
   or mount-crossing entry; no symlinked root or ancestor; no writable parent;
 - strict schemas: exact keys, no booleans for integers, no floats, ranges,
