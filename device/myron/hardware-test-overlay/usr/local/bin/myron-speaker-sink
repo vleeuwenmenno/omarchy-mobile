@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Publish the protected Myron FIFO bridge as the session's PipeWire sink.
+set -eu
+
+fifo=/run/myron-audio/speaker.pcm
+ready=/run/myron-audio/bridge-ready
+module=
+
+cleanup() {
+	if [ -n "$module" ]; then
+		pactl set-sink-mute myron_speaker 1 >/dev/null 2>&1 || true
+		pactl unload-module "$module" >/dev/null 2>&1 || true
+		module=
+	fi
+	rm -f "${XDG_RUNTIME_DIR:?}/myron-speaker-sink.ready"
+}
+terminate() { cleanup; exit 0; }
+trap cleanup EXIT
+trap terminate HUP INT TERM
+
+[ -p "$fifo" ] || { echo "myron-speaker-sink: missing protected FIFO" >&2; exit 1; }
+attempt=0
+while [ "$attempt" -lt 100 ] && [ ! -s "$ready" ]; do
+	sleep 0.1
+	attempt=$((attempt + 1))
+done
+[ -s "$ready" ] || { echo "myron-speaker-sink: root bridge is not ready" >&2; exit 1; }
+
+# The raw ALSA fallback opens PCM 0 without AudioReach metadata and repeatedly
+# underruns. Keep WirePlumber for policy/linking but disable only that card.
+card=$(pactl list short cards | awk '$2 == "alsa_card.platform-soc_spf_core_platform_sound" { print $2; exit }')
+[ -z "$card" ] || pactl set-card-profile "$card" off
+
+# A killed user service can leave a Pulse compatibility module behind. Remove
+# only exact stale Myron modules before creating one replacement.
+pactl list short modules | awk '$2 == "module-pipe-sink" && index($0, "sink_name=myron_speaker") { print $1 }' |
+while IFS= read -r stale; do
+	[ -z "$stale" ] || pactl unload-module "$stale" >/dev/null 2>&1 || true
+done
+
+module=$(pactl load-module module-pipe-sink \
+	sink_name=myron_speaker file="$fifo" format=s16le rate=48000 channels=2 \
+	sink_properties="device.description='Myron Speakers'")
+pactl set-default-sink myron_speaker
+# The root bridge independently caps client samples at -24 dBFS. A 100% sink
+# therefore remains inside the attended, audible safety envelope.
+pactl set-sink-volume myron_speaker 100%
+pactl set-sink-mute myron_speaker 0
+pactl list short sink-inputs | awk '{ print $1 }' |
+while IFS= read -r input; do
+	[ -z "$input" ] || pactl move-sink-input "$input" myron_speaker >/dev/null 2>&1 || true
+done
+printf 'ready\n' >"$XDG_RUNTIME_DIR/myron-speaker-sink.ready"
+
+while pactl list short modules | awk -v id="$module" '$1 == id { found=1 } END { exit !found }'; do
+	sleep 5
+done
+exit 1

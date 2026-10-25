@@ -11,4 +11,15 @@ readonly source_sha=f6bd910ace05a094b2286debc32e35d059d553671f521270bb1efecf087c
 	printf '%s\n' 'ERROR: postmarketOS audio devnode helper checksum mismatch' >&2
 	exit 1
 }
-exec /bin/sh "$source_script"
+/bin/sh "$source_script"
+
+# The reference audio helper assigns the shared system DMA heap to audio.
+# Zink/Turnip needs the same node after audio activation. Keep video as the
+# owning group; AudioReach activation and the protected bridges run as root.
+chgrp video /dev/dma_heap /dev/dma_heap/system
+chmod 0770 /dev/dma_heap
+chmod 0660 /dev/dma_heap/system
+[ "$(stat -c '%a:%G' /dev/dma_heap/system)" = 660:video ] || {
+	printf '%s\n' 'ERROR: system DMA heap lost the video-group contract' >&2
+	exit 1
+}

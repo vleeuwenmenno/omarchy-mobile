@@ -1,0 +1,62 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Explicit privacy switch for the temporary Myron microphone bridge.
+set -eu
+
+status() {
+	if systemctl --quiet is-active myron-microphone-bridge.service 2>/dev/null &&
+		systemctl --user --quiet is-active myron-microphone-source.service 2>/dev/null; then
+		printf '%s\n' on
+	else
+		printf '%s\n' off
+	fi
+}
+
+wait_speaker_powerdown() {
+	attempt=0
+	while [ "$attempt" -lt 50 ]; do
+		profile=$(amixer -c 0 cget 'name=TFA Profile' 2>/dev/null |
+			sed -n 's/^  : values=//p' | tail -n 1)
+		[ "$profile" = 6 ] && return 0
+		attempt=$((attempt + 1))
+		sleep 0.1
+	done
+	printf '%s\n' 'ERROR: speaker did not idle to TFA Powerdown before microphone switch' >&2
+	return 1
+}
+
+case ${1:-status} in
+	status)
+		if [ "${2:-}" = --json ]; then
+			printf '{"installed":true,"microphone":"%s"}\n' "$(status)"
+		else
+			status
+		fi
+		;;
+	on)
+		# Remove the FIFO writer first. This lets an active speaker transaction
+		# drain, idle, and return all three amplifiers to Powerdown before its
+		# root service is stopped for the mutually exclusive capture graph.
+		systemctl --user stop myron-speaker-sink.service || true
+		wait_speaker_powerdown || true
+		systemctl stop myron-speaker-bridge.service
+		systemctl start myron-microphone-bridge.service
+		if ! systemctl --user start myron-microphone-source.service; then
+			systemctl --user stop myron-microphone-source.service || true
+			systemctl stop myron-microphone-bridge.service || true
+			systemctl start myron-speaker-bridge.service || true
+			systemctl --user start myron-speaker-sink.service || true
+			exit 1
+		fi
+		;;
+	off)
+		systemctl --user stop myron-microphone-source.service || true
+		systemctl stop myron-microphone-bridge.service
+		systemctl start myron-speaker-bridge.service
+		systemctl --user start myron-speaker-sink.service
+		;;
+	*)
+		echo 'usage: omamobile-microphone {status [--json]|on|off}' >&2
+		exit 2
+		;;
+esac

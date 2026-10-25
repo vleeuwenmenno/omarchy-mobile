@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+install -d -m 0750 -o root -g audio /run/myron-audio
+if [ ! -p /run/myron-audio/speaker.pcm ]; then
+	rm -f /run/myron-audio/speaker.pcm
+	mkfifo -m 0660 /run/myron-audio/speaker.pcm
+fi
+chown root:audio /run/myron-audio/speaker.pcm
+chmod 0660 /run/myron-audio/speaker.pcm
+rm -f /run/myron-audio/bridge-ready

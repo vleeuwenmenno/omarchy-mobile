@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MIT
+// Temporary Myron microphone privacy switch: active wheel user may only
+// start/stop the exact attended microphone and protected speaker units.
+polkit.addRule(function(action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      subject.local && subject.active && subject.isInGroup("wheel") &&
+      /^(myron-microphone-bridge|myron-speaker-bridge)\.service$/.test(action.lookup("unit")) &&
+      (action.lookup("verb") == "start" || action.lookup("verb") == "stop")) {
+    return polkit.Result.YES;
+  }
+});

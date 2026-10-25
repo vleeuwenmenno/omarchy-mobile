@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Protected Myron AudioReach speaker bridge
+After=myron-reference-audio-foundation.service
+ConditionPathExists=/usr/local/libexec/myron-speaker/bridge.py
+ConditionPathExists=/run/myron-wireless/mounts/persist/audio/tfa_calr.bin
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/myron-speaker-prepare
+Environment=CONFIRM_PIPEWIRE_SPEAKER=PIPEWIRE-PCM16-MAX3S-MINUS24DBFS-OEM-MIPLAY-LEVEL0
+Environment=MYRON_SPEAKER_DAEMON=1
+Environment=MYRON_SPEAKER_MAX_SECONDS=0
+# The earlier -24 dB cap was barely audible. -12 dB equals 25% full-scale
+# amplitude and remains below the device-proven 0 dB bridge ceiling.
+Environment=MYRON_SPEAKER_GAIN_DB=-12
+Environment=MYRON_SPEAKER_WAIT_SECONDS=0
+ExecStart=/usr/bin/python3 /usr/local/libexec/myron-speaker/bridge.py
+ExecStopPost=/usr/local/sbin/myron-speaker-powerdown
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+
+# Deliberately no [Install] section. Start after the attended audio foundation.

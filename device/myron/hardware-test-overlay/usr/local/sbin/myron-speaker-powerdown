@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Last-resort amplifier cleanup for every speaker-service exit path.
+set -eu
+
+[ "$(id -u)" = 0 ] || {
+	printf '%s\n' 'ERROR: speaker Powerdown cleanup must run as root' >&2
+	exit 1
+}
+
+amixer -q -c 0 cset 'name=TFA Stop' '1,1,1'
+amixer -q -c 0 cset 'name=TFA Profile' Powerdown
+profile=$(amixer -c 0 cget 'name=TFA Profile' |
+	sed -n 's/^  : values=//p' | tail -n 1)
+[ "$profile" = 6 ] || {
+	printf 'ERROR: TFA amplifiers did not reach Powerdown: %s\n' "$profile" >&2
+	exit 1
+}

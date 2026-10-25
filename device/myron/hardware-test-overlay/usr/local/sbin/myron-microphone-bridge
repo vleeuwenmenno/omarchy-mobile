@@ -1,0 +1,55 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Feed the proven AudioReach built-in microphone graph into a raw PCM FIFO.
+set -eu
+
+fifo=/run/myron-audio/microphone.pcm
+ready=/run/myron-audio/microphone-ready
+child=
+old_cap=
+old_mux=
+old_volume=
+duration=${MYRON_MIC_SECONDS:-86400}
+
+get_value() {
+	amixer -c 0 cget "name=$1" | sed -n 's/^  : values=//p' | tail -n 1
+}
+set_value() { amixer -q -c 0 cset "name=$1" "$2"; }
+cleanup() {
+	trap - EXIT HUP INT TERM
+	rm -f "$ready"
+	[ -z "$child" ] || kill "$child" >/dev/null 2>&1 || true
+	[ -z "$child" ] || wait "$child" >/dev/null 2>&1 || true
+	[ -z "$old_cap" ] || set_value 'TX_AIF1_CAP Mixer DEC2' "$old_cap" || true
+	[ -z "$old_mux" ] || set_value 'TX DMIC MUX2' "$old_mux" || true
+	[ -z "$old_volume" ] || set_value 'TX_DEC2 Volume' "$old_volume" || true
+}
+trap cleanup EXIT HUP INT TERM
+
+[ "$(id -u)" -eq 0 ] || { echo 'myron-microphone-bridge: root required' >&2; exit 1; }
+case $duration in ''|*[!0-9]*) echo 'myron-microphone-bridge: invalid duration' >&2; exit 1 ;; esac
+[ "$duration" -ge 1 ] && [ "$duration" -le 86400 ] || {
+	echo 'myron-microphone-bridge: duration must be 1..86400 seconds' >&2
+	exit 1
+}
+[ -p "$fifo" ] || { echo 'myron-microphone-bridge: missing PCM FIFO' >&2; exit 1; }
+! pgrep -x agmcap >/dev/null || { echo 'myron-microphone-bridge: agmcap already active' >&2; exit 1; }
+! pgrep -x agmplay >/dev/null || { echo 'myron-microphone-bridge: agmplay active' >&2; exit 1; }
+command -v agmcap >/dev/null
+grep -q canoe-mtp-snd-card /proc/asound/cards
+
+old_cap=$(get_value 'TX_AIF1_CAP Mixer DEC2')
+old_mux=$(get_value 'TX DMIC MUX2')
+old_volume=$(get_value 'TX_DEC2 Volume')
+set_value 'TX_AIF1_CAP Mixer DEC2' 1
+set_value 'TX DMIC MUX2' DMIC0
+set_value 'TX_DEC2 Volume' 85
+printf 'ready\n' >"$ready"
+
+# agmcap writes a 44-byte WAV header first. module-pipe-source treats that as
+# 22 startup samples; all following bytes are mono 48-kHz S16_LE microphone.
+agmcap "$fifo" -D 100 -d 101 -c 1 -r 48000 -b 16 -T "$duration" \
+	-i CODEC_DMA-LPAIF_RXTX-TX-3 -skv 0xB1000001 -dkv 0xA3000001 -ikv 1 &
+child=$!
+wait "$child"
+child=

@@ -15,6 +15,7 @@ Usage: tools/myron-dev-image-compose \
   --module-stage ABSOLUTE_DIR \
   --runtime-stage ABSOLUTE_DIR \
   --bluetooth-probe ABSOLUTE_FILE \
+  --speaker-reference-repo ABSOLUTE_DIR \
   --firstboot-conf ABSOLUTE_FILE \
   --ssh-key ABSOLUTE_PUBLIC_KEY \
   --out ABSOLUTE_RAW_EXT4
@@ -27,13 +28,14 @@ and audio activation remain disabled until an attended, separately gated test.
 EOF
 }
 
-base= modules= runtime= bluetooth_probe= firstboot= ssh_key= out=
+base= modules= runtime= bluetooth_probe= speaker_reference= firstboot= ssh_key= out=
 while (($#)); do
   case $1 in
     --base-image) base=${2:?}; shift 2 ;;
     --module-stage) modules=${2:?}; shift 2 ;;
     --runtime-stage) runtime=${2:?}; shift 2 ;;
     --bluetooth-probe) bluetooth_probe=${2:?}; shift 2 ;;
+    --speaker-reference-repo) speaker_reference=${2:?}; shift 2 ;;
     --firstboot-conf) firstboot=${2:?}; shift 2 ;;
     --ssh-key) ssh_key=${2:?}; shift 2 ;;
     --out) out=${2:?}; shift 2 ;;
@@ -41,17 +43,18 @@ while (($#)); do
     *) die "unknown argument: $1" ;;
   esac
 done
-for value in base modules runtime bluetooth_probe firstboot ssh_key out; do
+for value in base modules runtime bluetooth_probe speaker_reference firstboot ssh_key out; do
   [[ -n ${!value} ]] || die "--${value//_/-} is required"
 done
-for path in "$base" "$modules" "$runtime" "$bluetooth_probe" "$firstboot" "$ssh_key"; do
+for path in "$base" "$modules" "$runtime" "$bluetooth_probe" "$speaker_reference" "$firstboot" "$ssh_key"; do
   [[ $path == /* && $path != *'/../'* && $path != */.. && $path != *'/./'* ]] ||
     die "input paths must be canonical absolute paths: $path"
   [[ -e $path && ! -L $path ]] || die "missing or linked input: $path"
 done
 [[ -f $base && -f $bluetooth_probe && -f $firstboot && -f $ssh_key ]] ||
   die 'base image, Bluetooth probe, firstboot config and SSH key must be regular files'
-[[ -d $modules && -d $runtime ]] || die 'module and runtime stages must be directories'
+[[ -d $modules && -d $runtime && -d $speaker_reference ]] ||
+  die 'module, runtime and speaker-reference inputs must be directories'
 [[ $out == /* && $out != / && $out != *'/../'* && $out != */.. && $out != *'/./'* ]] ||
   die '--out must be a canonical absolute path'
 [[ ! -e $out && ! -L $out ]] || die "refusing to replace $out"
@@ -71,6 +74,19 @@ packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify verif
   die 'Bluetooth probe is not the reviewed Attempt 71 source'
 grep -Fq -- '--prepare-qca-ibs-after-nvm' "$bluetooth_probe" ||
   die 'Bluetooth probe lacks the reviewed QCA IBS preparation mode'
+declare -A speaker_files=(
+  [experiments/speaker-pipewire-bridge/bridge.py]=9b788529fe4c0fd2b20d4f73fca24b4e532c9ab364fd67a10bd89b9577daafbc
+  [experiments/speaker-oem-miplay-graph/probe.py]=e5b99216ae3f3a6a97d03cef599803e9e80e85ca5b0903b4986f0582ca5d5cd0
+  [scripts/attempt78-tfa-hostless.py]=440329d141cd2b51ac728dfd70861b55947f8865e219431113d277b63be62750
+  [scripts/attempt78-tfa-calibration.py]=61965d4902719f410e904d383cad492bd4b6d43d81e6a42663e0274f0ebc2e6e
+  [scripts/myron-speaker-watchdog.py]=1ca8692482522147802bde26d153cc307006a87dca91ac48eca63e93b4aeadcf
+)
+for file in "${!speaker_files[@]}"; do
+  [[ -f $speaker_reference/$file && ! -L $speaker_reference/$file ]] ||
+    die "missing regular speaker bridge source: $file"
+  [[ $(sha256sum <"$speaker_reference/$file" | cut -d' ' -f1) == ${speaker_files[$file]} ]] ||
+    die "speaker bridge checksum mismatch: $file"
+done
 grep -Fxq 'USERNAME=menno' "$firstboot" || die 'firstboot config must create menno'
 grep -Eq '^PASSWORD_HASH=\$6\$' "$firstboot" || die 'firstboot config lacks a SHA-512 password hash'
 [[ $(grep -c '^SSH_KEY=' "$firstboot") == 1 ]] || die 'firstboot config must have exactly one SSH key'
@@ -97,6 +113,8 @@ docker run --rm --privileged --platform linux/arm64 \
   -v "$modules:/module-stage:ro" \
   -v "$runtime:/runtime-stage:ro" \
   -v "$bluetooth_probe:/bluetooth-probe.py:ro" \
+  -v "$speaker_reference:/speaker-reference:ro" \
+  -v "$ROOT/packages/omamobile-shell:/shell-source:ro" \
   -v "$ROOT/device/myron/hardware-test-overlay:/test-overlay:ro" \
   -v "$firstboot:/firstboot.conf:ro" \
   -v "$ssh_key:/owner.pub:ro" \
@@ -160,6 +178,26 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/etc/card-defs.xml"
     install -Dm0755 /bluetooth-probe.py \
       "$root/usr/local/sbin/myron-bluetooth-qca-probe"
+    install -Dm0755 /speaker-reference/experiments/speaker-pipewire-bridge/bridge.py \
+      "$root/usr/local/libexec/myron-speaker/bridge.py"
+    install -Dm0755 /speaker-reference/experiments/speaker-oem-miplay-graph/probe.py \
+      "$root/usr/local/libexec/myron-speaker/probe.py"
+    install -Dm0755 /speaker-reference/scripts/attempt78-tfa-hostless.py \
+      "$root/usr/local/libexec/myron-speaker/attempt78-tfa-hostless.py"
+    install -Dm0755 /speaker-reference/scripts/attempt78-tfa-calibration.py \
+      "$root/usr/local/libexec/myron-speaker/attempt78-tfa-calibration.py"
+    install -Dm0755 /speaker-reference/scripts/myron-speaker-watchdog.py \
+      "$root/usr/local/libexec/myron-speaker/watchdog.py"
+    # Carry the live-qualified temporary shell fixes into this test payload.
+    # Proper package promotion follows after hardware coexistence is proven.
+    install -Dm0644 /shell-source/plugins/omamobile.quicksettings/QuickSettings.qml \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml"
+    install -Dm0755 /shell-source/plugins/omamobile.quicksettings/tile-action.sh \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/tile-action.sh"
+    install -Dm0755 /shell-source/plugins/omamobile.quicksettings/tile-state.sh \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/tile-state.sh"
+    install -Dm0644 /shell-source/plugins/omamobile.switcher/Switcher.qml \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml"
     chown -R 0:0 "$root/usr/local/sbin/myron-attempt79-module-dir"
     chmod 0755 "$root/usr/local/sbin/myron-attempt79-module-dir"
     install -Dm0600 /firstboot.conf "$root/etc/omamobile/firstboot.conf"
@@ -168,11 +206,18 @@ docker run --rm --privileged --platform linux/arm64 \
     chown -R 0:0 "$root/root/.ssh" "$root/etc/omamobile/firstboot.conf"
     chmod 0755 "$root/usr/local/bin/myron-start-omarchy" \
       "$root/usr/local/bin/myron-omarchy-setup-user" \
+      "$root/usr/local/bin/myron-speaker-sink" \
+      "$root/usr/local/bin/myron-microphone-source" \
+      "$root/usr/local/bin/omamobile-microphone" \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
       "$root/usr/local/sbin/myron-reference-radio-start" \
       "$root/usr/local/sbin/myron-reference-audio-start" \
       "$root/usr/local/sbin/myron-audio-stage" \
       "$root/usr/local/sbin/myron-speaker-dsp-stage" \
+      "$root/usr/local/sbin/myron-speaker-prepare" \
+      "$root/usr/local/sbin/myron-speaker-powerdown" \
+      "$root/usr/local/sbin/myron-microphone-prepare" \
+      "$root/usr/local/sbin/myron-microphone-bridge" \
       "$root/usr/local/sbin/myron-bluetooth-stage" \
       "$root/usr/local/sbin/myron-input-stage" \
       "$root/usr/local/sbin/myron-batterysecret-start" \
@@ -204,6 +249,10 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/lib/myron-charging/bin/batterysecret \
   /usr/local/sbin/myron-batterysecret-start /etc/acdbdata/acdb_cal.acdb \
   /usr/local/sbin/myron-bluetooth-qca-probe \
+  /usr/local/libexec/myron-speaker/bridge.py /usr/local/bin/myron-speaker-sink \
+  /usr/local/bin/myron-microphone-source /usr/local/sbin/myron-microphone-bridge \
+  /usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml \
+  /usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml \
   /etc/backend_conf.xml /etc/card-defs.xml; do
   debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
     die "root ownership missing: $path"

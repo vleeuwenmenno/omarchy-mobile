@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+install -d -m 0750 -o root -g audio /run/myron-audio
+if [ ! -p /run/myron-audio/microphone.pcm ]; then
+	rm -f /run/myron-audio/microphone.pcm
+	mkfifo -m 0660 /run/myron-audio/microphone.pcm
+fi
+chown root:audio /run/myron-audio/microphone.pcm
+chmod 0660 /run/myron-audio/microphone.pcm
+rm -f /run/myron-audio/microphone-ready

@@ -21,12 +21,19 @@ for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initra
 done
 for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/bin/myron-omarchy-setup-user" \
+  "$overlay/usr/local/bin/myron-speaker-sink" \
+  "$overlay/usr/local/bin/myron-microphone-source" \
+  "$overlay/usr/local/bin/omamobile-microphone" \
   "$overlay/usr/local/bin/omamobile-gnss" \
   "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
   "$overlay/usr/local/sbin/myron-audio-stage" \
   "$overlay/usr/local/sbin/myron-speaker-dsp-stage" \
+  "$overlay/usr/local/sbin/myron-speaker-prepare" \
+  "$overlay/usr/local/sbin/myron-speaker-powerdown" \
+  "$overlay/usr/local/sbin/myron-microphone-prepare" \
+  "$overlay/usr/local/sbin/myron-microphone-bridge" \
   "$overlay/usr/local/sbin/myron-bluetooth-stage" \
   "$battery_start" \
   "$battery_stage" \
@@ -97,6 +104,14 @@ grep -Fq 'node_from_class /sys/class/dma_heap/system/dev /dev/dri/dmaheap-sys vi
   fail 'prepare does not create the downstream DMA-heap DRI alias'
 grep -Fq 'hyprland.lock' "$qualify" ||
   fail 'qualification does not resolve the runtime IPC instance from Hyprland lock metadata'
+for required in \
+  'backlight=/sys/class/backlight/panel0-backlight/brightness' \
+  'torch=/sys/class/leds/amber:flash-2/brightness' \
+  'chgrp video "$backlight"' 'chmod 0664 "$backlight"' \
+  'chgrp input "$torch"' 'chmod 0664 "$torch"'; do
+  grep -Fq "$required" "$prepare" ||
+    fail "hardware preparation lacks control contract: $required"
+done
 pass 'qualification requires native DSI, GPU nodes, isolated Mesa and stable Hyprland'
 
 grep -Fq 'ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed' \
@@ -199,6 +214,8 @@ grep -Fq '44002cfc132dd1d826b8cd770fa8b29611a15555f7dde138d9d12dcf4c7cb74b' "$au
   fail 'audio bridge does not pin the proven postmarketOS script'
 grep -Fq 'f6bd910ace05a094b2286debc32e35d059d553671f521270bb1efecf087c8d3c' "$devnodes" ||
   fail 'audio bridge does not pin the proven devnode helper'
+grep -Fq 'chgrp video /dev/dma_heap /dev/dma_heap/system' "$devnodes" ||
+  fail 'audio devnode bridge does not preserve GPU access to the shared DMA heap'
 grep -Fq 'mv "$arm" "$consumed"' "$radio" || fail 'radio arm is not one-shot'
 grep -Fq 'mv "$arm" "$consumed"' "$audio" || fail 'audio arm is not one-shot'
 grep -Fq 'is-active myron-reference-radio.service' "$audio" ||
@@ -302,13 +319,108 @@ if grep -Fq 'rc-service' "$bluetooth_stage"; then
 fi
 grep -Fq -- '--bluetooth-probe ABSOLUTE_FILE' "$compose" ||
   fail 'composer does not require the reviewed Bluetooth probe explicitly'
+grep -Fq -- '--speaker-reference-repo ABSOLUTE_DIR' "$compose" ||
+  fail 'composer does not require the reviewed speaker reference explicitly'
 grep -Fq '4a9d4da29c7ef46f4dcb08385e4c5ff85b16344884d4239c40b53923c5258608' "$compose" ||
   fail 'composer does not pin the reviewed Bluetooth probe'
 grep -Fq 'install -Dm0755 /bluetooth-probe.py' "$compose" ||
   fail 'composer does not install the reviewed Bluetooth probe'
+for hash in \
+  9b788529fe4c0fd2b20d4f73fca24b4e532c9ab364fd67a10bd89b9577daafbc \
+  e5b99216ae3f3a6a97d03cef599803e9e80e85ca5b0903b4986f0582ca5d5cd0 \
+  440329d141cd2b51ac728dfd70861b55947f8865e219431113d277b63be62750 \
+  61965d4902719f410e904d383cad492bd4b6d43d81e6a42663e0274f0ebc2e6e \
+  1ca8692482522147802bde26d153cc307006a87dca91ac48eca63e93b4aeadcf; do
+  grep -Fq "$hash" "$compose" || fail 'composer does not pin the complete speaker bridge source'
+done
+grep -Fq '/speaker-reference/experiments/speaker-pipewire-bridge/bridge.py' "$compose" ||
+  fail 'composer does not install the reviewed speaker bridge'
+for required in \
+  '/shell-source/plugins/omamobile.quicksettings/QuickSettings.qml' \
+  '/shell-source/plugins/omamobile.quicksettings/tile-action.sh' \
+  '/shell-source/plugins/omamobile.quicksettings/tile-state.sh' \
+  '/shell-source/plugins/omamobile.switcher/Switcher.qml'; do
+  grep -Fq "$required" "$compose" ||
+    fail "composer does not carry live-qualified shell source: $required"
+done
 grep -Fq '"$root/usr/local/sbin/myron-bluetooth-stage"' "$compose" ||
   fail 'composer does not explicitly install the Bluetooth runner as executable'
 pass 'Bluetooth bring-up is exact, one-shot, bounded, private and independently supervised'
+
+speaker_sink=$overlay/usr/local/bin/myron-speaker-sink
+speaker_service=$overlay/usr/lib/systemd/system/myron-speaker-bridge.service
+speaker_user_service=$overlay/usr/lib/systemd/user/myron-speaker-sink.service
+speaker_powerdown=$overlay/usr/local/sbin/myron-speaker-powerdown
+for required in \
+  'pactl set-card-profile "$card" off' \
+  'sink_name=myron_speaker' \
+  'pactl set-default-sink myron_speaker' \
+  'pactl set-sink-volume myron_speaker 100%' \
+  'pactl set-sink-mute myron_speaker 0' \
+  'pactl move-sink-input "$input" myron_speaker'; do
+  grep -Fq "$required" "$speaker_sink" || fail "speaker sink manager lacks: $required"
+done
+grep -Fxq 'Environment=MYRON_SPEAKER_GAIN_DB=-12' "$speaker_service" ||
+  fail 'speaker bridge lacks its independent -12 dBFS hard cap'
+grep -Fxq 'Environment=MYRON_SPEAKER_WAIT_SECONDS=0' "$speaker_service" ||
+  fail 'speaker bridge cannot remain safely idle'
+grep -Fxq 'ExecStopPost=/usr/local/sbin/myron-speaker-powerdown' "$speaker_service" ||
+  fail 'speaker bridge lacks independent exit Powerdown cleanup'
+for required in "name=TFA Stop" "name=TFA Profile" 'Powerdown' '"$profile" = 6'; do
+  grep -Fq "$required" "$speaker_powerdown" ||
+    fail "speaker exit cleanup lacks: $required"
+done
+grep -Fxq 'ExecStart=/usr/local/bin/myron-speaker-sink' "$speaker_user_service" ||
+  fail 'user service does not publish the protected PipeWire sink'
+for unit in "$speaker_service" "$speaker_user_service"; do
+  ! grep -Fxq '[Install]' "$unit" || fail "speaker activation is enabled without an attended gate: $unit"
+done
+pass 'speaker bridge is pinned, protected, session-visible and attended-only'
+
+microphone_bridge=$overlay/usr/local/sbin/myron-microphone-bridge
+microphone_source=$overlay/usr/local/bin/myron-microphone-source
+microphone_service=$overlay/usr/lib/systemd/system/myron-microphone-bridge.service
+microphone_user_service=$overlay/usr/lib/systemd/user/myron-microphone-source.service
+microphone_switch=$overlay/usr/local/bin/omamobile-microphone
+microphone_polkit=$overlay/etc/polkit-1/rules.d/50-myron-microphone.rules
+for required in \
+  "TX_AIF1_CAP Mixer DEC2" 'TX DMIC MUX2' 'TX_DEC2 Volume' \
+  '-D 100 -d 101 -c 1 -r 48000 -b 16' \
+  '-i CODEC_DMA-LPAIF_RXTX-TX-3' '-skv 0xB1000001' '-dkv 0xA3000001' '-ikv 1'; do
+  grep -Fq -- "$required" "$microphone_bridge" || fail "microphone bridge lacks: $required"
+done
+for required in \
+  'source_name=myron_microphone' \
+  'pactl set-default-source myron_microphone' \
+  'pactl set-source-mute myron_microphone 0'; do
+  grep -Fq "$required" "$microphone_source" || fail "microphone source manager lacks: $required"
+done
+grep -Fxq 'Conflicts=myron-speaker-bridge.service' "$microphone_service" ||
+  fail 'microphone graph does not exclude concurrent protected speaker playback'
+grep -Fxq 'Conflicts=myron-speaker-sink.service' "$microphone_user_service" ||
+  fail 'microphone source does not exclude the speaker sink session'
+for unit in "$microphone_service" "$microphone_user_service"; do
+  ! grep -Fxq '[Install]' "$unit" || fail "microphone activation is persistent: $unit"
+done
+for required in \
+  'systemctl --user stop myron-speaker-sink.service' \
+  'wait_speaker_powerdown' \
+  'speaker did not idle to TFA Powerdown before microphone switch' \
+  'systemctl stop myron-speaker-bridge.service' \
+  'systemctl start myron-microphone-bridge.service' \
+  'systemctl --user start myron-microphone-source.service' \
+  'systemctl --user stop myron-microphone-source.service' \
+  'systemctl stop myron-microphone-bridge.service' \
+  'systemctl start myron-speaker-bridge.service' \
+  'systemctl --user start myron-speaker-sink.service'; do
+  grep -Fq "$required" "$microphone_switch" ||
+    fail "microphone privacy switch lacks: $required"
+done
+grep -Fq '/^(myron-microphone-bridge|myron-speaker-bridge)\.service$/' "$microphone_polkit" ||
+  fail 'microphone polkit rule is not limited to exact bridge units'
+grep -Fq 'action.lookup("verb") == "start" || action.lookup("verb") == "stop"' "$microphone_polkit" ||
+  fail 'microphone polkit rule permits more than start and stop'
+pass 'microphone bridge exposes the proven route only during an attended session'
 
 for required in \
   '"gpio-keys": ("volume-up", 115)' \

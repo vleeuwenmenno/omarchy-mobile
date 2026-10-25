@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Attended Myron PipeWire microphone source
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Requires=pipewire-pulse.service wireplumber.service
+Conflicts=myron-speaker-sink.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/myron-microphone-source
+TimeoutStopSec=10
+
+# Deliberately no [Install] section. Microphone activation is explicit.

@@ -147,5 +147,29 @@ fi
 udevadm control --reload
 udevadm trigger --action=add --subsystem-match=drm >>"$log" 2>&1 || true
 
+# Match the proven postmarketOS hardware-control contract. These downstream
+# sysfs attributes are recreated root-only on every boot, so package-time
+# ownership is not enough. Keep screen brightness with the graphical `video`
+# group and the physically verified rear torch with the `input` group.
+backlight=/sys/class/backlight/panel0-backlight/brightness
+torch=/sys/class/leds/amber:flash-2/brightness
+for item in "$backlight" "$torch"; do
+  attempt=0
+  while [ ! -e "$item" ] && [ "$attempt" -lt 100 ]; do
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  [ -e "$item" ] || die "hardware control missing: $item"
+done
+chgrp video "$backlight"
+chmod 0664 "$backlight"
+chgrp input "$torch"
+chmod 0664 "$torch"
+[ "$(stat -c '%a:%G' "$backlight")" = 664:video ] ||
+  die 'panel backlight lost the video-group contract'
+[ "$(stat -c '%a:%G' "$torch")" = 664:input ] ||
+  die 'rear torch lost the input-group contract'
+say 'controls=ready backlight=panel0-backlight torch=amber:flash-2'
+
 touch /run/myron-omarchy-hardware-ready
 say "result=ready notes=$notes dsi=DSI-1 kgsl=/dev/kgsl-3d0 dma_heap=/dev/dma_heap/system touch=$touch_event raw_mode=disabled"

@@ -1,0 +1,41 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+
+fifo=/run/myron-audio/microphone.pcm
+ready=/run/myron-audio/microphone-ready
+module=
+cleanup() {
+	[ -z "$module" ] || pactl set-source-mute myron_microphone 1 >/dev/null 2>&1 || true
+	if [ -n "$module" ]; then
+		pactl unload-module "$module" >/dev/null 2>&1 || true
+		module=
+	fi
+	rm -f "${XDG_RUNTIME_DIR:?}/myron-microphone-source.ready"
+}
+terminate() { cleanup; exit 0; }
+trap cleanup EXIT
+trap terminate HUP INT TERM
+
+[ -p "$fifo" ] || { echo 'myron-microphone-source: missing FIFO' >&2; exit 1; }
+attempt=0
+while [ "$attempt" -lt 100 ] && [ ! -s "$ready" ]; do
+	sleep 0.1
+	attempt=$((attempt + 1))
+done
+[ -s "$ready" ] || { echo 'myron-microphone-source: root bridge is not ready' >&2; exit 1; }
+pactl list short modules | awk '$2 == "module-pipe-source" && index($0, "source_name=myron_microphone") { print $1 }' |
+while IFS= read -r stale; do
+	[ -z "$stale" ] || pactl unload-module "$stale" >/dev/null 2>&1 || true
+done
+module=$(pactl load-module module-pipe-source \
+	source_name=myron_microphone file="$fifo" format=s16le rate=48000 channels=1 \
+	source_properties="device.description='Myron Built-in Microphone'")
+pactl set-default-source myron_microphone
+pactl set-source-volume myron_microphone 100%
+pactl set-source-mute myron_microphone 0
+printf 'ready\n' >"$XDG_RUNTIME_DIR/myron-microphone-source.ready"
+while pactl list short modules | awk -v id="$module" '$1 == id { found=1 } END { exit !found }'; do
+	sleep 5
+done
+exit 1
