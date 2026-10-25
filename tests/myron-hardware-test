@@ -257,6 +257,7 @@ for required in \
   'Bluetooth module was already loaded' \
   'identities=not-persisted' \
   'cleanup=powered-off' \
+  'sensor=$sensor' \
   'hardware-test.disarm'; do
   grep -Fq "$required" "$bluetooth_stage" ||
     fail "checkpointed Bluetooth runner lacks: $required"
@@ -269,6 +270,15 @@ for module in rfkill.ko pwrseq-core.ko bluetooth.ko btbcm.ko btqca.ko hci_uart.k
 done
 grep -Fq 'systemctl start bluetooth.service' "$bluetooth_stage" ||
   fail 'Bluetooth runner does not use the Arch BlueZ service'
+for cleanup in \
+  'timeout 3 bluetoothctl scan off' \
+  'timeout 3 bluetoothctl power off' \
+  'timeout 10 systemctl stop bluetooth.service' \
+  'timeout 5 "$probe" --set-power off' \
+  'timeout 5 umount'; do
+  grep -Fq "$cleanup" "$bluetooth_stage" ||
+    fail "Bluetooth cleanup is not bounded: $cleanup"
+done
 if grep -Fq 'rc-service' "$bluetooth_stage"; then
   fail 'Bluetooth runner contains an Alpine/OpenRC service command'
 fi

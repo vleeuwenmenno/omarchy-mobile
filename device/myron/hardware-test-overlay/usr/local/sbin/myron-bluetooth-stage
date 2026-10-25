@@ -69,20 +69,26 @@ check_size() {
 
 hottest_temperature() {
 	hottest=0
+	hottest_type=unknown
 	for file in /sys/class/thermal/thermal_zone*/temp; do
 		[ -r "$file" ] || continue
 		type=$(cat "${file%/temp}/type" 2>/dev/null || printf unknown)
 		case "$type" in *-trip-*) continue ;; esac
 		value=$(cat "$file" 2>/dev/null || printf 0)
 		case "$value" in ''|*[!0-9]*) value=0 ;; esac
-		[ "$value" -le "$hottest" ] || hottest=$value
+		[ "$value" -le "$hottest" ] || {
+			hottest=$value
+			hottest_type=$type
+		}
 	done
-	printf '%s\n' "$hottest"
+	printf '%s %s\n' "$hottest" "$hottest_type"
 }
 
 require_temperature() {
-	value=$(hottest_temperature)
-	persist "stage=temperature maximum_mc=$value"
+	reading=$(hottest_temperature)
+	value=${reading%% *}
+	sensor=${reading#* }
+	persist "stage=temperature maximum_mc=$value sensor=$sensor"
 	[ "$value" -lt "$maximum_safe_temperature_mc" ] ||
 		fail "temperature safety limit reached: $value mC"
 }
@@ -206,9 +212,9 @@ mount_firmware() {
 stop_internal() {
 	cleanup_ok=1
 	rm -f /run/myron-bluetooth-ready "$scan_raw"
-	bluetoothctl scan off >/dev/null 2>&1 || true
-	bluetoothctl power off >/dev/null 2>&1 || true
-	systemctl stop bluetooth.service >/dev/null 2>&1 || true
+	timeout 3 bluetoothctl scan off >/dev/null 2>&1 || true
+	timeout 3 bluetoothctl power off >/dev/null 2>&1 || true
+	timeout 10 systemctl stop bluetooth.service >/dev/null 2>&1 || true
 	if [ -s "$pidfile" ]; then
 		pid=$(cat "$pidfile")
 		case "$pid" in ''|*[!0-9]*) pid= ;; esac
@@ -230,11 +236,11 @@ stop_internal() {
 		[ -f "$probe" ] && [ ! -L "$probe" ] &&
 			[ "$(sha256sum "$probe" | awk '{print $1}')" = "$probe_sha" ] || cleanup_ok=0
 		if [ "$cleanup_ok" -eq 1 ]; then
-			"$probe" --set-power off >/dev/null 2>&1 || cleanup_ok=0
+			timeout 5 "$probe" --set-power off >/dev/null 2>&1 || cleanup_ok=0
 		fi
 	fi
 	if mountpoint -q "$firmware_mnt"; then
-		umount "$firmware_mnt" || cleanup_ok=0
+		timeout 5 umount "$firmware_mnt" || cleanup_ok=0
 	fi
 	[ "$cleanup_ok" -eq 1 ]
 }

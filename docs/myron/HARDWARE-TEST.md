@@ -211,10 +211,21 @@ The offline Bluetooth successor is private and untracked:
 1a47033951c09f18b32c496b9afc2a3344c60e7a3ddd599a551c234472938240  init_boot_a-myron-omarchy-hardware-test-20261025-r5-v8.img
 ```
 
-It retains the 900-second slot-A-only rollback image and has not run on the
-phone yet. Earlier v6/v7 builds were superseded before deployment by stronger
+It retained the 900-second slot-A-only rollback image. Earlier v6/v7 builds
+were superseded before deployment by stronger
 same-boot replay protection, private transient-log permissions and
-signal-triggered cleanup.
+signal-triggered cleanup. The v8 boot qualified DSI/GPU and radio, then refused
+Bluetooth before module insertion when one thermal reading reached 94.6 C.
+That run also exposed an unbounded inactive-BlueZ cleanup call; v8 is retired.
+The next candidate adds hard cleanup timeouts and records the hottest sensor
+name with each reading.
+
+That corrected offline pair is:
+
+```text
+bd0294ff8edd36c66b4ae6290e51292f26ebe415dbb99f25edf0ec61d66df570  myron-omarchy-hardware-test-20261025-r5-v9.img
+be238f661b6c8f445e90cf544f768110cd8ed39338ee1b2b7e41c3712f3b8d9b  init_boot_a-myron-omarchy-hardware-test-20261025-r5-v9.img
+```
 
 ## Isolated Bluetooth stage
 
