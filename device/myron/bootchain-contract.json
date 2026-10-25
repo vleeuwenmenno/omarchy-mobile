@@ -1,0 +1,653 @@
+{
+  "authority": {
+    "atomic_snapshot_proof": false,
+    "atomicity_proven": false,
+    "bootable": false,
+    "deployment_authorized": false,
+    "flashable": false,
+    "hardware_qualified": false,
+    "hardware_read_authorized": false,
+    "image_ready": false,
+    "rollback_proven": false
+  },
+  "blockers": [
+    "kernel-source-lock-reproduction-not-verified",
+    "module-abi-import-and-load-order-not-verified",
+    "private-runtime-asset-bytes-not-bound-to-kit",
+    "atomic-snapshot-and-rollback-not-proven",
+    "no-bootable-image-or-captured-boot-chain",
+    "composed-kit-not-hardware-qualified",
+    "no-independent-deployment-review-or-authorization"
+  ],
+  "bound_contracts": {
+    "deployment_contract": {
+      "path": "device/myron/deployment-contract.json",
+      "sha256": "77aeb784326943ce9bcfa76de599d04502370a333d234561b477f269d9ebaee9"
+    },
+    "kernel_reference": {
+      "path": "device/myron/kernel-contract.json",
+      "sha256": "80321c737de5dd4ac7a671a83453c225ae23b7c2c1313e6cba0f8811ddcc8193"
+    },
+    "snapshot_contract": {
+      "path": "device/myron/snapshot-contract.json",
+      "sha256": "4dc53614992922b50cbfe7b59bfc10c473088c9d98058a9abec0933d345257ea"
+    }
+  },
+  "capture": {
+    "collector_transport_label_is_not_provenance": true,
+    "complete_capture": false,
+    "does_not_produce": [
+      "R1-identity-and-slot",
+      "R3-boot-image-headers",
+      "R4-dtb-dtbo-selection",
+      "R5-module-load-order",
+      "R6-storage-and-mount-model",
+      "R7-kernel-identity-revalidation"
+    ],
+    "kind": "myron-precaptured-fixture",
+    "operation_kind": "myron-precaptured-operation",
+    "produces": [
+      "R2-gpt-and-recovery-inventory"
+    ],
+    "transport": "external-precaptured-fixture",
+    "unchanged_for_collector": true,
+    "validated_by": [
+      "validate_operation"
+    ]
+  },
+  "components": {
+    "capture_contract": {
+      "path": "device/myron/capture-contract.json",
+      "sha256": "b5ccb100cf28c7d58ce40fc634719bb9ceede6a3e94476c546914af7a443edce"
+    },
+    "preflight_contract": {
+      "path": "device/myron/preflight-contract.json",
+      "sha256": "9fe3d28d4f2843bf652efb3081f61c21791421e45e021a3842d1a6b84185fb1b"
+    }
+  },
+  "coverage": {
+    "classes": [
+      "parsed-bytes",
+      "geometry-claim-dependent"
+    ],
+    "fields": [
+      {
+        "classification": "parsed-bytes",
+        "field": "partitions.partition_name",
+        "operation": "R2-gpt-and-recovery-inventory",
+        "semantics": "name-as-recorded",
+        "source": "gpt-entry-name-utf16le"
+      },
+      {
+        "classification": "geometry-claim-dependent",
+        "field": "partitions.size_bytes",
+        "operation": "R2-gpt-and-recovery-inventory",
+        "semantics": "extent-size-under-explicit-geometry-claim",
+        "source": "gpt-entry-lba-extent-times-explicit-sector-bytes"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "partitions.bootable_flag",
+        "operation": "R2-gpt-and-recovery-inventory",
+        "semantics": "legacy-bios-bootable-bit",
+        "source": "gpt-entry-attributes-bit-2"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "partitions.slot_suffix",
+        "operation": "R2-gpt-and-recovery-inventory",
+        "semantics": "name-suffix-only",
+        "source": "partition-name-suffix"
+      },
+      {
+        "classification": "parsed-bytes",
+        "field": "recovery_present",
+        "operation": "R2-gpt-and-recovery-inventory",
+        "semantics": "name-presence-in-this-gpt-only",
+        "source": "partition-name-match-in-one-gpt"
+      }
+    ],
+    "semantic_limits": [
+      "bootable_flag is the literal GPT attributes bit 2 (legacy-bios-bootable-bit)",
+      "bootable_flag does NOT prove Android slot priority",
+      "bootable_flag does NOT prove Android slot success",
+      "bootable_flag does NOT prove the active slot",
+      "bootable_flag does NOT prove bootability",
+      "bootable_flag does NOT prove recovery viability",
+      "slot_suffix is the partition name's _a or _b ending and nothing else",
+      "recovery_present is name presence inside this one GPT, not recovery viability"
+    ],
+    "unresolved_claims": [
+      {
+        "claim": "geometry-provenance-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "physical-acquisition-and-freshness-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "complete-device-disk-inventory-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "protective-mbr-not-parsed",
+        "state": "unresolved"
+      },
+      {
+        "claim": "android-slot-semantics-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "bootability-not-established",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r3-format-schema-successor-required",
+        "state": "unresolved"
+      },
+      {
+        "claim": "r4-selection-provenance-successor-required",
+        "state": "unresolved"
+      }
+    ]
+  },
+  "deferred": [
+    {
+      "id": "R3-boot-image-headers",
+      "requires": [
+        "format-specific parsers for Android boot v0-v4, vendor boot v3 and v4, and DTBO",
+        "nullable or not-applicable OS version semantics",
+        "component roles, hash coverage and profile limits"
+      ],
+      "state": "not-implemented",
+      "successor_gate": "r3-boot-image-schema-migration"
+    },
+    {
+      "id": "R4-dtb-dtbo-selection",
+      "requires": [
+        "a concrete selected-index source: parsing a DTBO or FDT does not prove selection",
+        "an actual Myron witness and contract cross-checks"
+      ],
+      "state": "not-implemented",
+      "successor_gate": "r4-selection-source-qualification"
+    }
+  ],
+  "dependencies": {
+    "byte_pinned": false,
+    "imports": [
+      "tools/myron-collect",
+      "tools/myron-preflight",
+      "tools/myron-snapshot",
+      "tools/myron-deployment"
+    ],
+    "note": "imported in-process and pinned by version and by the capture and preflight contract identities above; their bytes are not pinned here, and the collector implementation digest is bound only through the capture contract",
+    "trust": "trusted-version-pinned-imports"
+  },
+  "evidence_level": "synthetic-binary-parser-only",
+  "executes": false,
+  "format_version": "0.1.0",
+  "human_approval_required": true,
+  "identity": {
+    "device.codename": "myron",
+    "device.compatible": "qcom,canoe-mtp",
+    "device.soc": "sm8850",
+    "kernel.notes_sha256": "8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608",
+    "kernel.release": "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
+  },
+  "implementation": {
+    "algorithm": "sha256-of-captured-implementation-bytes",
+    "path": "tools/lib/myron-bootchain-impl.py",
+    "sha256": "cedff3b2b3f770fcd0533933497d5f8acee5c9c933e4c98da68792623340fa73"
+  },
+  "input": {
+    "closure": [
+      "geometry.json",
+      "gpt-backup-entries.bin",
+      "gpt-backup-header.bin",
+      "gpt-primary-entries.bin",
+      "gpt-primary-header.bin",
+      "reads.json"
+    ],
+    "closure_checked_before_payload_read": true,
+    "configurable": "nothing: filenames, paths, offsets, counts, algorithms and bounds are fixed here",
+    "entries_max": 7,
+    "extra_entries": "reject",
+    "files": [
+      {
+        "max_bytes": 8192,
+        "min_bytes": 1,
+        "path": "reads.json",
+        "role": "manifest"
+      },
+      {
+        "max_bytes": 1024,
+        "min_bytes": 1,
+        "path": "geometry.json",
+        "role": "explicit-geometry-claim"
+      },
+      {
+        "max_bytes": 4096,
+        "min_bytes": 512,
+        "path": "gpt-primary-header.bin",
+        "role": "gpt-primary-header"
+      },
+      {
+        "max_bytes": 16384,
+        "min_bytes": 16384,
+        "path": "gpt-primary-entries.bin",
+        "role": "gpt-primary-entry-table"
+      },
+      {
+        "max_bytes": 4096,
+        "min_bytes": 512,
+        "path": "gpt-backup-header.bin",
+        "role": "gpt-backup-header"
+      },
+      {
+        "max_bytes": 16384,
+        "min_bytes": 16384,
+        "path": "gpt-backup-entries.bin",
+        "role": "gpt-backup-entry-table"
+      }
+    ],
+    "format_version": 1,
+    "header_size_rule": "512..4096 at metadata admission, then exactly sector_bytes after geometry.json is read",
+    "json": "strict canonical ASCII; duplicate keys, floats, booleans for integers rejected",
+    "json_depth_max": 8,
+    "kind": "myron-synthetic-gpt-reads",
+    "layout": "flat",
+    "manifest": {
+      "binds": [
+        "bootchain_contract_sha256",
+        "request_sha256"
+      ],
+      "max_bytes": 8192,
+      "path": "reads.json",
+      "rows_sorted_by": "path"
+    },
+    "safety": [
+      "flat-tree-only",
+      "exact-closure-before-payload-read",
+      "no-symlinks",
+      "no-hardlinks",
+      "no-executable-files",
+      "no-special-files",
+      "no-mount-crossing",
+      "no-writable-ancestry",
+      "no-aliases-of-inputs",
+      "stable-while-read",
+      "metadata-admitted-before-payload-read",
+      "names-revalidated-after-read"
+    ],
+    "schemas": {
+      "geometry.json": {
+        "fields": {
+          "disk_lbas": {
+            "max": 2199023255552,
+            "min": 1,
+            "type": "int"
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-gpt-geometry"
+            ]
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "sector_bytes": {
+            "type": "int_enum",
+            "values": [
+              512,
+              4096
+            ]
+          }
+        },
+        "rule": "disk_lbas * sector_bytes <= 2^50 and disk_lbas >= 2 * (16384 / sector_bytes) + 4"
+      },
+      "reads.json": {
+        "fields": {
+          "bootchain_contract_sha256": {
+            "pattern": "[0-9a-f]{64}",
+            "type": "hash"
+          },
+          "format_version": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "kind": {
+            "type": "enum",
+            "values": [
+              "myron-synthetic-gpt-reads"
+            ]
+          },
+          "request_sha256": {
+            "pattern": "[0-9a-f]{64}",
+            "type": "hash"
+          },
+          "schema": {
+            "max": 1,
+            "min": 1,
+            "type": "int"
+          },
+          "synthetic": {
+            "const": true,
+            "type": "bool"
+          }
+        },
+        "rows": {
+          "max": 5,
+          "min": 5,
+          "row": {
+            "bytes": {
+              "max": 16384,
+              "min": 1,
+              "type": "int"
+            },
+            "path": {
+              "type": "enum",
+              "values": [
+                "geometry.json",
+                "gpt-backup-entries.bin",
+                "gpt-backup-header.bin",
+                "gpt-primary-entries.bin",
+                "gpt-primary-header.bin"
+              ]
+            },
+            "sha256": {
+              "pattern": "[0-9a-f]{64}",
+              "type": "hash"
+            }
+          },
+          "sorted_unique_by": "path",
+          "type": "rows"
+        },
+        "rows_field": "files"
+      }
+    },
+    "total_max_bytes": 50176
+  },
+  "kind": "myron-synthetic-bootchain-contract",
+  "kit_snapshot_reverified": false,
+  "limitations": [
+    "synthetic binary parser qualification only: the fixture bytes were never read from a phone or a block device",
+    "sector_bytes and disk_lbas are explicit synthetic claims: a GPT does not describe its own sector size or disk length",
+    "one GPT only: no protective MBR, no other disk or LUN, no complete device inventory",
+    "revision 1.0, 92-byte headers, exactly 128 entries of 128 bytes and sectors of 512 or 4096 only; other valid GPT variants are refused as unsupported",
+    "header bytes after the 92-byte header must be zero: a profile restriction, not universal GPT validity",
+    "a partition name fills at most 35 UTF-16 units and must be NUL terminated (a profile restriction)",
+    "bootable_flag is legacy-bios-bootable-bit and proves no Android priority, success, active slot, bootability or recovery viability",
+    "R3 and R4 are not implemented: each is a recorded successor gate and the parse is an operation fragment, not a capture",
+    "bytes_read is fixture payload accounting only: it counts consumed fixture bytes and is no device I/O",
+    "the collector, preflight, snapshot and deployment imports are trusted version-pinned dependencies, not fully byte-pinned execution",
+    "the bootchain contract pins the bootchain implementation bytes; the collector implementation is bound only through the capture contract",
+    "each gather is an internally validated descriptor-read snapshot of the exact bytes consumed, not an atomic filesystem snapshot: the caller-owned source can diverge after any file's final observation, a writable shared mapping can change bytes without changing metadata, and a later verify against a changed source rejects",
+    "a concurrent mutation first observable after payload traversal can consume bounded bytes (at most 50176) before rejection; zero payload bytes is promised only for a defect detected before traversal",
+    "publication is durable only if the output parent's fsync succeeds; a failure there removes the just-published output by identity on a best-effort basis and, if that cleanup also fails, can leave an output while reporting failure"
+  ],
+  "live": false,
+  "non_goals": [
+    "real acquisition from a device",
+    "live transport of any kind, or a raw device or storage handle",
+    "hardware evidence or captured provenance",
+    "authorization of any read, deployment or boot",
+    "closing any blocker",
+    "R3 boot image header parsing, R4 DTB or DTBO selection, or any complete R1-R7 capture",
+    "Android slot, priority, success or recovery qualification"
+  ],
+  "output": {
+    "accounting": {
+      "bytes_read": "exact-consumed-fixture-payload-bytes",
+      "excludes": [
+        "reads.json",
+        "manifest-validation-rereads",
+        "verification-reruns"
+      ],
+      "includes": [
+        "geometry.json",
+        "gpt-primary-header.bin",
+        "gpt-primary-entries.bin",
+        "gpt-backup-header.bin",
+        "gpt-backup-entries.bin"
+      ],
+      "max": 41984,
+      "meaning": "fixture-payload-accounting-not-device-io"
+    },
+    "closure": {
+      "checksums": {
+        "covers": [
+          "parse.json",
+          "operations/R2-gpt-and-recovery-inventory.json"
+        ],
+        "parse_json_binds_checksums": false,
+        "path": "SHA256SUMS",
+        "sorted": "canonical-byte-order-of-path",
+        "sufficient_for_verification": false
+      },
+      "directories": [
+        "operations"
+      ],
+      "extra_entries": "reject",
+      "files": [
+        "SHA256SUMS",
+        "operations/R2-gpt-and-recovery-inventory.json",
+        "parse.json"
+      ],
+      "modes": {
+        "directories": "0755",
+        "files": "0644"
+      }
+    },
+    "deterministic": true,
+    "kind": "myron-synthetic-gpt-parse",
+    "published": "atomic-no-replace",
+    "verification": "recompute-from-request-and-reads-byte-for-byte"
+  },
+  "pinned_versions": {
+    "collector": "0.1.0",
+    "deployment": "0.4.0",
+    "preflight": "0.2.1",
+    "snapshot": "0.2.0"
+  },
+  "profile": {
+    "gpt": {
+      "backup_entries_lba": "disk_lbas - 1 - 16384 / sector_bytes",
+      "backup_header_lba": "disk_lbas - 1",
+      "crc": "crc32-ieee-reflected-poly-0xedb88320",
+      "disk_guid": "nonzero-never-emitted",
+      "entries": {
+        "extent": "first_lba <= last_lba, inside the usable range, no overlap after sorting by first_lba",
+        "guids_emitted": false,
+        "name": "UTF-16LE strict, 1..35 units, NUL terminated, zero padded, [a-z0-9_]{1,36}, unique",
+        "occupied": "nonzero type guid, nonzero unique guid unique among occupied entries",
+        "order": "arbitrary entry order; rows emitted sorted by partition_name",
+        "unused": "type guid all zero: every other field ignored"
+      },
+      "entry_count": 128,
+      "entry_layout": [
+        {
+          "bytes": 16,
+          "encoding": "all zero means unused; never emitted",
+          "field": "type_guid",
+          "offset": 0
+        },
+        {
+          "bytes": 16,
+          "encoding": "nonzero and unique among occupied entries; never emitted",
+          "field": "unique_guid",
+          "offset": 16
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le",
+          "field": "first_lba",
+          "offset": 32
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le",
+          "field": "last_lba",
+          "offset": 40
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le; only bit 2 is read",
+          "field": "attributes",
+          "offset": 48
+        },
+        {
+          "bytes": 72,
+          "encoding": "UTF-16LE, strict, NUL terminated, zero padded",
+          "field": "name",
+          "offset": 56
+        }
+      ],
+      "entry_size": 128,
+      "entry_table_bytes": 16384,
+      "header_layout": [
+        {
+          "bytes": 8,
+          "encoding": "ascii EFI PART",
+          "field": "signature",
+          "offset": 0
+        },
+        {
+          "bytes": 4,
+          "encoding": "u32le 0x00010000",
+          "field": "revision",
+          "offset": 8
+        },
+        {
+          "bytes": 4,
+          "encoding": "u32le 92",
+          "field": "header_size",
+          "offset": 12
+        },
+        {
+          "bytes": 4,
+          "encoding": "u32le over header_size bytes with this field zeroed",
+          "field": "header_crc32",
+          "offset": 16
+        },
+        {
+          "bytes": 4,
+          "encoding": "u32le 0",
+          "field": "reserved",
+          "offset": 20
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le",
+          "field": "my_lba",
+          "offset": 24
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le",
+          "field": "alternate_lba",
+          "offset": 32
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le",
+          "field": "first_usable_lba",
+          "offset": 40
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le",
+          "field": "last_usable_lba",
+          "offset": 48
+        },
+        {
+          "bytes": 16,
+          "encoding": "16 bytes, nonzero, never emitted",
+          "field": "disk_guid",
+          "offset": 56
+        },
+        {
+          "bytes": 8,
+          "encoding": "u64le",
+          "field": "entries_lba",
+          "offset": 72
+        },
+        {
+          "bytes": 4,
+          "encoding": "u32le 128",
+          "field": "entry_count",
+          "offset": 80
+        },
+        {
+          "bytes": 4,
+          "encoding": "u32le 128",
+          "field": "entry_size",
+          "offset": 84
+        },
+        {
+          "bytes": 4,
+          "encoding": "u32le over the 16384-byte table",
+          "field": "entries_crc32",
+          "offset": 88
+        }
+      ],
+      "header_size": 92,
+      "header_trailing_bytes": "zero-required-profile-restriction",
+      "mappings": {
+        "bootable_flag": "attributes bit 2, semantics legacy-bios-bootable-bit",
+        "recovery_present": "any name matches recovery, recovery_a or recovery_b in this one GPT",
+        "size_bytes": "(last_lba - first_lba + 1) * sector_bytes, 1..2^50",
+        "slot_suffix": "_a or _b ending of the name, else empty"
+      },
+      "primary_entries_lba": 2,
+      "primary_header_lba": 1,
+      "revision": "1.0",
+      "sector_bytes": [
+        512,
+        4096
+      ],
+      "table_rule": "copies byte-identical, then crc32 equals the header field; no fallback, repair or preference",
+      "unsupported_is_not_corrupt": [
+        "revision other than 1.0",
+        "header_size other than 92",
+        "entry_count other than 128",
+        "entry_size other than 128",
+        "nonzero bytes after the header",
+        "name outside the pattern",
+        "no occupied entry"
+      ],
+      "usable_range": "first_usable >= 2 + 16384 / sector_bytes, last_usable <= disk_lbas - 2 - 16384 / sector_bytes, first_usable <= last_usable"
+    },
+    "inventory_scope": "one-synthetic-gpt",
+    "name": "gpt-v1-128x128-primary-backup",
+    "operation": "R2-gpt-and-recovery-inventory"
+  },
+  "qualification": {
+    "binary_parser": "synthetic-fixtures-only",
+    "captured_provenance": false,
+    "deferred_operations": [
+      {
+        "id": "R3-boot-image-headers",
+        "state": "not-implemented",
+        "successor_gate": "r3-boot-image-schema-migration"
+      },
+      {
+        "id": "R4-dtb-dtbo-selection",
+        "state": "not-implemented",
+        "successor_gate": "r4-selection-source-qualification"
+      }
+    ],
+    "implemented_operations": [
+      "R2-gpt-and-recovery-inventory"
+    ]
+  },
+  "remote_commands": [],
+  "schema": 1,
+  "status": "synthetic-parse-recorded",
+  "synthetic": true,
+  "transport": "synthetic-binary-gpt-fixture"
+}

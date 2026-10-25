@@ -105,6 +105,19 @@ hardware evidence, no authorization, no blocker closure and no GPT, boot-image
 or device-tree parser. The collector and preflight are trusted version-pinned
 imports, not byte-pinned. See [SESSION-GATE.md](../../docs/myron/SESSION-GATE.md).
 
+Phase 2.14 adds `device/myron/bootchain-contract.json` and `tools/myron-bootchain`
+0.1.0 (a minimal trusted loader for `tools/lib/myron-bootchain-impl.py`, whose
+captured bytes the contract pins). It parses one **synthetic** GPT (revision 1.0,
+128 entries of 128 bytes, primary and backup copies, sectors of 512 or 4096
+bytes) into the R2 operation fragment and checks it with the unchanged
+collector. It is synthetic binary parser qualification only: sector size and
+disk length are explicit synthetic claims, `bootable_flag` is the literal GPT
+attributes bit 2 (`legacy-bios-bootable-bit`, no Android priority, success,
+active-slot, bootability or recovery claim), and nothing is acquired from a
+phone. R3 and R4 are not implemented: the R3 schema migration and the R4
+selection-source qualification are required successor gates. See
+[BOOTCHAIN-GATE.md](../../docs/myron/BOOTCHAIN-GATE.md).
+
 Stage-only rootfs (`ROOTFS_INTEGRATION=external-contract`): `tools/build-rootfs
 --stage-only` writes a package tree and MANIFEST under `out/`. It is not
 bootable, not image-ready, and not hardware-qualified; it carries no kernel,

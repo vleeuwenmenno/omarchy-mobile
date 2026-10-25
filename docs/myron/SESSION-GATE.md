@@ -245,7 +245,10 @@ failure.
 - The reads are synthetic projections. Nothing shows a real phone, GPT, boot
   image or device tree would produce them.
 - No GPT, Android boot image or device-tree parser exists here; a real one needs
-  its own gate and its own qualification against real captures.
+  its own gate and its own qualification against real captures. Phase 2.14 adds
+  a separate, synthetic-only GPT-to-R2 byte parser
+  ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)); it does not change this rehearsal,
+  and R3 and R4 still have no parser.
 - R3 header values and the R4 selection are claims, not parsed values.
 - R5 order is the fixture file order, not historical load chronology.
 - The R7 projections are deliberately narrow, not full command-line or

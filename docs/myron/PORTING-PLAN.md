@@ -185,6 +185,20 @@ evidence, authorization, blocker closure or device-format qualification; no GPT,
 Android boot-image or device-tree parser exists
 ([SESSION-GATE.md](SESSION-GATE.md)).
 
+Phase 2.14 (laptop-only, synthetic parser done): `device/myron/bootchain-contract.json`
+and `tools/myron-bootchain` 0.1.0 parse one **synthetic** GPT (revision 1.0,
+92-byte headers, 128 entries of 128 bytes, primary and backup copies) byte for
+byte into the R2 operation fragment the unchanged collector accepts. This is
+synthetic binary parser qualification only: no captured provenance, live
+transport, hardware evidence, authorization or blocker closure. R3 (boot image
+headers) and R4 (selection) are **not** implemented and stay required successor
+gates: the R3 schema migration (format-specific Android boot v0-v4, vendor boot
+v3/v4 and DTBO; nullable or not-applicable OS-version semantics; component
+roles, hash coverage and profile limits) and the R4 selection-source
+qualification (a concrete selected-index source, an actual Myron witness and
+contract cross-checks; parsing a DTBO or FDT does not prove selection)
+([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
+
 Phase 2.11 (laptop-only, mechanism done): kernel-contract and deployment tool
 0.4.0 add synthetic coverage for standard AArch64/GKI module layouts so real
 owner bytes are no longer guaranteed to fail on RELA, PREL32 exports,
@@ -330,7 +344,9 @@ Future build gates:
 Offline refusal tooling is now complete through the preflight request, and the
 fixture collector (Phase 2.12) can check the shape of pre-captured evidence; the
 synthetic adapter rehearsal (Phase 2.13) shows synthetic projections adapt into that
-fixture. Next,
+fixture, and the synthetic GPT parser (Phase 2.14) parses one synthetic GPT into R2
+only (the R3 schema migration and the R4 selection-source qualification are the
+required successor gates). Next,
 assemble a **real** kit and snapshot candidate from the owner-supplied qualified
 archive, runtime tree and symvers pair, then generate and independently review
 its preflight request SHA-256. That work stays offline. The following boundary

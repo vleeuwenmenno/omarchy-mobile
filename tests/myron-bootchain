@@ -1,0 +1,2538 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests for the Myron synthetic GPT-to-R2 parser (Phase 2.14). Everything
+# here is synthetic: no phone, no network, no process, no block device, no real capture.
+# The GPT bytes are encoded in this file, independently of the parser, and exist only
+# in a temporary directory: no raw binary fixture is committed.
+set -euo pipefail
+export LC_ALL=C
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tmp=$(mktemp -d)
+trap 'chmod -R u+rwx "$tmp" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+export PYTHONPYCACHEPREFIX="$tmp/pycache"
+tmp=$(realpath "$tmp")
+
+impl=tools/lib/myron-bootchain-impl.py
+python3 -m py_compile tools/myron-bootchain "$impl" || fail "tool parses"
+for f in tools/myron-bootchain "$impl"; do
+  grep -Eq '^(import|from) (subprocess|shutil|socket|urllib|http|ctypes|ssl|requests|zipfile|tarfile|gzip|zlib|lzma|bz2|pty|signal)|os\.(system|popen|exec|spawn|fork)|posix_spawn' "$f" \
+    && fail "$f references process, network, archive, decompression, or broad-copy facilities"
+  grep -Eqi '\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b' "$f" \
+    && fail "$f names a live transport command"
+  grep -Eq '/dev/|/proc/|/sys/|O_DIRECT($|[^O])|BLKGETSIZE|ioctl|mmap' "$f" \
+    && fail "$f names a raw device or kernel interface"
+done
+grep -q 'synthetic-binary-gpt-fixture' "$impl" || fail "tool lacks the synthetic transport"
+[[ $(wc -l < tools/myron-bootchain) -le 90 ]] || fail "the trusted loader grew past 90 lines"
+pass "loader and implementation parse and have no process, network, archive, decompression, raw-device, or live-transport facility"
+
+for f in tests/myron-bootchain; do bash -n "$f" || fail "$f parses"; done
+grep -Eq '^BOOT_METHOD=external-android$' device/myron/device.conf || fail "device.conf boot method changed"
+grep -Eq '^BOOT_IMAGES=""$' device/myron/device.conf || fail "device.conf BOOT_IMAGES is not empty"
+grep -Eq '^UFS_RW=""$' device/myron/device.conf || fail "device.conf UFS_RW is not empty"
+pass "device.conf is still external-android with empty BOOT_IMAGES and UFS_RW"
+
+tools/myron-bootchain show > "$tmp/show.json" || fail "repository bootchain contract failed"
+python3 - "$tmp/show.json" <<'PY' || exit 1
+import hashlib, json, sys
+value = json.load(open(sys.argv[1]))
+assert value["kind"] == "myron-synthetic-bootchain-contract"
+assert value["format_version"] == "0.1.0"
+assert value["pinned_versions"] == {
+    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0",
+}
+assert value["dependencies"]["trust"] == "trusted-version-pinned-imports"
+assert value["dependencies"]["byte_pinned"] is False
+assert value["synthetic"] is True and value["live"] is False and value["executes"] is False
+assert value["kit_snapshot_reverified"] is False and value["remote_commands"] == []
+assert len(value["blockers"]) == 7
+assert len(value["authority"]) == 9 and all(v is False for v in value["authority"].values())
+for name, path in (("preflight_contract", "device/myron/preflight-contract.json"),
+                   ("capture_contract", "device/myron/capture-contract.json")):
+    pinned = value["components"][name]
+    assert pinned["path"] == path
+    assert pinned["sha256"] == hashlib.sha256(open(path, "rb").read()).hexdigest(), name
+for name, path in (("deployment_contract", "device/myron/deployment-contract.json"),
+                   ("kernel_reference", "device/myron/kernel-contract.json"),
+                   ("snapshot_contract", "device/myron/snapshot-contract.json")):
+    pinned = value["bound_contracts"][name]
+    assert pinned["path"] == path
+    assert pinned["sha256"] == hashlib.sha256(open(path, "rb").read()).hexdigest(), name
+for name in ("preflight", "capture", "deployment", "snapshot", "session", "stage", "kernel"):
+    assert "bootchain" not in open(f"device/myron/{name}-contract.json").read(), "pins are one-way"
+impl = value["implementation"]
+assert impl["path"] == "tools/lib/myron-bootchain-impl.py"
+assert impl["sha256"] == hashlib.sha256(open(impl["path"], "rb").read()).hexdigest()
+PY
+pass "repository contract is canonical, one-way pinned, synthetic, and authorizes nothing"
+tools/myron-bootchain derive-contract > "$tmp/derived.json" || fail "derive-contract failed"
+cmp -s "$tmp/derived.json" device/myron/bootchain-contract.json \
+  || fail "committed bootchain contract differs from derive-contract (regenerate it, see docs/myron/BOOTCHAIN-GATE.md)"
+tools/myron-bootchain show | cmp -s - "$tmp/derived.json" || fail "show differs from derive-contract"
+pass "derive-contract output equals the committed bootchain contract byte for byte"
+
+mkdir "$tmp/fixture"
+MYRON_SNAPSHOT_FIXTURE_OUT="$tmp/fixture" tests/myron-snapshot > "$tmp/snapshot-suite.log" \
+  || { cat "$tmp/snapshot-suite.log" >&2; fail "snapshot fixture export"; }
+
+python3 - "$PWD" "$tmp" <<'PY' || exit 1
+import contextlib
+import copy
+import errno
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import mmap
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import uuid
+import zlib
+
+repo = Path(sys.argv[1])
+work = Path(sys.argv[2])
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+B = load("bootchain_tool_test", repo / "tools/myron-bootchain")
+C = B.collect()
+CT = load("collect_tool_for_bootchain_test", repo / "tools/myron-collect")
+P = C.preflight()
+D = P.deploy()
+K = D.kernel()
+paths = {key: Path(value) for key, value in json.loads(
+    (work / "fixture/paths.json").read_text()
+).items()}
+contracts_root = paths["contracts_root"]
+contracts = D.load_contracts(contracts_root)
+_, _, snapshot_sha = P.snapshot().load_snapshot_contract(contracts_root, contracts)
+preflight_bytes = D.render_json(P.expected_preflight_contract(contracts, snapshot_sha))
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).parent.mkdir(parents=True, exist_ok=True)
+(contracts_root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes)
+capture_contract_bytes = D.render_json(
+    C.expected_capture_contract(D.sha256_bytes(preflight_bytes), contracts)
+)
+(contracts_root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes)
+collector_env = C.load_environment(contracts_root)
+bootchain_contract = B.expected_bootchain_contract(collector_env)
+bootchain_contract_bytes = D.render_json(bootchain_contract)
+(contracts_root / B.BOOTCHAIN_CONTRACT_PATH).write_bytes(bootchain_contract_bytes)
+env = B.load_environment(contracts_root)
+BC = env.contract_sha256
+assert BC == hashlib.sha256(bootchain_contract_bytes).hexdigest()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def ok(name):
+    print(f"ok - {name}")
+
+
+counter = [0]
+
+
+def fresh(name):
+    counter[0] += 1
+    path = work / f"{name}-{counter[0]}"
+    path.mkdir()
+    return path
+
+
+def invoke(*arguments, root=None):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = B.main([str(value) for value in arguments], contracts_root=root or contracts_root)
+        except SystemExit as error:
+            code = error.code
+    return code, out.getvalue(), err.getvalue()
+
+
+def expect_ok(*arguments, **kwargs):
+    code, out, err = invoke(*arguments, **kwargs)
+    assert code == 0, (arguments, err)
+    return json.loads(out), out
+
+
+@contextlib.contextmanager
+def payload_counter(directory):
+    """Count the bytes os.read returns from any file under DIRECTORY (None: count nothing)."""
+    counted = [0]
+    if directory is None:
+        yield counted
+        return
+    prefix = str(directory) + "/"
+    original = os.read
+
+    def counting(descriptor, count):
+        block = original(descriptor, count)
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            target = ""
+        if target.startswith(prefix):
+            counted[0] += len(block)
+        return block
+
+    os.read = counting
+    try:
+        yield counted
+    finally:
+        os.read = original
+
+
+def expect_fail(name, arguments, *outputs, match=None, absent=(), untouched=None, single_line=False, **kwargs):
+    """UNTOUCHED names a reads directory from which not one payload byte may have been read."""
+    with payload_counter(untouched) as counted:
+        code, out, err = invoke(*arguments, **kwargs)
+    assert code != 0, f"{name}: accepted\n{out}"
+    assert out == "", f"{name}: stdout is not empty"
+    if untouched is not None:
+        assert counted[0] == 0, f"{name}: {counted[0]} payload bytes were read before the refusal"
+    if match is not None:
+        assert match in err, f"{name}: expected {match!r}, got {err!r}"
+    if single_line:
+        assert err.count("\n") == 1 and err.startswith("ERROR: "), f"{name}: not one line: {err!r}"
+    for text in absent:
+        assert text not in err and text not in out, f"{name}: diagnostics echo {text!r}: {err}"
+    for output in outputs:
+        assert not os.path.lexists(output), f"{name}: left output {output}"
+    ok(f"{name} is rejected")
+    return err
+
+
+def walk(path):
+    descriptor = D.open_canonical_dir(str(path), "test tree")
+    try:
+        tree = D.walk_tree(descriptor, B.output_limits(), allow_symlinks=False, keep_data=True)
+    finally:
+        os.close(descriptor)
+    return tree.entries, tree.data
+
+
+def with_patch(owner, attribute, replacement, run):
+    original = getattr(owner, attribute)
+    setattr(owner, attribute, replacement(original))
+    try:
+        return run()
+    finally:
+        setattr(owner, attribute, original)
+
+
+def no_leftovers(label):
+    leftovers = [p.name for p in work.iterdir() if ".tmp-" in p.name]
+    assert not leftovers, (label, leftovers)
+
+
+def jbytes(value):
+    return D.render_json(value)
+
+
+# A real preflight request, built by the pinned preflight tool, is the only request input.
+request = work / "request"
+with contextlib.redirect_stdout(io.StringIO()):
+    code = P.main(
+        ["assess", "--kit", str(paths["kit"]), "--snapshot", str(paths["snapshot"]),
+         "--rootfs-stage", str(paths["rootfs"]), "--rootfs-manifest", str(paths["manifest"]),
+         "--assets", str(paths["archive"]), "--runtime-assets", "none",
+         "--vmlinux-symvers", "none", "--module-symvers", "none", "--out", str(request)],
+        contracts_root=contracts_root,
+    )
+assert code == 0
+request_sha256 = digest((request / "SHA256SUMS").read_bytes())
+request_document = json.loads((request / "request.json").read_text())
+READS = request_document["requested_reads"]
+OPERATION_IDS = [row["id"] for row in READS]
+R1, R2, R3, R4, R5, R6, R7 = OPERATION_IDS
+R2_ROW = READS[1]
+assert R2 == B.R2_ID and R2_ROW["max_bytes"] == 1024 * 1024
+
+# --- an independent GPT encoder (never calls a parser helper) ------------------------------
+
+TABLE = 16384
+BOOT_BIT = 0x4
+DISK_GUID = bytes.fromhex("c3a1f0e29b7d4c58a6e3d1b0f2879a4e")
+TYPE_GUID = bytes.fromhex("5d8e2fb1a04c43769e1b7c30d4a8f651")
+NAME_CANARY = "canary" + "q7k2"
+
+
+def crc(data):
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def unique_guid(name):
+    return hashlib.sha256(b"unique-guid-" + name.encode()).digest()[:16]
+
+
+def guid_forms(raw):
+    forms = set()
+    for value in (raw.hex(), str(uuid.UUID(bytes=raw)), str(uuid.UUID(bytes_le=raw))):
+        forms |= {value, value.upper()}
+    return forms
+
+
+def name_field(name):
+    data = name.encode("utf-16-le")
+    assert len(data) <= 72
+    return data + bytes(72 - len(data))
+
+
+def entry(first, last, attributes, name_raw, type_guid=TYPE_GUID, unique=None, name=None):
+    unique = unique if unique is not None else unique_guid(name)
+    return type_guid + unique + struct.pack("<QQQ", first, last, attributes) + name_raw
+
+
+def header(sector, my, alt, first, last, guid, entries_lba, entries_crc, *, revision=0x00010000,
+           size=92, reserved=0, count=128, entry_size=128, signature=b"EFI PART", trailing=None,
+           crc_value=None, mutate=None):
+    raw = bytearray(sector)
+    struct.pack_into("<8sIIIIQQQQ16sQIII", raw, 0, signature, revision, size, 0, reserved, my, alt,
+                     first, last, guid, entries_lba, count, entry_size, entries_crc)
+    for offset, value in (trailing or {}).items():
+        raw[offset:offset + len(value)] = value
+    if mutate:
+        mutate(raw)
+    stored = crc(bytes(raw[:size])) if crc_value is None else crc_value
+    struct.pack_into("<I", raw, 16, stored)
+    return bytes(raw)
+
+
+UNITS = [  # (name, size in 4096-byte units, attributes), in LBA order
+    ("boot_a", 24576, 0x8000000000000004), ("vendor_boot_a", 24576, 0x1000000000000003),
+    ("pmos_root", 10485760, 0), ("dtbo_a", 6144, 0x0000000000000008),
+    ("recovery_a", 25600, 0xFFFFFFFFFFFFFFFB), ("boot_b", 24576, 0x1000000000000003),
+    ("init_boot_a", 2048, 0),
+]
+
+
+def default_parts(sector):
+    scale, lba, parts = 4096 // sector, 2 + TABLE // sector, []
+    for name, units, attributes in UNITS:
+        sectors = units * scale
+        parts.append((name, lba, lba + sectors - 1, attributes))
+        lba += sectors + 2
+    return parts, lba
+
+
+def disk_for(sector):
+    return default_parts(sector)[1] + 1000 + TABLE // sector
+
+
+def slot_of(index):
+    return (index * 37 + 5) % 128  # arbitrary, distinct, not LBA order
+
+
+def build_table(parts, slots=None, name_raws=None, edit=None):
+    table = bytearray(TABLE)
+    for slot in range(128):  # unused entries hold garbage everywhere but the type GUID
+        table[slot * 128 + 16:(slot + 1) * 128] = bytes([0xEE]) * 112
+        table[slot * 128:slot * 128 + 16] = bytes(16)
+    seen = set()
+    for index, (name, first, last, attributes) in enumerate(parts):
+        slot = slots[index] if slots else slot_of(index)
+        raw = (name_raws or {}).get(name) or name_field(name)
+        unique = unique_guid(name) if name not in seen else hashlib.sha256(b"repeat-%d" % index).digest()[:16]
+        seen.add(name)
+        table[slot * 128:(slot + 1) * 128] = entry(first, last, attributes, raw, unique=unique)
+    if edit:
+        edit(table)
+    return table
+
+
+def gpt_files(sector=4096, disk=None, parts=None, slots=None, name_raws=None, table_edit=None,
+              primary_table_edit=None, backup_table_edit=None, after_edit=None, ph=None, bh=None,
+              ph_kw=None, bh_kw=None):
+    parts = parts if parts is not None else default_parts(sector)[0]
+    disk = disk if disk is not None else disk_for(sector)
+    n = TABLE // sector
+    table = build_table(parts, slots, name_raws, table_edit)
+    table_crc = crc(bytes(table))
+    primary_table, backup_table = bytearray(table), bytearray(table)
+    if primary_table_edit:
+        primary_table_edit(primary_table)
+    if backup_table_edit:
+        backup_table_edit(backup_table)
+    if after_edit:  # both copies, checksum not recomputed
+        after_edit(primary_table)
+        after_edit(backup_table)
+    p = dict(my=1, alt=disk - 1, first=2 + n, last=disk - 2 - n, guid=DISK_GUID, entries_lba=2,
+             entries_crc=table_crc)
+    b = dict(my=disk - 1, alt=1, first=2 + n, last=disk - 2 - n, guid=DISK_GUID,
+             entries_lba=disk - 1 - n, entries_crc=table_crc)
+    p.update(ph or {})
+    b.update(bh or {})
+    return {
+        "geometry.json": jbytes({"schema": 1, "kind": "myron-synthetic-gpt-geometry",
+                                 "sector_bytes": sector, "disk_lbas": disk}),
+        "gpt-primary-header.bin": header(sector, p["my"], p["alt"], p["first"], p["last"], p["guid"],
+                                         p["entries_lba"], p["entries_crc"], **(ph_kw or {})),
+        "gpt-primary-entries.bin": bytes(primary_table),
+        "gpt-backup-header.bin": header(sector, b["my"], b["alt"], b["first"], b["last"], b["guid"],
+                                        b["entries_lba"], b["entries_crc"], **(bh_kw or {})),
+        "gpt-backup-entries.bin": bytes(backup_table),
+    }
+
+
+def expected_rows(sector, parts=None):
+    parts = parts if parts is not None else default_parts(sector)[0]
+    return sorted(({
+        "partition_name": name, "size_bytes": (last - first + 1) * sector,
+        "bootable_flag": bool(attributes & 4),
+        "slot_suffix": name[-2:] if name.endswith(("_a", "_b")) else "",
+    } for name, first, last, attributes in parts), key=lambda row: row["partition_name"])
+
+
+def recovery_of(parts):
+    return any(name in ("recovery", "recovery_a", "recovery_b") for name, *_ in parts)
+
+
+def manifest_document(files, req_sha=None, **overrides):
+    value = {
+        "schema": 1, "kind": B.READS_KIND, "format_version": 1,
+        "bootchain_contract_sha256": BC, "request_sha256": req_sha or request_sha256,
+        "synthetic": True,
+        "files": [{"path": name, "bytes": len(files[name]), "sha256": digest(files[name])}
+                  for name in sorted(files)],
+    }
+    value.update(overrides)
+    return value
+
+
+def write_reads(path, files=None, edits=None, drop=(), manifest_edit=None, manifest_raw=None,
+                req_sha=None, keep_manifest_rows=False):
+    """Write the flat closure; EDITS replace file bytes and the manifest is regenerated."""
+    files = copy.deepcopy(files if files is not None else gpt_files())
+    original = copy.deepcopy(files)
+    for name, data in (edits or {}).items():
+        files[name] = data
+    path.mkdir(parents=True)
+    manifest = manifest_document(original if keep_manifest_rows else files, req_sha)
+    if manifest_edit:
+        manifest_edit(manifest)
+    raw = manifest_raw if manifest_raw is not None else jbytes(manifest)
+    for name, data in {**files, "reads.json": raw}.items():
+        if name in drop:
+            continue
+        (path / name).write_bytes(data)
+        (path / name).chmod(0o644)
+    path.chmod(0o755)
+    return files
+
+
+reads = fresh("reads") / "reads"
+FILES = write_reads(reads)
+args = lambda **extra: ["--request", request, "--reads", reads,
+                        *sum(([f"--{k}", v] for k, v in extra.items()), [])]
+PARTS4096 = default_parts(4096)[0]
+EXPECTED_DATA = {"partitions": expected_rows(4096), "recovery_present": True}
+BYTES_READ = len(FILES["geometry.json"]) + 2 * 4096 + 2 * TABLE
+assert BYTES_READ == len(FILES["geometry.json"]) + sum(
+    len(FILES[n]) for n in FILES if n != "geometry.json")
+
+# --- known CRC vectors, independent of the parser and of the encoder ----------------------
+
+for data, expected in ((b"", 0), (b"a", 0xE8B7BE43), (b"123456789", 0xCBF43926),
+                       (bytes(512), 0xB2AA7578), (bytes(16384), 0xAB54D286)):
+    assert B.crc32(data) == expected == crc(data), data[:9]
+rng = random.Random(7)
+for size in (1, 2, 3, 31, 92, 4096, 16384):
+    sample = bytes(rng.randrange(256) for _ in range(size))
+    assert B.crc32(sample) == crc(sample)
+ok("CRC-32 matches the published vectors and zlib on random data")
+
+# --- contract -----------------------------------------------------------------
+
+contract = json.loads(bootchain_contract_bytes)
+assert contract["components"]["capture_contract"] == {
+    "path": C.CAPTURE_CONTRACT_PATH, "sha256": digest(capture_contract_bytes)}
+assert contract["components"]["preflight_contract"] == {
+    "path": C.PREFLIGHT_CONTRACT_PATH, "sha256": digest(preflight_bytes)}
+assert contract["bound_contracts"]["deployment_contract"]["sha256"] == contracts.deployment_sha256
+assert contract["bound_contracts"]["kernel_reference"]["sha256"] == contracts.reference_sha256
+assert contract["bound_contracts"]["snapshot_contract"]["sha256"] == snapshot_sha
+assert contract["pinned_versions"] == {
+    "collector": "0.1.0", "deployment": "0.4.0", "preflight": "0.2.1", "snapshot": "0.2.0"}
+assert contract["dependencies"]["trust"] == "trusted-version-pinned-imports"
+assert contract["dependencies"]["byte_pinned"] is False and "not pinned" in contract["dependencies"]["note"]
+assert contract["implementation"] == B.implementation_binding()
+assert contract["implementation"]["sha256"] == digest((repo / "tools/lib/myron-bootchain-impl.py").read_bytes())
+assert contract["transport"] == "synthetic-binary-gpt-fixture"
+assert contract["evidence_level"] == "synthetic-binary-parser-only"
+assert contract["status"] == "synthetic-parse-recorded"
+assert contract["synthetic"] is True and contract["live"] is False and contract["executes"] is False
+assert contract["kit_snapshot_reverified"] is False and contract["remote_commands"] == []
+assert contract["human_approval_required"] is True
+assert contract["blockers"] == D.BLOCKERS and len(D.BLOCKERS) == 7
+assert contract["authority"] == {flag: False for flag in P.AUTHORITY_FLAGS} and len(contract["authority"]) == 9
+assert contract["profile"]["name"] == "gpt-v1-128x128-primary-backup"
+assert contract["profile"]["inventory_scope"] == "one-synthetic-gpt"
+gpt = contract["profile"]["gpt"]
+assert (gpt["revision"], gpt["header_size"], gpt["entry_count"], gpt["entry_size"]) == ("1.0", 92, 128, 128)
+assert gpt["entry_table_bytes"] == 16384 and gpt["sector_bytes"] == [512, 4096]
+assert gpt["entries"]["guids_emitted"] is False
+assert gpt["mappings"]["bootable_flag"] == "attributes bit 2, semantics legacy-bios-bootable-bit"
+assert gpt["header_trailing_bytes"] == "zero-required-profile-restriction"
+assert contract["input"]["closure"] == sorted([
+    "reads.json", "geometry.json", "gpt-primary-header.bin", "gpt-primary-entries.bin",
+    "gpt-backup-header.bin", "gpt-backup-entries.bin"])
+assert contract["input"]["total_max_bytes"] == 50176 and contract["input"]["format_version"] == 1
+assert contract["input"]["manifest"]["max_bytes"] == 8192
+assert {row["path"]: (row["min_bytes"], row["max_bytes"]) for row in contract["input"]["files"]} == {
+    "reads.json": (1, 8192), "geometry.json": (1, 1024), "gpt-primary-header.bin": (512, 4096),
+    "gpt-backup-header.bin": (512, 4096), "gpt-primary-entries.bin": (16384, 16384),
+    "gpt-backup-entries.bin": (16384, 16384)}
+assert contract["input"]["json_depth_max"] == 8 and contract["input"]["layout"] == "flat"
+assert contract["input"]["closure_checked_before_payload_read"] is True
+assert contract["input"]["extra_entries"] == "reject" and "nothing" in contract["input"]["configurable"]
+assert contract["output"]["closure"]["files"] == sorted(
+    ["SHA256SUMS", "parse.json", f"operations/{R2}.json"])
+assert contract["output"]["closure"]["directories"] == ["operations"]
+assert contract["output"]["closure"]["checksums"]["parse_json_binds_checksums"] is False
+assert contract["output"]["accounting"]["meaning"] == "fixture-payload-accounting-not-device-io"
+assert contract["output"]["accounting"]["excludes"] == [
+    "reads.json", "manifest-validation-rereads", "verification-reruns"]
+assert contract["output"]["accounting"]["max"] == 41984
+assert contract["capture"]["unchanged_for_collector"] is True
+assert contract["capture"]["complete_capture"] is False and contract["capture"]["produces"] == [R2]
+assert contract["capture"]["does_not_produce"] == [R1, R3, R4, R5, R6, R7]
+assert contract["identity"] == C.identity_values(contracts)
+fields = {row["field"]: row for row in contract["coverage"]["fields"]}
+assert set(fields) == {"partitions.partition_name", "partitions.size_bytes", "partitions.bootable_flag",
+                       "partitions.slot_suffix", "recovery_present"}
+assert fields["partitions.bootable_flag"]["semantics"] == "legacy-bios-bootable-bit"
+assert fields["partitions.size_bytes"]["classification"] == "geometry-claim-dependent"
+assert [row["claim"] for row in contract["coverage"]["unresolved_claims"]] == [
+    "geometry-provenance-not-established", "physical-acquisition-and-freshness-not-established",
+    "complete-device-disk-inventory-not-established", "protective-mbr-not-parsed",
+    "android-slot-semantics-not-established", "bootability-not-established",
+    "r3-format-schema-successor-required", "r4-selection-provenance-successor-required"]
+assert any("does NOT prove Android slot priority" in t for t in contract["coverage"]["semantic_limits"])
+assert [(row["id"], row["state"], row["successor_gate"]) for row in contract["deferred"]] == [
+    (R3, "not-implemented", "r3-boot-image-schema-migration"),
+    (R4, "not-implemented", "r4-selection-source-qualification")]
+assert contract["qualification"]["captured_provenance"] is False
+assert contract["qualification"]["implemented_operations"] == [R2]
+assert any("successor" in text or "not implemented" in text for text in contract["limitations"])
+assert any("R3" in text and "R4" in text for text in contract["non_goals"])
+assert not re.search(r"\b(adb|fastboot|ssh|scp|rsync|curl|wget)\b", bootchain_contract_bytes.decode())
+shown, shown_text = expect_ok("show")
+assert shown == contract and shown_text.encode() == json.dumps(contract, indent=2, sort_keys=True).encode() + b"\n"
+ok("bootchain contract binds the pins, profile, closure, mappings, coverage, deferred gates and every false authority")
+
+
+def clone_root(name):
+    target = fresh(name) / "root"
+    shutil.copytree(contracts_root, target)
+    return target
+
+
+def contract_tamper(name, mutate, match="differs from its derived form"):
+    root = clone_root("contract-tamper")
+    value = json.loads(bootchain_contract_bytes)
+    mutate(value)
+    (root / B.BOOTCHAIN_CONTRACT_PATH).write_bytes(D.render_json(value))
+    expect_fail(name, ["show"], root=root, match=match)
+
+
+contract_tamper("contract without a pin", lambda v: v["components"].pop("capture_contract"))
+contract_tamper("contract capture hash", lambda v: v["components"]["capture_contract"].update(sha256="0" * 64))
+contract_tamper("contract preflight hash", lambda v: v["components"]["preflight_contract"].update(sha256="0" * 64))
+contract_tamper("contract bound deployment hash", lambda v: v["bound_contracts"]["deployment_contract"].update(sha256="0" * 64))
+contract_tamper("contract bound kernel hash", lambda v: v["bound_contracts"]["kernel_reference"].update(sha256="0" * 64))
+contract_tamper("contract version pin", lambda v: v["pinned_versions"].update(collector="0.2.0"))
+contract_tamper("contract dependencies claim byte pin", lambda v: v["dependencies"].update(byte_pinned=True))
+contract_tamper("contract implementation hash", lambda v: v["implementation"].update(sha256="0" * 64))
+contract_tamper("contract implementation dropped", lambda v: v.pop("implementation"))
+contract_tamper("contract live claim", lambda v: v.update(live=True))
+contract_tamper("contract execution claim", lambda v: v.update(executes=True))
+contract_tamper("contract remote command", lambda v: v["remote_commands"].append("x"))
+contract_tamper("contract authority", lambda v: v["authority"].update(bootable=True))
+contract_tamper("contract blocker dropped", lambda v: v["blockers"].pop())
+contract_tamper("contract closure widened", lambda v: v["input"]["closure"].append("extra.bin"))
+contract_tamper("contract file bound widened", lambda v: v["input"]["files"][2].update(max_bytes=2**30))
+contract_tamper("contract profile entry count", lambda v: v["profile"]["gpt"].update(entry_count=256))
+contract_tamper("contract bootable semantics", lambda v: v["profile"]["gpt"]["mappings"].update(bootable_flag="android-bootable"))
+contract_tamper("contract coverage class changed", lambda v: v["coverage"]["fields"][0].update(classification="geometry-claim-dependent"))
+contract_tamper("contract unresolved claim dropped", lambda v: v["coverage"]["unresolved_claims"].pop())
+contract_tamper("contract deferred gate dropped", lambda v: v["deferred"].pop())
+contract_tamper("contract qualification claims provenance", lambda v: v["qualification"].update(captured_provenance=True))
+contract_tamper("contract output closure", lambda v: v["output"]["closure"]["files"].pop())
+contract_tamper("contract accounting meaning", lambda v: v["output"]["accounting"].update(meaning="device-read"))
+contract_tamper("contract limitations dropped", lambda v: v["limitations"].pop())
+contract_tamper("contract non-goal dropped", lambda v: v["non_goals"].pop())
+root = clone_root("contract-noncanonical")
+(root / B.BOOTCHAIN_CONTRACT_PATH).write_bytes(json.dumps(bootchain_contract).encode())
+expect_fail("non-canonical contract", ["show"], root=root)
+root = clone_root("contract-missing")
+(root / B.BOOTCHAIN_CONTRACT_PATH).unlink()
+expect_fail("missing contract", ["show"], root=root)
+root = clone_root("capture-contract-changed")
+(root / C.CAPTURE_CONTRACT_PATH).write_bytes(capture_contract_bytes + b" ")
+expect_fail("capture contract changed under the pin", ["show"], root=root)
+root = clone_root("preflight-contract-changed")
+(root / P.PREFLIGHT_CONTRACT_PATH).write_bytes(preflight_bytes + b" ")
+expect_fail("preflight contract changed under the pin", ["show"], root=root)
+ok("contract tampering and changed pinned contracts fail closed")
+
+derived, derived_text = expect_ok("derive-contract")
+assert derived_text.encode() == bootchain_contract_bytes and derived == contract
+root = clone_root("derive-without-contract")
+(root / B.BOOTCHAIN_CONTRACT_PATH).unlink()
+_, text = expect_ok("derive-contract", root=root)
+assert text.encode() == bootchain_contract_bytes and not (root / B.BOOTCHAIN_CONTRACT_PATH).exists()
+expect_fail("show without its committed contract", ["show"], root=root)
+root = clone_root("derive-over-tampered-contract")
+bad = json.loads(bootchain_contract_bytes)
+bad["authority"]["bootable"] = True
+(root / B.BOOTCHAIN_CONTRACT_PATH).write_bytes(D.render_json(bad))
+_, text = expect_ok("derive-contract", root=root)
+assert text.encode() == bootchain_contract_bytes and "bootable\": true" not in text
+expect_fail("derive-contract takes no output argument", ["derive-contract", "--out", work / "derive-out"],
+            work / "derive-out")
+committed = subprocess.run([str(repo / "tools/myron-bootchain"), "derive-contract"], check=True,
+                           capture_output=True, cwd=repo)
+assert committed.stdout == (repo / "device/myron/bootchain-contract.json").read_bytes(), (
+    "regenerate: tools/myron-bootchain derive-contract (see docs/myron/BOOTCHAIN-GATE.md)")
+assert committed.stderr == b""
+ok("derive-contract prints the canonical derived contract to stdout, writes and authorizes nothing, "
+   "and equals the committed contract")
+
+# --- plan ---------------------------------------------------------------------
+
+plan_a, plan_text = expect_ok("plan", "--request", request)
+_, plan_text_b = expect_ok("plan", "--request", request)
+assert plan_text == plan_text_b and plan_text.encode("ascii") == D.render_json(plan_a)
+assert plan_a["kind"] == "myron-synthetic-gpt-parse-plan"
+assert plan_a["request_sha256"] == request_sha256 and plan_a["bootchain_contract_sha256"] == BC
+assert plan_a["request_binding"]["operation"] == R2 and plan_a["request_binding"]["max_bytes"] == 1024 * 1024
+assert plan_a["supported_profile"] == contract["profile"] and plan_a["input_closure"]["total_max_bytes"] == 50176
+assert plan_a["synthetic"] is True and plan_a["live"] is False and plan_a["executes"] is False
+assert plan_a["remote_commands"] == [] and plan_a["blockers"] == D.BLOCKERS
+assert plan_a["authority"] == {flag: False for flag in P.AUTHORITY_FLAGS}
+assert plan_a["implementation"] == B.implementation_binding() and plan_a["complete_capture"] is False
+assert plan_a["output_closure"] == contract["output"]["closure"]
+assert [row["id"] for row in plan_a["deferred"]] == [R3, R4]
+assert not re.search(r"\b(adb|fastboot|ssh|scp|rsync|curl|wget|sudo|bash|chmod)\b", plan_text)
+assert "$(" not in plan_text and "export " not in plan_text and "<<" not in plan_text
+for needle in ("/proc", "/sys", "/dev", "pmos_root", "sm8850", "qcom,canoe"):
+    assert needle not in plan_text, needle
+
+
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in list(value) + list(value.values()):
+            yield from strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
+
+
+assert not any(text.startswith("/") for text in strings(plan_a)), "no absolute path in the plan"
+expect_fail("plan without a request", ["plan"])
+expect_fail("plan with a live option", ["plan", "--request", request, "--live"])
+canary_request = fresh("canary-request") / "request"
+shutil.copytree(request, canary_request, symlinks=True)
+(canary_request / NAME_CANARY).symlink_to("request.json")
+for label, arguments in (
+    ("plan from a request tree holding a canary symlink", ["plan", "--request", canary_request]),
+    ("parse against a request tree holding a canary symlink",
+     ["parse", "--request", canary_request, "--reads", reads, "--out", work / "canary-plan-out"]),
+    ("verify-parse against a request tree holding a canary symlink",
+     ["verify-parse", "--request", canary_request, "--reads", reads, "--parse", work / "no-parse"]),
+):
+    code, out, err = invoke(*arguments)
+    assert code != 0 and out == "" and NAME_CANARY not in err, (label, err)
+    assert err.count("\n") == 1 and "code request-rejected" in err, (label, err)
+    assert not os.path.lexists(work / "canary-plan-out")
+    ok(f"{label} is rejected without naming it")
+ok("plan is deterministic, canonical, value-free, command-free and binds the verified request")
+
+# --- parse: end to end, both sector sizes ----------------------------------------------
+
+parse_a, parse_b = work / "parse-a", work / "parse-b"
+result, result_text = expect_ok("parse", *args(), "--out", parse_a)
+expect_ok("parse", *args(), "--out", parse_b)
+assert walk(parse_a) == walk(parse_b), "repeat parses are byte-identical"
+entries, data = walk(parse_a)
+assert sorted(e.path for e in entries if e.kind == "file") == sorted(
+    ["SHA256SUMS", "parse.json", f"operations/{R2}.json"])
+assert {e.path for e in entries if e.kind == "dir"} == {".", "operations"}
+assert all(e.mode == 0o644 for e in entries if e.kind == "file")
+assert all(e.mode == 0o755 for e in entries if e.kind == "dir")
+OP = data[f"operations/{R2}.json"]
+operation = json.loads(OP)
+assert operation == {
+    "schema": 1, "kind": "myron-precaptured-operation", "id": R2, "request_sha256": request_sha256,
+    "transport": "external-precaptured-fixture", "read_only": True, "bytes_read": BYTES_READ,
+    "data": EXPECTED_DATA}
+assert OP == jbytes(operation) and len(OP) <= R2_ROW["max_bytes"]
+assert [row["partition_name"] for row in operation["data"]["partitions"]] == sorted(
+    row["partition_name"] for row in operation["data"]["partitions"])
+sums_expected = "".join(f"{digest(data[p])}  {p}\n" for p in sorted(
+    ("parse.json", f"operations/{R2}.json"), key=lambda p: p.encode())).encode()
+assert data["SHA256SUMS"] == sums_expected and "SHA256SUMS" not in data["SHA256SUMS"].decode()
+parse_doc = json.loads(data["parse.json"])
+assert data["parse.json"] == jbytes(parse_doc)
+assert set(parse_doc) == {
+    "schema", "kind", "format_version", "bootchain_contract_sha256", "capture_contract_sha256",
+    "preflight_contract_sha256", "request_sha256", "reads_sha256", "implementation", "dependencies",
+    "profile", "inventory_scope", "transport", "evidence_level", "status", "synthetic", "live",
+    "executes", "kit_snapshot_reverified", "remote_commands", "human_approval_required",
+    "complete_capture", "inputs", "operation", "accounting", "coverage", "semantic_limits",
+    "unresolved_claims", "deferred", "qualification", "limitations", "non_goals", "blockers",
+    "authority"}
+assert parse_doc["kind"] == "myron-synthetic-gpt-parse" and parse_doc["format_version"] == "0.1.0"
+assert parse_doc["profile"] == "gpt-v1-128x128-primary-backup"
+assert parse_doc["inventory_scope"] == "one-synthetic-gpt"
+assert parse_doc["evidence_level"] == "synthetic-binary-parser-only"
+assert parse_doc["status"] == "synthetic-parse-recorded"
+assert parse_doc["synthetic"] is True and parse_doc["live"] is False and parse_doc["executes"] is False
+assert parse_doc["kit_snapshot_reverified"] is False and parse_doc["remote_commands"] == []
+assert parse_doc["complete_capture"] is False and parse_doc["human_approval_required"] is True
+assert parse_doc["bootchain_contract_sha256"] == BC and parse_doc["request_sha256"] == request_sha256
+assert parse_doc["capture_contract_sha256"] == digest(capture_contract_bytes)
+assert parse_doc["preflight_contract_sha256"] == digest(preflight_bytes)
+assert parse_doc["reads_sha256"] == digest((reads / "reads.json").read_bytes())
+assert parse_doc["implementation"] == B.implementation_binding()
+assert parse_doc["dependencies"] == {"trust": "trusted-version-pinned-imports", "byte_pinned": False,
+                                     "pinned_versions": contract["pinned_versions"]}
+assert parse_doc["inputs"] == [
+    {"path": p, "role": r, "bytes": len((reads / p).read_bytes()), "sha256": digest((reads / p).read_bytes())}
+    for p, r in sorted({
+        "geometry.json": "explicit-geometry-claim", "gpt-backup-entries.bin": "gpt-backup-entry-table",
+        "gpt-backup-header.bin": "gpt-backup-header", "gpt-primary-entries.bin": "gpt-primary-entry-table",
+        "gpt-primary-header.bin": "gpt-primary-header", "reads.json": "manifest"}.items())]
+assert parse_doc["operation"] == {
+    "id": R2, "path": f"operations/{R2}.json", "bytes": len(OP), "sha256": digest(OP),
+    "bytes_read": BYTES_READ, "max_bytes": 1024 * 1024, "partition_count": 7}
+assert parse_doc["accounting"]["meaning"] == "fixture-payload-accounting-not-device-io"
+assert parse_doc["accounting"]["excludes"] == ["reads.json", "manifest-validation-rereads", "verification-reruns"]
+assert parse_doc["accounting"]["total_fixture_payload_bytes"] == BYTES_READ + len(
+    (reads / "reads.json").read_bytes())
+assert parse_doc["authority"] == {flag: False for flag in P.AUTHORITY_FLAGS}
+assert [row["blocker"] for row in parse_doc["blockers"]] == D.BLOCKERS
+assert all(row == {"blocker": row["blocker"], "state": "missing"} for row in parse_doc["blockers"])
+assert "blocker_cleared" not in json.dumps(parse_doc)
+assert parse_doc["coverage"] == contract["coverage"]["fields"]
+assert parse_doc["unresolved_claims"] == contract["coverage"]["unresolved_claims"]
+assert parse_doc["deferred"] == contract["deferred"] and parse_doc["qualification"] == contract["qualification"]
+assert parse_doc["limitations"] == contract["limitations"] and parse_doc["non_goals"] == contract["non_goals"]
+assert "SHA256SUMS" not in json.dumps(parse_doc) and "sums" not in parse_doc, "parse.json never binds the checksum list"
+assert result["status"] == "parsed" and result["synthetic"] is True and result["complete_capture"] is False
+assert result["live"] is False and result["executes"] is False and result["kit_snapshot_reverified"] is False
+assert all(result[flag] is False for flag in P.AUTHORITY_FLAGS) and result["blocker_count"] == 7
+assert result["parse_sha256"] == digest(data["SHA256SUMS"]) and result["operation_sha256"] == digest(OP)
+assert result["reads_sha256"] == parse_doc["reads_sha256"] and result["bytes_read"] == BYTES_READ
+assert result["partition_count"] == 7 and result["operation"] == R2
+verified, _ = expect_ok("verify-parse", *args(), "--parse", parse_a)
+assert verified["status"] == "verified" and verified["parse_sha256"] == result["parse_sha256"]
+assert all(verified[flag] is False for flag in P.AUTHORITY_FLAGS)
+# Bootable bit 2 is the only bit read: boot_a has bit 2 and bit 63, recovery_a has every bit but 2.
+flags = {row["partition_name"]: row["bootable_flag"] for row in operation["data"]["partitions"]}
+assert flags == {"boot_a": True, "vendor_boot_a": False, "pmos_root": False, "dtbo_a": False,
+                 "recovery_a": False, "boot_b": False, "init_boot_a": False}
+ok("parse is deterministic, exact closure and modes, byte-exact operation, bound hashes, every blocker missing")
+
+# The operation is a fragment the unchanged collector accepts on its own.
+document, outcome = C.validate_operation(OP, R2_ROW, request_sha256, collector_env.identity)
+assert outcome is None and document["bytes_read"] == BYTES_READ
+for token in ("guid", "uuid", "unique", "type", "crc", "attributes", "disk"):
+    assert token not in OP.decode().lower().replace("partition_name", "").replace("size_bytes", ""), token
+ok("the generated R2 operation passes the unchanged collector's validate_operation")
+
+# Both supported sector sizes, byte-exact partition and flag derivation, independent of the parser.
+for sector in (512, 4096):
+    files = gpt_files(sector)
+    base = fresh(f"sector-{sector}") / "reads"
+    write_reads(base, files)
+    out = work / f"sector-out-{sector}"
+    result, _ = expect_ok("parse", "--request", request, "--reads", base, "--out", out)
+    produced = json.loads(walk(out)[1][f"operations/{R2}.json"])
+    assert produced["data"] == {"partitions": expected_rows(sector), "recovery_present": True}
+    assert produced["bytes_read"] == len(files["geometry.json"]) + 2 * sector + 2 * TABLE
+    assert [row["size_bytes"] for row in produced["data"]["partitions"]] == [
+        (last - first + 1) * sector for _n, first, last, _a in sorted(default_parts(sector)[0])]
+    expect_ok("verify-parse", "--request", request, "--reads", base, "--parse", out)
+ok("sector sizes 512 and 4096 parse to byte-exact sizes, suffixes, flags and bytes_read")
+
+
+def derived_data(label, parts, sector=4096, **kwargs):
+    base = fresh("derive") / "reads"
+    write_reads(base, gpt_files(sector, parts=parts, **kwargs))
+    out = work / f"derive-out-{counter[0]}"
+    expect_ok("parse", "--request", request, "--reads", base, "--out", out)
+    return json.loads(walk(out)[1][f"operations/{R2}.json"])["data"]
+
+
+def layout(names_attrs, sector=4096):
+    parts, lba = [], 2 + TABLE // sector
+    for name, attributes in names_attrs:
+        parts.append((name, lba, lba + 9, attributes))
+        lba += 12
+    return parts
+
+
+for label, names, recovery in (
+    ("recovery", ["boot_a", "recovery"], True), ("recovery_a", ["recovery_a"], True),
+    ("recovery_b", ["x", "recovery_b"], True), ("recovery_x", ["recovery_x", "recovery_ab"], False),
+    ("precovery", ["precovery", "recovery_"], False), ("no recovery", ["boot_a", "boot_b"], False),
+):
+    parts = layout([(name, 0) for name in names])
+    produced = derived_data(label, parts)
+    assert produced["recovery_present"] is recovery is recovery_of(parts), label
+    assert produced["partitions"] == expected_rows(4096, parts)
+for name, suffix in (("boot_a", "_a"), ("x_b", "_b"), ("xa", ""), ("a", ""), ("boot_ab", ""), ("_a", "_a"),
+                     ("boot_c", ""), ("b_", "")):
+    produced = derived_data("suffix", layout([(name, 0)]))
+    assert produced["partitions"][0]["slot_suffix"] == suffix, name
+for attributes, flag in ((0, False), (4, True), (3, False), (0xFFFFFFFFFFFFFFFB, False),
+                         (0xFFFFFFFFFFFFFFFF, True), (1 << 63, False), ((1 << 63) | 4, True), (1 << 2, True)):
+    produced = derived_data("bit", layout([("boot_a", attributes)]))
+    assert produced["partitions"][0]["bootable_flag"] is flag, hex(attributes)
+ok("recovery presence, slot suffix and literal attributes bit 2 derive exactly and independently")
+
+# Entry order is arbitrary: reversed, identity and shuffled tables give identical output.
+parts = default_parts(4096)[0]
+outputs = []
+for slots in (list(range(7)), list(range(127, 120, -1)), [5, 120, 0, 77, 127, 64, 33]):
+    outputs.append(derived_data("order", parts, slots=slots))
+assert all(item == EXPECTED_DATA for item in outputs)
+# Unused entries (zero type GUID) are ignored whatever else they hold; names accepted at the bounds.
+produced = derived_data("max-name", layout([("q" * 35, 0), ("z" * 34 + "_", 0)]))
+assert [row["partition_name"] for row in produced["partitions"]] == ["q" * 35, "z" * 34 + "_"]
+produced = derived_data("single", layout([("x", 0)]))
+assert produced["partitions"] == expected_rows(4096, layout([("x", 0)]))
+full = [(f"p{index:03d}", 0) for index in range(128)]
+produced = derived_data("full table", layout(full))
+assert len(produced["partitions"]) == 128 and produced["partitions"][0]["partition_name"] == "p000"
+ok("entry order is arbitrary; unused entries are ignored; one-entry, 35-unit and 128-entry tables parse")
+
+# --- composed capture: the generated R2 inside a complete synthetic R1-R7 fixture ------------
+
+identity = collector_env.identity
+RELEASE, NOTES_SHA = identity["kernel.release"], identity["kernel.notes_sha256"]
+MODULES = [("pwrseq_core", ""), ("bluetooth", ""), ("extra_mod", "O"), ("btbcm", ""),
+           ("btqca", ""), ("hci_uart", ""), ("rfkill", ""), ("rmnet", "")]
+
+
+def header_row(name, absent):
+    if absent:
+        return {"partition_name": name, "absent": True, "header_version": None, "page_size": None,
+                "os_version": None, "component_sizes": [], "component_offsets": [],
+                "segment_count": 0, "header_sha256": None}
+    return {"partition_name": name, "absent": False, "header_version": 4, "page_size": 4096,
+            "os_version": "16.0.0", "component_sizes": [4096, 8192],
+            "component_offsets": [4096, 8192], "segment_count": 2, "header_sha256": digest(name.encode())}
+
+
+IMAGE_LIKE = re.compile(r"(boot|init_boot|vendor_boot|vendor_kernel_boot|dtbo|recovery)(_a|_b)?")
+
+
+def other_data(r3_absent=("vendor_kernel_boot_a",), root_name="pmos_root", r2_names=None):
+    r2_names = r2_names or [row["partition_name"] for row in EXPECTED_DATA["partitions"]]
+    images = sorted({n for n in r2_names if IMAGE_LIKE.fullmatch(n)} | set(r3_absent))
+    return {
+        R1: {"codename": identity["device.codename"], "soc": identity["device.soc"],
+             "compatible_prefix": identity["device.compatible"], "current_slot": "a",
+             "slot_suffix": "_a", "verified_boot_state": "orange", "sources_agree": True},
+        R3: {"images": [header_row(n, n in r3_absent) for n in images]},
+        R4: {"dtb_count": 2, "selected_board_id": 7, "selected_board_revision": 1,
+             "dtbo_entry_count": 3, "compatible_prefix": identity["device.compatible"],
+             "selection_source": "bootconfig"},
+        R5: {"module_names": [n for n, _ in MODULES], "load_order_index": list(range(8)),
+             "taint_flags": [t for _, t in MODULES], "order_matches_declared": True},
+        R6: {"root_source_gpt_name": root_name, "filesystem_type": "ext4",
+             "mount_options": ["noatime", "rw"], "block_size": 4096,
+             "rounded_total_bytes": 42949672960, "rounded_free_bytes": 21474836480},
+        R7: {"kernel_release": RELEASE, "notes_sha256": NOTES_SHA,
+             "allowlisted_cmdline": [{"key": "androidboot.slot_suffix", "value": "_a"},
+                                     {"key": "bootconfig", "value": "present"}],
+             "allowlisted_bootconfig_keys": [{"key": "androidboot.hardware", "value": "myron"},
+                                             {"key": "androidboot.verifiedbootstate", "value": "orange"}]},
+    }
+
+
+def r3_complete(r2_names, rows):
+    """Phase 2.13's stronger R3 profile: every inventoried boot image has a present row, and an
+    absent row is only accepted where R2 lacks the partition."""
+    listed = {row["partition_name"]: row["absent"] for row in rows}
+    if any(name in listed and listed[name] for name in r2_names):
+        return False
+    if any(name in r2_names and name not in listed for name in r2_names if IMAGE_LIKE.fullmatch(name)):
+        return False
+    return not any(not absent and name not in r2_names for name, absent in listed.items())
+
+
+def write_capture(base, r2_bytes, others, extra_manifest=None):
+    """The exact capture tree, from this test's own manifest logic (not the collector's builder)."""
+    base.mkdir(parents=True)
+    (base / "operations").mkdir()
+    files = {f"operations/{R2}.json": r2_bytes}
+    for operation_id, value in others.items():
+        files[f"operations/{operation_id}.json"] = jbytes({
+            "schema": 1, "kind": "myron-precaptured-operation", "id": operation_id,
+            "request_sha256": request_sha256, "transport": "external-precaptured-fixture",
+            "read_only": True, "bytes_read": 4096, "data": value})
+    manifest = {
+        "schema": 1, "kind": "myron-precaptured-fixture", "format_version": C.VERSION,
+        "contract_sha256": digest(capture_contract_bytes), "request_sha256": request_sha256,
+        "capture_schema": P.CAPTURE_SCHEMA, "transport": "external-precaptured-fixture", "live": False,
+        "operations": [{"id": i, "sha256": digest(files[f"operations/{i}.json"]),
+                        "bytes": len(files[f"operations/{i}.json"])} for i in OPERATION_IDS],
+    }
+    if extra_manifest:
+        extra_manifest(manifest)
+    files["capture.json"] = jbytes(manifest)
+    for name, content in files.items():
+        (base / name).write_bytes(content)
+        (base / name).chmod(0o644)
+    (base / "operations").chmod(0o755)
+    base.chmod(0o755)
+    return files
+
+
+def read_capture(path):
+    return C.read_capture(str(path), collector_env, request_document, request_sha256)
+
+
+names_present = [row["partition_name"] for row in EXPECTED_DATA["partitions"]]
+good_others = other_data()
+assert r3_complete(names_present, good_others[R3]["images"])
+composed = fresh("composed") / "capture"
+capture_files = write_capture(composed, OP, good_others)
+assert json.loads(capture_files["capture.json"]) == C.manifest_document(
+    collector_env, request_sha256, request_document, capture_files), "test manifest equals the collector's"
+captured = read_capture(composed)
+assert captured.documents[R2]["data"] == EXPECTED_DATA
+assert captured.documents[R2]["bytes_read"] == BYTES_READ
+collect_out = work / "collector-evidence"
+out_buf, err_buf = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+    code = CT.main(["collect", "--request", str(request), "--capture", str(composed),
+                    "--out", str(collect_out)], contracts_root=contracts_root)
+assert code == 0, err_buf.getvalue()
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_buf):
+    code = CT.main(["verify-evidence", "--request", str(request), "--capture", str(composed),
+                    "--evidence", str(collect_out)], contracts_root=contracts_root)
+assert code == 0, err_buf.getvalue()
+evidence = json.loads(walk(collect_out)[1]["evidence.json"])
+r2_evidence = next(row for row in evidence["operations"] if row["id"] == R2)
+assert r2_evidence["data"] == EXPECTED_DATA and r2_evidence["bytes_read"] == BYTES_READ
+assert evidence["evidence_level"] == "artifact-structure-only" and evidence["live"] is False
+ok("the generated R2 sits in a complete R1-R7 fixture the unchanged collector reads, collects and verifies")
+
+
+def rejected_capture(label, r2_bytes, others, match, extra_manifest=None):
+    base = fresh("composed-bad") / "capture"
+    write_capture(base, r2_bytes, others, extra_manifest)
+    try:
+        read_capture(base)
+    except C.CollectError as error:
+        assert match in str(error), (label, str(error))
+    else:
+        raise AssertionError(f"{label}: the collector accepted it")
+    ok(f"{label} is rejected by the unchanged collector")
+
+
+# Contradictory R3 presence and an R6 root outside the inventory must reject, in the composed fixture.
+for name in ("boot_b", "boot_a"):
+    others = other_data()
+    rows = others[R3]["images"]
+    for index, row in enumerate(rows):
+        if row["partition_name"] == name:
+            rows[index] = header_row(name, True)
+    assert not r3_complete(names_present, rows)
+    rejected_capture(f"R3 marking the inventoried {name} absent", OP, others, "R3 presence differs from the R2 inventory")
+others = other_data()
+others[R3]["images"] = sorted(others[R3]["images"] + [header_row("vendor_kernel_boot_b", False)],
+                              key=lambda row: row["partition_name"])
+assert not r3_complete(names_present, others[R3]["images"])
+rejected_capture("R3 listing a present image R2 lacks", OP, others, "R3 presence differs from the R2 inventory")
+for root_name in ("userdata", "boot_c"):
+    rejected_capture(f"R6 root {root_name} outside the R2 inventory", OP, other_data(root_name=root_name),
+                     "R6 root partition is not in the R2 inventory")
+# the stronger completeness profile: a missing image row is flagged by the profile even though a
+# row-less R3 passes the collector's own checks
+others = other_data()
+others[R3]["images"] = [row for row in others[R3]["images"] if row["partition_name"] != "boot_b"]
+assert not r3_complete(names_present, others[R3]["images"])
+ok("the composed fixture satisfies the stronger R3 completeness profile; contradictions are detected")
+# a tampered or foreign R2 fragment is rejected by the unchanged collector
+for label, mutate in (
+    ("R2 with a wrong request binding", lambda v: v.update(request_sha256="0" * 64)),
+    ("R2 with bytes_read zero", lambda v: v.update(bytes_read=0)),
+    ("R2 with bytes_read past its bound", lambda v: v.update(bytes_read=1024 * 1024 + 1)),
+    ("R2 with a wrong transport", lambda v: v.update(transport="synthetic-binary-gpt-fixture")),
+    ("R2 with an unsorted inventory", lambda v: v["data"]["partitions"].reverse()),
+    ("R2 with a wrong recovery flag", lambda v: v["data"].update(recovery_present=False)),
+    ("R2 with a wrong suffix", lambda v: v["data"]["partitions"][0].update(slot_suffix="_b")),
+    ("R2 with an extra field", lambda v: v["data"]["partitions"][0].update(guid="x")),
+):
+    value = json.loads(OP)
+    mutate(value)
+    try:
+        C.validate_operation(jbytes(value), R2_ROW, request_sha256, collector_env.identity)
+    except C.CollectError:
+        ok(f"{label} is rejected by the unchanged collector")
+    else:
+        raise AssertionError(label)
+ok("the standalone parse remains an operation fragment: no R1 or R3-R7 operation is produced")
+assert sorted(p.name for p in (parse_a / "operations").iterdir()) == [f"{R2}.json"]
+assert not hasattr(B, "derive_r3") and not hasattr(B, "derive_r4") and not hasattr(B, "parse_r3")
+
+# --- binary refusals: one defect at a time, none echoing a value --------------------------
+
+GPT_CANARIES = set()
+for raw in (DISK_GUID, TYPE_GUID, *(unique_guid(n) for n, *_ in PARTS4096)):
+    GPT_CANARIES |= guid_forms(raw)
+
+
+def refuse(label, match, *, sector=4096, zero=False, absent=(), edits=None, **build):
+    base = fresh("gpt-bad") / "reads"
+    write_reads(base, gpt_files(sector, **build), edits=edits)
+    out = work / f"gpt-out-{counter[0]}"
+    err = expect_fail(label, ["parse", "--request", request, "--reads", base, "--out", out], out,
+                      match=match, absent=(*GPT_CANARIES, NAME_CANARY, *absent), single_line=True,
+                      untouched=base if zero else None)
+    return err
+
+
+CORRUPT, UNSUPPORTED = "(code gpt-corrupt)", "(code gpt-unsupported)"
+for which, kw, edit_key in (("primary", "ph_kw", "ph"), ("backup", "bh_kw", "bh")):
+    kwargs = lambda **extra: {kw: extra}
+    refuse(f"{which} header signature", f"GPT {which} header signature differs {CORRUPT}", **kwargs(signature=b"EFI PARX"))
+    refuse(f"{which} header lowercase signature", "signature differs", **kwargs(signature=b"efi part"))
+    refuse(f"{which} header revision", f"GPT {which} header revision is unsupported {UNSUPPORTED}", **kwargs(revision=0x00010001))
+    refuse(f"{which} header revision 2.0", "revision is unsupported", **kwargs(revision=0x00020000))
+    refuse(f"{which} header size 96", f"GPT {which} header size is unsupported {UNSUPPORTED}", **kwargs(size=96))
+    refuse(f"{which} header size 512", "size is unsupported", **kwargs(size=512))
+    refuse(f"{which} header size 91", f"GPT {which} header size is outside the GPT range {CORRUPT}", **kwargs(size=91))
+    refuse(f"{which} header size 0", "size is outside the GPT range", **kwargs(size=0))
+    refuse(f"{which} header size past the sector", "size is outside the GPT range", **kwargs(size=4097))
+    refuse(f"{which} header size 2^32-1", "size is outside the GPT range", **kwargs(size=0xFFFFFFFF))
+    refuse(f"{which} header reserved field", f"GPT {which} header reserved field is not zero {CORRUPT}", **kwargs(reserved=1))
+    refuse(f"{which} header stored checksum", f"GPT {which} header checksum differs {CORRUPT}", **kwargs(crc_value=0x12345678))
+    refuse(f"{which} header zero checksum", "header checksum differs", **kwargs(crc_value=0))
+    refuse(f"{which} header edited without a new checksum", "header checksum differs",
+           **kwargs(mutate=None, crc_value=crc(b"x")))
+    refuse(f"{which} header 64 entries", f"GPT {which} header entry geometry is unsupported {UNSUPPORTED}", **kwargs(count=64))
+    refuse(f"{which} header 256 entries", "entry geometry is unsupported", **kwargs(count=256))
+    refuse(f"{which} header entry size 256", "entry geometry is unsupported", **kwargs(entry_size=256))
+    refuse(f"{which} header entry size 0", "entry geometry is unsupported", **kwargs(entry_size=0))
+    refuse(f"{which} header trailing byte", f"nonzero bytes after the header (profile restriction) {UNSUPPORTED}",
+           **kwargs(trailing={92: b"\x01"}))
+    refuse(f"{which} header trailing last byte", "nonzero bytes after the header", **kwargs(trailing={4095: b"\x01"}))
+    refuse(f"{which} header zero disk identifier", f"GPT {which} header disk identifier is zero {CORRUPT}",
+           **{edit_key: {"guid": bytes(16)}})
+refuse("primary own location", "own location differs", ph={"my": 2})
+refuse("primary own location zero", "own location differs", ph={"my": 0})
+refuse("primary alternate location", "alternate location differs", ph={"alt": disk_for(4096) - 2})
+refuse("primary entry table location", "entry table location differs", ph={"entries_lba": 3})
+refuse("primary entry table at the backup location", "entry table location differs", ph={"entries_lba": disk_for(4096) - 5})
+refuse("backup own location", "own location differs", bh={"my": disk_for(4096) - 2})
+refuse("backup alternate location", "alternate location differs", bh={"alt": 2})
+refuse("backup entry table location one past", "entry table location differs", bh={"entries_lba": disk_for(4096) - 4})
+refuse("backup entry table location one before", "entry table location differs", bh={"entries_lba": disk_for(4096) - 6})
+refuse("backup entry table at the primary location", "entry table location differs", bh={"entries_lba": 2})
+refuse("reciprocal locations swapped", "own location differs", ph={"my": disk_for(4096) - 1}, bh={"my": 1})
+refuse("usable start inside the primary table", "overlaps the GPT metadata", ph={"first": 5}, bh={"first": 5})
+refuse("usable start on the primary header", "overlaps the GPT metadata", ph={"first": 1}, bh={"first": 1})
+refuse("usable end inside the backup table", "overlaps the GPT metadata",
+       ph={"last": disk_for(4096) - 5}, bh={"last": disk_for(4096) - 5})
+refuse("usable end on the backup header", "overlaps the GPT metadata",
+       ph={"last": disk_for(4096) - 1}, bh={"last": disk_for(4096) - 1})
+refuse("usable range reversed", "usable range is reversed", ph={"first": 100, "last": 99}, bh={"first": 100, "last": 99})
+refuse("usable range 2^64-1", "overlaps the GPT metadata", ph={"last": 2**64 - 1}, bh={"last": 2**64 - 1})
+refuse("headers disagree on the disk identifier", "headers disagree on the disk identifier",
+       bh={"guid": bytes.fromhex("0102030405060708090a0b0c0d0e0f10")})
+refuse("headers disagree on the usable start", "headers disagree on the usable range", bh={"first": 7})
+refuse("headers disagree on the usable end", "headers disagree on the usable range", bh={"last": disk_for(4096) - 7})
+refuse("headers disagree on the table checksum", "headers disagree on the entry table checksum", bh={"entries_crc": 1})
+ok("header refusals: magic, revision, size, reserved, checksum, geometry, trailing bytes, identifiers, locations, ranges")
+
+# Tables: copies, checksum, truncation and trailing bytes (the closure bound stops the last two).
+refuse("entry table copies differ", f"GPT entry table copies differ {CORRUPT}",
+       backup_table_edit=lambda t: t.__setitem__(slice(8000, 8001), b"\x01"))
+refuse("primary table differs from the backup", "entry table copies differ",
+       primary_table_edit=lambda t: t.__setitem__(slice(0, 1), b"\x07"))
+refuse("both tables changed after the checksum", f"entry table checksum differs from the headers {CORRUPT}",
+       after_edit=lambda t: t.__setitem__(slice(9, 10), b"\x01"))
+refuse("tables with one flipped bit in an unused entry", "entry table checksum differs from the headers",
+       after_edit=lambda t: t.__setitem__(slice(127 * 128 + 100, 127 * 128 + 101), b"\x00"))
+for size_name, size in (("truncated by one", TABLE - 1), ("with a trailing byte", TABLE + 1), ("empty", 0),
+                        ("half length", TABLE // 2), ("double length", 2 * TABLE)):
+    for name in ("gpt-primary-entries.bin", "gpt-backup-entries.bin"):
+        files = gpt_files()
+        files[name] = files[name][:size] if size <= TABLE else files[name] + bytes(size - TABLE)
+        base = fresh("table-size") / "reads"
+        write_reads(base, files)
+        out = work / f"table-size-out-{counter[0]}"
+        expect_fail(f"{name} {size_name}", ["parse", "--request", request, "--reads", base, "--out", out], out,
+                    match="byte bounds", untouched=base)
+for size_name, size in (("511 bytes", 511), ("4097 bytes", 4097), ("1 byte", 1)):
+    for name in ("gpt-primary-header.bin", "gpt-backup-header.bin"):
+        files = gpt_files()
+        files[name] = files[name][:size] if size < 512 else files[name] + bytes(size - 4096)
+        base = fresh("header-size") / "reads"
+        write_reads(base, files)
+        out = work / f"header-size-out-{counter[0]}"
+        expect_fail(f"{name} {size_name}", ["parse", "--request", request, "--reads", base, "--out", out], out,
+                    match="byte bounds", untouched=base)
+ok("table and header truncation or trailing bytes stop at the metadata bounds with zero payload bytes read")
+
+# Geometry: unsupported sector sizes, a header file that is not exactly one sector, tiny and huge disks.
+for label, geometry, match in (
+    ("sector size 1024", {"sector_bytes": 1024, "disk_lbas": 100000}, "sector_bytes is not an allowed value"),
+    ("sector size 0", {"sector_bytes": 0, "disk_lbas": 100000}, "sector_bytes is not an allowed value"),
+    ("sector size as a string", {"sector_bytes": "4096", "disk_lbas": 100000}, "sector_bytes is not an allowed value"),
+    ("sector size as a boolean", {"sector_bytes": True, "disk_lbas": 100000}, "sector_bytes is not an allowed value"),
+    ("disk of zero blocks", {"sector_bytes": 4096, "disk_lbas": 0}, "disk_lbas is outside"),
+    ("disk of eleven blocks (4096)", {"sector_bytes": 4096, "disk_lbas": 11}, "too small for the GPT metadata"),
+    ("disk of sixty-seven blocks (512)", {"sector_bytes": 512, "disk_lbas": 67}, "too small for the GPT metadata"),
+    ("disk past 2^50 bytes (4096)", {"sector_bytes": 4096, "disk_lbas": 2**38 + 1}, "disk size is outside the supported range"),
+    ("disk past 2^50 bytes (512)", {"sector_bytes": 512, "disk_lbas": 2**41 + 1}, "disk_lbas is outside"),
+    ("disk lba count as a float", {"sector_bytes": 4096, "disk_lbas": 100000.0}, "disk_lbas is outside"),
+    ("disk lba count negative", {"sector_bytes": 4096, "disk_lbas": -1}, "disk_lbas is outside"),
+):
+    files = gpt_files()
+    geometry_raw = jbytes({"schema": 1, "kind": "myron-synthetic-gpt-geometry", **geometry})
+    base = fresh("geometry") / "reads"
+    write_reads(base, files, edits={"geometry.json": geometry_raw})
+    out = work / f"geometry-out-{counter[0]}"
+    expect_fail(f"geometry {label}", ["parse", "--request", request, "--reads", base, "--out", out], out,
+                match=match, single_line=True)
+edge = gpt_files(4096, disk=2**38)  # exactly 2^50 bytes: accepted by the geometry rule, refused by locations
+base = fresh("geometry-edge") / "reads"
+write_reads(base, edge)
+out = work / "geometry-edge-out"
+expect_ok("parse", "--request", request, "--reads", base, "--out", out)
+mini = gpt_files(4096, disk=12, parts=[("x", 6, 6, 0)])
+base = fresh("geometry-min") / "reads"
+write_reads(base, mini)
+out = work / "geometry-min-out"
+expect_ok("parse", "--request", request, "--reads", base, "--out", out)
+assert json.loads(walk(out)[1][f"operations/{R2}.json"])["data"]["partitions"] == [
+    {"partition_name": "x", "size_bytes": 4096, "bootable_flag": False, "slot_suffix": ""}]
+# header file not exactly one geometry sector: refused after geometry.json alone was read
+for sector, wrong in ((4096, 512), (4096, 2048), (512, 4096), (512, 1024)):
+    files = gpt_files(sector)
+    files["gpt-primary-header.bin"] = files["gpt-primary-header.bin"][:wrong].ljust(wrong, b"\0")
+    base = fresh("header-sector") / "reads"
+    write_reads(base, files)
+    out = work / f"header-sector-out-{counter[0]}"
+    with payload_counter(base) as counted:
+        code, stdout, stderr = invoke("parse", "--request", request, "--reads", base, "--out", out)
+    assert code != 0 and stdout == "" and "is not exactly one geometry sector" in stderr, stderr
+    assert counted[0] == len(files["geometry.json"]), "only geometry.json may be read before this refusal"
+    assert not os.path.lexists(out)
+    ok(f"a {wrong}-byte header with a {sector}-byte sector claim is refused after reading only geometry.json")
+files = gpt_files(4096)
+files["gpt-backup-header.bin"] = gpt_files(512)["gpt-backup-header.bin"]
+base = fresh("header-sector-backup") / "reads"
+write_reads(base, files)
+expect_fail("a backup header of another sector size", ["parse", "--request", request, "--reads", base,
+            "--out", work / "hs-out"], work / "hs-out", match="is not exactly one geometry sector")
+ok("geometry refusals: sector size, disk bounds, metadata minimum and header size against sector_bytes")
+
+# Entries: identifiers, extents, overlaps and names.
+default = default_parts(4096)[0]
+first_usable, last_usable = 6, disk_for(4096) - 6
+
+
+def with_part(index, **change):
+    parts = [list(p) for p in default]
+    for key, value in change.items():
+        parts[index][{"first": 1, "last": 2, "attributes": 3}[key]] = value
+    return [tuple(p) for p in parts]
+
+
+def zero_unique(table):
+    slot = slot_of(0)
+    table[slot * 128 + 16:slot * 128 + 32] = bytes(16)
+
+
+def duplicate_unique(table):
+    table[slot_of(1) * 128 + 16:slot_of(1) * 128 + 32] = table[slot_of(0) * 128 + 16:slot_of(0) * 128 + 32]
+
+
+refuse("zero partition identifier", f"GPT entry unique identifier is zero {CORRUPT}", table_edit=zero_unique)
+refuse("duplicate partition identifiers", "GPT entries repeat a unique identifier", table_edit=duplicate_unique)
+refuse("reversed extent", "GPT entry extent is reversed", parts=with_part(0, first=default[0][2], last=default[0][1]))
+refuse("extent first below the usable range", "outside the usable range", parts=with_part(0, first=first_usable - 1))
+refuse("extent first at LBA 0", "outside the usable range", parts=with_part(0, first=0))
+refuse("extent last above the usable range", "outside the usable range", parts=with_part(6, last=last_usable + 1))
+refuse("extent last at the backup header", "outside the usable range", parts=with_part(6, last=disk_for(4096) - 1))
+refuse("extent last 2^64-1", "outside the usable range", parts=with_part(6, last=2**64 - 1))
+refuse("extent first 2^64-1 and last 2^64-1", "outside the usable range", parts=with_part(0, first=2**64 - 1, last=2**64 - 1))
+refuse("extent first 2^63", "outside the usable range", parts=with_part(0, first=2**63, last=2**63 + 1))
+refuse("extents sharing one block", "GPT entry extents overlap", parts=with_part(1, first=default[0][2]))
+refuse("extent nested inside another", "GPT entry extents overlap", parts=with_part(
+    1, first=default[0][1] + 1, last=default[0][1] + 2))
+refuse("identical extents", "GPT entry extents overlap", parts=with_part(1, first=default[0][1], last=default[0][2]))
+refuse("extent overlap in descending table order", "GPT entry extents overlap",
+       parts=with_part(1, first=default[0][2]), slots=[100, 3, 50, 60, 70, 80, 90])
+refuse("duplicate partition names", "GPT entries repeat a name", parts=[
+    ("boot_a", 6, 10, 0), ("boot_a", 20, 30, 0)])
+refuse("no occupied entry", f"GPT holds no occupied entry {UNSUPPORTED}", parts=[])
+
+
+def name_case(label, raw, match, **kw):
+    refuse(label, match, name_raws={"boot_a": raw}, **kw)
+
+
+units = lambda text: text.encode("utf-16-le")
+name_case("name with a lone high surrogate", b"\x00\xd8" + bytes(70), f"name is not valid UTF-16 {CORRUPT}")
+name_case("name with a lone low surrogate", b"a\x00\x00\xdc" + bytes(68), "name is not valid UTF-16")
+name_case("name ending in a high surrogate", b"a\x00\x00\xd8" + bytes(68), "name is not valid UTF-16")
+name_case("name with a valid surrogate pair", units("\U0001F600") + bytes(68), f"name is outside the supported pattern {UNSUPPORTED}")
+name_case("name with no NUL", units("a" * 36), f"name is not NUL terminated {CORRUPT}")
+name_case("name with 35 units and a nonzero tail", units("a" * 35) + b"\x01\x00", "name is not NUL terminated")
+name_case("name padded with a nonzero byte", units("boot_a") + b"\x00\x00\x41" + bytes(57), "name padding is not zero")
+name_case("name padded with a nonzero second byte", units("boot_a") + b"\x00\x00\x00\x01" + bytes(56), "name padding is not zero")
+name_case("name padded with a trailing character", units("boot_a") + bytes(2) + units("x") + bytes(56), "name padding is not zero")
+name_case("empty name", bytes(72), f"name is empty {CORRUPT}")
+name_case("name starting with NUL then text", bytes(2) + units("boot") + bytes(62), "name padding is not zero")
+name_case("uppercase name", units("Boot_a") + bytes(60), "name is outside the supported pattern")
+name_case("name with a hyphen", units("boot-a") + bytes(60), "name is outside the supported pattern")
+name_case("name with a space", units("boot a") + bytes(60), "name is outside the supported pattern")
+name_case("name with a control character", units("boot\x01a") + bytes(60), "name is outside the supported pattern")
+name_case("name with a non-ASCII letter", units("boöt") + bytes(64), "name is outside the supported pattern")
+name_case("name with a byte order mark", b"\xff\xfe" + units("boot") + bytes(62), "name is outside the supported pattern")
+name_case("name with a canary", units(NAME_CANARY.upper()) + bytes(72 - 2 * len(NAME_CANARY)), "name is outside the supported pattern")
+name_case("name with a canary in lowercase and a space", units(NAME_CANARY + " x") + bytes(72 - 2 * len(NAME_CANARY) - 4),
+          "name is outside the supported pattern")
+name_case("name with a NUL then more NULs in the middle", units("a") + bytes(2) + units("b") + bytes(66), "name padding is not zero")
+ok("entry refusals: identifiers, extents, overlaps, duplicates, UTF-16 and name pattern, none echoing a value")
+
+# Unused entries never matter: garbage, GUIDs and bad names under a zero type GUID are ignored.
+
+
+def junk_unused(table):
+    for slot in (0, 1, 2, 126, 127):
+        if table[slot * 128:slot * 128 + 16] == bytes(16):
+            table[slot * 128:(slot + 1) * 128] = bytes(16) + bytes(range(112))
+
+
+produced = derived_data("unused junk", default, table_edit=junk_unused)
+assert produced == EXPECTED_DATA
+ok("an unused entry's fields are ignored whatever they hold")
+
+# Hostile GPT content never reaches the diagnostics or the published output.
+for canary in GPT_CANARIES:
+    assert canary.encode() not in b"".join(walk(parse_a)[1].values()), canary
+    assert canary.encode() not in (plan_text + result_text).encode(), canary
+ok("GUIDs, in every textual form, appear in no published file, plan or result")
+
+# --- exact input closure and tree hazards -------------------------------------------------
+
+
+def bad_reads(name, edits=None, *, files=None, match=None, absent=(), zero=False, **kwargs):
+    base = fresh("reads-bad") / "reads"
+    write_reads(base, files, edits, **kwargs)
+    out = work / f"bad-out-{counter[0]}"
+    expect_fail(name, ["parse", "--request", request, "--reads", base, "--out", out], out,
+                match=match, absent=absent, untouched=base if zero else None)
+    return base
+
+
+def mutated_reads(name, mutate, match=None, absent=()):
+    """Closure and metadata hazards: refused with zero payload bytes read."""
+    base = fresh("reads-shape") / "reads"
+    write_reads(base)
+    mutate(base)
+    out = work / f"shape-out-{counter[0]}"
+    expect_fail(name, ["parse", "--request", request, "--reads", base, "--out", out], out,
+                match=match, absent=absent, untouched=base)
+
+
+mutated_reads("extra file", lambda c: (c / "notes.txt").write_text("x"), match="exact closure")
+mutated_reads("extra file with a long name", lambda c: (c / ("x" * 200)).write_text("x"), match="exact closure")
+mutated_reads("nested directory", lambda c: (c / "sub").mkdir(), match="exact closure")
+mutated_reads("nested file", lambda c: ((c / "sub").mkdir(), (c / "sub/h.bin").write_text("x")))
+mutated_reads("missing geometry", lambda c: (c / "geometry.json").unlink(), match="exact closure")
+mutated_reads("missing table", lambda c: (c / "gpt-backup-entries.bin").unlink(), match="exact closure")
+mutated_reads("missing manifest", lambda c: (c / "reads.json").unlink(), match="exact closure")
+mutated_reads("renamed header", lambda c: (c / "gpt-backup-header.bin").rename(c / "gpt-backup-header.img"),
+              match="exact closure")
+swapped = fresh("swapped-headers") / "reads"
+write_reads(swapped)
+(swapped / "gpt-backup-header.bin").rename(swapped / "tmp")
+(swapped / "gpt-primary-header.bin").rename(swapped / "gpt-backup-header.bin")
+(swapped / "tmp").rename(swapped / "gpt-primary-header.bin")
+expect_fail("swapped header file names (a valid closure the manifest hashes refuse)", [
+    "parse", "--request", request, "--reads", swapped, "--out", work / "swap-out"], work / "swap-out",
+    match="differs from the file")
+mutated_reads("table symlink", lambda c: (
+    (c / "gpt-backup-entries.bin").unlink(), (c / "gpt-backup-entries.bin").symlink_to("gpt-primary-entries.bin")))
+mutated_reads("manifest symlink", lambda c: (
+    (c / "reads.json").rename(c / "real.json"), (c / "reads.json").symlink_to("real.json")))
+mutated_reads("header hardlink", lambda c: (
+    (c / "gpt-backup-header.bin").unlink(), os.link(c / "gpt-primary-header.bin", c / "gpt-backup-header.bin")))
+mutated_reads("hardlink to an outside file", lambda c: (
+    (c / "gpt-backup-header.bin").unlink(), os.link(paths["archive"], c / "gpt-backup-header.bin")))
+mutated_reads("table fifo", lambda c: ((c / "gpt-primary-entries.bin").unlink(), os.mkfifo(c / "gpt-primary-entries.bin")))
+mutated_reads("table directory", lambda c: ((c / "gpt-primary-entries.bin").unlink(), (c / "gpt-primary-entries.bin").mkdir()))
+mutated_reads("table socket", lambda c: (
+    (c / "gpt-primary-entries.bin").unlink(),
+    socket.socket(socket.AF_UNIX).bind(str(c / "gpt-primary-entries.bin"))))
+mutated_reads("executable header", lambda c: (c / "gpt-primary-header.bin").chmod(0o755), match="executable")
+mutated_reads("executable manifest", lambda c: (c / "reads.json").chmod(0o744), match="executable")
+mutated_reads("executable geometry", lambda c: (c / "geometry.json").chmod(0o700), match="executable")
+mutated_reads("world-writable header", lambda c: (c / "gpt-primary-header.bin").chmod(0o666))
+mutated_reads("group-writable table", lambda c: (c / "gpt-primary-entries.bin").chmod(0o664))
+mutated_reads("group-writable reads root", lambda c: c.chmod(0o775))
+mutated_reads("world-writable reads root", lambda c: c.chmod(0o757))
+
+real = fresh("root-symlink")
+write_reads(real / "reads")
+(real / "link").symlink_to(real / "reads")
+expect_fail("reads root symlink", ["parse", "--request", request, "--reads", real / "link", "--out", work / "o1"], work / "o1")
+(real / "parent-link").symlink_to(real)
+expect_fail("reads ancestor symlink", ["parse", "--request", request, "--reads", real / "parent-link/reads",
+                                        "--out", work / "o2"], work / "o2")
+unsafe = fresh("writable-parent")
+write_reads(unsafe / "reads")
+unsafe.chmod(0o777)
+try:
+    expect_fail("writable reads ancestry", ["parse", "--request", request, "--reads", unsafe / "reads",
+                                            "--out", work / "o3"], work / "o3")
+finally:
+    unsafe.chmod(0o700)
+expect_fail("relative reads path", ["parse", "--request", request, "--reads", "reads", "--out", work / "o4"])
+expect_fail("noncanonical reads path", ["parse", "--request", request, "--reads", f"{reads}/../reads",
+                                        "--out", work / "o5"], work / "o5")
+expect_fail("missing reads directory", ["parse", "--request", request, "--reads", work / "nothing",
+                                        "--out", work / "o6"], work / "o6")
+expect_fail("reads path with a newline", ["parse", "--request", request, "--reads", f"{work}/a\nb",
+                                           "--out", work / "o6b"], work / "o6b", single_line=True)
+
+real_mount = K.mount_id_for_fd
+
+
+def crossing_reader(original):
+    def patched(*a, **kw):
+        mounts = [0]
+
+        def crossing_mount(descriptor, label):
+            mounts[0] += 1
+            return real_mount(descriptor, label) + (mounts[0] > 1)
+
+        K.mount_id_for_fd = crossing_mount
+        try:
+            return original(*a, **kw)
+        finally:
+            K.mount_id_for_fd = real_mount
+    return patched
+
+
+with_patch(B, "read_reads", crossing_reader, lambda: expect_fail(
+    "mount crossing inside the reads tree", ["parse", *args(), "--out", work / "o7"], work / "o7", match="mount"))
+
+# Bounds: every file over its bound, empty files, the manifest, and the closure before any payload.
+for name, size in (("reads.json", 8193), ("geometry.json", 1025), ("gpt-primary-header.bin", 4097),
+                   ("gpt-backup-header.bin", 511), ("gpt-primary-entries.bin", 16385),
+                   ("gpt-backup-entries.bin", 16383)):
+    bad_reads(f"{name} outside its bound",
+              files=None, edits={name: b" " * size} if name != "reads.json" else None,
+              manifest_raw=b" " * size if name == "reads.json" else None, match="byte bounds", zero=True)
+bad_reads("empty geometry", {"geometry.json": b""}, match="byte bounds", zero=True)
+bad_reads("empty manifest", manifest_raw=b"", match="byte bounds", zero=True)
+over = fresh("entries") / "reads"
+write_reads(over)
+(over / "extra0.bin").write_bytes(b"x")
+(over / "extra1.bin").write_bytes(b"x")
+expect_fail("more entries than the bound", ["parse", "--request", request, "--reads", over, "--out", work / "o8"],
+            work / "o8", match="exceed the entry bound", untouched=over)
+big = fresh("closure-first") / "reads"
+write_reads(big)
+(big / "z-extra.bin").write_bytes(b"x" * (3 * 1024 * 1024))
+expect_fail("oversized extra file", ["parse", "--request", request, "--reads", big, "--out", work / "o9"],
+            work / "o9", match="exact closure", untouched=big)
+assert len(B.INPUT_FILES) == 6 and len(B.CLOSURE) == 6 and B.READS_ENTRIES == 7 and B.TOTAL_READS_BYTES == 50176
+assert sum(row["max_bytes"] for row in B.INPUT_FILES) == 50176 and len(list(reads.iterdir())) == 6
+assert sorted(p.name for p in reads.iterdir()) == B.CLOSURE
+ok("exact closure, links, special files, writable ancestry, mount crossing and bounds fail closed")
+
+# Unknown names never reach a diagnostic, at the top level or nested, whatever their kind.
+for label, plant in (
+    ("canary file", lambda c: (c / f"{NAME_CANARY}.json").write_text("x")),
+    ("canary directory", lambda c: (c / NAME_CANARY).mkdir()),
+    ("canary nested file", lambda c: ((c / NAME_CANARY).mkdir(), (c / NAME_CANARY / f"{NAME_CANARY}.txt").write_text("x"))),
+    ("canary symlink", lambda c: (c / NAME_CANARY).symlink_to("geometry.json")),
+    ("canary fifo", lambda c: os.mkfifo(c / NAME_CANARY)),
+    ("canary replacing a payload name", lambda c: (c / "gpt-backup-header.bin").rename(c / NAME_CANARY)),
+    ("canary with a control character", lambda c: (c / f"bad\x01{NAME_CANARY}").write_text("x")),
+    ("canary with a newline", lambda c: (c / f"ERROR: forged\n{NAME_CANARY}").write_text("x")),
+):
+    mutated_reads(f"unknown name: {label}", plant, match="exact closure", absent=(NAME_CANARY,))
+canary_reads = fresh("canary-verify-reads") / "reads"
+write_reads(canary_reads)
+(canary_reads / NAME_CANARY).mkdir()
+expect_fail("verify-parse with an unknown name in the reads", [
+    "verify-parse", "--request", request, "--reads", canary_reads, "--parse", work / "no-parse"],
+    match="exact closure", absent=(NAME_CANARY,), untouched=canary_reads)
+ok("input-side closure errors count names and never echo an unknown one")
+
+
+# Admission races: the tree changes after the listing, while the descriptors are being pinned.
+def admission_race(label, hooks, match):
+    base = fresh("admission") / "reads"
+    write_reads(base)
+    out = work / f"admission-out-{counter[0]}"
+    fired = []
+    real_open = D.open_pinned_regular_at
+
+    def factory(original):
+        def patched(directory_fd, name, description):
+            hook = hooks.get((name, "before")) if name in B.CLOSURE else None
+            if hook:
+                fired.append((name, "before"))
+                hook(base)
+            result = original(directory_fd, name, description)
+            hook = hooks.get((name, "after")) if name in B.CLOSURE else None
+            if hook:
+                fired.append((name, "after"))
+                hook(base)
+            return result
+        return patched
+
+    with_patch(D, "open_pinned_regular_at", factory, lambda: expect_fail(
+        label, ["parse", "--request", request, "--reads", base, "--out", out], out,
+        match=match, untouched=base))
+    assert fired, f"{label}: the injection never ran"
+    assert D.open_pinned_regular_at is real_open
+
+
+def unlink(name):
+    return lambda base: (base / name).unlink()
+
+
+def add_file(base):
+    (base / "late-extra.bin").write_bytes(b"x" * 6949)
+
+
+def rename_away(name):
+    return lambda base: (base / name).rename(base / (name + ".moved"))
+
+
+def make_executable(name):
+    return lambda base: (base / name).chmod(0o755)
+
+
+def replace_with_copy(name):
+    def apply(base):
+        (base / "swap.tmp").write_bytes((base / name).read_bytes())
+        (base / "swap.tmp").chmod(0o644)
+        os.replace(base / "swap.tmp", base / name)
+    return apply
+
+
+def grow(name, extra=b" "):
+    def apply(base):
+        with (base / name).open("ab") as stream:
+            stream.write(extra)
+    return apply
+
+
+FIRST, LAST = B.CLOSURE[0], B.CLOSURE[-1]
+GAP = "changed during admission and differ from the exact closure"
+admission_race("header deleted before its pin", {(FIRST, "before"): unlink("gpt-primary-header.bin")}, "cannot be opened safely")
+admission_race("header deleted after its own pin", {("gpt-primary-header.bin", "after"): unlink("gpt-primary-header.bin")},
+               f"{GAP} (0 extra, 1 missing)")
+admission_race("pinned file deleted after a later pin", {("gpt-primary-entries.bin", "after"): unlink(FIRST)}, GAP)
+admission_race("manifest deleted after the last pin", {(LAST, "after"): unlink("reads.json")}, GAP)
+admission_race("file added before the first pin", {(FIRST, "before"): add_file}, f"{GAP} (1 extra, 0 missing)")
+admission_race("file added after the last pin", {(LAST, "after"): add_file}, f"{GAP} (1 extra, 0 missing)")
+admission_race("pinned table renamed away", {("gpt-backup-entries.bin", "after"): rename_away("gpt-backup-entries.bin")},
+               f"{GAP} (1 extra, 1 missing)")
+admission_race("header renamed away before its pin", {(FIRST, "before"): rename_away("gpt-backup-header.bin")}, "cannot be opened safely")
+admission_race("pinned header replaced by a same-bytes file", {("gpt-primary-header.bin", "after"): replace_with_copy("gpt-primary-header.bin")},
+               "changed during admission")
+admission_race("table swapped for a symlink before its pin", {("gpt-primary-entries.bin", "before"): lambda b: (
+    (b / "gpt-primary-entries.bin").unlink(), (b / "gpt-primary-entries.bin").symlink_to("geometry.json"))}, "not a regular file")
+admission_race("table swapped for a fifo before its pin", {("gpt-primary-entries.bin", "before"): lambda b: (
+    (b / "gpt-primary-entries.bin").unlink(), os.mkfifo(b / "gpt-primary-entries.bin"))}, "not a regular file")
+admission_race("header swapped for a hardlink before its pin", {("gpt-backup-header.bin", "before"): lambda b: (
+    (b / "gpt-backup-header.bin").unlink(), os.link(b / "gpt-primary-header.bin", b / "gpt-backup-header.bin"))},
+               "additional hard links")
+admission_race("header made executable before its pin", {("gpt-primary-header.bin", "before"): make_executable("gpt-primary-header.bin")}, "executable")
+admission_race("pinned geometry made executable after its pin", {("geometry.json", "after"): make_executable("geometry.json")},
+               "changed during admission")
+admission_race("manifest made executable before its pin", {("reads.json", "before"): make_executable("reads.json")}, "executable")
+admission_race("table made group-writable before its pin", {("gpt-backup-entries.bin", "before"):
+               lambda b: (b / "gpt-backup-entries.bin").chmod(0o664)}, "writable")
+admission_race("header grown past its bound before its pin", {("gpt-primary-header.bin", "before"):
+               lambda b: (b / "gpt-primary-header.bin").write_bytes(b"x" * 5000)}, "byte bounds")
+admission_race("pinned geometry grown after its pin", {("geometry.json", "after"): grow("geometry.json")}, "changed during admission")
+admission_race("reads directory made group-writable after the pins", {(LAST, "after"): lambda b: b.chmod(0o775)}, "changed during admission")
+no_leftovers("admission races")
+ok("closure, metadata and identity changes during admission refuse with zero payload bytes read")
+
+
+def during_read(label, victim_name, mutate, match, nth=1):
+    base = fresh("during-read") / "reads"
+    write_reads(base)
+    victim = str(base / victim_name)
+    seen, fired = [0], []
+    original = os.read
+
+    def patched(descriptor, count):
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            target = ""
+        if target == victim:
+            seen[0] += 1
+            if seen[0] == nth:
+                fired.append(True)
+                mutate(base)
+        return original(descriptor, count)
+
+    out = work / f"during-read-out-{counter[0]}"
+    os.read = patched
+    try:
+        err = expect_fail(label, ["parse", "--request", request, "--reads", base, "--out", out], out, match=match)
+    finally:
+        os.read = original
+    assert fired, f"{label}: the injection never ran"
+    assert "differs from the file" not in err, f"{label}: failed on a manifest mismatch, not instability"
+
+
+def overwrite_same_size(name):
+    def apply(base):
+        content = (base / name).read_bytes()
+        with (base / name).open("r+b") as stream:
+            stream.write(bytes([content[0] ^ 1]) + content[1:])
+    return apply
+
+
+def truncate(name, cut=3):
+    return lambda base: (base / name).write_bytes((base / name).read_bytes()[:-cut])
+
+
+during_read("table grows during its own read", "gpt-primary-entries.bin", grow("gpt-primary-entries.bin", b"extra"), "grew while being read")
+during_read("manifest grows during its own read", "reads.json", grow("reads.json"), "grew while being read")
+during_read("header shrinks during its own read", "gpt-primary-header.bin", truncate("gpt-primary-header.bin"), "changed size while being read")
+during_read("table rewritten in place during its own read", "gpt-backup-entries.bin",
+            overwrite_same_size("gpt-backup-entries.bin"), "changed while being read")
+during_read("geometry made executable during its own read", "geometry.json", make_executable("geometry.json"), "changed while being read")
+during_read("table grows after its bytes were read", "gpt-primary-entries.bin", grow("gpt-primary-entries.bin", b"x"), "grew while being read", nth=2)
+during_read("another file grows while a later one is read", "gpt-primary-header.bin", grow("geometry.json"), "changed while being read")
+during_read("an earlier file is deleted while a later one is read", "gpt-primary-header.bin", unlink("gpt-backup-entries.bin"), "changed while being read")
+during_read("an extra file appears while the last file is read", "reads.json", add_file,
+            "changed while being read and differ from the exact closure", nth=2)
+during_read("an earlier file is replaced while the last file is read", "reads.json",
+            replace_with_copy("geometry.json"), "changed while being read", nth=2)
+no_leftovers("reads read races")
+ok("grow, shrink, rewrite, delete, add and replace during the captured-descriptor reads fail for instability")
+
+# Reads bound to another request or contract, and manifest rows.
+bad_reads("manifest wrong request", req_sha="1" * 64, match="request binding")
+bad_reads("manifest wrong contract", manifest_edit=lambda m: m.update(bootchain_contract_sha256="0" * 64),
+          match="bootchain contract binding")
+bad_reads("manifest synthetic false", manifest_edit=lambda m: m.update(synthetic=False))
+bad_reads("manifest kind", manifest_edit=lambda m: m.update(kind="myron-precaptured-fixture"))
+bad_reads("manifest version 2", manifest_edit=lambda m: m.update(format_version=2))
+bad_reads("manifest version as a string", manifest_edit=lambda m: m.update(format_version="0.1.0"))
+bad_reads("manifest version as a boolean", manifest_edit=lambda m: m.update(format_version=True))
+bad_reads("manifest schema 2", manifest_edit=lambda m: m.update(schema=2))
+bad_reads("manifest extra field", manifest_edit=lambda m: m.update(parser="x"), match="fields differ")
+bad_reads("manifest missing field", manifest_edit=lambda m: m.pop("synthetic"))
+bad_reads("manifest unknown path row", manifest_edit=lambda m: m["files"][0].update(path="other.json"))
+bad_reads("manifest row extra field", manifest_edit=lambda m: m["files"][0].update(offset=0))
+bad_reads("manifest row byte count", manifest_edit=lambda m: m["files"][0].update(bytes=1), match="differs from the file")
+bad_reads("manifest row hash", manifest_edit=lambda m: m["files"][0].update(sha256="0" * 64), match="differs from the file")
+bad_reads("manifest unsorted rows", manifest_edit=lambda m: m["files"].reverse())
+bad_reads("manifest dropped row", manifest_edit=lambda m: m["files"].pop())
+bad_reads("manifest duplicate row", manifest_edit=lambda m: m["files"].append(dict(m["files"][0])))
+bad_reads("manifest includes itself", manifest_edit=lambda m: m["files"].append(
+    {"path": "reads.json", "bytes": 1, "sha256": "0" * 64}))
+bad_reads("manifest not canonical", manifest_raw=json.dumps(manifest_document(gpt_files())).encode())
+bad_reads("manifest duplicate key", manifest_raw=b'{"schema": 1, "schema": 1}\n', match="repeats a JSON key")
+bad_reads("manifest NaN", manifest_raw=b'{"schema": NaN}\n', match="non-finite")
+bad_reads("manifest not JSON", manifest_raw=b"not json\n", match="invalid JSON")
+bad_reads("manifest not an object", manifest_raw=b"[]\n", match="not a JSON object")
+bad_reads("manifest not ASCII", manifest_raw="{\"schema\": \"é\"}\n".encode(), match="reads.json")
+bad_reads("manifest stale rows", {"gpt-primary-header.bin": gpt_files()["gpt-primary-header.bin"][:-1] + b"\x01"},
+          keep_manifest_rows=True, match="differs from the file")
+for levels in (B.JSON_DEPTH + 1, 200, 4000):
+    bad_reads(f"manifest nested {levels} deep", manifest_raw=b'{"data": ' + b"[" * levels + b"]" * levels + b"}",
+              match="nests too deeply" if levels < 1000 else "reads.json")
+bad_reads("geometry duplicate key", {"geometry.json": b'{"schema": 1, "schema": 1}\n'}, match="repeats a JSON key")
+bad_reads("geometry not canonical", {"geometry.json": json.dumps(json.loads(gpt_files()["geometry.json"])).encode()},
+          match="not canonical JSON")
+bad_reads("geometry extra field", {"geometry.json": jbytes({**json.loads(gpt_files()["geometry.json"]), "x": 1})}, match="fields differ")
+bad_reads("geometry missing field", {"geometry.json": jbytes({"schema": 1, "kind": "myron-synthetic-gpt-geometry", "disk_lbas": 99999})},
+          match="fields differ")
+bad_reads("geometry wrong kind", {"geometry.json": jbytes({**json.loads(gpt_files()["geometry.json"]), "kind": "x"})},
+          match="kind is not an allowed value")
+bad_reads("geometry schema 2", {"geometry.json": jbytes({**json.loads(gpt_files()["geometry.json"]), "schema": 2})},
+          match="schema is outside")
+bad_reads("geometry not JSON", {"geometry.json": b"\xff\xfe"}, match="geometry.json is invalid JSON")
+bad_reads("geometry hash differing from its row", {"geometry.json": gpt_files()["geometry.json"]},
+          files={**gpt_files(), "geometry.json": jbytes({"schema": 1, "kind": "myron-synthetic-gpt-geometry",
+                                                         "sector_bytes": 4096, "disk_lbas": 100000})},
+          keep_manifest_rows=True, match="differs from the file")
+ok("reads.json and geometry.json bind the contract and request, list exact rows, and select no path or bound")
+
+# --- privacy canaries --------------------------------------------------------------
+
+MAC_CANARY = ":".join(["02"] * 6)
+UUID_CANARY = "-".join(["123e4567", "e89b", "12d3", "a456", "426614174000"])
+DIGITS_CANARY = "4" + "9" * 14
+for canary in (DIGITS_CANARY, "c" * 30, "ab12" * 7):
+    err = refuse(f"identifier-shaped GPT name {canary[:6]}", "identifier-shaped value",
+                 name_raws={"boot_a": units(canary) + bytes(72 - 2 * len(canary))}, absent=(canary,))
+    assert "R2-gpt-and-recovery-inventory" in err
+canary_manifest = fresh("canary-manifest") / "reads"
+write_reads(canary_manifest, manifest_edit=lambda m: m.update({NAME_CANARY: 1}))
+expect_fail("canary as a manifest key", ["parse", "--request", request, "--reads", canary_manifest,
+            "--out", work / "canary-manifest-out"], work / "canary-manifest-out", absent=(NAME_CANARY,))
+bad_reads("canary as a duplicate geometry key",
+          {"geometry.json": b'{"' + NAME_CANARY.encode() + b'": 1, "' + NAME_CANARY.encode() + b'": 2}\n'}, absent=(NAME_CANARY,))
+good_output = b"".join(walk(parse_a)[1].values()) + plan_text.encode() + result_text.encode()
+for canary in (MAC_CANARY, UUID_CANARY, DIGITS_CANARY, NAME_CANARY, *GPT_CANARIES):
+    assert canary.encode() not in good_output, canary
+for banned in ("android_id", "partition_uuid", "disk_guid", "raw_payload", "module_bytes"):
+    assert banned.encode() not in walk(parse_a)[1][f"operations/{R2}.json"]
+raw_inputs = b"".join(FILES[name] for name in sorted(FILES) if name.endswith(".bin"))
+for window in (raw_inputs[i:i + 16] for i in range(0, len(raw_inputs), 16)):
+    if window != bytes(16) and window != bytes([0xEE]) * 16:
+        assert window not in good_output, f"raw GPT bytes were copied into an output: {window.hex()}"
+ok("identifier and privacy canaries are rejected, never echoed, and absent from every output")
+
+# --- verify-parse: every outer binding, operation, claim and checksum ---------------------
+
+SUM_FILES = lambda root: sorted(
+    str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+
+
+def reseal(clone):
+    (clone / "SHA256SUMS").write_text("".join(
+        f"{digest((clone / name).read_bytes())}  {name}\n" for name in sorted(SUM_FILES(clone), key=str.encode)))
+
+
+def tampered(name, mutate_files=None, *, resum=True, match=None, absent=()):
+    clone = fresh("parse-tamper") / "parse"
+    shutil.copytree(parse_a, clone)
+    if mutate_files:
+        mutate_files(clone)
+    if resum:
+        reseal(clone)
+    return expect_fail(name, ["verify-parse", *args(), "--parse", clone], match=match, absent=absent)
+
+
+def edit_document(relative, mutate):
+    def apply(clone):
+        value = json.loads((clone / relative).read_text())
+        mutate(value)
+        (clone / relative).write_bytes(D.render_json(value))
+    return apply
+
+
+clone = fresh("parse-control") / "parse"
+shutil.copytree(parse_a, clone)
+reseal(clone)
+assert (clone / "SHA256SUMS").read_bytes() == (parse_a / "SHA256SUMS").read_bytes(), "reseal is faithful"
+expect_ok("verify-parse", *args(), "--parse", clone)
+for field, value in (
+    ("schema", 2), ("kind", "x"), ("format_version", "9"), ("bootchain_contract_sha256", "0" * 64),
+    ("capture_contract_sha256", "0" * 64), ("preflight_contract_sha256", "0" * 64),
+    ("request_sha256", "0" * 64), ("reads_sha256", "0" * 64), ("transport", "external-precaptured-fixture"),
+    ("evidence_level", "live"), ("status", "collected"), ("profile", "gpt-v2"), ("inventory_scope", "whole-disk"),
+    ("synthetic", False), ("live", True), ("executes", True), ("kit_snapshot_reverified", True),
+    ("human_approval_required", False), ("complete_capture", True), ("remote_commands", ["x"]),
+    ("limitations", []), ("non_goals", []), ("unresolved_claims", []), ("coverage", []), ("inputs", []),
+    ("operation", {}), ("dependencies", {"trust": "byte-pinned", "byte_pinned": True}), ("blockers", []),
+    ("authority", {}), ("deferred", []), ("qualification", {}), ("semantic_limits", []), ("accounting", {}),
+    ("implementation", {}), ("extra", 1),
+):
+    tampered(f"parse.json {field}", edit_document("parse.json", lambda v, f=field, x=value: v.update({f: x})),
+             match="parse differs at")
+tampered("parse.json field removed", edit_document("parse.json", lambda v: v.pop("synthetic")))
+tampered("parse blocker cleared", edit_document("parse.json", lambda v: v["blockers"][0].update(state="present")))
+tampered("parse blocker removed", edit_document("parse.json", lambda v: v["blockers"].pop()))
+tampered("parse blocker cleared flag", edit_document("parse.json", lambda v: v["blockers"][0].update(blocker_cleared=True)))
+for flag in P.AUTHORITY_FLAGS:
+    tampered(f"parse authority {flag}", edit_document("parse.json", lambda v, f=flag: v["authority"].update({f: True})))
+tampered("parse operation bytes_read", edit_document("parse.json", lambda v: v["operation"].update(bytes_read=1)))
+tampered("parse operation hash", edit_document("parse.json", lambda v: v["operation"].update(sha256="0" * 64)))
+tampered("parse input hash", edit_document("parse.json", lambda v: v["inputs"][0].update(sha256="0" * 64)))
+tampered("parse input length", edit_document("parse.json", lambda v: v["inputs"][0].update(bytes=1)))
+tampered("parse coverage class", edit_document("parse.json", lambda v: v["coverage"][0].update(classification="geometry-claim-dependent")))
+tampered("parse bootable semantics reworded", edit_document("parse.json", lambda v: [
+    row.update(semantics="android-bootable") for row in v["coverage"] if row["field"] == "partitions.bootable_flag"]))
+tampered("parse deferred gate marked implemented", edit_document("parse.json", lambda v: v["deferred"][0].update(state="implemented")))
+tampered("parse accounting", edit_document("parse.json", lambda v: v["accounting"].update(meaning="device-read")))
+tampered("parse.json not canonical", lambda c: (c / "parse.json").write_text(json.dumps(json.loads((c / "parse.json").read_text()))))
+# A forged operation with a recomputed SHA256SUMS and a matching parse.json binding still fails when its
+# semantics differ from the recomputed parse (and the collector's own validation is not the only check).
+for label, mutate in (
+    ("flag flipped", lambda v: v["data"]["partitions"][0].update(bootable_flag=not v["data"]["partitions"][0]["bootable_flag"])),
+    ("size changed", lambda v: v["data"]["partitions"][1].update(size_bytes=v["data"]["partitions"][1]["size_bytes"] + 4096)),
+    ("partition renamed", lambda v: v["data"]["partitions"][0].update(partition_name="aaa_a", slot_suffix="_a")),
+    ("partition dropped", lambda v: v["data"]["partitions"].pop()),
+    ("bytes_read changed", lambda v: v.update(bytes_read=v["bytes_read"] - 1)),
+):
+    def forge(clone, mutate=mutate):
+        edit_document(f"operations/{R2}.json", mutate)(clone)
+        edit_document("parse.json", lambda v: v["operation"].update(
+            sha256=digest((clone / f"operations/{R2}.json").read_bytes()),
+            bytes=len((clone / f"operations/{R2}.json").read_bytes())))(clone)
+    tampered(f"forged operation ({label}) with recomputed hashes", forge, match="parse differs at")
+tampered("operation not canonical", lambda c: (c / f"operations/{R2}.json").write_text(
+    json.dumps(json.loads((c / f"operations/{R2}.json").read_text()))))
+tampered("checksum list with a wrong hash", lambda c: (c / "SHA256SUMS").write_text(
+    (c / "SHA256SUMS").read_text().replace(digest(OP), "0" * 64)), resum=False)
+tampered("checksum list reordered", lambda c: (c / "SHA256SUMS").write_text(
+    "".join(reversed((c / "SHA256SUMS").read_text().splitlines(True)))), resum=False)
+tampered("checksum list with an extra line", lambda c: (c / "SHA256SUMS").write_text(
+    (c / "SHA256SUMS").read_text() + f"{'0' * 64}  extra\n"), resum=False)
+tampered("checksum list missing", lambda c: (c / "SHA256SUMS").unlink(), resum=False, match="missing paths")
+tampered("parse.json missing", lambda c: (c / "parse.json").unlink(), match="missing paths")
+tampered("operation missing", lambda c: (c / f"operations/{R2}.json").unlink(), match="missing paths")
+tampered("extra file", lambda c: (c / "extra.json").write_text("{}"), match="unexpected paths (names withheld)")
+tampered("extra file named by a canary", lambda c: (c / f"{NAME_CANARY}.json").write_text("{}"), absent=(NAME_CANARY,),
+         match="unexpected paths (names withheld)")
+tampered("extra directory", lambda c: (c / "extra").mkdir(), match="unexpected paths (names withheld)")
+tampered("extra file in operations", lambda c: (c / "operations/extra.json").write_text("{}"), match="unexpected paths")
+tampered("R3 operation smuggled in", lambda c: (c / f"operations/{R3}.json").write_text("{}"), match="unexpected paths")
+tampered("file mode 0600", lambda c: (c / "parse.json").chmod(0o600), match="differs at")
+tampered("file mode 0664", lambda c: (c / "parse.json").chmod(0o664), match="ownership-or-mode")
+tampered("executable operation", lambda c: (c / f"operations/{R2}.json").chmod(0o755), match="differs at")
+tampered("directory mode 0700", lambda c: (c / "operations").chmod(0o700), match="differs at")
+tampered("directory mode 0775", lambda c: (c / "operations").chmod(0o775), match="ownership-or-mode")
+tampered("root mode 0775", lambda c: c.chmod(0o775))
+tampered("symlinked file", lambda c: ((c / "parse.json").rename(c / "real"), (c / "parse.json").symlink_to("real")),
+         match="code symlink", absent=("real",))
+tampered("canary symlink", lambda c: (c / NAME_CANARY).symlink_to("parse.json"), match="code symlink", absent=(NAME_CANARY,))
+tampered("fifo", lambda c: os.mkfifo(c / NAME_CANARY), match="code special-file", absent=(NAME_CANARY,))
+tampered("hardlinked file", lambda c: os.link(c / "parse.json", c / "operations/copy"), match="code hardlink")
+tampered("hardlink to an outside file", lambda c: ((c / "parse.json").unlink(), os.link(paths["archive"], c / "parse.json")),
+         match="code hardlink")
+tampered("operation as a directory", lambda c: ((c / f"operations/{R2}.json").unlink(), (c / f"operations/{R2}.json").mkdir()))
+for tree_error, label in ((K.ContractError, "contract"), (ValueError, "value"), (OSError, "os")):
+    def raising_walker(original, tree_error=tree_error):
+        def patched(descriptor, limits, **kw):
+            if kw.get("label") == "parse":
+                raise tree_error(f"unexpected file /{NAME_CANARY}")
+            return original(descriptor, limits, **kw)
+        return patched
+    with_patch(D, "walk_tree", raising_walker, lambda: expect_fail(
+        f"{label} error from the tree reader in verify-parse", ["verify-parse", *args(), "--parse", parse_a],
+        match="tree failed safe inspection", absent=(NAME_CANARY,), single_line=True))
+    out = work / f"canary-tree-{counter[0]}"
+    counter[0] += 1
+    with_patch(D, "walk_tree", raising_walker, lambda: expect_fail(
+        f"{label} error from the tree reader in the built tree", ["parse", *args(), "--out", out], out,
+        match="tree failed safe inspection", absent=(NAME_CANARY,), single_line=True))
+out = work / "canary-built-extra"
+
+
+def planting_walker(original):
+    def patched(descriptor, limits, **kw):
+        tree = original(descriptor, limits, **kw)
+        if kw.get("label") == "parse":
+            tree.entries.append(D.Entry(NAME_CANARY, "file", 0o644, 1, "0" * 64, ""))
+        return tree
+    return patched
+
+
+with_patch(D, "walk_tree", planting_walker, lambda: expect_fail(
+    "unexpected name in the built tree", ["parse", *args(), "--out", out], out,
+    match="unexpected paths (names withheld)", absent=(NAME_CANARY,)))
+for label, error in (("collector error", C.CollectError(f"R2 names /{NAME_CANARY}")),
+                     ("os error", OSError(5, "I/O error", f"/{NAME_CANARY}"))):
+    out = work / f"canary-op-{counter[0]}"
+    counter[0] += 1
+    calls = [0]
+
+    def late_validate(original, error=error, calls=calls):
+        def patched(*a, **kw):
+            calls[0] += 1
+            if calls[0] == 3:  # the built tree's operation: after the two recomputes' validations
+                raise error
+            return original(*a, **kw)
+        return patched
+
+    with_patch(C, "validate_operation", late_validate, lambda: expect_fail(
+        f"{label} from the collector validating the built operation", ["parse", *args(), "--out", out], out,
+        match="built operation was refused by the collector (code operation-rejected)",
+        absent=(NAME_CANARY,), single_line=True))
+with_patch(C, "validate_operation", lambda original: lambda *a, **kw: (_ for _ in ()).throw(
+    OSError(5, "I/O error", f"/{NAME_CANARY}")),
+    lambda: expect_fail("os error from the collector during verify-parse", ["verify-parse", *args(), "--parse", parse_a],
+                        match="code io-error", absent=(NAME_CANARY,), single_line=True))
+parse_other = fresh("parse-aliases")
+for label, arguments in (
+    ("parse equal to the reads", ["--parse", reads]),
+    ("parse inside the reads", ["--parse", reads / "operations"]),
+    ("parse containing the reads", ["--parse", reads.parent]),
+    ("parse equal to the request", ["--parse", request]),
+):
+    expect_fail(f"verify-{label}", ["verify-parse", "--request", request, "--reads", reads, *arguments],
+                match="overlaps an input")
+os.symlink(parse_a, parse_other / "alias")
+os.symlink(reads, parse_other / "reads-alias")
+expect_fail("verify-parse through a symlinked artifact path", ["verify-parse", *args(), "--parse", parse_other / "alias"])
+expect_fail("verify-parse of a relative path", ["verify-parse", *args(), "--parse", "parse-a"])
+expect_fail("verify-parse of a missing artifact", ["verify-parse", *args(), "--parse", work / "no-such-parse"], single_line=True)
+other_reads = fresh("other-reads") / "reads"
+write_reads(other_reads, gpt_files(512))
+expect_fail("verify-parse against other reads", ["verify-parse", "--request", request, "--reads", other_reads,
+                                                  "--parse", parse_a], match="parse differs at")
+other_request = fresh("other-request") / "request"
+shutil.copytree(request, other_request)
+value = json.loads((other_request / "request.json").read_text())
+value["synthetic_marker"] = 1
+(other_request / "request.json").write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+expect_fail("verify-parse against a modified request", ["verify-parse", "--request", other_request, "--reads", reads,
+                                                         "--parse", parse_a])
+ok("verify-parse recomputes every byte: forged, resealed, widened, aliased and unsafe artifacts fail with value-free text")
+
+# --- snapshot semantics: validated descriptor-read snapshot, never atomic ------------------
+
+
+def settle_mutation(label, nth, command, match, untouched=True):
+    base = fresh("settle-mutation") / "reads"
+    write_reads(base)
+    state = {"calls": 0, "inside": False, "fired": []}
+    real_stat = os.stat
+
+    def wrap_settle(original):
+        def patched(*a, **kw):
+            state["calls"] += 1
+            state["inside"] = True
+            try:
+                return original(*a, **kw)
+            finally:
+                state["inside"] = False
+        return patched
+
+    def stat_hook(path, *a, **kw):
+        if state["inside"] and state["calls"] == nth and path == "reads.json" and not state["fired"]:
+            state["fired"].append(True)
+            (base / "late-extra.bin").write_bytes(b"x" * 6949)
+        return real_stat(path, *a, **kw)
+
+    if command == "parse":
+        out = work / f"settle-mutation-out-{counter[0]}"
+        arguments, outputs = ["parse", "--request", request, "--reads", base, "--out", out], (out,)
+    else:
+        arguments, outputs = ["verify-parse", "--request", request, "--reads", base, "--parse", parse_a], ()
+    os.stat = stat_hook
+    try:
+        with_patch(B, "settle_reads", wrap_settle, lambda: expect_fail(
+            label, arguments, *outputs, match=match, untouched=base if untouched else None))
+    finally:
+        os.stat = real_stat
+    assert state["fired"], f"{label}: the injection never ran"
+
+
+settle_mutation("file added during the admission settle's name checks", 1, "parse",
+                f"{GAP} (1 extra, 0 missing)")
+settle_mutation("file added during the final settle's name checks (parse)", 2, "parse",
+                "changed while being read and differ from the exact closure (1 extra, 0 missing)", untouched=False)
+settle_mutation("file added during the final settle's name checks (verify-parse)", 2, "verify-parse",
+                "changed while being read and differ from the exact closure (1 extra, 0 missing)", untouched=False)
+no_leftovers("settle mutation")
+ok("directory mutations during the settle name checks refuse; admission reads zero payload bytes")
+
+
+def settle_file_mutation(label, nth, command, mutate, match, zero):
+    base = fresh("settle-file") / "reads"
+    write_reads(base)
+    state = {"calls": 0, "inside": False, "fired": []}
+    real_stat = os.stat
+
+    def wrap_settle(original):
+        def patched(*a, **kw):
+            state["calls"] += 1
+            state["inside"] = True
+            try:
+                return original(*a, **kw)
+            finally:
+                state["inside"] = False
+        return patched
+
+    def stat_hook(path, *a, **kw):
+        # reads.json sorts last: every other file was already checked when this fires
+        if state["inside"] and state["calls"] == nth and path == "reads.json" and not state["fired"]:
+            state["fired"].append(True)
+            mutate(base)
+        return real_stat(path, *a, **kw)
+
+    if command == "parse":
+        out = work / f"settle-file-out-{counter[0]}"
+        arguments, outputs = ["parse", "--request", request, "--reads", base, "--out", out], (out,)
+    else:
+        arguments, outputs = ["verify-parse", "--request", request, "--reads", base, "--parse", parse_a], ()
+    os.stat = stat_hook
+    try:
+        if zero:
+            with_patch(B, "settle_reads", wrap_settle, lambda: expect_fail(
+                label, arguments, *outputs, match=match, untouched=base))
+        else:
+            with payload_counter(base) as counted:
+                err = with_patch(B, "settle_reads", wrap_settle, lambda: expect_fail(
+                    label, arguments, *outputs, match=match))
+            assert counted[0] > 0, f"{label}: the payload was never read, so the final settle was not exercised"
+    finally:
+        os.stat = real_stat
+    assert state["fired"], f"{label}: the injection never ran"
+
+
+def rewrite_in_place(base):
+    victim = base / "gpt-primary-header.bin"
+    content = bytearray(victim.read_bytes())
+    content[0] ^= 0x01  # same size: only mtime and ctime move
+    with victim.open("r+b") as stream:
+        stream.write(bytes(content))
+
+
+for command, nth, when, zero in (("parse", 1, "during admission", True), ("parse", 2, "while being read", False),
+                                 ("verify-parse", 1, "during admission", True), ("verify-parse", 2, "while being read", False)):
+    settle_file_mutation(f"already-checked header chmod during the {command} settle ({when})", nth, command,
+                         lambda base: (base / "gpt-primary-header.bin").chmod(0o755),
+                         f"synthetic GPT reads file gpt-primary-header.bin changed {when}", zero)
+    settle_file_mutation(f"already-checked header rewritten in place during the {command} settle ({when})", nth, command,
+                         rewrite_in_place, f"synthetic GPT reads file gpt-primary-header.bin changed {when}", zero)
+no_leftovers("settle file mutation")
+ok("chmod and in-place writes during a settle refuse: zero payload bytes in admission, no success after the read")
+
+descriptors_before = len(os.listdir("/proc/self/fd"))
+baseline_tree = walk(parse_a)
+
+
+def second_pass_mutation(label, command, nth, mutate, admission):
+    base = fresh("second-pass") / "reads"
+    write_reads(base)
+    state = {"calls": 0, "inside": False, "names": 0, "fired": []}
+    real_stat = os.stat
+
+    def wrap_settle(original):
+        def patched(*a, **kw):
+            state["calls"] += 1
+            state["inside"] = True
+            try:
+                return original(*a, **kw)
+            finally:
+                state["inside"] = False
+        return patched
+
+    def stat_hook(path, *a, **kw):
+        if state["inside"] and state["calls"] == nth and path == "reads.json":
+            state["names"] += 1
+            if state["names"] == 2:  # second per-file pass, after the header was checked
+                state["fired"].append(True)
+                mutate(base)
+        return real_stat(path, *a, **kw)
+
+    if command == "parse":
+        out = work / f"second-pass-out-{counter[0]}"
+        arguments = ["parse", "--request", request, "--reads", base, "--out", out]
+    else:
+        out = parse_a
+        arguments = ["verify-parse", "--request", request, "--reads", base, "--parse", parse_a]
+    os.stat = stat_hook
+    try:
+        with payload_counter(base) as counted:
+            code, stdout, stderr = with_patch(B, "settle_reads", wrap_settle, lambda: invoke(*arguments))
+    finally:
+        os.stat = real_stat
+    assert state["fired"], f"{label}: the injection never ran"
+    if admission:
+        # the admission settle missed it: bounded payload bytes were consumed, the later settle refuses
+        assert code != 0 and not stdout, f"{label}: accepted"
+        assert 0 < counted[0] <= 50176, f"{label}: {counted[0]} payload bytes"
+        assert "parsed" not in stderr and "verified" not in stderr
+        if command == "parse":
+            assert not os.path.lexists(out), f"{label}: left output"
+    else:
+        # past the captured bytes' final observation: the already-bound snapshot may be produced...
+        assert code == 0, f"{label}: {stderr}"
+        if command == "parse":
+            assert walk(out) == baseline_tree, f"{label}: artifact differs from the validated snapshot"
+        # ...but the source changed, so an immediate unhooked verification rejects it
+        verify_against = out if command == "parse" else parse_a
+        code2, stdout2, _ = invoke("verify-parse", "--request", request, "--reads", base, "--parse", verify_against)
+        assert code2 != 0 and not stdout2, f"{label}: the changed source verified"
+    ok(f"{label}: " + ("rejected after bounded payload, no output" if admission
+                       else "bound snapshot only; later verification rejects the changed source"))
+
+
+for command, nth, admission in (("parse", 1, True), ("verify-parse", 1, True), ("parse", 6, False), ("verify-parse", 4, False)):
+    where = "admission settle" if admission else f"final {command} gather settle"
+    second_pass_mutation(f"second-pass chmod after the header was checked ({where})", command, nth,
+                         lambda base: (base / "gpt-primary-header.bin").chmod(0o755), admission)
+    second_pass_mutation(f"second-pass same-size rewrite after the header was checked ({where})", command, nth,
+                         rewrite_in_place, admission)
+no_leftovers("second-pass mutation")
+assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
+
+
+def mapped_mutation(command, nth):
+    base = fresh("mmap-source") / "reads"
+    write_reads(base)
+    victim = base / "gpt-primary-entries.bin"
+    out = work / f"mmap-out-{counter[0]}"
+    calls, fired = [0], []
+    with victim.open("r+b") as stream, mmap.mmap(stream.fileno(), 0) as mapping:
+        mapping[0] = mapping[0]  # fault a writable page now; later stores need no write fault
+        before = D.fingerprint(victim.stat())
+        real_read = os.read
+
+        def mutating_read(descriptor, count):
+            data = real_read(descriptor, count)
+            if data and os.readlink(f"/proc/self/fd/{descriptor}") == str(victim):
+                calls[0] += 1
+                if calls[0] == nth:
+                    mapping[100] = mapping[100] ^ 0xFF
+                    fired.append(True)
+                    assert D.fingerprint(victim.stat()) == before, "the mapped store moved the metadata"
+            return data
+
+        if command == "parse":
+            arguments = ["parse", "--request", request, "--reads", base, "--out", out]
+        else:
+            arguments = ["verify-parse", "--request", request, "--reads", base, "--parse", parse_a]
+        os.read = mutating_read
+        try:
+            code, stdout, stderr = invoke(*arguments)
+        finally:
+            os.read = real_read
+        assert fired, f"{command}: the mapped mutation never ran"
+        assert D.fingerprint(victim.stat()) == before
+        assert code == 0, f"{command}: {stderr}"  # the bound snapshot was produced from the bytes read
+        if command == "parse":
+            assert walk(out) == baseline_tree, "artifact differs from the validated pre-mutation snapshot"
+        verify_against = out if command == "parse" else parse_a
+        code2, stdout2, _ = invoke("verify-parse", "--request", request, "--reads", base, "--parse", verify_against)
+        assert code2 != 0 and not stdout2, f"{command}: the mutated source verified"
+    ok(f"mapped same-metadata rewrite during {command}: bound snapshot only; later verification rejects")
+
+
+mapped_mutation("parse", 3)
+mapped_mutation("verify-parse", 2)
+no_leftovers("mapped mutation")
+assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
+
+# --- publication: durability, rename and verification failures, residuals ----------------
+
+real_fsync = os.fsync
+parent_path = str(work)
+PUBLISH_CODE = "parse could not be published safely (code publish-rejected)"
+
+
+def one_shot_parent_fsync(fired):
+    def failing(descriptor):
+        if not fired and os.readlink(f"/proc/self/fd/{descriptor}") == parent_path:
+            fired.append(True)
+            raise OSError(errno.EIO, f"injected parent fsync failure {NAME_CANARY}")
+        return real_fsync(descriptor)
+    return failing
+
+
+fsync_out = work / "bootchain-fsync-out"
+fired = []
+os.fsync = one_shot_parent_fsync(fired)
+try:
+    code, stdout, stderr = invoke("parse", *args(), "--out", fsync_out)
+finally:
+    os.fsync = real_fsync
+assert fired and code == 1 and not stdout, (code, stdout, stderr)
+assert stderr == f"ERROR: {PUBLISH_CODE}\n", stderr
+assert NAME_CANARY not in stderr and "fsync" not in stderr and "EIO" not in stderr
+assert not os.path.lexists(fsync_out)
+no_leftovers("parent fsync failure")
+existing_out = work / "bootchain-fsync-existing"
+existing_out.mkdir()
+(existing_out / "precious").write_text("keep")
+fired = []
+os.fsync = one_shot_parent_fsync(fired)
+try:
+    code, stdout, stderr = invoke("parse", *args(), "--out", existing_out)
+finally:
+    os.fsync = real_fsync
+assert code != 0 and not stdout and not fired
+assert sorted(os.listdir(existing_out)) == ["precious"] and (existing_out / "precious").read_text() == "keep"
+assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
+ok("a parent-directory fsync failure with successful cleanup is publish-rejected with no leftovers")
+
+# A cleanup that also fails can leave an output while the command still reports failure: documented residual.
+fired = []
+residual_out = work / "bootchain-residual"
+real_rmdir, real_unlink = os.rmdir, os.unlink
+os.fsync = one_shot_parent_fsync(fired)
+os.rmdir = os.unlink = lambda *a, **kw: (_ for _ in ()).throw(OSError(errno.EIO, "cleanup refused"))
+try:
+    code, stdout, stderr = invoke("parse", *args(), "--out", residual_out)
+finally:
+    os.fsync, os.rmdir, os.unlink = real_fsync, real_rmdir, real_unlink
+assert fired and code == 1 and not stdout and stderr == f"ERROR: {PUBLISH_CODE}\n", (code, stderr)
+residue = [p for p in work.iterdir() if p.name == residual_out.name or p.name.startswith(f".{residual_out.name}.tmp-")]
+assert residue, "the documented cleanup residual did not occur"
+for path in residue:
+    shutil.rmtree(path, ignore_errors=True)
+ok("a failed cleanup after a failed fsync can leave an output while reporting failure (documented residual)")
+
+# A rename failure and a verification failure: fixed diagnostic, no success, no output, no temp.
+for label, patch_target, make in (
+    ("rename failure", "rename_noreplace", lambda original: lambda *a, **kw: (_ for _ in ()).throw(
+        D.DeploymentError(f"cannot publish /{NAME_CANARY}: Invalid argument"))),
+    ("rename failure as an OS error", "rename_noreplace", lambda original: lambda *a, **kw: (_ for _ in ()).throw(
+        OSError(errno.EXDEV, "cross-device", f"/{NAME_CANARY}"))),
+):
+    out = work / f"publish-{counter[0]}"
+    counter[0] += 1
+    with_patch(D, patch_target, make, lambda: expect_fail(
+        label, ["parse", *args(), "--out", out], out, match=PUBLISH_CODE, absent=(NAME_CANARY,), single_line=True))
+real_publish = D.publish
+out = work / "publish-race"
+
+
+def racing_publish(out_path, protected, ids, spec, verify_built):
+    seen = [0]
+
+    def wrapped(path, descriptor):
+        seen[0] += 1
+        if seen[0] == 2:
+            raise D.DeploymentError("injected failure after publication")
+        return verify_built(path, descriptor)
+    return real_publish(out_path, protected, ids, spec, wrapped)
+
+
+D.publish = racing_publish
+try:
+    expect_fail("failure after the atomic rename removes the output", ["parse", *args(), "--out", out], out,
+                match=PUBLISH_CODE, absent=("injected failure after publication",))
+finally:
+    D.publish = real_publish
+no_leftovers("publication race")
+for label, error in (
+    ("deployment error", D.DeploymentError(f"cannot publish /{NAME_CANARY}\nsecond line")),
+    ("contract error", K.ContractError(f"unexpected /{NAME_CANARY}")),
+    ("value error", ValueError(f"unexpected /{NAME_CANARY}")),
+    ("os error", OSError(28, "No space left on device", f"/{NAME_CANARY}")),
+):
+    out = work / f"canary-publish-{counter[0]}"
+    counter[0] += 1
+    with_patch(D, "publish", lambda original, error=error: lambda *a, **kw: (_ for _ in ()).throw(error),
+               lambda: expect_fail(f"{label} from publication", ["parse", *args(), "--out", out], out,
+                                   match=PUBLISH_CODE, absent=(NAME_CANARY,), single_line=True))
+D.publish = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("internal bug marker"))
+try:
+    try:
+        invoke("parse", *args(), "--out", work / "canary-publish-bug")
+    except RuntimeError as error:
+        assert str(error) == "internal bug marker"
+    else:
+        raise AssertionError("a programmer error was swallowed by the publication sanitizer")
+finally:
+    D.publish = real_publish
+existing = work / "existing"
+existing.mkdir()
+(existing / "keep.txt").write_text("kept")
+before_existing = walk(existing)
+for label, out in (
+    ("existing output directory", existing), ("output inside reads", reads / "out"),
+    ("output inside request", request / "out"), ("output equal to reads", reads),
+    ("output containing reads", reads.parent), ("output with dot components", f"{work}/./out-dots"),
+    ("relative output path", "out"), ("output with a control character", f"{work}/bad\x01{NAME_CANARY}"),
+    ("output name past the length bound", f"{work}/{NAME_CANARY}" + "x" * 220),
+):
+    code, stdout, stderr = invoke("parse", *args(), "--out", out)
+    assert code != 0 and stdout == "" and NAME_CANARY not in stderr and stderr.count("\n") == 1, (label, stderr)
+    ok(f"{label} is refused with a value-free single-line diagnostic")
+assert walk(existing) == before_existing, "the existing output was modified"
+expect_fail("reads equal request", ["parse", "--request", request, "--reads", request, "--out", work / "o10"], work / "o10")
+nest = fresh("nest")
+shutil.copytree(request, nest / "request")
+write_reads(nest / "request/reads")
+expect_fail("reads inside request", ["parse", "--request", nest / "request", "--reads", nest / "request/reads",
+                                      "--out", work / "o11"], work / "o11")
+unsafe_out = work / "unsafe-out"
+unsafe_out.mkdir()
+unsafe_out.chmod(0o777)
+try:
+    expect_fail("writable output parent", ["parse", *args(), "--out", unsafe_out / "out"], unsafe_out / "out")
+finally:
+    unsafe_out.chmod(0o700)
+alias_parent = fresh("alias-parent")
+os.symlink(reads, alias_parent / "alias")
+expect_fail("output through a symlink into the reads", ["parse", *args(), "--out", alias_parent / "alias/out"])
+assert not (reads / "out").exists()
+expect_fail("a live option", ["parse", *args(), "--out", work / "never", "--live"])
+expect_fail("a device option", ["parse", *args(), "--out", work / "never", "--device", "/dev/null"])
+expect_fail("a missing reads option", ["parse", "--request", request, "--out", work / "never"])
+assert not os.path.lexists(work / "never")
+no_leftovers("hazards")
+expect_ok("parse", *args(), "--out", work / "after-publication-failures")
+for racy_target in ("gpt-primary-header.bin", "reads.json"):
+    for at in (1, 2):
+        racy = fresh("race") / "reads"
+        write_reads(racy)
+        victim = racy / racy_target
+        calls = [0]
+
+        def mutate_after_read(original, victim=victim, at=at, calls=calls):
+            def patched(*a, **kw):
+                result = original(*a, **kw)
+                calls[0] += 1
+                if calls[0] == at:
+                    victim.write_bytes(victim.read_bytes() + b" ")
+                return result
+            return patched
+
+        out = work / f"race-out-{counter[0]}"
+        with_patch(B, "read_reads", mutate_after_read, lambda: expect_fail(
+            f"{racy_target} changed after read {at}", ["parse", "--request", request, "--reads", racy, "--out", out], out))
+no_leftovers("reads races")
+for at in (1, 2):
+    clone = fresh("race-request-copy") / "request"
+    shutil.copytree(request, clone)
+    calls = [0]
+
+    def poke_request(original, clone=clone, at=at, calls=calls):
+        def patched(*a, **kw):
+            result = original(*a, **kw)
+            calls[0] += 1
+            if calls[0] == at:
+                with (clone / "STATUS.txt").open("ab") as stream:
+                    stream.write(b"x")
+            return result
+        return patched
+
+    out = work / f"race-request-{at}"
+    with_patch(B, "read_request", poke_request, lambda: expect_fail(
+        f"request changed after read {at}", ["parse", "--request", clone, "--reads", reads, "--out", out], out))
+no_leftovers("request races")
+for target in ("validate_operation",):
+    out = work / f"collector-{target}"
+    with_patch(C, target, lambda original: lambda *a, **kw: (_ for _ in ()).throw(C.CollectError("injected collector rejection")),
+               lambda: expect_fail(f"collector {target} rejection", ["parse", *args(), "--out", out], out,
+                                   match="injected collector rejection"))
+no_leftovers("collector rejection")
+ok("hazards, races and collector rejection leave no output or temp tree; the existing output is untouched")
+
+# --- no process, no network, no raw device --------------------------------------------
+
+
+def boom(*a, **kw):
+    raise AssertionError("process or network use attempted")
+
+
+saved = (os.system, os.fork, os.posix_spawn, os.execv, os.execvp, subprocess.Popen, socket.socket,
+         socket.create_connection, socket.getaddrinfo)
+os.system, os.fork, os.posix_spawn, os.execv, os.execvp = (boom,) * 5
+subprocess.Popen = socket.socket = socket.create_connection = socket.getaddrinfo = boom
+try:
+    expect_ok("show")
+    expect_ok("plan", "--request", request)
+    expect_ok("parse", *args(), "--out", work / "spawn-free")
+    expect_ok("verify-parse", *args(), "--parse", work / "spawn-free")
+finally:
+    (os.system, os.fork, os.posix_spawn, os.execv, os.execvp, subprocess.Popen, socket.socket,
+     socket.create_connection, socket.getaddrinfo) = saved
+opened_targets = []
+real_open = os.open
+
+
+def recording_open(path, *a, **kw):
+    opened_targets.append(os.fspath(path))
+    return real_open(path, *a, **kw)
+
+
+os.open = recording_open
+try:
+    expect_ok("parse", *args(), "--out", work / "open-audit")
+finally:
+    os.open = real_open
+assert opened_targets and not [t for t in opened_targets if t.startswith(("/dev", "/sys"))], opened_targets
+ok("planning, parsing and verification spawn no process, open no network and open no raw device")
+
+# --- scope: existing artifacts untouched, R3 and R4 not implemented, nothing committed raw ---
+
+for name in ("capture", "preflight", "deployment", "snapshot", "session", "stage", "kernel"):
+    text = (repo / f"device/myron/{name}-contract.json").read_text()
+    assert "bootchain" not in text and "gpt-v1-128x128" not in text, name
+for tool in ("myron-collect", "myron-preflight", "myron-session", "myron-snapshot", "myron-deployment"):
+    assert "bootchain" not in (repo / "tools" / tool).read_text().lower(), tool
+for tool in ("myron-collect-impl.py", "myron-session-impl.py"):
+    assert "bootchain" not in (repo / "tools/lib" / tool).read_text().lower(), tool
+tracked = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=repo,
+                         capture_output=True, text=True, check=True).stdout.split()
+assert not [p for p in tracked if re.search(r"(^|/)gpt[-_].*\.bin$|(^|/)geometry\.json$|\.img$", p)
+            and p.startswith(("tests/", "tools/", "device/myron/", "docs/myron/"))], "a raw GPT fixture is committed"
+assert (repo / "tools/myron-bootchain").exists() and "tests/myron-bootchain" in (repo / "tests/all").read_text()
+assert sum(1 for line in (repo / "tests/all").read_text().splitlines() if "tests/myron-bootchain" in line) == 1
+plan_all = json.dumps(plan_a)
+assert "R3 and R4 are not implemented" in plan_all and "r3-boot-image-schema-migration" in plan_all
+assert "r4-selection-source-qualification" in plan_all
+ok("existing contracts and tools are untouched, R3 and R4 are recorded successor gates, no raw fixture is committed")
+
+# --- registry drift and consistency --------------------------------------------------
+
+baseline = D.render_json(B.expected_bootchain_contract(collector_env))
+assert baseline == bootchain_contract_bytes
+
+
+def drift(name, apply, restore):
+    apply()
+    try:
+        drifted = D.render_json(B.expected_bootchain_contract(collector_env))
+        assert drifted != baseline, f"{name}: contract did not change"
+        code, _out, err = invoke("show")
+        assert code != 0 and "differs from its derived form" in err, err
+    finally:
+        restore()
+    assert D.render_json(B.expected_bootchain_contract(collector_env)) == baseline
+    ok(f"{name} changes the derived contract and the committed contract is refused")
+
+
+saved_coverage, saved_files = list(B.COVERAGE), copy.deepcopy(B.INPUT_FILES)
+drift("input file role change", lambda: B.INPUT_FILES[1].update(role="x"),
+      lambda: B.INPUT_FILES[1].update(role="explicit-geometry-claim"))
+drift("input file bound change with the total kept", lambda: (B.INPUT_FILES[1].update(max_bytes=512),
+                                                              B.INPUT_FILES[0].update(max_bytes=8704)),
+      lambda: (B.INPUT_FILES[1].update(max_bytes=1024), B.INPUT_FILES[0].update(max_bytes=8192)))
+drift("coverage semantics change", lambda: B.COVERAGE.__setitem__(
+    2, ("partitions.bootable_flag", "parsed-bytes", "gpt-entry-attributes-bit-2", "android-bootable")),
+      lambda: B.COVERAGE.__setitem__(2, saved_coverage[2]))
+drift("limitation text change", lambda: B.LIMITATIONS.append("x"), lambda: B.LIMITATIONS.pop())
+drift("unresolved claim change", lambda: B.UNRESOLVED.append("x"), lambda: B.UNRESOLVED.pop())
+drift("deferred gate change", lambda: B.DEFERRED[0].update(state="implemented"),
+      lambda: B.DEFERRED[0].update(state="not-implemented"))
+drift("semantic limit change", lambda: B.SEMANTIC_LIMITS.pop(), lambda: B.SEMANTIC_LIMITS.append(
+    "recovery_present is name presence inside this one GPT, not recovery viability"))
+drift("profile constant change", lambda: setattr(B, "BOOTABLE_BIT", 1), lambda: setattr(B, "BOOTABLE_BIT", 2))
+drift("sector size set change", lambda: B.SECTOR_SIZES.append(1024), lambda: B.SECTOR_SIZES.pop())
+
+
+def inconsistent(name, mutate, restore):
+    mutate()
+    try:
+        B.check_registry_consistency(C)
+    except B.BootchainError as error:
+        assert any(word in str(error) for word in ("inconsistent", "differ", "exceed")), error
+    else:
+        raise AssertionError(f"{name}: inconsistent registry accepted")
+    finally:
+        restore()
+    B.check_registry_consistency(C)
+    ok(f"{name} is refused by the registry consistency check")
+
+
+saved_pattern, saved_recovery = B.PARTITION_NAME, B.RECOVERY_NAME
+inconsistent("partition pattern differing from the collector", lambda: setattr(B, "PARTITION_NAME", re.compile(r"[a-z]{1,8}")),
+             lambda: setattr(B, "PARTITION_NAME", saved_pattern))
+inconsistent("recovery pattern differing from the collector", lambda: setattr(B, "RECOVERY_NAME", re.compile(r"recovery")),
+             lambda: setattr(B, "RECOVERY_NAME", saved_recovery))
+inconsistent("partition bound differing from the collector", lambda: setattr(B, "MAX_PARTITIONS", 100),
+             lambda: setattr(B, "MAX_PARTITIONS", 128))
+inconsistent("size bound differing from the collector", lambda: setattr(B, "BYTE_LIMIT", 2**49),
+             lambda: setattr(B, "BYTE_LIMIT", 2**50))
+inconsistent("coverage row removed", lambda: B.COVERAGE.pop(), lambda: B.COVERAGE.append(saved_coverage[-1]))
+inconsistent("coverage duplicate field", lambda: B.COVERAGE.append(saved_coverage[0]), lambda: B.COVERAGE.pop())
+inconsistent("coverage unknown class", lambda: B.COVERAGE.__setitem__(0, ("partitions.partition_name", "verified", "x", "y")),
+             lambda: B.COVERAGE.__setitem__(0, saved_coverage[0]))
+inconsistent("input bound past the total", lambda: B.INPUT_FILES[0].update(max_bytes=9000),
+             lambda: B.INPUT_FILES[0].update(max_bytes=8192))
+inconsistent("byte accounting past the operation bound", lambda: setattr(B, "MAX_BYTES_READ", 2 * 1024 * 1024),
+             lambda: setattr(B, "MAX_BYTES_READ", 41984))
+ok("registry drift changes the derived contract and a contradictory registry stops every command")
+
+# --- trusted loader: source pin and races ---------------------------------------------
+
+impl_path = repo / "tools/lib/myron-bootchain-impl.py"
+tool_bytes = impl_path.read_bytes()
+implementation = {"algorithm": "sha256-of-captured-implementation-bytes",
+                  "path": "tools/lib/myron-bootchain-impl.py", "sha256": digest(tool_bytes)}
+assert B.implementation_binding() == implementation and B.CAPTURED_IMPLEMENTATION_SHA256 == implementation["sha256"]
+assert contract["implementation"] == implementation and plan_a["implementation"] == implementation
+assert parse_doc["implementation"] == implementation
+loader_bytes = (repo / "tools/myron-bootchain").read_bytes()
+for held in (tool_bytes, loader_bytes):
+    assert implementation["sha256"].encode() not in held, "no source file holds the pin"
+    assert digest(bootchain_contract_bytes).encode() not in held
+assert [name for name, value in vars(B).items()
+        if type(value) is str and B.HEX256.fullmatch(value)] == ["CAPTURED_IMPLEMENTATION_SHA256"], \
+    "the only digest in the namespace is the loader's capture"
+contract_tamper("contract implementation path", lambda v: v["implementation"].update(path="tools/other"))
+contract_tamper("contract implementation algorithm", lambda v: v["implementation"].update(algorithm="none"))
+ok("bootchain contract, plan and parse bind the SHA-256 of the captured implementation bytes, held in no source file")
+
+
+def tool_copy(name, edit=None):
+    """A private copy of tools/ with its own bootchain source, loaded as its own module."""
+    base = fresh(name)
+    (base / "packages").mkdir()
+    for part in ["tools", *(f"packages/{p.name}" for p in (repo / "packages").glob("omamobile-myron-*"))]:
+        shutil.copytree(repo / part, base / part, ignore=shutil.ignore_patterns("__pycache__"))
+    source = base / "tools/lib/myron-bootchain-impl.py"
+    if edit is not None:
+        text = source.read_text()
+        edited = edit(text)
+        assert edited != text, f"{name}: edit changed nothing"
+        source.write_text(edited)
+    return base, load(f"bootchain_copy_{counter[0]}", base / "tools/myron-bootchain")
+
+
+def refuses(module, label):
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = module.main(["show"], contracts_root=contracts_root)
+    assert code != 0 and "differs from its derived form" in err.getvalue(), (label, err.getvalue())
+
+
+_, control = tool_copy("impl-control")
+control_err = io.StringIO()
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(control_err):
+    control_code = control.main(["show"], contracts_root=contracts_root)
+assert control_code == 0, control_err.getvalue()
+assert control.implementation_binding() == implementation, "a byte-identical copy keeps the pin"
+SOURCE_EDITS = {
+    "a comment-only edit": lambda t: t + "# unreviewed\n",
+    "a dropped overlap rule": lambda t: t.replace("if next_first <= previous_last:", "if False:", 1),
+    "a dropped duplicate-name rule": lambda t: t.replace("if name in seen_names:", "if False:", 1),
+    "a dropped copy-agreement rule": lambda t: t.replace("if table != files[BACKUP_ENTRIES]:", "if False:", 1),
+    "a moved bootable bit": lambda t: t.replace("(attributes >> BOOTABLE_BIT) & 1", "(attributes >> 1) & 1", 1),
+    "a dropped zero-padding rule": lambda t: t.replace("if any(raw[end:]):", "if False:", 1),
+    "a loosened header checksum": lambda t: t.replace("!= u32(raw, 16):", "!= u32(raw, 16) and False:", 1),
+}
+for label, edit in SOURCE_EDITS.items():
+    _, edited = tool_copy("impl-edit", edit)
+    assert edited.implementation_binding()["sha256"] != implementation["sha256"], label
+    refuses(edited, label)
+    ok(f"{label} in the bootchain source changes the pin and the committed contract is refused")
+other_base, _ = tool_copy("impl-moved")
+(other_base / "tools/myron-bootchain").rename(other_base / "tools/myron-bootchain-renamed")
+try:
+    load("bootchain_renamed", other_base / "tools/myron-bootchain-renamed").implementation_binding()
+except Exception as error:
+    assert type(error).__name__ == "BootchainError" and "pinned path" in str(error), error
+else:
+    raise AssertionError("a bootchain tool outside its pinned path produced a pin")
+rule_edit = lambda text: text.replace("if table != files[BACKUP_ENTRIES]:", "if False:", 1)
+base, modified = tool_copy("impl-restore", rule_edit)
+impl_copy = base / "tools/lib/myron-bootchain-impl.py"
+modified_sha = digest(impl_copy.read_bytes())
+impl_copy.write_bytes(tool_bytes)
+assert modified.implementation_binding()["sha256"] == modified_sha != implementation["sha256"]
+refuses(modified, "a modified validator with its path restored")
+assert load("bootchain_restored", base / "tools/myron-bootchain").implementation_binding() == implementation
+base, _ = tool_copy("impl-swap", rule_edit)
+impl_copy = base / "tools/lib/myron-bootchain-impl.py"
+modified_sha = digest(impl_copy.read_bytes())
+real_read, real_open_fn, opened, swapped = os.read, os.open, [], []
+
+
+def swapping_read(descriptor, count):
+    if not swapped:
+        swapped.append(True)
+        replacement = impl_copy.with_name("swap.tmp")
+        replacement.write_bytes(tool_bytes)
+        replacement.chmod(0o644)
+        os.replace(replacement, impl_copy)
+    return real_read(descriptor, count)
+
+
+def counting_open(path, *a, **kw):
+    opened.append(os.fspath(path))
+    return real_open_fn(path, *a, **kw)
+
+
+os.read, os.open = swapping_read, counting_open
+try:
+    swapped_module = load("bootchain_swapped", base / "tools/myron-bootchain")
+finally:
+    os.read, os.open = real_read, real_open_fn
+assert swapped and digest(impl_copy.read_bytes()) == implementation["sha256"]
+assert swapped_module.implementation_binding()["sha256"] == modified_sha
+assert opened.count("myron-bootchain-impl.py") == 1, opened
+ok("path replacement during the capture changes neither the hashed nor the executed bytes")
+
+
+def loader_refuses(label, damage, match):
+    base, _ = tool_copy("impl-loader")
+    damage(base / "tools/lib/myron-bootchain-impl.py")
+    try:
+        load(f"bootchain_bad_{counter[0]}", base / "tools/myron-bootchain")
+    except ImportError as error:
+        assert match in str(error), (label, error)
+    else:
+        raise AssertionError(f"{label}: the loader accepted it")
+    result = subprocess.run([sys.executable, "-I", str(base / "tools/myron-bootchain"), "show"],
+                            capture_output=True, text=True)
+    assert result.returncode == 1 and result.stderr.startswith("ERROR: ") and not result.stdout, label
+    ok(f"the loader refuses {label}")
+
+
+def to_symlink(path):
+    target = path.with_name("target.py")
+    path.rename(target)
+    path.symlink_to(target)
+
+
+def to_fifo(path):
+    path.unlink()
+    os.mkfifo(path)
+
+
+loader_refuses("an implementation that is a symlink", to_symlink, "cannot read")
+loader_refuses("an implementation that is not a regular file", to_fifo, "not a regular file")
+loader_refuses("a group-writable implementation", lambda path: path.chmod(0o664), "writable by others")
+loader_refuses("an oversize implementation", lambda path: path.write_bytes(b"#" * (1024 * 1024 + 1)), "byte bound")
+loader_refuses("a missing implementation", lambda path: path.unlink(), "cannot read")
+
+
+def version_pin(label, tool, old, new, expect):
+    base = fresh("version-pin")
+    (base / "packages").mkdir()
+    for part in ["tools", *(f"packages/{p.name}" for p in (repo / "packages").glob("omamobile-myron-*"))]:
+        shutil.copytree(repo / part, base / part, ignore=shutil.ignore_patterns("__pycache__"))
+    target = base / tool
+    text = target.read_text()
+    assert old in text, label
+    target.write_text(text.replace(old, new, 1))
+    module = load(f"bootchain_pin_{counter[0]}", base / "tools/myron-bootchain")
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        code = module.main(["show"], contracts_root=contracts_root)
+    assert code != 0 and expect in err.getvalue(), (label, err.getvalue())
+    ok(f"{label} is refused before any use")
+
+
+version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
+            'VERSION = "0.1.0"', 'VERSION = "0.1.1"', "unsupported verifier versions")
+version_pin("a preflight at another version", "tools/myron-preflight",
+            'VERSION = "0.2.1"', 'VERSION = "0.2.0"', "unsupported verifier versions")
+ok("dependency version pins are enforced")
+
+assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
+print("ok - myron bootchain parser tests passed")
+PY
+
+pass "myron bootchain tests passed"
