@@ -2544,19 +2544,29 @@ assert opened.count("myron-bootchain-impl.py") == 1, opened
 ok("path replacement during the capture changes neither the hashed nor the executed bytes")
 
 
-def loader_refuses(label, damage, match):
-    base, _ = tool_copy("impl-loader")
+LOADER_LINE = "bootchain implementation could not be loaded (code loader-rejected)"
+
+
+def loader_refuses(label, damage, match=LOADER_LINE):
+    base, _ = tool_copy(f"impl-loader-{CANARY0}")
     damage(base / "tools/lib/myron-bootchain-impl.py")
     try:
         load(f"bootchain_bad_{counter[0]}", base / "tools/myron-bootchain")
     except ImportError as error:
-        assert match in str(error), (label, error)
+        assert str(error) == match and error.__cause__ is None and error.__suppress_context__, (label, error)
     else:
         raise AssertionError(f"{label}: the loader accepted it")
-    result = subprocess.run([sys.executable, "-I", str(base / "tools/myron-bootchain"), "show"],
-                            capture_output=True, text=True)
-    assert result.returncode == 1 and result.stderr.startswith("ERROR: ") and not result.stdout, label
+    for command in ("show", "derive-contract"):
+        result = subprocess.run([sys.executable, "-I", str(base / "tools/myron-bootchain"), command],
+                                capture_output=True, text=True, cwd=base)
+        assert result.returncode == 1 and not result.stdout, (label, result)
+        assert result.stderr == f"ERROR: {match}\n", (label, result.stderr)
+        for leak in (CANARY0, str(base), "Traceback", "Errno", "File \"", "null bytes"):
+            assert leak not in result.stderr, (label, leak)
     ok(f"the loader refuses {label}")
+
+
+CANARY0 = "CANARYl0"
 
 
 def to_symlink(path):
@@ -2570,11 +2580,25 @@ def to_fifo(path):
     os.mkfifo(path)
 
 
-loader_refuses("an implementation that is a symlink", to_symlink, "cannot read")
-loader_refuses("an implementation that is not a regular file", to_fifo, "not a regular file")
-loader_refuses("a group-writable implementation", lambda path: path.chmod(0o664), "writable by others")
-loader_refuses("an oversize implementation", lambda path: path.write_bytes(b"#" * (1024 * 1024 + 1)), "byte bound")
-loader_refuses("a missing implementation", lambda path: path.unlink(), "cannot read")
+loader_refuses("an implementation that is a symlink", to_symlink)
+loader_refuses("an implementation that is not a regular file", to_fifo)
+loader_refuses("a group-writable implementation", lambda path: path.chmod(0o664))
+loader_refuses("an unreadable implementation", lambda path: path.chmod(0o000))
+loader_refuses("an oversize implementation", lambda path: path.write_bytes(b"#" * (1024 * 1024 + 1)))
+loader_refuses("a missing implementation", lambda path: path.unlink())
+loader_refuses("a syntax-invalid implementation", lambda path: path.write_text(f"def (: {CANARY0}\n"))
+loader_refuses("an implementation holding a NUL byte", lambda path: path.write_bytes(b"x = 1\n\0" + CANARY0.encode()))
+loader_refuses("an implementation whose import fails",
+               lambda path: path.write_text(f"raise ImportError('{CANARY0} /secret/path')\n"))
+loader_refuses("an implementation that raises", lambda path: path.write_text(f"raise RuntimeError('{CANARY0}')\n"))
+# The implementation's own SystemExit keeps its status: the loader does not swallow or rewrite it.
+for payload, status, text in ((0, 0, ""), (3, 3, ""), (f"'{CANARY0} exit'", 1, f"{CANARY0} exit\n")):
+    base, _ = tool_copy("impl-exit")
+    (base / "tools/lib/myron-bootchain-impl.py").write_text(f"raise SystemExit({payload})\n")
+    result = subprocess.run([sys.executable, "-I", str(base / "tools/myron-bootchain"), "show"],
+                            capture_output=True, text=True, cwd=base)
+    assert (result.returncode, result.stdout, result.stderr) == (status, "", text), result
+ok("the loader leaves the implementation's own SystemExit alone")
 
 
 def version_pin(label, tool, old, new, expect):
@@ -2595,7 +2619,7 @@ def version_pin(label, tool, old, new, expect):
 
 
 version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
-            'VERSION = "0.1.0"', 'VERSION = "0.1.1"', "unsupported verifier versions")
+            'VERSION = "0.1.0"', 'VERSION = "0.1.1"', "(code dependency-version)")
 version_pin("a preflight at another version", "tools/myron-preflight",
             'VERSION = "0.2.1"', 'VERSION = "0.2.0"', "(code dependency-rejected)")
 ok("dependency version pins are enforced")
@@ -2618,6 +2642,8 @@ DAMAGE = {
     "missing": lambda path: path.unlink(),
     "syntax-invalid": lambda path: path.write_text("def (:\n"),
     "raising": lambda path: path.write_text(f"raise RuntimeError('{CANARY} raised')\n"),
+    "exiting with 0": lambda path: path.write_text("raise SystemExit(0)\n"),
+    "exiting with text": lambda path: path.write_text(f"raise SystemExit('{CANARY} exit')\n"),
 }
 
 
@@ -2653,9 +2679,96 @@ for label, relative in DEPENDENCIES.items():
             assert done.returncode == 1, (where, done.returncode, done.stderr)
             assert done.stdout == "", (where, done.stdout)
             assert done.stderr == STARTUP, (where, done.stderr)
-            for leak in (CANARY, removed, str(base), "Traceback", "Errno", "No such file", "raised"):
+            for leak in (CANARY, removed, str(base), "Traceback", "Errno", "No such file", "raised", "exit"):
                 assert leak not in done.stderr, (where, leak)
-ok("a missing, syntax-invalid or raising dependency is one fixed value-free line for all five commands, in a fresh process")
+ok("a missing, syntax-invalid, raising or exiting dependency is one fixed value-free line for all five commands, in a fresh process")
+
+
+def all_five(base):
+    return {
+        "show": [],
+        "derive-contract": [],
+        "plan": ["--request", str(base / "no-request")],
+        "parse": ["--request", str(base / "no-request"), "--reads", str(base / "no-reads"),
+                  "--out", str(base / "no-out")],
+        "verify-parse": ["--request", str(base / "no-request"), "--reads", str(base / "no-reads"),
+                         "--parse", str(base / "no-parse")],
+    }
+
+
+def startup_refusal(where, base, expected=STARTUP, leaks=()):
+    for command, extra in all_five(base).items():
+        done = subprocess.run(
+            [sys.executable, "-I", str(base / "tools/myron-bootchain"), command, *extra],
+            capture_output=True, text=True, cwd=base, env={"PATH": os.environ["PATH"], "LC_ALL": "C"},
+        )
+        assert done.returncode == 1 and done.stdout == "" and done.stderr == expected, (where, command, done)
+        assert not (base / "no-out").exists(), (where, command)
+        for leak in (CANARY, str(base), "Traceback", "Errno", *leaks):
+            assert leak not in done.stderr, (where, command, leak)
+
+
+# A nested dependency that exits at import time, and exports that are not plain exception classes.
+for label, relative, payload in (
+    ("nested collector implementation exiting with 0", "tools/lib/myron-collect-impl.py", "raise SystemExit(0)\n"),
+    ("nested collector implementation exiting with text", "tools/lib/myron-collect-impl.py",
+     f"raise SystemExit('{CANARY} exit')\n"),
+):
+    base = startup_copy("nested")
+    (base / relative).write_text(payload)
+    startup_refusal(label, base, leaks=("exit",))
+EXPORTS = {
+    "CollectError as an object": ("tools/lib/myron-collect-impl.py", "CollectError = object()\n"),
+    "CollectError as an instance exception": ("tools/lib/myron-collect-impl.py", "CollectError = ValueError('x')\n"),
+    "CollectError as a non-exception class": ("tools/lib/myron-collect-impl.py", "CollectError = int\n"),
+    "CollectError as SystemExit": ("tools/lib/myron-collect-impl.py", "CollectError = SystemExit\n"),
+    "ContractError as an object": ("packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify",
+                                   "ContractError = object()\n"),
+    "ProfileError as a string": ("packages/omamobile-myron-gpu-profile/bin/omamobile-myron-gpu-profile",
+                                 f"ProfileError = '{CANARY}'\n"),
+    "PreflightError as None": ("tools/myron-preflight", "PreflightError = None\n"),
+}
+for label, (relative, line) in EXPORTS.items():
+    base = startup_copy("export")
+    target = base / relative
+    target.write_text(target.read_text() + "\n" + line)
+    startup_refusal(label, base)
+ok("an import-time exit in a nested dependency, or a non-exception-class export, is dependency-rejected before any input is read")
+
+# A hostile reported version is never printed, and is never reached through an except clause.
+VERSION_LINE = "bootchain dependencies are not the pinned versions (code dependency-version)"
+base = startup_copy("hostile-version")
+target = base / "tools/lib/myron-collect-impl.py"
+text = target.read_text()
+assert 'VERSION = "0.1.0"' in text
+target.write_text(text.replace('VERSION = "0.1.0"', f'VERSION = "{CANARY}\\nERROR: injected\\x1b[31m"', 1))
+startup_refusal("hostile version", base, expected=f"ERROR: {VERSION_LINE}\n", leaks=("injected", "\x1b", "0.1.0", "0.2.1"))
+
+# An unexpected ValueError at runtime is one fixed line; the text never leaves.
+def raiser(error):
+    def replacement(original):
+        def raising(*args, **kwargs):
+            raise error
+        return raising
+    return replacement
+
+
+for error in (ValueError(f"{CANARY} /secret/path\nERROR: injected"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, CANARY)):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = with_patch(B, "load_environment", raiser(error), lambda: B.main(["show"], contracts_root=contracts_root))
+    assert code == 1 and out.getvalue() == "", (code, out.getvalue())
+    assert err.getvalue() == "ERROR: an input could not be processed (code value-error)\n", err.getvalue()
+# SystemExit and KeyboardInterrupt are never swallowed by the runtime handlers.
+for error in (SystemExit(0), KeyboardInterrupt()):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with_patch(B, "load_environment", raiser(error), lambda: B.main(["show"], contracts_root=contracts_root))
+    except type(error):
+        pass
+    else:
+        raise AssertionError(f"{type(error).__name__} was swallowed")
+ok("a hostile dependency version is one fixed line naming no version; a runtime ValueError is fixed and exits are not swallowed")
 
 assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
 print("ok - myron bootchain parser tests passed")

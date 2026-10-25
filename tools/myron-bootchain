@@ -61,22 +61,29 @@ def capture_implementation(root: str) -> bytes:
     return data
 
 
+LOADER_REJECTED = "bootchain implementation could not be loaded (code loader-rejected)"
+
+
 def _load() -> None:
-    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    try:
-        data = capture_implementation(root)
-    except OSError as error:
-        raise ImportError(f"cannot read the bootchain implementation: {error}") from error
+    """Capture, compile and run the implementation. Any failure, including an ImportError
+    the implementation itself raises while running, is one fixed text: the checkout path,
+    errno text and source lines never leave. SystemExit and KeyboardInterrupt pass through,
+    so the implementation's own final SystemExit(main()) keeps its status."""
     global CAPTURED_IMPLEMENTATION_SHA256
-    CAPTURED_IMPLEMENTATION_SHA256 = hashlib.sha256(data).hexdigest()
-    code = compile(data, os.path.join(root, IMPLEMENTATION_PATH), "exec", dont_inherit=True)
-    exec(code, globals())
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        data = capture_implementation(root)
+        CAPTURED_IMPLEMENTATION_SHA256 = hashlib.sha256(data).hexdigest()
+        code = compile(data, os.path.join(root, IMPLEMENTATION_PATH), "exec", dont_inherit=True)
+        exec(code, globals())
+    except Exception:
+        raise ImportError(LOADER_REJECTED) from None
 
 
 if __name__ == "__main__":
     try:
         _load()
     except ImportError as error:
-        raise SystemExit(f"ERROR: {error}") from error
+        raise SystemExit(f"ERROR: {error}") from None
 else:
     _load()

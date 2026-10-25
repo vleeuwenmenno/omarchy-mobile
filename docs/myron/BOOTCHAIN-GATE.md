@@ -330,9 +330,14 @@ Residuals, as in Phase 2.13:
   `dependency-rejected`): no argument, key, number or path from the input is echoed.
   A missing or broken collector, preflight, snapshot, deployment, kernel or GPU
   verifier is `dependency-rejected` for every command, before any input is read, and
-  prints no checkout path. The runtime exception tuple is built once during that
-  startup, so no `except` clause loads anything. A dependency at another version is
-  still refused with the pinned-version message.
+  prints no checkout path. A dependency that exits at import time (any status or
+  payload) or exports something that is not a plain exception class is refused the
+  same way. The runtime exception tuple is validated and built once during that
+  startup, so no `except` clause loads anything. A dependency at another version
+  is refused as `dependency-version` without printing any observed or expected
+  version. An unexpected `ValueError` while a command runs is `value-error`, with no
+  text. `KeyboardInterrupt` is never caught. The trusted loader reports any capture,
+  compile or implementation-import failure as one fixed `loader-rejected` line.
 - `bootable_flag` is a bit, not a bootability claim.
 - The dependency imports are version-pinned, not byte-pinned.
 - R3 and R4 are not implemented.

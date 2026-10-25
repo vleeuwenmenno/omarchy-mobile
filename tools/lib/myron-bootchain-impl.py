@@ -205,6 +205,7 @@ _collect = None
 
 # Loader exceptions carry the checkout path and the underlying errno text: never print them.
 DEPENDENCY_REJECTED = "bootchain dependencies could not be loaded (code dependency-rejected)"
+VERSION_MISMATCH = "bootchain dependencies are not the pinned versions (code dependency-version)"
 
 
 def collect():
@@ -222,10 +223,15 @@ def collect():
                 "snapshot": p.snapshot().VERSION,
                 "deployment": p.deploy().VERSION,
             }
-        except Exception as error:  # the loader boundary: any failure to load or pin is a refusal
+        except (Exception, SystemExit):
+            # The loader boundary: any failure to load or pin is a refusal, including a
+            # dependency that exits at import time. Only dependency code runs in this try, so
+            # the tool's own final SystemExit is never caught here. KeyboardInterrupt passes.
             raise BootchainError(DEPENDENCY_REJECTED) from None
         if found != PINNED_VERSIONS:
-            raise BootchainError(f"unsupported verifier versions {found}; expected {PINNED_VERSIONS}")
+            # Neither the observed nor the expected versions are printed: the observed values
+            # come from dependency code and are not trusted text.
+            raise BootchainError(VERSION_MISMATCH)
         _collect = module
     return _collect
 
@@ -1474,12 +1480,16 @@ def load_dependencies():
         d = p.deploy()
         s = p.snapshot()
         # d.handled_errors() would add OSError and ValueError, whose text can carry paths:
-        # those keep their own fixed io-error handling in main.
-        runtime_errors = (BootchainError, c.CollectError, p.PreflightError, s.SnapshotError,
-                          d.DeploymentError, d.kernel().ContractError, d.gpu().ProfileError)
+        # those keep their own fixed handling in main.
+        exported = (BootchainError, c.CollectError, p.PreflightError, s.SnapshotError,
+                    d.DeploymentError, d.kernel().ContractError, d.gpu().ProfileError)
+        # An export that is not a plain exception class would fail inside an except clause.
+        if not all(type(error) is type and issubclass(error, Exception) for error in exported):
+            raise BootchainError(DEPENDENCY_REJECTED)
+        runtime_errors = exported
     except BootchainError:
-        raise  # collect(): fixed text, or the pinned-version refusal
-    except Exception:
+        raise  # collect(), or the check above: fixed text, or the pinned-version refusal
+    except (Exception, SystemExit):
         raise BootchainError(DEPENDENCY_REJECTED) from None
     return c, p, d, s, runtime_errors
 
@@ -1516,6 +1526,11 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
         return 1
     except OSError:
         print("ERROR: an input or output operation failed (code io-error)", file=sys.stderr)
+        return 1
+    except ValueError:
+        # Text of an unexpected ValueError (numbers, UTF-8) is never printed. Only Exception
+        # subclasses are caught: SystemExit and KeyboardInterrupt pass through.
+        print("ERROR: an input could not be processed (code value-error)", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
