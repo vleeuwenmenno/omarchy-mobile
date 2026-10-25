@@ -1,0 +1,44 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# One guarded boot transaction: radio -> Bluetooth -> AudioReach -> speaker.
+set -eu
+umask 077
+
+runtime=/run/omamobile-myron
+ready=/run/myron-coexistence-ready
+
+fail() {
+	printf 'ERROR: Myron coexistence bring-up: %s\n' "$*" >&2
+	exit 1
+}
+
+[ "$(id -u)" = 0 ] || fail 'must run as root'
+[ -f /run/myron-host/var/lib/omarchy-mobile/hardware-test.armed ] ||
+	fail 'temporary hardware-test arm is absent'
+systemctl --quiet is-active myron-hardware-watchdog.service ||
+	fail 'independent rollback watchdog is not active'
+! pgrep -x ModemManager >/dev/null ||
+	fail 'ModemManager must remain stopped until coexistence is qualified'
+[ ! -e "$ready" ] || exit 0
+
+install -d -m0700 "$runtime"
+printf '%s\n' verified-read-only-backup >"$runtime/radio-backup-verified"
+systemctl start myron-reference-radio.service
+[ -s /run/myron-wireless-ready ] || fail 'radio foundation did not become ready'
+
+/usr/local/sbin/myron-bluetooth-stage arm
+/usr/local/sbin/myron-bluetooth-stage start
+[ -e /sys/class/bluetooth/hci0 ] && [ -s /run/myron-bluetooth-ready ] ||
+	fail 'Bluetooth controller did not remain ready'
+
+printf '%s\n' verified-audio-foundation >"$runtime/audio-foundation.armed"
+systemctl start myron-reference-audio-foundation.service
+grep -q canoe-mtp-snd-card /proc/asound/cards ||
+	fail 'AudioReach card did not become ready'
+systemctl start myron-speaker-bridge.service
+systemctl --quiet is-active myron-speaker-bridge.service ||
+	fail 'protected speaker bridge did not remain active'
+
+printf 'radio=ready\nbluetooth=hci0-powered\naudio=AudioReach\nspeaker=protected-idle\n' >"$ready"
+chmod 0600 "$ready"
+printf '%s\n' 'result=ready radio=wifi bluetooth=hci0 audio=AudioReach speaker=protected modem=deferred'

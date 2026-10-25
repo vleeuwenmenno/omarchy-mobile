@@ -22,3 +22,9 @@ hl.monitor({ output = "Virtual-1", disabled = true })
 hl.monitor({ output = "Virtual-2", disabled = true })
 LUA
 fi
+
+# Root coexistence bring-up finishes before the display manager. Publish its
+# protected FIFO sink only inside the logged-in PipeWire session.
+if [[ -f /run/myron-coexistence-ready ]]; then
+  systemctl --user start myron-speaker-sink.service
+fi

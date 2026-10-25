@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Guarded Myron radio, Bluetooth and audio coexistence bring-up
+Requires=myron-omarchy-prepare.service myron-hardware-watchdog.service
+After=myron-omarchy-prepare.service myron-hardware-watchdog.service
+Before=NetworkManager.service display-manager.service myron-omarchy-qualify.service
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-coexistence-start
+RemainAfterExit=yes
+TimeoutStartSec=6min
+
+[Install]
+WantedBy=multi-user.target

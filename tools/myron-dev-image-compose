@@ -212,6 +212,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
       "$root/usr/local/sbin/myron-reference-radio-start" \
       "$root/usr/local/sbin/myron-reference-audio-start" \
+      "$root/usr/local/sbin/myron-coexistence-start" \
       "$root/usr/local/sbin/myron-audio-stage" \
       "$root/usr/local/sbin/myron-speaker-dsp-stage" \
       "$root/usr/local/sbin/myron-speaker-prepare" \
@@ -228,7 +229,8 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-omarchy-qualify"
     systemctl --root="$root" enable myron-hardware-watchdog.service \
       myron-batterysecret.service \
-      myron-omarchy-prepare.service myron-omarchy-qualify.service sshd.service \
+      myron-omarchy-prepare.service myron-coexistence.service \
+      myron-omarchy-qualify.service sshd.service \
       systemd-networkd.service >/dev/null
     # Omarchy Mobile has its own non-interactive first-boot service.  Arch
     # stock prompt otherwise blocks sysinit.target behind Plymouth forever.
@@ -261,6 +263,8 @@ debugfs -R 'stat /etc/systemd/system/systemd-firstboot.service' "$out" 2>/dev/nu
   grep -Fq 'Fast link dest: "/dev/null"' || die 'stock interactive systemd-firstboot is not masked'
 debugfs -R 'stat /etc/systemd/system/sysinit.target.wants/myron-hardware-watchdog.service' \
   "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'hardware watchdog is not enabled'
+debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-coexistence.service' \
+  "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'coexistence bring-up is not enabled'
 hash=$(sha256sum <"$out" | cut -d" " -f1)
 printf '%s  %s\n' "$hash" "$(basename -- "$out")" >"$out.sha256"
 chmod 0600 "$out.sha256"

@@ -28,6 +28,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
+  "$overlay/usr/local/sbin/myron-coexistence-start" \
   "$overlay/usr/local/sbin/myron-audio-stage" \
   "$overlay/usr/local/sbin/myron-speaker-dsp-stage" \
   "$overlay/usr/local/sbin/myron-speaker-prepare" \
@@ -131,6 +132,8 @@ grep -Fq 'fail_boot previous-test-rebooted-before-disarm' "$initramfs/systemd-st
   fail 'initramfs does not restore after an unexpected armed test reboot'
 grep -Fq 'enable myron-hardware-watchdog.service' "$compose" ||
   fail 'rollback watchdog is not enabled in the payload'
+grep -Fq 'myron-coexistence.service' "$compose" ||
+  fail 'guarded coexistence bring-up is not enabled in the payload'
 grep -Fq 'mask ModemManager.service systemd-firstboot.service' "$compose" ||
   fail 'interactive stock firstboot is not masked'
 grep -Fq 'Session=myron-omarchy.desktop' "$overlay/etc/sddm.conf.d/zz-myron-test.conf" ||
@@ -179,6 +182,34 @@ grep -Fxq 'Path=platform-1c00000.pcie-pci-0000:01:00.0' "$link" ||
 grep -Fxq 'Name=wlan0' "$link" ||
   fail 'WLAN link does not preserve the reference wlan0 contract'
 pass 'services require explicit arm marker and preserve USB rescue address'
+
+coexist=$overlay/usr/local/sbin/myron-coexistence-start
+coexist_unit=$overlay/usr/lib/systemd/system/myron-coexistence.service
+previous=0
+for required in \
+  'systemctl start myron-reference-radio.service' \
+  '/usr/local/sbin/myron-bluetooth-stage arm' \
+  '/usr/local/sbin/myron-bluetooth-stage start' \
+  'systemctl start myron-reference-audio-foundation.service' \
+  'systemctl start myron-speaker-bridge.service'; do
+  line=$(grep -nF "$required" "$coexist" | cut -d: -f1)
+  [[ -n $line && $line -gt $previous ]] ||
+    fail "coexistence order is missing or invalid at: $required"
+  previous=$line
+done
+grep -Fq 'ModemManager must remain stopped until coexistence is qualified' "$coexist" ||
+  fail 'coexistence bring-up does not defer modem/GNSS userspace'
+grep -Fq 'myron-hardware-watchdog.service' "$coexist" ||
+  fail 'coexistence bring-up does not require the rollback watchdog'
+grep -Fq 'Before=NetworkManager.service display-manager.service myron-omarchy-qualify.service' "$coexist_unit" ||
+  fail 'coexistence service is not ordered before networking, graphics, and qualification'
+grep -Fq 'Requires=myron-omarchy-prepare.service myron-coexistence.service' \
+  "$overlay/usr/lib/systemd/system/myron-omarchy-qualify.service" ||
+  fail 'graphical qualification can disarm rollback before coexistence succeeds'
+grep -Fq 'systemctl --user start myron-speaker-sink.service' \
+  "$overlay/usr/local/bin/myron-omarchy-setup-user" ||
+  fail 'graphical session does not publish the protected speaker sink'
+pass 'coexistence boot orders radio, Bluetooth, audio and speakers before qualification'
 
 gnss=$overlay/usr/local/bin/omamobile-gnss
 grep -Fq -- '--location-enable-gps-raw' "$gnss" ||

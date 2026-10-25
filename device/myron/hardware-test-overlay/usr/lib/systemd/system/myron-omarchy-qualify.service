@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 [Unit]
 Description=Qualify native Hyprland and disarm Myron rollback watchdog
-Requires=myron-omarchy-prepare.service
-After=myron-omarchy-prepare.service display-manager.service sshd.service
+Requires=myron-omarchy-prepare.service myron-coexistence.service
+After=myron-omarchy-prepare.service myron-coexistence.service display-manager.service sshd.service
 ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
 
 [Service]
