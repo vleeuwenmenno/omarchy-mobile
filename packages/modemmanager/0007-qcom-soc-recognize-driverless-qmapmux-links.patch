@@ -1,0 +1,46 @@
+From 4f52a43cbab515fa82fb934ae2c44787d9070707 Mon Sep 17 00:00:00 2001
+From: Menno <menno@example.invalid>
+Date: Thu, 10 Sep 2026 07:00:00 +0200
+Subject: [PATCH] qcom-soc: recognize driverless qmapmux links
+
+Downstream Qualcomm IPA creates qmapmux netdevs without a lower-device
+relationship or WWAN parent. ModemManager consequently treats the dynamically
+created mux netdev as a new primary port, tears down the existing modem for a
+reprobe, and leaves the bearer waiting on an empty link-port table.
+
+For the qcom-soc device only, route qmapmux netdevs through the same dynamic
+link-port path used by lower and WWAN multiplexed devices. The qmapmux link is
+then available to the bearer without reprobe or modem destruction.
+---
+ src/mm-device.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/mm-device.c b/src/mm-device.c
+index d0598605..3a2fef1e 100644
+--- a/src/mm-device.c
++++ b/src/mm-device.c
+@@ -235,6 +235,22 @@ mm_device_grab_port (MMDevice       *self,
+                         error->message);
+         return FALSE;
+     }
++    if (!g_strcmp0 (mm_device_get_uid (self), "qcom-soc") &&
++        !g_strcmp0 ("net", mm_kernel_device_get_subsystem (kernel_port)) &&
++        g_str_has_prefix (mm_kernel_device_get_name (kernel_port), "qmapmux")) {
++        g_autoptr(GError) error = NULL;
++
++        /* Downstream IPA qmapmux devices have neither a lower-device nor a
++         * WWAN relationship, but they are dynamically instantiated links. */
++        mm_obj_dbg (self, "grabbing downstream IPA multiplexed device %s",
++                    mm_kernel_device_get_name (kernel_port));
++        if (self->priv->modem &&
++            !mm_base_modem_grab_link_port (self->priv->modem, kernel_port, &error))
++            mm_obj_dbg (self, "fully ignoring link port %s from now on: %s",
++                        mm_kernel_device_get_name (kernel_port),
++                        error->message);
++        return FALSE;
++    }
+     if (!g_strcmp0 ("net", mm_kernel_device_get_subsystem (kernel_port)) &&
+         mm_kernel_device_get_wwandev_sysfs_path (kernel_port)) {
+         /* This is a wwan netdevice, possibly a multiplexed one.
+-- 
+2.51.0

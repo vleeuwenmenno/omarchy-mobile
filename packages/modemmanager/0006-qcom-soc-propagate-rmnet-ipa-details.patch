@@ -1,0 +1,40 @@
+From 01d281d61e9a473ab94e2da1783041b095a01caf Mon Sep 17 00:00:00 2001
+From: Menno <menno@example.invalid>
+Date: Thu, 10 Sep 2026 06:10:00 +0200
+Subject: [PATCH] qcom-soc: query endpoints on downstream RMNET net port
+
+The endpoint ioctl fallback added for downstream Qualcomm RMNET used the QMI
+control port's device name (qrtr0). Derive the interface name from the saved
+network sysfs path instead so RMNET_IOCTL_GET_EP_PAIR targets rmnet_ipa0.
+---
+ src/mm-port-qmi.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
+index c8ad3f86..3e4c79e4 100644
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -1832,7 +1832,7 @@ rmnet_ipa_get_endpoint_pair (MMPortQmi *self,
+                              guint     *consumer_pipe_num,
+                              guint     *producer_pipe_num)
+ {
+-    const gchar        *ifname;
++    g_autofree gchar   *ifname = NULL;
+     RmnetIoctlExtended  extended = { 0 };
+     struct ifreq        request = { 0 };
+     int                 fd;
+@@ -1840,7 +1840,10 @@ rmnet_ipa_get_endpoint_pair (MMPortQmi *self,
+     int                 saved_errno;
+ 
+-    ifname = mm_port_get_device (MM_PORT (self));
+-    if (!ifname || !g_str_has_prefix (ifname, "rmnet_ipa"))
++    if (!self->priv->net_sysfs_path)
++        return FALSE;
++
++    ifname = g_path_get_basename (self->priv->net_sysfs_path);
++    if (!g_str_has_prefix (ifname, "rmnet_ipa"))
+         return FALSE;
+ 
+     fd = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+-- 
+2.51.0

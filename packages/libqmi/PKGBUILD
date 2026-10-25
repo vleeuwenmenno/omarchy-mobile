@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: 0BSD
+#
+# Derived from Arch Linux's libqmi PKGBUILD:
+# https://gitlab.archlinux.org/archlinux/packaging/packages/libqmi
+#
+# Myron needs the LOC Register Events client-identity TLVs added after the
+# 1.38.0 release.  Pin the exact libqmi revision qualified on postmarketOS;
+# ModemManager's AFW GNSS client depends on these generated APIs.
+
+pkgname=libqmi
+pkgver=1.38.0.r20261005
+pkgrel=1
+pkgdesc="QMI modem protocol helper library (Myron LOC AFW support)"
+url="https://www.freedesktop.org/wiki/Software/libqmi/"
+arch=(aarch64)
+license=(
+  GPL-2.0-or-later
+  LGPL-2.1-or-later
+)
+depends=(
+  bash
+  glib2
+  glibc
+  libgcc
+  libgudev
+  libmbim
+  libqrtr-glib
+)
+makedepends=(
+  bash-completion
+  gobject-introspection
+  help2man
+  meson
+)
+_commit=1c972b8ab901565f26b9f95e1705269277bbfa1b
+_archive="libqmi-$_commit"
+source=("$_archive.tar.gz::https://gitlab.freedesktop.org/mobile-broadband/libqmi/-/archive/$_commit/$_archive.tar.gz")
+sha256sums=('f186c784c2ec9daefaf0752fbf1a605308b7f6a941d74b3ebba510ef818f8f6c')
+
+build() {
+  local meson_options=(
+    -D gtk_doc=false
+  )
+
+  arch-meson "$_archive" build "${meson_options[@]}"
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  provides=(libqmi-glib.so)
+
+  meson install -C build --destdir "$pkgdir"
+}
+
+# vim:set sw=2 sts=-1 et:

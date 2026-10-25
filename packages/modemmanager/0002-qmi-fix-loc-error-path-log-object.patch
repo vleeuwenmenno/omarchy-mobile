@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Menno <menno@localhost>
+Date: Wed, 9 Sep 2026 23:40:00 +0200
+Subject: [PATCH] qmi: fix LOC assistance error-path log object
+
+QmiClientLoc does not implement MMLogObject.  If LOC rejects the optional
+inject-time/inject-position event mask, passing the QMI client to
+mm_obj_warn() dereferences an invalid log object and crashes ModemManager.
+
+Resolve the owning MMSharedQmi object before handling the response and use it
+for both warnings.  This matches current upstream behavior.
+---
+ src/mm-shared-qmi.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/mm-shared-qmi.c b/src/mm-shared-qmi.c
+index 1234567..89abcde 100644
+--- a/src/mm-shared-qmi.c
++++ b/src/mm-shared-qmi.c
+@@ -7045,20 +7045,20 @@ loc_register_event_inject_req_ready (QmiClientLoc *client,
+     MMSharedQmi                                  *self;
+     Private                                      *priv;
+ 
++    self = g_task_get_source_object (task);
++    priv = get_private (self);
++
+     output = qmi_client_loc_register_events_finish (client, res, &error);
+     if (!output) {
+-        mm_obj_warn (client, "QMI operation failed: %s", error->message);
++        mm_obj_warn (self, "QMI operation failed: %s", error->message);
+         goto out;
+     }
+ 
+     if (!qmi_message_loc_register_events_output_get_result (output, &error)) {
+-        mm_obj_warn (client, "Couldn't not register tracking events: %s", error->message);
++        mm_obj_warn (self, "Couldn't not register tracking events: %s", error->message);
+         goto out;
+     }
+ 
+-    self = g_task_get_source_object (task);
+-    priv = get_private (self);
+-
+     g_assert (!priv->loc_assistance_inject_time_req_indication_id);
+     priv->loc_assistance_inject_time_req_indication_id =
+         g_signal_connect (client,
+-- 
+2.51.0

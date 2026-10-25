@@ -1,0 +1,313 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Menno <menno@localhost>
+Date: Fri, 16 Oct 2026 17:10:00 +0200
+Subject: [PATCH] qmi: support AFW position reports without modem NMEA
+
+Newer Snapdragon GNSS engines reject LOC Start with GENERAL_FAILURE unless
+the same LOC client first registers as an application-framework client.  Send
+the identity TLVs added in libqmi 1.38.0_git20261005 and move event
+registration before LOC Start.  Retain the identity on the assistance event
+registration too.
+
+Some Qualcomm firmware accepts that authenticated session but emits position
+reports instead of the requested NMEA indications.  Subscribe to those reports
+and convert successful latitude/longitude fixes into GGA sentences for
+ModemManager's existing GPS raw, NMEA and location-cache paths.
+---
+ src/mm-shared-qmi.c | 99 +++++++++++++++++++++++++++------------------
+ 1 file changed, 60 insertions(+), 39 deletions(-)
+
+diff --git a/src/mm-shared-qmi.c b/src/mm-shared-qmi.c
+index 1234567..89abcde 100644
+--- a/src/mm-shared-qmi.c
++++ b/src/mm-shared-qmi.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <config.h>
++#include <math.h>
+ #include <string.h>
+ #include <arpa/inet.h>
+ 
+@@ -88,6 +89,7 @@ typedef struct {
+     gulong                          pds_location_event_report_indication_id;
+     QmiClient                      *loc_client;
+     gulong                          loc_location_nmea_indication_id;
++    gulong                          loc_location_position_report_indication_id;
+     gchar                         **loc_assistance_data_servers;
+     guint32                         loc_assistance_data_max_file_size;
+     guint32                         loc_assistance_data_max_part_size;
+@@ -126,6 +128,8 @@ private_free (Private *priv)
+         g_object_unref (priv->pds_client);
+     if (priv->loc_location_nmea_indication_id)
+         g_signal_handler_disconnect (priv->loc_client, priv->loc_location_nmea_indication_id);
++    if (priv->loc_location_position_report_indication_id)
++        g_signal_handler_disconnect (priv->loc_client, priv->loc_location_position_report_indication_id);
+     if (priv->loc_assistance_inject_time_req_indication_id)
+         g_signal_handler_disconnect (priv->loc_client, priv->loc_assistance_inject_time_req_indication_id);
+     if (priv->loc_assistance_inject_position_req_indication_id)
+@@ -5161,6 +5165,10 @@ loc_stop_ready (QmiClientLoc *client,
+             g_signal_handler_disconnect (priv->loc_client, priv->loc_location_nmea_indication_id);
+             priv->loc_location_nmea_indication_id = 0;
+         }
++        if (priv->loc_location_position_report_indication_id != 0) {
++            g_signal_handler_disconnect (priv->loc_client, priv->loc_location_position_report_indication_id);
++            priv->loc_location_position_report_indication_id = 0;
++        }
+         g_clear_object (&priv->loc_client);
+     }
+ 
+@@ -5269,6 +5277,88 @@ loc_location_nmea_indication_cb (QmiClientLoc               *client,
+     mm_location_cache_update_from_nmea (priv->location_cache, nmea);
+ }
+ 
++static void
++loc_location_position_report_indication_cb (QmiClientLoc                         *client,
++                                            QmiIndicationLocPositionReportOutput *output,
++                                            MMSharedQmi                          *self)
++{
++    g_autoptr(GDateTime) now = NULL;
++    g_autofree gchar    *body = NULL;
++    g_autofree gchar    *nmea = NULL;
++    QmiLocSessionStatus  status;
++    GArray              *satellites = NULL;
++    gdouble              latitude;
++    gdouble              longitude;
++    gdouble              latitude_abs;
++    gdouble              longitude_abs;
++    guint                latitude_degrees;
++    guint                longitude_degrees;
++    gdouble              latitude_minutes;
++    gdouble              longitude_minutes;
++    gfloat               altitude = 0.0f;
++    gfloat               hdop = 0.0f;
++    gboolean             altitude_known;
++    gboolean             hdop_known;
++    gchar                latitude_minutes_str[G_ASCII_DTOSTR_BUF_SIZE];
++    gchar                longitude_minutes_str[G_ASCII_DTOSTR_BUF_SIZE];
++    gchar                altitude_str[G_ASCII_DTOSTR_BUF_SIZE] = "";
++    gchar                hdop_str[G_ASCII_DTOSTR_BUF_SIZE] = "";
++    guint8               checksum = 0;
++    gsize                i;
++    Private             *priv;
++
++    if (!qmi_indication_loc_position_report_output_get_session_status (output, &status, NULL) ||
++        status != QMI_LOC_SESSION_STATUS_SUCCESS ||
++        !qmi_indication_loc_position_report_output_get_latitude (output, &latitude, NULL) ||
++        !qmi_indication_loc_position_report_output_get_longitude (output, &longitude, NULL) ||
++        !isfinite (latitude) || !isfinite (longitude) ||
++        latitude < -90.0 || latitude > 90.0 ||
++        longitude < -180.0 || longitude > 180.0)
++        return;
++
++    priv = get_private (MM_SHARED_QMI (self));
++    qmi_indication_loc_position_report_output_get_satellites_used (output, &satellites, NULL);
++    altitude_known = qmi_indication_loc_position_report_output_get_altitude_from_sealevel (output, &altitude, NULL);
++    hdop_known = qmi_indication_loc_position_report_output_get_dop (output, NULL, &hdop, NULL, NULL);
++
++    latitude_abs = fabs (latitude);
++    longitude_abs = fabs (longitude);
++    latitude_degrees = (guint) floor (latitude_abs);
++    longitude_degrees = (guint) floor (longitude_abs);
++    latitude_minutes = (latitude_abs - latitude_degrees) * 60.0;
++    longitude_minutes = (longitude_abs - longitude_degrees) * 60.0;
++
++    g_ascii_formatd (latitude_minutes_str, sizeof (latitude_minutes_str), "%09.6f", latitude_minutes);
++    g_ascii_formatd (longitude_minutes_str, sizeof (longitude_minutes_str), "%09.6f", longitude_minutes);
++    if (altitude_known)
++        g_ascii_formatd (altitude_str, sizeof (altitude_str), "%.1f", altitude);
++    if (hdop_known)
++        g_ascii_formatd (hdop_str, sizeof (hdop_str), "%.1f", hdop);
++
++    now = g_date_time_new_now_utc ();
++    body = g_strdup_printf ("GPGGA,%02d%02d%02d.00,%02u%s,%c,%03u%s,%c,1,%02u,%s,%s,M,,M,,",
++                            g_date_time_get_hour (now),
++                            g_date_time_get_minute (now),
++                            g_date_time_get_second (now),
++                            latitude_degrees,
++                            latitude_minutes_str,
++                            latitude < 0.0 ? 'S' : 'N',
++                            longitude_degrees,
++                            longitude_minutes_str,
++                            longitude < 0.0 ? 'W' : 'E',
++                            MIN (satellites ? satellites->len : 0, 99u),
++                            hdop_str,
++                            altitude_str);
++    for (i = 0; body[i]; i++)
++        checksum ^= (guint8) body[i];
++    nmea = g_strdup_printf ("$%s*%02X", body, checksum);
++
++    mm_obj_dbg (self, "LOC position report converted to GGA (%u satellites)",
++                satellites ? satellites->len : 0);
++    mm_iface_modem_location_gps_update (MM_IFACE_MODEM_LOCATION (self), nmea);
++    mm_location_cache_update_from_nmea (priv->location_cache, nmea);
++}
++
+ /*****************************************************************************/
+ /* Location: internal helper: setup minimum required NMEA traces */
+ 
+@@ -5666,13 +5756,24 @@ pds_gps_service_state_start_ready (QmiClientPds *client,
+     qmi_message_pds_set_auto_tracking_state_input_unref (input);
+ }
+ 
++static void loc_start_ready (QmiClientLoc *client,
++                             GAsyncResult *res,
++                             GTask        *task);
++
+ static void
+-loc_register_events_ready (QmiClientLoc *client,
+-                           GAsyncResult *res,
+-                           GTask        *task)
++loc_register_events_set_afw_identity (QmiMessageLocRegisterEventsInput *input)
+ {
+-    MMSharedQmi                       *self;
+-    Private                           *priv;
++    qmi_message_loc_register_events_input_set_client_string_id (input, "MHAL", NULL);
++    qmi_message_loc_register_events_input_set_client_type (input, QMI_LOC_CLIENT_TYPE_AFW, NULL);
++    qmi_message_loc_register_events_input_set_enable_positioning_request_notification (input, TRUE, NULL);
++}
++
++static void
++loc_register_events_before_start_ready (QmiClientLoc *client,
++                                        GAsyncResult *res,
++                                        GTask        *task)
++{
++    QmiMessageLocStartInput           *input;
+     QmiMessageLocRegisterEventsOutput *output;
+     GError                            *error = NULL;
+ 
+@@ -5694,20 +5705,18 @@ loc_register_events_ready (QmiClientLoc *client,
+ 
+     qmi_message_loc_register_events_output_unref (output);
+ 
+-    self = g_task_get_source_object (task);
+-    priv = get_private (self);
+-
+-    g_assert (!priv->loc_client);
+-    g_assert (!priv->loc_location_nmea_indication_id);
+-    priv->loc_client = QMI_CLIENT (g_object_ref (client));
+-    priv->loc_location_nmea_indication_id =
+-        g_signal_connect (client,
+-                          "nmea",
+-                          G_CALLBACK (loc_location_nmea_indication_cb),
+-                          self);
+-
+-    g_task_return_boolean (task, TRUE);
+-    g_object_unref (task);
++    input = qmi_message_loc_start_input_new ();
++    qmi_message_loc_start_input_set_session_id (input, DEFAULT_LOC_SESSION_ID, NULL);
++    qmi_message_loc_start_input_set_intermediate_report_state (input, QMI_LOC_INTERMEDIATE_REPORT_STATE_DISABLE, NULL);
++    qmi_message_loc_start_input_set_minimum_interval_between_position_reports (input, 1000, NULL);
++    qmi_message_loc_start_input_set_fix_recurrence_type (input, QMI_LOC_FIX_RECURRENCE_TYPE_REQUEST_PERIODIC_FIXES, NULL);
++    qmi_client_loc_start (client,
++                          input,
++                          10,
++                          NULL,
++                          (GAsyncReadyCallback) loc_start_ready,
++                          task);
++    qmi_message_loc_start_input_unref (input);
+ }
+ 
+ static void
+@@ -5715,10 +5724,10 @@ loc_start_ready (QmiClientLoc *client,
+                  GAsyncResult *res,
+                  GTask        *task)
+ {
+-    QmiMessageLocRegisterEventsInput *input;
+-    QmiMessageLocStartOutput         *output;
+-    guint64                           event_mask;
+-    GError                           *error = NULL;
++    MMSharedQmi              *self;
++    Private                  *priv;
++    QmiMessageLocStartOutput *output;
++    GError                   *error = NULL;
+ 
+     output = qmi_client_loc_start_finish (client, res, &error);
+     if (!output) {
+@@ -5738,19 +5747,26 @@ loc_start_ready (QmiClientLoc *client,
+ 
+     qmi_message_loc_start_output_unref (output);
+ 
+-    input = qmi_message_loc_register_events_input_new ();
+-    event_mask = QMI_LOC_EVENT_REGISTRATION_FLAG_NMEA |
+-                 QMI_LOC_EVENT_REGISTRATION_FLAG_INJECT_TIME_REQUEST |
+-                 QMI_LOC_EVENT_REGISTRATION_FLAG_INJECT_POSITION_REQUEST;
+-    qmi_message_loc_register_events_input_set_event_registration_mask (
+-        input, event_mask, NULL);
+-    qmi_client_loc_register_events (client,
+-                                    input,
+-                                    10,
+-                                    NULL,
+-                                    (GAsyncReadyCallback) loc_register_events_ready,
+-                                    task);
+-    qmi_message_loc_register_events_input_unref (input);
++    self = g_task_get_source_object (task);
++    priv = get_private (self);
++
++    g_assert (!priv->loc_client);
++    g_assert (!priv->loc_location_nmea_indication_id);
++    g_assert (!priv->loc_location_position_report_indication_id);
++    priv->loc_client = QMI_CLIENT (g_object_ref (client));
++    priv->loc_location_nmea_indication_id =
++        g_signal_connect (client,
++                          "nmea",
++                          G_CALLBACK (loc_location_nmea_indication_cb),
++                          self);
++    priv->loc_location_position_report_indication_id =
++        g_signal_connect (client,
++                          "position-report",
++                          G_CALLBACK (loc_location_position_report_indication_cb),
++                          self);
++
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
+ }
+ 
+ 
+@@ -5791,20 +5801,23 @@ start_gps_engine (MMSharedQmi         *self,
+                                         MM_PORT_QMI_FLAG_DEFAULT,
+                                         NULL);
+     if (client) {
+-        QmiMessageLocStartInput *input;
++        QmiMessageLocRegisterEventsInput *input;
++        guint64                           event_mask;
+ 
+-        input = qmi_message_loc_start_input_new ();
+-        qmi_message_loc_start_input_set_session_id (input, DEFAULT_LOC_SESSION_ID, NULL);
+-        qmi_message_loc_start_input_set_intermediate_report_state (input, QMI_LOC_INTERMEDIATE_REPORT_STATE_DISABLE, NULL);
+-        qmi_message_loc_start_input_set_minimum_interval_between_position_reports (input, 1000, NULL);
+-        qmi_message_loc_start_input_set_fix_recurrence_type (input, QMI_LOC_FIX_RECURRENCE_TYPE_REQUEST_PERIODIC_FIXES, NULL);
+-        qmi_client_loc_start (QMI_CLIENT_LOC (client),
+-                              input,
+-                              10,
+-                              NULL,
+-                              (GAsyncReadyCallback) loc_start_ready,
+-                              task);
+-        qmi_message_loc_start_input_unref (input);
++        input = qmi_message_loc_register_events_input_new ();
++        event_mask = QMI_LOC_EVENT_REGISTRATION_FLAG_POSITION_REPORT |
++                     QMI_LOC_EVENT_REGISTRATION_FLAG_NMEA |
++                     QMI_LOC_EVENT_REGISTRATION_FLAG_INJECT_TIME_REQUEST |
++                     QMI_LOC_EVENT_REGISTRATION_FLAG_INJECT_POSITION_REQUEST;
++        qmi_message_loc_register_events_input_set_event_registration_mask (input, event_mask, NULL);
++        loc_register_events_set_afw_identity (input);
++        qmi_client_loc_register_events (QMI_CLIENT_LOC (client),
++                                        input,
++                                        10,
++                                        NULL,
++                                        (GAsyncReadyCallback) loc_register_events_before_start_ready,
++                                        task);
++        qmi_message_loc_register_events_input_unref (input);
+         return;
+     }
+ 
+@@ -7170,6 +7182,7 @@ loc_location_get_predicted_orbits_data_source_indication_cb (QmiClientLoc
+         input = qmi_message_loc_register_events_input_new ();
+         qmi_message_loc_register_events_input_set_event_registration_mask (
+             input, event_mask, NULL);
++        loc_register_events_set_afw_identity (input);
+         qmi_client_loc_register_events (client,
+                                         input,
+                                         10,
+-- 
+2.55.0

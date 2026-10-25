@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: 0BSD
+#
+# Derived from Arch Linux's ModemManager PKGBUILD:
+# https://gitlab.archlinux.org/archlinux/packaging/packages/modemmanager
+#
+# Myron keeps the upstream qcom-soc plugin and layers only the downstream IPA
+# and LOC behavior already qualified on postmarketOS.  The service remains
+# disabled/masked by the hardware-test image until an attended test enables it.
+
+pkgbase=modemmanager
+pkgname=(
+  modemmanager
+  libmm-glib
+)
+pkgver=1.25.95.r20261005
+pkgrel=1
+pkgdesc="Mobile broadband modem management service (Myron downstream Qualcomm support)"
+url="https://www.freedesktop.org/wiki/Software/ModemManager/"
+arch=(aarch64)
+license=(
+  GPL-2.0-or-later
+  LGPL-2.1-or-later
+)
+depends=(
+  bash
+  glib2
+  glibc
+  hicolor-icon-theme
+  libgcc
+  libgudev
+  libmbim
+  'libqmi>=1.38.0.r20261005'
+  libqrtr-glib
+  mobile-broadband-provider-info
+  polkit
+  ppp
+  systemd-libs
+)
+makedepends=(
+  bash-completion
+  glib2-devel
+  gobject-introspection
+  gtk-doc
+  meson
+  systemd
+  vala
+)
+checkdepends=(
+  python-dbus
+  python-gobject
+)
+_commit=d776ea38d29ca472a12323c1d45002ee19a66f57
+_archive="ModemManager-$_commit"
+_myron_patches=(
+  0002-qmi-fix-loc-error-path-log-object.patch
+  0003-qmi-serialize-pdc-config-info-requests.patch
+  0004-qcom-soc-infer-rmnet-ipa-driver.patch
+  0005-qcom-soc-read-rmnet-ipa-endpoints.patch
+  0006-qcom-soc-propagate-rmnet-ipa-details.patch
+  0007-qcom-soc-recognize-driverless-qmapmux-links.patch
+  0008-qcom-soc-configure-rmnet-ipa-datapath.patch
+  0009-qmi-identify-loc-client-as-afw.patch
+  0010-qmi-loc-operation-mode-response.patch
+)
+source=(
+  "$_archive.tar.gz::https://gitlab.freedesktop.org/mobile-broadband/ModemManager/-/archive/$_commit/$_archive.tar.gz"
+  "${_myron_patches[@]}"
+)
+sha256sums=(
+  'aa9bcdceae348c49c53db9935942dbacf3a9d4d146499b8ca6d98526d9c5f56e'
+  '6579d82c919d914d874a370bf92cb1531d5254bcae68c0511dd482fda8fa14f6'
+  'ef3ed01c32ac3e1c55ff1d272fb2def739fed9fd30081e968687f399ca97f751'
+  '6c40b802457d2427e193cd56dec52830d5ed31276ce37cdda7dd57086ceedb0f'
+  '390a85ae35137678e694b0328bd9f179d66760afd189ce2395b365366aabcf2d'
+  '49c701b9ca11c27d645106cbb71808bee1af874db3c2d5fb1d2a269265330c69'
+  '468eda12743ce25c1fbe4c2ac1be9a74d0fe10cc3642391c4f7db3223f5d2616'
+  '9ac7d9a4607ba1b4216bb24dcd8f3674c846d9b688e4f7940a4bf5b49e5333c4'
+  '59b12e06dc1c75ed4c9c30b35f09be2d95a2cd50edd1ebf58cfc1f1f5188653a'
+  '0360d6d611b7b167ace890efd1925c0b80e872b151b53de182290fa4905771de'
+)
+
+prepare() {
+  cd "$_archive"
+
+  local patch
+  for patch in "${_myron_patches[@]}"; do
+    patch -Np1 -i "$srcdir/$patch"
+  done
+}
+
+build() {
+  local meson_options=(
+    -D dbus_policy_dir=/usr/share/dbus-1/system.d
+    -D dist_version="\"$pkgver-$pkgrel\""
+    -D gtk_doc=false
+    -D polkit=permissive
+    -D vapi=true
+  )
+
+  arch-meson "$_archive" build "${meson_options[@]}"
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+_pick() {
+  local p="$1" f d
+  shift
+  for f; do
+    d="$srcdir/$p/${f#$pkgdir/}"
+    mkdir -p "$(dirname "$d")"
+    mv "$f" "$d"
+    rmdir -p --ignore-fail-on-non-empty "$(dirname "$f")"
+  done
+}
+
+package_modemmanager() {
+  license=(GPL-2.0-or-later)
+  depends+=(
+    "libmm-glib=$pkgver-$pkgrel" libmm-glib.so
+    libgudev-1.0.so
+    libg{lib,object,io,module}-2.0.so
+    libmbim-glib.so
+    libqmi-glib.so
+    libsystemd.so
+  )
+  optdepends=(
+    'usb_modeswitch: install if your modem shows up as a storage drive'
+  )
+
+  meson install -C build --destdir "$pkgdir"
+
+  cd "$pkgdir"
+  _pick libmm usr/include
+  _pick libmm usr/lib/girepository-1.0
+  _pick libmm usr/lib/libmm-glib.so*
+  _pick libmm usr/lib/pkgconfig
+  _pick libmm usr/share/gir-1.0
+  _pick libmm usr/share/vala
+}
+
+package_libmm-glib() {
+  pkgdesc="ModemManager library"
+  license=(LGPL-2.1-or-later)
+  depends=(
+    glib2 libg{lib,object,io}-2.0.so
+    glibc
+    libgcc
+  )
+  provides=(libmm-glib.so)
+
+  mv libmm/* "$pkgdir"
+}
+
+# vim:set sw=2 sts=-1 et:

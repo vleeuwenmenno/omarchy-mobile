@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Menno <menno@localhost>
+Date: Fri, 16 Oct 2026 18:05:00 +0200
+Subject: [PATCH] qmi: accept LOC operation-mode command responses
+
+The Myron GNSS firmware can send LOC operation-mode indications before
+libqmi delivers the matching command response. ModemManager only connects
+the indication handler after that response, waits ten seconds, then reports
+failure even though the modem changed mode. GeoClue consequently aborts GPS
+enablement after AGPS-MSB.
+
+For the LOC backend, set the requested mode directly and use the successful
+command response as completion. The older PDS backend keeps its query and
+set flow unchanged.
+---
+ src/mm-shared-qmi.c | 55 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/src/mm-shared-qmi.c b/src/mm-shared-qmi.c
+index 89abcde..cdef012 100644
+--- a/src/mm-shared-qmi.c
++++ b/src/mm-shared-qmi.c
+@@ -6037,9 +6037,11 @@ loc_set_operation_mode_ready (QmiClientLoc *client,
+                               GTask        *task)
+ {
++    MMSharedQmi                     *self;
+     SetGpsOperationModeContext          *ctx;
+     QmiMessageLocSetOperationModeOutput *output;
+     GError                              *error = NULL;
+ 
++    self = g_task_get_source_object (task);
+     ctx = g_task_get_task_data (task);
+ 
+     output = qmi_client_loc_set_operation_mode_finish (client, res, &error);
+@@ -6056,17 +6058,25 @@ loc_set_operation_mode_ready (QmiClientLoc *client,
+         return;
+     }
+ 
+-    /* The task ownership is shared between signal and timeout; the one which is
+-     * scheduled first will cancel the other. */
+-    ctx->indication_id = g_signal_connect (ctx->client,
+-                                           "set-operation-mode",
+-                                           G_CALLBACK (loc_location_set_operation_mode_indication_cb),
+-                                           task);
+-    ctx->timeout_id = g_timeout_add_seconds (10,
+-                                             (GSourceFunc)loc_location_operation_mode_indication_timed_out,
+-                                             task);
+-
+     qmi_message_loc_set_operation_mode_output_unref (output);
++
++    switch (ctx->mode) {
++        case GPS_OPERATION_MODE_AGPS_MSA:
++            mm_obj_dbg (self, "MSA A-GPS operation mode command accepted");
++            break;
++        case GPS_OPERATION_MODE_AGPS_MSB:
++            mm_obj_dbg (self, "MSB A-GPS operation mode command accepted");
++            break;
++        case GPS_OPERATION_MODE_STANDALONE:
++            mm_obj_dbg (self, "standalone operation mode command accepted");
++            break;
++        case GPS_OPERATION_MODE_UNKNOWN:
++        default:
++            g_assert_not_reached ();
++    }
++
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
+ }
+ 
+ static void
+@@ -6229,14 +6241,42 @@ set_gps_operation_mode (MMSharedQmi         *self,
+                                         MM_PORT_QMI_FLAG_DEFAULT,
+                                         NULL);
+     if (client) {
++        QmiMessageLocSetOperationModeInput *input;
++        QmiLocOperationMode                 loc_mode;
++
+         ctx->client = g_object_ref (client);
+-        qmi_client_loc_get_operation_mode (
++
++        switch (mode) {
++            case GPS_OPERATION_MODE_AGPS_MSA:
++                loc_mode = QMI_LOC_OPERATION_MODE_MSA;
++                mm_obj_dbg (self, "setting MSA A-GPS operation mode directly");
++                break;
++            case GPS_OPERATION_MODE_AGPS_MSB:
++                loc_mode = QMI_LOC_OPERATION_MODE_MSB;
++                mm_obj_dbg (self, "setting MSB A-GPS operation mode directly");
++                break;
++            case GPS_OPERATION_MODE_STANDALONE:
++                loc_mode = QMI_LOC_OPERATION_MODE_STANDALONE;
++                mm_obj_dbg (self, "setting standalone operation mode directly");
++                break;
++            case GPS_OPERATION_MODE_UNKNOWN:
++            default:
++                g_assert_not_reached ();
++        }
++
++        input = qmi_message_loc_set_operation_mode_input_new ();
++        qmi_message_loc_set_operation_mode_input_set_operation_mode (
++            input,
++            loc_mode,
++            NULL);
++        qmi_client_loc_set_operation_mode (
+             QMI_CLIENT_LOC (ctx->client),
+-            NULL,
++            input,
+             10,
+             NULL, /* cancellable */
+-            (GAsyncReadyCallback)loc_get_operation_mode_ready,
++            (GAsyncReadyCallback)loc_set_operation_mode_ready,
+             task);
++        qmi_message_loc_set_operation_mode_input_unref (input);
+         return;
+     }
+ 
+-- 
+2.55.0

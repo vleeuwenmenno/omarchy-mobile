@@ -1,0 +1,162 @@
+From 5b54c1f1ca337725525486e657b56572e437eb5d Mon Sep 17 00:00:00 2001
+From: Menno <menno@example.invalid>
+Date: Thu, 10 Sep 2026 04:20:00 +0200
+Subject: [PATCH] qcom-soc: read IPA endpoint pair from rmnet ioctl
+
+Qualcomm's downstream rmnet_ipa network interface is virtual and does not
+provide the device/modem/tx_endpoint_id and rx_endpoint_id sysfs attributes
+used by upstream IPA integrations. It exposes the same endpoint pair through
+RMNET_IOCTL_GET_EP_PAIR instead.
+
+Use the read-only ioctl as a fallback for rmnet_ipa interfaces. The consumer
+pipe is the IPA receive endpoint and the producer pipe is the IPA transmit
+endpoint, matching the DPM hardware port fields.
+---
+ src/mm-port-qmi.c | 94 ++++++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 80 insertions(+), 14 deletions(-)
+
+diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
+index 0ce84f75..c8ad3f86 100644
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -16,8 +16,13 @@
+  */
+ 
+ #include <config.h>
++#include <errno.h>
++#include <net/if.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <unistd.h>
+ 
+ #include <libqmi-glib.h>
+ 
+@@ -30,6 +35,25 @@
+ #define RMNET_MAX_PACKET_SIZE 16384
+ #define MHI_NET_MTU_DEFAULT   16384
+ 
++/* Qualcomm downstream RMNET private ioctl ABI. */
++#define RMNET_IOCTL_EXTENDED 0x89FD
++#define RMNET_IOCTL_GET_EP_PAIR 0x0010
++
++typedef struct {
++    guint32 consumer_pipe_num;
++    guint32 producer_pipe_num;
++} RmnetIpaEndpointPair;
++
++typedef struct {
++    guint32 extended_ioctl;
++    union {
++        guint32 data;
++        gchar if_name[IFNAMSIZ];
++        RmnetIpaEndpointPair pair;
++        guint8 padding[20];
++    } u;
++} RmnetIoctlExtended;
++
+ G_DEFINE_TYPE (MMPortQmi, mm_port_qmi, MM_TYPE_PORT)
+ 
+ #if defined WITH_QRTR
+@@ -1803,6 +1827,46 @@ dpm_open_port_ready (QmiClientDpm *client,
+     internal_setup_data_format_context_step (task);
+ }
+ 
++static gboolean
++rmnet_ipa_get_endpoint_pair (MMPortQmi *self,
++                             guint     *consumer_pipe_num,
++                             guint     *producer_pipe_num)
++{
++    const gchar        *ifname;
++    RmnetIoctlExtended  extended = { 0 };
++    struct ifreq        request = { 0 };
++    int                 fd;
++    int                 saved_errno;
++
++    ifname = mm_port_get_device (MM_PORT (self));
++    if (!ifname || !g_str_has_prefix (ifname, "rmnet_ipa"))
++        return FALSE;
++
++    fd = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++    if (fd < 0)
++        return FALSE;
++
++    extended.extended_ioctl = RMNET_IOCTL_GET_EP_PAIR;
++    g_strlcpy (request.ifr_name, ifname, sizeof (request.ifr_name));
++    request.ifr_data = (void *)&extended;
++
++    if (ioctl (fd, RMNET_IOCTL_EXTENDED, &request) < 0) {
++        saved_errno = errno;
++        close (fd);
++        mm_obj_warn (self, "Unable to query IPA endpoint pair from rmnet ioctl: %s",
++                     g_strerror (saved_errno));
++        return FALSE;
++    }
++    close (fd);
++
++    if (!extended.u.pair.consumer_pipe_num || !extended.u.pair.producer_pipe_num)
++        return FALSE;
++
++    *consumer_pipe_num = extended.u.pair.consumer_pipe_num;
++    *producer_pipe_num = extended.u.pair.producer_pipe_num;
++    return TRUE;
++}
++
+ static void
+ dpm_open_port (GTask *task)
+ {
+@@ -1815,9 +1879,9 @@ dpm_open_port (GTask *task)
+     g_autofree gchar *tx_sysfs_path = NULL;
+     g_autofree gchar *rx_sysfs_path = NULL;
+     g_autofree gchar *tx_sysfs_str = NULL;
+     g_autofree gchar *rx_sysfs_str = NULL;
+-    guint tx_id = 0;
+-    guint rx_id = 0;
++    guint consumer_pipe_num = 0;
++    guint producer_pipe_num = 0;
+ 
+     self = g_task_get_source_object (task);
+     ctx  = g_task_get_task_data (task);
+@@ -1826,25 +1890,27 @@ dpm_open_port (GTask *task)
+     if (g_file_get_contents (rx_sysfs_path, &rx_sysfs_str, NULL, NULL) &&
+         g_file_get_contents (tx_sysfs_path, &tx_sysfs_str, NULL, NULL)) {
+         if (rx_sysfs_str && tx_sysfs_str) {
+-            mm_get_uint_from_str (rx_sysfs_str, &rx_id);
+-            mm_get_uint_from_str (tx_sysfs_str, &tx_id);
++            mm_get_uint_from_str (tx_sysfs_str, &consumer_pipe_num);
++            mm_get_uint_from_str (rx_sysfs_str, &producer_pipe_num);
+         }
+     }
+ 
+-    if (tx_id == 0 || rx_id == 0) {
+-        mm_obj_warn (self, "Unable to read TX and RX endpoint IDs from sysfs. skipping automatic DPM port opening.");
+-
+-        /* Go on to next step */
+-        ctx->step++;
+-        internal_setup_data_format_context_step (task);
+-        return;
++    if ((!consumer_pipe_num || !producer_pipe_num) &&
++        !rmnet_ipa_get_endpoint_pair (self, &consumer_pipe_num, &producer_pipe_num)) {
++            mm_obj_warn (self, "Unable to read IPA endpoint IDs from sysfs or rmnet ioctl. skipping automatic DPM port opening.");
++
++            /* Go on to next step */
++            ctx->step++;
++            internal_setup_data_format_context_step (task);
++            return;
+     }
+ 
+-    mm_obj_dbg (self, "Opening DPM port with TX ID: %u and RX ID: %u", tx_id, rx_id);
++    mm_obj_dbg (self, "Opening DPM port with consumer ID: %u and producer ID: %u",
++                consumer_pipe_num, producer_pipe_num);
+ 
+     /* The modem TX endpoint connects with the IPA's RX port and the modem RX endpoint connects with the IPA's TX port. */
+-    hw_port.rx_endpoint_number = tx_id;
+-    hw_port.tx_endpoint_number = rx_id;
++    hw_port.rx_endpoint_number = consumer_pipe_num;
++    hw_port.tx_endpoint_number = producer_pipe_num;
+     hw_port.endpoint_type = self->priv->endpoint_type;
+     hw_port.interface_number = self->priv->endpoint_interface_number;
+     hw_data_ports = g_array_new (FALSE, FALSE, sizeof (QmiMessageDpmOpenPortInputHardwareDataPortsElement));
+-- 
+2.51.0

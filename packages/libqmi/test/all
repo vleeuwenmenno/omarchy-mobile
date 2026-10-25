@@ -1,0 +1,15 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+bash -n PKGBUILD
+grep -Fq '_commit=1c972b8ab901565f26b9f95e1705269277bbfa1b' PKGBUILD
+grep -Fq 'pkgver=1.38.0.r20261005' PKGBUILD
+grep -Fq 'f186c784c2ec9daefaf0752fbf1a605308b7f6a941d74b3ebba510ef818f8f6c' PKGBUILD
+grep -Fq -- '-D gtk_doc=false' PKGBUILD
+! grep -Fq 'gi-docgen' PKGBUILD
+grep -Fq 'provides=(libqmi-glib.so)' PKGBUILD
+! grep -Eq "(sha256sums|b2sums)=.*SKIP" PKGBUILD
+
+printf '%s\n' 'ok - libqmi pins the Myron-qualified LOC AFW snapshot'

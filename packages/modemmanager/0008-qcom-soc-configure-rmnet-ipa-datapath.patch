@@ -1,0 +1,301 @@
+From 9af026479bc17a76592379a8bb472648be675600 Mon Sep 17 00:00:00 2001
+From: Menno <menno@example.invalid>
+Date: Thu, 10 Sep 2026 16:00:00 +0200
+Subject: [PATCH] qcom-soc: configure downstream RMNET IPA data path
+
+The downstream IPA WAN driver does not create its physical producer and
+consumer pipes from WDA or DPM alone. It requires the legacy RMNET private
+ioctls to select MAP multiplexing and downlink deaggregation. It also requires
+an ADD_MUX_CHANNEL notification after each qmap link is created so that IPA
+installs the per-mux header and filter rules.
+
+Without those calls ModemManager exports a connected bearer with an address,
+but rmnet_ipa0 drops every uplink packet and receives no downlink traffic.
+
+Apply the physical format once after WDA has settled, then register the actual
+mux id and qmap interface name before the bearer waits for that link. Limit the
+workaround to downstream rmnet_ipa interfaces and propagate failures through
+the normal bearer cleanup path.
+---
+ src/mm-bearer-qmi.c |   6 ++
+ src/mm-port-qmi.c   | 187 +++++++++++++++++++++++++++++++++++++++++++++
+ src/mm-port-qmi.h   |   5 ++
+ 3 files changed, 198 insertions(+)
+
+diff --git a/src/mm-bearer-qmi.c b/src/mm-bearer-qmi.c
+index f3e2f30..cc05217 100644
+--- a/src/mm-bearer-qmi.c
++++ b/src/mm-bearer-qmi.c
+@@ -1758,6 +1758,12 @@ setup_link_ready (MMPortQmi     *qmi,
+      * whether we should cleanup the link upon a connection failure */
+     mm_obj_msg (ctx->self, "net link %s created (mux id %u)", ctx->link_name, ctx->mux_id);
+ 
++    if (!mm_port_qmi_register_rmnet_ipa_mux (qmi, ctx->link_name, ctx->mux_id, &error)) {
++        g_prefix_error (&error, "failed to register RMNET IPA mux channel: ");
++        complete_connect (task, NULL, error);
++        return;
++    }
++
+     /* Wait for the data port with the given interface name, which will be
+      * added asynchronously */
+     g_object_get (ctx->self,
+diff --git a/src/mm-port-qmi.c b/src/mm-port-qmi.c
+index 9bcc061..90c40de 100644
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -19,6 +19,7 @@
+ #include <net/if.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+@@ -40,8 +41,19 @@
+ 
+ /* Qualcomm downstream RMNET private ioctl ABI. */
+ #define RMNET_IOCTL_EXTENDED 0x89FD
++#define RMNET_IOCTL_GET_SUPPORTED_FEATURES 0x0000
++#define RMNET_IOCTL_ADD_MUX_CHANNEL 0x0005
++#define RMNET_IOCTL_SET_EGRESS_DATA_FORMAT 0x0006
++#define RMNET_IOCTL_SET_INGRESS_DATA_FORMAT 0x0007
+ #define RMNET_IOCTL_GET_EP_PAIR 0x0010
+ 
++#define RMNET_IOCTL_FEAT_NOTIFY_MUX_CHANNEL       (1U << 0)
++#define RMNET_IOCTL_FEAT_SET_EGRESS_DATA_FORMAT  (1U << 1)
++#define RMNET_IOCTL_FEAT_SET_INGRESS_DATA_FORMAT (1U << 2)
++
++#define RMNET_IOCTL_EGRESS_FORMAT_FLAGS 0x0000000A
++#define RMNET_IOCTL_INGRESS_FORMAT_FLAGS 0x0000002E
++
+ typedef struct {
+     guint32 consumer_pipe_num;
+     guint32 producer_pipe_num;
+@@ -53,6 +65,15 @@ typedef struct {
+         guint32 data;
+         gchar if_name[IFNAMSIZ];
+         RmnetIpaEndpointPair pair;
++        struct {
++            guint32 flags;
++            guint32 aggregation_size;
++            guint32 aggregation_count;
++        } data_format;
++        struct {
++            guint32 mux_id;
++            gchar   vchannel_name[IFNAMSIZ];
++        } mux_channel;
+         guint8 padding[20];
+     } u;
+ } RmnetIoctlExtended;
+@@ -109,6 +130,8 @@ struct _MMPortQmiPrivate {
+     GList    *preallocated_links_setup_pending;
+     /* first multiplex setup */
+     gboolean first_multiplex_setup;
++    /* downstream IPA physical pipe setup */
++    gboolean rmnet_ipa_data_format_setup;
+ };
+ 
+ /*****************************************************************************/
+@@ -1282,6 +1305,157 @@ load_supported_kernel_data_modes (MMPortQmi *self,
+ #define DEFAULT_DOWNLINK_DATA_AGGREGATION_MAX_SIZE_QMI_WWAN_RMNET 16384
+ #define DEFAULT_DOWNLINK_DATA_AGGREGATION_MAX_DATAGRAMS           32
+ 
++static gchar *
++rmnet_ipa_get_interface_name (MMPortQmi *self)
++{
++    gchar *ifname;
++
++    if (!self->priv->net_sysfs_path)
++        return NULL;
++
++    ifname = g_path_get_basename (self->priv->net_sysfs_path);
++    if (!g_str_has_prefix (ifname, "rmnet_ipa")) {
++        g_free (ifname);
++        return NULL;
++    }
++    return ifname;
++}
++
++static gboolean
++rmnet_ipa_extended_ioctl (int                 fd,
++                          const gchar        *ifname,
++                          RmnetIoctlExtended *extended,
++                          GError            **error)
++{
++    struct ifreq request = { 0 };
++
++    g_strlcpy (request.ifr_name, ifname, sizeof (request.ifr_name));
++    request.ifr_data = (void *)extended;
++    if (ioctl (fd, RMNET_IOCTL_EXTENDED, &request) < 0) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "RMNET IPA ioctl 0x%04x failed on %s: %s",
++                     extended->extended_ioctl, ifname, g_strerror (errno));
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static gboolean
++rmnet_ipa_setup_data_format (MMPortQmi  *self,
++                             guint32     aggregation_size,
++                             guint32     aggregation_count,
++                             GError    **error)
++{
++    g_autofree gchar   *ifname = NULL;
++    RmnetIoctlExtended  extended = { 0 };
++    int                 fd;
++    gboolean            success = FALSE;
++
++    ifname = rmnet_ipa_get_interface_name (self);
++    if (!ifname)
++        return TRUE;
++
++    fd = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++    if (fd < 0) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "Couldn't open socket for RMNET IPA setup: %s", g_strerror (errno));
++        return FALSE;
++    }
++
++    extended.extended_ioctl = RMNET_IOCTL_GET_SUPPORTED_FEATURES;
++    if (!rmnet_ipa_extended_ioctl (fd, ifname, &extended, error))
++        goto out;
++    if ((extended.u.data & (RMNET_IOCTL_FEAT_SET_EGRESS_DATA_FORMAT |
++                            RMNET_IOCTL_FEAT_SET_INGRESS_DATA_FORMAT)) !=
++                           (RMNET_IOCTL_FEAT_SET_EGRESS_DATA_FORMAT |
++                            RMNET_IOCTL_FEAT_SET_INGRESS_DATA_FORMAT)) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                     "RMNET IPA device %s lacks physical data format setup", ifname);
++        goto out;
++    }
++
++    extended = (RmnetIoctlExtended) { 0 };
++    extended.extended_ioctl = RMNET_IOCTL_SET_EGRESS_DATA_FORMAT;
++    extended.u.data_format.flags = RMNET_IOCTL_EGRESS_FORMAT_FLAGS;
++    if (!rmnet_ipa_extended_ioctl (fd, ifname, &extended, error))
++        goto out;
++
++    extended = (RmnetIoctlExtended) { 0 };
++    extended.extended_ioctl = RMNET_IOCTL_SET_INGRESS_DATA_FORMAT;
++    extended.u.data_format.flags = RMNET_IOCTL_INGRESS_FORMAT_FLAGS;
++    extended.u.data_format.aggregation_size = MIN (aggregation_size ? aggregation_size : DEFAULT_DOWNLINK_DATA_AGGREGATION_MAX_SIZE,
++                                                   DEFAULT_DOWNLINK_DATA_AGGREGATION_MAX_SIZE);
++    extended.u.data_format.aggregation_count = MIN (aggregation_count ? aggregation_count : DEFAULT_DOWNLINK_DATA_AGGREGATION_MAX_DATAGRAMS,
++                                                    DEFAULT_DOWNLINK_DATA_AGGREGATION_MAX_DATAGRAMS);
++    if (!rmnet_ipa_extended_ioctl (fd, ifname, &extended, error))
++        goto out;
++
++    mm_obj_dbg (self, "configured RMNET IPA physical data format on %s (DL %u bytes/%u datagrams)",
++                ifname,
++                extended.u.data_format.aggregation_size,
++                extended.u.data_format.aggregation_count);
++    success = TRUE;
++
++out:
++    close (fd);
++    return success;
++}
++
++gboolean
++mm_port_qmi_register_rmnet_ipa_mux (MMPortQmi   *self,
++                                    const gchar *link_name,
++                                    guint        mux_id,
++                                    GError     **error)
++{
++    g_autofree gchar   *ifname = NULL;
++    RmnetIoctlExtended  extended = { 0 };
++    int                 fd;
++    gboolean            success = FALSE;
++
++    ifname = rmnet_ipa_get_interface_name (self);
++    if (!ifname)
++        return TRUE;
++
++    if (!link_name || !link_name[0] || strlen (link_name) >= IFNAMSIZ ||
++        mux_id < QMI_DEVICE_MUX_ID_MIN || mux_id > QMI_DEVICE_MUX_ID_MAX) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
++                     "Invalid RMNET IPA mux interface name");
++        return FALSE;
++    }
++
++    fd = socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++    if (fd < 0) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "Couldn't open socket for RMNET IPA mux registration: %s", g_strerror (errno));
++        return FALSE;
++    }
++
++    extended.extended_ioctl = RMNET_IOCTL_GET_SUPPORTED_FEATURES;
++    if (!rmnet_ipa_extended_ioctl (fd, ifname, &extended, error))
++        goto out;
++    if (!(extended.u.data & RMNET_IOCTL_FEAT_NOTIFY_MUX_CHANNEL)) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                     "RMNET IPA device %s lacks mux notification support", ifname);
++        goto out;
++    }
++
++    extended = (RmnetIoctlExtended) { 0 };
++    extended.extended_ioctl = RMNET_IOCTL_ADD_MUX_CHANNEL;
++    extended.u.mux_channel.mux_id = mux_id;
++    g_strlcpy (extended.u.mux_channel.vchannel_name,
++               link_name,
++               sizeof (extended.u.mux_channel.vchannel_name));
++    if (!rmnet_ipa_extended_ioctl (fd, ifname, &extended, error))
++        goto out;
++
++    mm_obj_dbg (self, "registered RMNET IPA mux id %u as %s on %s", mux_id, link_name, ifname);
++    success = TRUE;
++
++out:
++    close (fd);
++    return success;
++}
++
+ typedef struct {
+     MMPortQmiKernelDataMode       kernel_data_mode;
+     QmiWdaLinkLayerProtocol       wda_llp;
+@@ -1668,6 +1842,18 @@ setup_data_format_completed (GTask *task)
+         (ctx->wda_llp_current    == ctx->wda_llp_requested) &&
+         (ctx->wda_ul_dap_current == ctx->wda_ul_dap_requested) &&
+         (ctx->wda_dl_dap_current == ctx->wda_dl_dap_requested)) {
++        if ((ctx->kernel_data_modes_requested & MM_PORT_QMI_KERNEL_DATA_MODE_MUX_RMNET) &&
++            !self->priv->rmnet_ipa_data_format_setup) {
++            GError *error = NULL;
++
++            if (!rmnet_ipa_setup_data_format (self, ctx->wda_dl_dap_max_size_current,
++                                              ctx->wda_dl_dap_max_datagrams_current, &error)) {
++                g_task_return_error (task, error);
++                g_object_unref (task);
++                return TRUE;
++            }
++            self->priv->rmnet_ipa_data_format_setup = TRUE;
++        }
+         g_task_return_boolean (task, TRUE);
+         g_object_unref (task);
+         return TRUE;
+@@ -2903,6 +3089,7 @@ mm_port_qmi_close (MMPortQmi           *self,
+     }
+ 
+     self->priv->in_progress = TRUE;
++    self->priv->rmnet_ipa_data_format_setup = FALSE;
+ 
+     /* Store device to close in the context */
+     ctx = g_slice_new0 (PortQmiCloseContext);
+diff --git a/src/mm-port-qmi.h b/src/mm-port-qmi.h
+index 148067f..4d7d546 100644
+--- a/src/mm-port-qmi.h
++++ b/src/mm-port-qmi.h
+@@ -159,6 +159,11 @@ gchar *mm_port_qmi_setup_link_finish (MMPortQmi             *self,
+                                       guint                 *mux_id,
+                                       GError               **error);
+ 
++gboolean mm_port_qmi_register_rmnet_ipa_mux (MMPortQmi   *self,
++                                             const gchar *link_name,
++                                             guint        mux_id,
++                                             GError     **error);
++
+ void   mm_port_qmi_cleanup_link          (MMPortQmi            *self,
+                                           const gchar          *link_name,
+                                           guint                 mux_id,
+-- 
+2.51.0

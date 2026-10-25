@@ -1,0 +1,33 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+bash -n PKGBUILD
+grep -Fq '_commit=d776ea38d29ca472a12323c1d45002ee19a66f57' PKGBUILD
+grep -Fq 'pkgver=1.25.95.r20261005' PKGBUILD
+grep -Fq "'libqmi>=1.38.0.r20261005'" PKGBUILD
+grep -Fq -- '-D gtk_doc=false' PKGBUILD
+! grep -Eq "(sha256sums|b2sums)=.*SKIP" PKGBUILD
+
+for patch in \
+  0002-qmi-fix-loc-error-path-log-object.patch \
+  0003-qmi-serialize-pdc-config-info-requests.patch \
+  0004-qcom-soc-infer-rmnet-ipa-driver.patch \
+  0005-qcom-soc-read-rmnet-ipa-endpoints.patch \
+  0006-qcom-soc-propagate-rmnet-ipa-details.patch \
+  0007-qcom-soc-recognize-driverless-qmapmux-links.patch \
+  0008-qcom-soc-configure-rmnet-ipa-datapath.patch \
+  0009-qmi-identify-loc-client-as-afw.patch \
+  0010-qmi-loc-operation-mode-response.patch; do
+  test -s "$patch"
+  grep -Fq "$patch" PKGBUILD
+done
+
+grep -Fq 'RMNET_IOCTL_GET_EP_PAIR' 0005-qcom-soc-read-rmnet-ipa-endpoints.patch
+grep -Fq 'RMNET_IOCTL_ADD_MUX_CHANNEL' 0008-qcom-soc-configure-rmnet-ipa-datapath.patch
+grep -Fq 'QMI_LOC_CLIENT_TYPE_AFW' 0009-qmi-identify-loc-client-as-afw.patch
+grep -Fq 'loc_location_position_report_indication_cb' 0009-qmi-identify-loc-client-as-afw.patch
+grep -Fq 'operation mode command accepted' 0010-qmi-loc-operation-mode-response.patch
+
+printf '%s\n' 'ok - ModemManager pins the proven Myron IPA and GNSS patch stack'

@@ -1,0 +1,51 @@
+From: Menno <menno@localhost>
+Subject: [PATCH] qcom-soc: classify virtual rmnet_ipa as IPA
+
+Some downstream Qualcomm kernels expose the main IPA data interface as a
+virtual rmnet_ipa device. Such a device has no sysfs driver symlink, so the
+qcom-soc backend cannot select its IPA data path and QMI initialization uses
+the generic raw-IP fallback instead.
+
+Infer the IPA transport only for driverless rmnet_ipa interfaces. Keep the
+normal kernel-driver detection unchanged for every other interface.
+
+--- a/src/mm-bearer-qmi.c
++++ b/src/mm-bearer-qmi.c
+@@ -2434,6 +2434,9 @@ load_settings_from_bearer (MMBearerQmi         *self,
+ 
+     /* Check multiplex support in the kernel and the device */
+     data_port_driver = mm_kernel_device_get_driver (mm_port_peek_kernel_device (ctx->data));
++    if ((!data_port_driver || !data_port_driver[0]) &&
++        g_str_has_prefix (mm_port_get_device (ctx->data), "rmnet_ipa"))
++        data_port_driver = "ipa";
+     /* All drivers should support multiplexing */
+     if (!max_multiplexed_bearers)
+         multiplex_supported = FALSE;
+--- a/src/mm-port-qmi.c
++++ b/src/mm-port-qmi.c
+@@ -2743,6 +2743,12 @@ mm_port_qmi_set_net_details (MMPortQmi *self,
+ 
+     g_assert (!self->priv->net_driver);
+     self->priv->net_driver = g_strdup (mm_kernel_device_get_driver (first_net_dev));
++    if ((!self->priv->net_driver || !self->priv->net_driver[0]) &&
++        g_str_has_prefix (mm_port_get_device (first_net), "rmnet_ipa")) {
++        g_clear_pointer (&self->priv->net_driver, g_free);
++        self->priv->net_driver = g_strdup ("ipa");
++    }
++
+ 
+     g_assert (!self->priv->net_sysfs_path);
+     self->priv->net_sysfs_path = g_strdup (mm_kernel_device_get_sysfs_path (first_net_dev));
+--- a/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
++++ b/src/plugins/qcom-soc/mm-broadband-modem-qmi-qcom-soc.c
+@@ -110,7 +110,9 @@ peek_port_qmi_for_data (MMBroadbandModemQmi  *self,
+     net_port = mm_port_peek_kernel_device (data);
+     net_port_driver = mm_kernel_device_get_driver (net_port);
+ 
+-    if (g_strcmp0 (net_port_driver, "ipa") == 0)
++    if ((g_strcmp0 (net_port_driver, "ipa") == 0) ||
++        ((!net_port_driver || !net_port_driver[0]) &&
++         g_str_has_prefix (mm_port_get_device (data), "rmnet_ipa")))
+         return peek_port_qmi_for_data_ipa (self, data, out_endpoint, error);
+ 
+     if (g_strcmp0 (net_port_driver, "bam-dmux") == 0)
