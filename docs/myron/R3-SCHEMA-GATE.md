@@ -97,6 +97,16 @@ field; vendor boot and DT table also take it from the header.
 Ranges are positive, sorted, non-overlapping, **adjacent ranges merged**,
 indexed sequentially from 0, and `covered_bytes` is their exact sum. Component
 hashes are never required to exist for uncovered bytes and never allowed to.
+The rule `r3-hash-equal-for-identical-extents` ties the digests together:
+whenever two declarations in one image describe exactly the same non-empty
+`(offset, size_bytes)` (the image extent `(0, size_bytes)`, the header, a
+non-empty table and any component), they must carry the same non-null hash. An
+image whose header fills it (boot v4 with `size_bytes` equal to the 1,584-byte
+header) cannot carry one digest for the image and another for the header. Only
+equal extents are compared; contained or overlapping extents are different
+claims, and zero-size extents name no byte, so the empty-table hash and null
+zero-size component hashes keep their own rules.
+
 Full-image coverage claims the source bytes and padding were covered. It still
 proves **no provenance and no hardware freshness**.
 

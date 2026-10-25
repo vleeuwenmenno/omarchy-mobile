@@ -196,7 +196,9 @@ implemented and stay required successor gates: the R3 binary parsers
 (`r3-binary-image-parsers`; the schema they fill exists since Phase 2.15A) and
 the R4 selection-source qualification (a concrete selected-index source, an
 actual Myron witness and contract cross-checks; parsing a DTBO or FDT does not
-prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)).
+prove selection) ([BOOTCHAIN-GATE.md](BOOTCHAIN-GATE.md)). Offline R3 parsing
+(2.15B) needs only the format parsers and recomputed hashes and coverage; a
+byte-counting hardware transport is later acquisition qualification.
 
 Phase 2.15A (laptop-only, schema done): the preflight (0.3.0), collector
 (0.2.0), session (0.2.0) and bootchain (0.2.0) tools migrate to one R3

@@ -58,7 +58,7 @@
   "components": {
     "capture_contract": {
       "path": "device/myron/capture-contract.json",
-      "sha256": "e9fe948063f73fdb38818c07e5e7bea0da67d3f03fb340373cadd4acb10d7d89"
+      "sha256": "7948af6d5b9f90e76062956833956b94aabfe8a817f0e4fe1db40793fb2a8e86"
     },
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",
@@ -155,10 +155,12 @@
   "deferred": [
     {
       "id": "R3-boot-image-headers",
+      "later_acquisition_qualification": [
+        "a hardware transport that counts actual returned bytes, rereads and overreads separately: a later acquisition gate, not a prerequisite of the offline parser phase"
+      ],
       "requires": [
         "format-specific binary parsers for Android boot v0-v4, vendor boot v3 and v4, and DT table v0",
-        "hashes and coverage recomputed from image bytes: the schema generation only represents them",
-        "a hardware transport that counts actual returned bytes, rereads and overreads separately"
+        "hashes and coverage recomputed from image bytes: the schema generation only represents them"
       ],
       "state": "not-implemented",
       "successor_gate": "r3-binary-image-parsers"
@@ -198,7 +200,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-bootchain-impl.py",
-    "sha256": "8abbf2e3aa34f289393f5423924a04dc367d6227038fffa7037512c3dcfde00a"
+    "sha256": "3fa8d0f868657fd5b77acb77e43b461b101c0b049ab89cf9a26ceb45654c9b66"
   },
   "input": {
     "closure": [

@@ -48,7 +48,7 @@
   "components": {
     "capture_contract": {
       "path": "device/myron/capture-contract.json",
-      "sha256": "e9fe948063f73fdb38818c07e5e7bea0da67d3f03fb340373cadd4acb10d7d89"
+      "sha256": "7948af6d5b9f90e76062956833956b94aabfe8a817f0e4fe1db40793fb2a8e86"
     },
     "preflight_contract": {
       "path": "device/myron/preflight-contract.json",

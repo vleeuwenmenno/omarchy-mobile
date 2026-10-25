@@ -1710,15 +1710,70 @@ five = as_rows({n: full_sized(n, 4) for n in ("boot_a", "boot_b", "recovery_a", 
 r3_must("five 16 MiB full-image claims", lambda r: None,
         "full-image coverage exceeds the fixture input budget", base=five)
 assert max(row["max_output_bytes"] for row in READS) == 2**20
-# The largest legitimate R3 document fits its output bound.
-biggest = as_rows({
+# A high-cardinality VALID document: maximum table entries (256 DT entries, 64 vendor
+# fragments) in as many rows as the 65,536-byte metadata budget admits (not claimed to be
+# the maximum of all valid documents). 3 * 8224 + 4 * 9040 + 2 * 1660 = 64,152 metadata bytes.
+high = as_rows({
     **{n: make(n, 0, entries=256) for n in ("dtbo", "dtbo_a", "dtbo_b")},
     **{n: make(n, 4, entries=64) for n in ("vendor_boot", "vendor_boot_a", "vendor_boot_b",
-                                           "vendor_kernel_boot", "vendor_kernel_boot_a",
-                                           "vendor_kernel_boot_b")},
+                                           "vendor_kernel_boot")},
+    **{n: make(n, 2) for n in ("boot_a", "boot_b")},
 })
+metadata_total = sum(row["image"]["coverage"]["covered_bytes"] for row in high if row["image"])
+assert metadata_total == 64152 <= 65536, metadata_total
+assert [len(row["image"]["components"]) for row in high if row["image"]
+        and row["role"] == "dtbo"] == [256] * 3
+assert r3_doc_error(high) is None, r3_doc_error(high)
+biggest = high
 size = len(D.render_json(operation_document(R3, data={"images": biggest})))
 assert size < READS[2]["max_output_bytes"], size
+# A conservative serialized-size upper bound over every profile shape, not an exact maximum:
+# all 18 rows present, each with the largest-serializing layout its role admits (maximum
+# components and table entries), 32 coverage ranges, every hash present, and every integer
+# widened to 10 digits. Validity limits (disjoint extents, the 16 MiB image, the metadata
+# budget) are ignored on purpose, so no valid document can serialize larger.
+WIDE = 2**32 - 1
+profile = C.r3_profile()
+
+
+def worst_image(role, layout):
+    entries = {"vendor_ramdisk_fragment": 64, "dt_entry": 256}
+    fmt, version = layout["format"], layout["version"]
+    image = fixtures.clone(make("dtbo" if fmt == "android-dt-table" else role, version,
+                                entries=256 if fmt == "android-dt-table" else 64))
+    assert len(image["components"]) <= 256 + 3
+    digest = "f" * 64
+    image["size_bytes"] = WIDE
+    image["page_size"] = 16384
+    image["os_version"] = WIDE if fmt == "android-boot" else None
+    image["sha256"] = digest
+    image["header"].update(offset=WIDE, size_bytes=WIDE, sha256=digest)
+    for item in image["components"]:
+        item.update(offset=WIDE, size_bytes=WIDE, sha256=digest)
+        if item["ramdisk_type"] is not None:
+            item["ramdisk_type"] = 3
+    if image["table"] is not None:
+        image["table"].update(offset=WIDE, size_bytes=WIDE, sha256=digest, entry_size=WIDE,
+                              entry_count=WIDE)
+    image["coverage"] = {
+        "kind": "metadata-only", "covered_bytes": WIDE,
+        "ranges": [{"index": i, "offset": WIDE, "size_bytes": WIDE}
+                   for i in range(profile["max_coverage_ranges"])],
+    }
+    return image
+
+
+worst = {}
+for name in fixtures.NAMES:
+    role = fixtures.role_of(name)
+    worst[name] = max(
+        (worst_image(role, layout) for layout in profile["layouts"]
+         if layout["format"] == fixtures.ROLE_FORMAT[role]
+         and layout["version"] in fixtures.ROLE_VERSIONS[role]),
+        key=lambda image: len(D.render_json(image)))
+bound = len(D.render_json(operation_document(R3, data={"images": as_rows(worst)})))
+assert size < bound < 2**20, (size, bound)
+assert bound < 4 * 464749  # the independent review's observed ceiling stays far below it
 oversize = fixtures.clone(biggest)
 raw = D.render_json(operation_document(R3, data={"images": oversize}))
 try:
@@ -1729,6 +1784,72 @@ except C.CollectError as error:
 else:
     raise AssertionError("an R3 document over max_output_bytes was accepted")
 ok("metadata coverage, full-image coverage and output stay inside their separate R3 bounds")
+
+# 7b. Identical extents carry identical hashes (r3-hash-equal-for-identical-extents).
+def header_fills_image(name="boot_a"):
+    """Boot v4 whose image is exactly its header: image extent == header extent (0, 1584)."""
+    image = make(name, 4, "full-image")
+    header = image["header"]["size_bytes"]
+    for item in image["components"]:
+        item.update(offset=header, size_bytes=0, sha256=None)
+    image["size_bytes"] = header
+    image["coverage"] = {"kind": "full-image", "covered_bytes": header,
+                         "ranges": [{"index": 0, "offset": 0, "size_bytes": header}]}
+    image["header"]["sha256"] = image["sha256"] = fixtures.digest("one extent, one hash")
+    return image
+
+
+r3_accepted("header equals the image with one equal hash", base=as_rows({"boot_a": header_fills_image()}))
+split_hash = header_fills_image()
+split_hash["header"]["sha256"] = fixtures.digest("a different header hash")
+r3_must("boot v4 header equals image size with different hashes", lambda r: None,
+        "identical extents carry different hashes", base=as_rows({"boot_a": split_hash}))
+r3_accepted("a shorter header keeps its own hash beside the image hash", base=as_rows({
+    "boot_a": make("boot_a", 4, "full-image")}))
+
+RULE = C.R3_RULES["r3-hash-equal-for-identical-extents"]
+assert "r3-hash-equal-for-identical-extents" in C.policy_registry()["operations"][R3]["rules"]
+HASH_A, HASH_B = fixtures.digest("a"), fixtures.digest("b")
+
+
+def rule_image(image_hash=None, table=None, components=(), header_hash=HASH_A, size=1 << 20):
+    return [{"image": {
+        "size_bytes": size, "sha256": image_hash,
+        "header": {"offset": 0, "size_bytes": 512, "sha256": header_hash},
+        "table": table,
+        "components": [{"offset": o, "size_bytes": s, "sha256": h} for o, s, h in components],
+    }}]
+
+
+def rule_error(rows):
+    try:
+        RULE(rows, None, None)
+    except C.CollectError as error:
+        return str(error)
+    return None
+
+
+def table_at(offset, size, digest):
+    return {"offset": offset, "size_bytes": size, "sha256": digest}
+
+
+assert rule_error(rule_image(HASH_B, header_hash=HASH_A, size=512)) is not None
+assert rule_error(rule_image(HASH_A, header_hash=HASH_A, size=512)) is None
+assert rule_error(rule_image(None, header_hash=HASH_A, size=512)) is not None, "null beside non-null"
+assert rule_error(rule_image(table=table_at(512, 4096, HASH_A),
+                             components=[(512, 4096, HASH_B)])) is not None
+assert rule_error(rule_image(table=table_at(512, 4096, HASH_A),
+                             components=[(512, 4096, HASH_A)])) is None
+assert rule_error(rule_image(components=[(4096, 4096, HASH_A), (4096, 4096, HASH_B)])) is not None
+assert rule_error(rule_image(components=[(4096, 4096, HASH_A), (4096, 4096, HASH_A)])) is None
+# Different extents are never equated, even when one is inside another or they share an offset.
+assert rule_error(rule_image(HASH_B, header_hash=HASH_A, size=1 << 20)) is None
+assert rule_error(rule_image(components=[(0, 4096, HASH_B)], header_hash=HASH_A)) is None
+assert rule_error(rule_image(components=[(512, 4096, HASH_A), (512, 8192, HASH_B)])) is None
+# Zero-size extents name no byte: differing hashes there keep their own rules.
+assert rule_error(rule_image(table=table_at(512, 0, HASH_A), components=[(512, 0, None), (512, 0, HASH_B)])) is None
+assert rule_error(rule_image(HASH_B, header_hash=HASH_A, size=0)) is None
+ok("identical declared extents must carry equal non-null hashes; different and empty extents stay separate")
 
 # 8. Eighteen rows exactly, the null form and the previous R3 forms.
 r3_must("row omitted", lambda r: r.pop(), "must hold 18..18 entries")

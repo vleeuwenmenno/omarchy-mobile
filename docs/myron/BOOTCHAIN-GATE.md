@@ -45,7 +45,12 @@ and nothing here implements or claims either.
   exact header and table hash coverage, metadata-only versus full-image
   coverage). That is schema only; the **R3 binary parsers**
   (`r3-binary-image-parsers`) that would fill those rows from image bytes are the
-  remaining successor gate, and this tool still has none.
+  remaining successor gate, and this tool still has none. Offline Phase 2.15B
+  needs only the binary format parsers and hashes and coverage recomputed from
+  image bytes. A hardware transport that counts returned bytes, rereads and
+  overreads separately is **later acquisition qualification**, not a
+  prerequisite of 2.15B; the contract lists it as
+  `later_acquisition_qualification`.
 - **R4 selection-source qualification** (`r4-selection-source-qualification`).
   There is no concrete selected-index source. Parsing a DTBO or a device-tree
   blob does not prove which entry the bootloader selects. R4 needs an actual

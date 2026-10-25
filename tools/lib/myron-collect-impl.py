@@ -1250,6 +1250,29 @@ def r3_hash_iff_covered(rows, profile, budgets) -> None:
                 raise CollectError("R3 component sha256 is present only where its whole extent is covered")
 
 
+def r3_hash_equal_for_identical_extents(rows, profile, budgets) -> None:
+    """Two declarations of exactly the same non-empty (offset, size) bytes within one image
+    describe the same bytes, so their hashes must be equal and non-null together. Only equal
+    extents are compared: an extent contained in or overlapping another is a different claim."""
+    for _row, image in present_images(rows):
+        declared = [((0, image["size_bytes"]), image["sha256"]),
+                    ((image["header"]["offset"], image["header"]["size_bytes"]),
+                     image["header"]["sha256"])]
+        table = image["table"]
+        if table is not None:
+            declared.append(((table["offset"], table["size_bytes"]), table["sha256"]))
+        declared += [((item["offset"], item["size_bytes"]), item["sha256"])
+                     for item in image["components"]]
+        seen = {}
+        for extent, digest in declared:
+            if extent[1] == 0:
+                continue  # an empty extent names no byte; zero-size hashes keep their own rules
+            seen.setdefault(extent, []).append(digest)
+        for digests in seen.values():
+            if len(digests) > 1 and (None in digests or len(set(digests)) != 1):
+                raise CollectError("R3 declarations of identical extents carry different hashes")
+
+
 def r3_coverage_budgets(rows, profile, budgets) -> None:
     metadata = sum(
         image["coverage"]["covered_bytes"] for _row, image in present_images(rows)
@@ -1278,6 +1301,7 @@ R3_RULES = {
     "r3-coverage-canonical": r3_coverage_canonical,
     "r3-coverage-by-kind": r3_coverage_kind,
     "r3-hash-iff-covered": r3_hash_iff_covered,
+    "r3-hash-equal-for-identical-extents": r3_hash_equal_for_identical_extents,
     "r3-coverage-budgets": r3_coverage_budgets,
 }
 

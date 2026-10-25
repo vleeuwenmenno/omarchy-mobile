@@ -137,7 +137,10 @@ DEFERRED = [
         "requires": [
             "format-specific binary parsers for Android boot v0-v4, vendor boot v3 and v4, and DT table v0",
             "hashes and coverage recomputed from image bytes: the schema generation only represents them",
-            "a hardware transport that counts actual returned bytes, rereads and overreads separately",
+        ],
+        "later_acquisition_qualification": [
+            "a hardware transport that counts actual returned bytes, rereads and overreads separately: "
+            "a later acquisition gate, not a prerequisite of the offline parser phase",
         ],
     },
     {
@@ -376,7 +379,11 @@ def unresolved_claims() -> list[dict]:
 
 
 def deferred_rows() -> list[dict]:
-    return [{**row, "requires": list(row["requires"])} for row in DEFERRED]
+    return [
+        {**row, **{key: list(row[key]) for key in ("requires", "later_acquisition_qualification")
+                   if key in row}}
+        for row in DEFERRED
+    ]
 
 
 def output_closure() -> dict:

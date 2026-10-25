@@ -536,6 +536,15 @@ assert any("does NOT prove Android slot priority" in t for t in contract["covera
 assert [(row["id"], row["state"], row["successor_gate"]) for row in contract["deferred"]] == [
     (R3, "not-implemented", "r3-binary-image-parsers"),
     (R4, "not-implemented", "r4-selection-source-qualification")]
+r3_deferred = contract["deferred"][0]
+assert r3_deferred["requires"] == [
+    "format-specific binary parsers for Android boot v0-v4, vendor boot v3 and v4, and DT table v0",
+    "hashes and coverage recomputed from image bytes: the schema generation only represents them"]
+assert len(r3_deferred["later_acquisition_qualification"]) == 1
+assert "hardware transport" in r3_deferred["later_acquisition_qualification"][0]
+assert "not a prerequisite" in r3_deferred["later_acquisition_qualification"][0]
+assert not any("hardware" in text for text in r3_deferred["requires"]), "offline 2.15B needs no hardware transport"
+assert "later_acquisition_qualification" not in contract["deferred"][1]
 assert contract["qualification"]["captured_provenance"] is False
 assert contract["qualification"]["implemented_operations"] == [R2]
 assert any("successor" in text or "not implemented" in text for text in contract["limitations"])
@@ -2411,6 +2420,11 @@ drift("limitation text change", lambda: B.LIMITATIONS.append("x"), lambda: B.LIM
 drift("unresolved claim change", lambda: B.UNRESOLVED.append("x"), lambda: B.UNRESOLVED.pop())
 drift("deferred gate change", lambda: B.DEFERRED[0].update(state="implemented"),
       lambda: B.DEFERRED[0].update(state="not-implemented"))
+drift("R3 later acquisition qualification change",
+      lambda: B.DEFERRED[0]["later_acquisition_qualification"].append("x"),
+      lambda: B.DEFERRED[0]["later_acquisition_qualification"].pop())
+drift("R3 offline prerequisite change", lambda: B.DEFERRED[0]["requires"].append("a hardware transport"),
+      lambda: B.DEFERRED[0]["requires"].pop())
 drift("semantic limit change", lambda: B.SEMANTIC_LIMITS.pop(), lambda: B.SEMANTIC_LIMITS.append(
     "recovery_present is name presence inside this one GPT, not recovery viability"))
 drift("profile constant change", lambda: setattr(B, "BOOTABLE_BIT", 1), lambda: setattr(B, "BOOTABLE_BIT", 2))

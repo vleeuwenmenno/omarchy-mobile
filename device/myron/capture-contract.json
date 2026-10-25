@@ -74,7 +74,7 @@
   "implementation": {
     "algorithm": "sha256-of-captured-implementation-bytes",
     "path": "tools/lib/myron-collect-impl.py",
-    "sha256": "8fc49e1d14c68d225d6bc52c3f8886bec5ab720f6c7beb69a0909618c181776a"
+    "sha256": "d41944c520ec592e11348082b026e369fd255afc05ce0d251b3dfdd6e61e0502"
   },
   "kind": "myron-capture-collector-contract",
   "pinned_versions": {
@@ -790,6 +790,7 @@
           "r3-coverage-canonical",
           "r3-coverage-by-kind",
           "r3-hash-iff-covered",
+          "r3-hash-equal-for-identical-extents",
           "r3-coverage-budgets"
         ]
       },
