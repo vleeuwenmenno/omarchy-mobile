@@ -203,6 +203,9 @@ class UnsupportedGpt(BootchainError):
 
 _collect = None
 
+# Loader exceptions carry the checkout path and the underlying errno text: never print them.
+DEPENDENCY_REJECTED = "bootchain dependencies could not be loaded (code dependency-rejected)"
+
 
 def collect():
     global _collect
@@ -220,7 +223,7 @@ def collect():
                 "deployment": p.deploy().VERSION,
             }
         except Exception as error:  # the loader boundary: any failure to load or pin is a refusal
-            raise BootchainError(f"cannot load the collector: {error}") from error
+            raise BootchainError(DEPENDENCY_REJECTED) from None
         if found != PINNED_VERSIONS:
             raise BootchainError(f"unsupported verifier versions {found}; expected {PINNED_VERSIONS}")
         _collect = module
@@ -1459,6 +1462,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def load_dependencies():
+    """Every dependency, loaded once before any input is read, inside one protected phase.
+
+    A missing or broken collector, preflight, snapshot, deployment, kernel or GPU verifier is
+    one fixed refusal. The runtime exception tuple is built here from plain types, so no
+    except clause later imports or loads anything while it handles another failure."""
+    try:
+        c = collect()
+        p = c.preflight()
+        d = p.deploy()
+        s = p.snapshot()
+        # d.handled_errors() would add OSError and ValueError, whose text can carry paths:
+        # those keep their own fixed io-error handling in main.
+        runtime_errors = (BootchainError, c.CollectError, p.PreflightError, s.SnapshotError,
+                          d.DeploymentError, d.kernel().ContractError, d.gpu().ProfileError)
+    except BootchainError:
+        raise  # collect(): fixed text, or the pinned-version refusal
+    except Exception:
+        raise BootchainError(DEPENDENCY_REJECTED) from None
+    return c, p, d, s, runtime_errors
+
+
 def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
@@ -1466,13 +1491,10 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     try:
-        c = collect()
+        c, p, d, s, runtime_errors = load_dependencies()
     except BootchainError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    p = c.preflight()
-    d = p.deploy()
-    s = p.snapshot()
     root = contracts_root or REPO
     try:
         if args.command == "derive-contract":
@@ -1489,8 +1511,7 @@ def main(argv: list[str] | None = None, contracts_root: Path | None = None) -> i
                 result = command_parse(env, args)
             else:
                 result = command_verify_parse(env, args)
-    except (BootchainError, c.CollectError, p.PreflightError, s.SnapshotError, d.DeploymentError,
-            d.kernel().ContractError, d.gpu().ProfileError) as error:
+    except runtime_errors as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     except OSError:

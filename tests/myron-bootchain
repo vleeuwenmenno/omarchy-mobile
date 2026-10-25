@@ -2597,8 +2597,65 @@ def version_pin(label, tool, old, new, expect):
 version_pin("a collector at another version", "tools/lib/myron-collect-impl.py",
             'VERSION = "0.1.0"', 'VERSION = "0.1.1"', "unsupported verifier versions")
 version_pin("a preflight at another version", "tools/myron-preflight",
-            'VERSION = "0.2.1"', 'VERSION = "0.2.0"', "unsupported verifier versions")
+            'VERSION = "0.2.1"', 'VERSION = "0.2.0"', "(code dependency-rejected)")
 ok("dependency version pins are enforced")
+
+# Dependency acquisition is fully protected. Every case runs in a fresh process, so no import
+# cache of this test or of an earlier case can hide a failure. The checkout path carries a canary.
+import subprocess
+
+STARTUP = "ERROR: bootchain dependencies could not be loaded (code dependency-rejected)\n"
+CANARY = "CANARYq7"
+DEPENDENCIES = {
+    "collector": "tools/myron-collect",
+    "preflight": "tools/myron-preflight",
+    "snapshot": "tools/myron-snapshot",
+    "deployment": "tools/myron-deployment",
+    "kernel verifier": "packages/omamobile-myron-kernel-contract/bin/omamobile-myron-kernel-verify",
+    "GPU verifier": "packages/omamobile-myron-gpu-profile/bin/omamobile-myron-gpu-profile",
+}
+DAMAGE = {
+    "missing": lambda path: path.unlink(),
+    "syntax-invalid": lambda path: path.write_text("def (:\n"),
+    "raising": lambda path: path.write_text(f"raise RuntimeError('{CANARY} raised')\n"),
+}
+
+
+def startup_copy(name):
+    base = fresh(f"{CANARY}-{name}")
+    (base / "packages").mkdir()
+    for part in ["tools", *(f"packages/{p.name}" for p in (repo / "packages").glob("omamobile-myron-*"))]:
+        shutil.copytree(repo / part, base / part, ignore=shutil.ignore_patterns("__pycache__"))
+    return base
+
+
+for label, relative in DEPENDENCIES.items():
+    for kind, damage in DAMAGE.items():
+        base = startup_copy("startup")
+        target = base / relative
+        removed = target.name
+        damage(target)
+        arguments = {
+            "show": [],
+            "derive-contract": [],
+            "plan": ["--request", str(base / "no-request")],
+            "parse": ["--request", str(base / "no-request"), "--reads", str(base / "no-reads"),
+                      "--out", str(base / "no-out")],
+            "verify-parse": ["--request", str(base / "no-request"), "--reads", str(base / "no-reads"),
+                             "--parse", str(base / "no-parse")],
+        }
+        for command, extra in arguments.items():
+            done = subprocess.run(
+                [sys.executable, "-I", str(base / "tools/myron-bootchain"), command, *extra],
+                capture_output=True, text=True, cwd=base, env={"PATH": os.environ["PATH"], "LC_ALL": "C"},
+            )
+            where = f"{kind} {label} ({command})"
+            assert done.returncode == 1, (where, done.returncode, done.stderr)
+            assert done.stdout == "", (where, done.stdout)
+            assert done.stderr == STARTUP, (where, done.stderr)
+            for leak in (CANARY, removed, str(base), "Traceback", "Errno", "No such file", "raised"):
+                assert leak not in done.stderr, (where, leak)
+ok("a missing, syntax-invalid or raising dependency is one fixed value-free line for all five commands, in a fresh process")
 
 assert len(os.listdir("/proc/self/fd")) == descriptors_before, "descriptors leaked"
 print("ok - myron bootchain parser tests passed")

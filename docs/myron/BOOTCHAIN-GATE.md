@@ -325,9 +325,14 @@ Residuals, as in Phase 2.13:
   so it is refused as `gpt-unsupported`: a profile restriction, not a claim that
   such a field is invalid GPT. A nonzero byte after the 92-byte header and other
   GPT variants are refused by the profile for the same reason.
-- Command-line, contract and environment failures print one fixed, value-free line
-  (`code usage`, `contract-rejected`, `environment-rejected`): no argument, key,
-  number or path from the input is echoed.
+- Command-line, contract, environment and dependency failures print one fixed,
+  value-free line (`code usage`, `contract-rejected`, `environment-rejected`,
+  `dependency-rejected`): no argument, key, number or path from the input is echoed.
+  A missing or broken collector, preflight, snapshot, deployment, kernel or GPU
+  verifier is `dependency-rejected` for every command, before any input is read, and
+  prints no checkout path. The runtime exception tuple is built once during that
+  startup, so no `except` clause loads anything. A dependency at another version is
+  still refused with the pinned-version message.
 - `bootable_flag` is a bit, not a bootability claim.
 - The dependency imports are version-pinned, not byte-pinned.
 - R3 and R4 are not implemented.
