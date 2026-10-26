@@ -8,6 +8,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import qs.services as OmarchyServices
+import "../DeviceProfile.js" as DeviceProfile
 import "LauncherModel.js" as LauncherModel
 
 // The phone's home surface, after Omalauncher: one bar at the bottom of the
@@ -31,6 +32,19 @@ Item {
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
+
+  property string deviceDescriptor: ""
+  readonly property var deviceProfile: DeviceProfile.profile(deviceDescriptor)
+  readonly property int sideInset: Style.space(deviceProfile.sideInset)
+
+  FileView {
+    path: DeviceProfile.DESCRIPTOR_PATH
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.deviceDescriptor = text()
+    onLoadFailed: root.deviceDescriptor = ""
+  }
 
   readonly property string pluginId: (manifest && manifest.id) || "omamobile.launcher"
   readonly property var appLibrary: shell && shell.appLibrary ? shell.appLibrary : localLibrary.item
@@ -272,7 +286,10 @@ Item {
 
         SearchPill {
           anchors.fill: parent
-          anchors.margins: Style.spacing.xxl
+          anchors.topMargin: Style.spacing.xxl
+          anchors.bottomMargin: Style.spacing.xxl
+          anchors.leftMargin: Style.spacing.xxl + root.sideInset
+          anchors.rightMargin: Style.spacing.xxl + root.sideInset
           placeholder: (root.hasAgent ? "Search apps or ask " + root.agentName + "…" : "Search apps…")
           onTapped: root.expand()
         }

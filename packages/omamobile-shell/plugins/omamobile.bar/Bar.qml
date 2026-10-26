@@ -8,6 +8,7 @@ import Quickshell.Services.UPower
 import Quickshell.Wayland
 import qs.Commons
 import qs.Commons as Commons
+import "../DeviceProfile.js" as DeviceProfile
 import "StatusModel.js" as StatusModel
 
 // Phone status bar, a full `bar` option that replaces omarchy.bar.
@@ -34,9 +35,23 @@ Item {
   readonly property string position: "top"
   readonly property bool vertical: false
   readonly property string fontFamily: Style.font.family
-  // A phone status bar is a touch target, and the Pixel's camera cutout sits
-  // in it, so it is never thinner than 44 logical px.
-  readonly property int barSize: Math.max(44, Style.bar.sizeHorizontal)
+  // Device packages install this descriptor. Missing, malformed and unknown
+  // descriptors deliberately keep the common layout.
+  property string deviceDescriptor: ""
+  readonly property var deviceProfile: DeviceProfile.profile(deviceDescriptor)
+  readonly property int baseBarSize: Math.max(44, Style.bar.sizeHorizontal)
+  readonly property int barSize: DeviceProfile.barSize(baseBarSize, deviceProfile)
+  readonly property int sideInset: Style.space(deviceProfile.sideInset)
+  readonly property int centerClearance: Style.space(deviceProfile.centerClearance)
+
+  FileView {
+    path: DeviceProfile.DESCRIPTOR_PATH
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.deviceDescriptor = text()
+    onLoadFailed: root.deviceDescriptor = ""
+  }
 
   readonly property color foreground: Commons.Color.bar.text
   readonly property color background: Commons.Color.bar.background
@@ -194,112 +209,145 @@ Item {
       Item {
         z: 1
         anchors.fill: parent
-        anchors.leftMargin: Style.spacing.huge
-        anchors.rightMargin: Style.spacing.huge
+        anchors.leftMargin: Style.spacing.huge + root.sideInset
+        anchors.rightMargin: Style.spacing.huge + root.sideInset
 
-        Text {
-          id: clockText
+        Item {
+          id: leftStatus
           anchors.left: parent.left
-          anchors.verticalCenter: parent.verticalCenter
-          textFormat: Text.PlainText
-          text: Qt.formatDateTime(clock.date, root.clockFormat)
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.title
-          font.bold: true
-        }
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          width: root.centerClearance > 0 ? Math.max(0, (parent.width - root.centerClearance) / 2) : parent.width
+          clip: root.centerClearance > 0
 
-        // The call in progress, beside the clock; a tap opens the Phone
-        // app's in-call screen (the bar is never shown over the lock).
-        Rectangle {
-          id: callChipPill
-          objectName: "callChip"
-          visible: root.callChip !== ""
-          z: 2
-          anchors.left: clockText.right
-          anchors.leftMargin: Style.spacing.lg
-          anchors.verticalCenter: parent.verticalCenter
-          height: Math.round(root.barSize * 0.66)
-          width: chipRow.implicitWidth + Style.spacing.lg * 2
-          radius: height / 2
-          color: chipTap.pressed ? Qt.darker("#1e9e53", 1.2) : "#1e9e53"
-
-          Row {
-            id: chipRow
-            anchors.centerIn: parent
-            spacing: Style.spacing.xs
-            Text { anchors.verticalCenter: parent.verticalCenter; textFormat: Text.PlainText; text: String.fromCodePoint(0xF03F2); color: "white"; font.family: root.fontFamily; font.pixelSize: Style.font.body }
-            Text { anchors.verticalCenter: parent.verticalCenter; textFormat: Text.PlainText; text: root.callChip; color: "white"; font.family: root.fontFamily; font.pixelSize: Style.font.body; font.bold: true }
-          }
-
-          MouseArea {
-            id: chipTap
-            anchors.fill: parent
-            onClicked: Quickshell.execDetached(["omaphone", "--in-call"])
-          }
-        }
-
-        Row {
-          id: status
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.spacing.xl
-
-          StatusGlyph {
-            visible: root.doNotDisturb
-            text: "󰂛"
-          }
-
-          StatusGlyph {
-            visible: !!root.btAdapter && root.btAdapter.enabled
-            text: root.bluetoothConnected ? "󰂱" : "󰂯"
-          }
-
-          Row {
-            visible: root.cellGlyph !== ""
-            spacing: Style.spacing.xs
+          Text {
+            id: clockText
+            anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
-            opacity: root.cell && root.cell.state === "searching" ? 0.55 : 1
+            textFormat: Text.PlainText
+            text: Qt.formatDateTime(clock.date, root.clockFormat)
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+          }
 
-            StatusGlyph { text: root.cellGlyph }
-            Text {
-              visible: text !== ""
-              anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: root.cellText
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
+          // The call in progress, beside the clock; a tap opens the Phone
+          // app's in-call screen (the bar is never shown over the lock).
+          Rectangle {
+            id: callChipPill
+            objectName: "callChip"
+            visible: root.callChip !== ""
+            z: 2
+            anchors.left: clockText.right
+            anchors.leftMargin: Style.spacing.lg
+            anchors.verticalCenter: parent.verticalCenter
+            height: Math.round(root.baseBarSize * 0.66)
+            width: chipRow.implicitWidth + Style.spacing.lg * 2
+            radius: height / 2
+            color: chipTap.pressed ? Qt.darker("#1e9e53", 1.2) : "#1e9e53"
+
+            Row {
+              id: chipRow
+              anchors.centerIn: parent
+              spacing: Style.spacing.xs
+              Text { anchors.verticalCenter: parent.verticalCenter; textFormat: Text.PlainText; text: String.fromCodePoint(0xF03F2); color: "white"; font.family: root.fontFamily; font.pixelSize: Style.font.body }
+              Text { anchors.verticalCenter: parent.verticalCenter; textFormat: Text.PlainText; text: root.callChip; color: "white"; font.family: root.fontFamily; font.pixelSize: Style.font.body; font.bold: true }
+            }
+
+            MouseArea {
+              id: chipTap
+              anchors.fill: parent
+              onClicked: Quickshell.execDetached(["omaphone", "--in-call"])
             }
           }
+        }
 
-          StatusGlyph {
-            visible: root.networkIcon !== ""
-            text: root.networkIcon
-            opacity: root.networkKind === "off" || root.networkKind === "disconnected" ? 0.55 : 1
-          }
+        Item {
+          id: rightStatus
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          width: root.centerClearance > 0 ? Math.max(0, (parent.width - root.centerClearance) / 2) : parent.width
+          clip: root.centerClearance > 0
 
           Row {
-            visible: root.hasBattery
-            spacing: Style.spacing.xs
+            id: status
+            anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.xl
 
             StatusGlyph {
-              text: root.batteryIcon
-              color: root.batteryPercent >= 0 && root.batteryPercent <= 10 && !root.charging ? root.urgent : root.foreground
+              visible: root.doNotDisturb
+              text: "󰂛"
             }
 
-            Text {
-              visible: root.showBatteryPercent
+            StatusGlyph {
+              visible: !!root.btAdapter && root.btAdapter.enabled
+              text: root.bluetoothConnected ? "󰂱" : "󰂯"
+            }
+
+            Row {
+              visible: root.cellGlyph !== ""
+              spacing: Style.spacing.xs
               anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: root.batteryPercent + "%"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
+              opacity: root.cell && root.cell.state === "searching" ? 0.55 : 1
+
+              StatusGlyph { text: root.cellGlyph }
+              Text {
+                visible: text !== ""
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: root.cellText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+            }
+
+            StatusGlyph {
+              visible: root.networkIcon !== ""
+              text: root.networkIcon
+              opacity: root.networkKind === "off" || root.networkKind === "disconnected" ? 0.55 : 1
+            }
+
+            Row {
+              visible: root.hasBattery
+              spacing: Style.spacing.xs
+              anchors.verticalCenter: parent.verticalCenter
+
+              StatusGlyph {
+                text: root.batteryIcon
+                color: root.batteryPercent >= 0 && root.batteryPercent <= 10 && !root.charging ? root.urgent : root.foreground
+              }
+
+              Text {
+                visible: root.showBatteryPercent
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: root.batteryPercent + "%"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
             }
           }
+        }
+
+        // Static camera treatment only. The reserved center keeps every
+        // status item clear; behavior can be added later without moving it.
+        Rectangle {
+          id: cameraPill
+          objectName: "myronCameraPill"
+          visible: root.deviceProfile.codename === "myron"
+          anchors.top: parent.top
+          anchors.topMargin: Style.space(root.deviceProfile.cameraPillTop)
+          anchors.horizontalCenter: parent.horizontalCenter
+          width: Style.space(root.deviceProfile.cameraPillWidth)
+          height: Style.space(root.deviceProfile.cameraPillHeight)
+          radius: height / 2
+          color: "#080808"
         }
       }
 
