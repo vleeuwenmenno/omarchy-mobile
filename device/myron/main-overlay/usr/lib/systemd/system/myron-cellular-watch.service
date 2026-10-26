@@ -8,6 +8,9 @@ ConditionPathExists=/run/myron-main/boot-id
 
 [Service]
 Type=simple
+# ExecStopPost cannot run while ExecStart remains stuck in uninterruptible
+# sleep; that D-state case can keep the last status until the task exits or the
+# phone reboots. Once ExecStopPost runs, lock contention cannot preserve "on".
 ExecStart=/usr/local/sbin/myron-cellular-op watch
 ExecStopPost=/usr/local/sbin/myron-cellular-op watch-stopped
 Restart=no

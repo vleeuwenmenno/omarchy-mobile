@@ -71,6 +71,13 @@ command_bound=$(sed -n 's/^command_seconds=//p' "$reboot_src")
 (( lock_bound + 3 * (stop_bound + 1) + controller_bound + controller_kill_bound + grace_bound + 4 * (command_bound + 1) < 300 )) || fail 'worst-case abort path is not below 300 seconds'
 grep -Fq 'myron-cellular-reboot-failsafe' tools/myron-dev-image-compose || fail 'composer omits the reboot failsafe'
 grep -Fq "cellular reboot failsafe differs from the repository" tools/myron-dev-image-compose || fail 'composer does not byte-verify the reboot failsafe'
+for program in \
+  device/myron/main-overlay/usr/local/sbin/myron-cellular-op \
+  device/myron/main-overlay/usr/local/bin/myron-mobile-data \
+  device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage; do
+  grep -Fq "$program" tools/myron-dev-image-compose || fail "composer does not byte-verify $program"
+done
+grep -Fq 'cellular program differs from the repository' tools/myron-dev-image-compose || fail 'composer cellular-program mismatch is not fatal'
 if grep -niE 'imei|imsi|iccid|msisdn|own-numbers|equipment-identifier|hw-addr|mac-address|ether ' "$op_src" "$helper_src" "$reboot_src"; then
   fail 'supervisor or helper reads or prints identity fields'
 fi
@@ -461,8 +468,8 @@ opq nonce-new || fail 'nonce-new'
 nonce=$(op ssh-nonce); [[ $nonce =~ $nonce_re ]] || fail "nonce shape: $nonce"
 [[ $(stat -c %a "$fix/op/ssh-nonce") == 600 ]] || fail 'nonce mode'
 printf '2: usb0    inet 172.16.42.1/24 scope global usb0\n3: wlan0    inet 192.168.50.7/24 scope global wlan0\n4: rmnet_data0    inet 100.64.1.2/30 scope global rmnet_data0\n' >"$fix/ip-addr"
-printf '0 0 172.16.42.1:22 172.16.42.2:51000\n0 0 192.168.50.7:22 192.168.50.9:51001\n0 0 172.16.42.1:22 172.16.42.2:51002\n0 0 192.168.50.7:22 192.168.50.9:51003\n0 0 100.64.1.2:22 100.64.1.9:51004\n' >"$fix/ss-established"
-printf 'session 172.16.42.1:22 172.16.42.2:51000\nsession 192.168.50.7:22 192.168.50.9:51001\n' >"$fix/rescue.before"
+printf '0 0 172.16.42.1:22 172.16.42.2:51000\n0 0 192.168.50.7:22 192.168.50.9:51001\n0 0 172.16.42.1:22 172.16.42.2:51002\n0 0 192.168.50.7:22 192.168.50.9:51003\n0 0 100.64.1.2:22 100.64.1.9:51004\n0 0 [::ffff:172.16.42.1]:22 [::ffff:172.16.42.2]:51005\n0 0 [::ffff:192.168.50.7]:22 [::ffff:192.168.50.9]:51006\n' >"$fix/ss-established"
+printf 'session 172.16.42.1:22 172.16.42.2:51000\nsession 192.168.50.7:22 192.168.50.9:51001\nsession [::ffff:172.16.42.1]:22 [::ffff:172.16.42.2]:51005\nsession [::ffff:192.168.50.7]:22 [::ffff:192.168.50.9]:51006\n' >"$fix/rescue.before"
 chmod 600 "$fix/rescue.before"
 opq proofs-ok && fail 'proofs ok with none'
 # Missing, linked or group/other-accessible pre-activation facts can never
@@ -484,6 +491,8 @@ opq proofs-ok || fail 'both proofs not accepted'
 refused() { local what=$1; shift; opq "$@" && fail "ssh-proof accepted $what"; return 0; }
 sshenv '172.16.42.2 51000 172.16.42.1 22' "$nonce" && fail 'a pre-existing USB session was accepted'
 sshenv '192.168.50.9 51001 192.168.50.7 22' "$nonce" && fail 'a pre-existing Wi-Fi session was accepted'
+sshenv '172.16.42.2 51005 172.16.42.1 22' "$nonce" && fail 'an IPv4-mapped pre-existing USB session was accepted'
+sshenv '192.168.50.9 51006 192.168.50.7 22' "$nonce" && fail 'an IPv4-mapped pre-existing Wi-Fi session was accepted'
 sshenv '172.16.42.2 51002 172.16.42.1 22' "deadbeefdeadbeefdeadbeefdeadbeef" && fail 'a wrong nonce was accepted'
 sshenv '172.16.42.2 51002 172.16.42.1 22' "" && fail 'an empty nonce was accepted'
 sshenv '172.16.42.2 51002 172.16.42.1 22' "NOT-HEX" && fail 'a malformed nonce was accepted'
@@ -580,6 +589,17 @@ sealed_attended; rm -f "$fix/active-myron-cellular-watch.service"; opq watch-sto
 opq proof-ready && fail 'proof-ready accepted a dead observer'
 opq record-evidence && fail 'evidence recorded without a live observer'
 [[ ! -e $fix/main/cellular-evidence ]] || fail 'dead-observer refusal wrote evidence'
+# A stuck transition must not make ExecStopPost time out while the dead
+# observer remains publicly on. The marker also blocks a late observer revival.
+sealed_attended; rm -f "$fix/active-myron-cellular-watch.service"
+( exec 8>"$fix/lock"; flock 8; touch "$fix/lock-held"; sleep 4 ) & holder=$!
+for i in {1..20}; do [[ -e $fix/lock-held ]] && break; command sleep 0.05; done
+[[ -e $fix/lock-held ]] || fail 'watch-stopped contention holder did not take the lock'
+opq watch-stopped || fail 'observer exit hook under lock contention'
+[[ -e $fix/op/watch-stopped && $(pubv state) == restart && $(reboots) == 0 ]] || fail 'lock contention left a dead observer displayed on'
+wait "$holder" || true
+rm -f "$fix/lock-held"
+opq watch && fail 'a late observer revived after the exit hook'
 sealed_attended; opq proof-ready || fail 'proof-ready'; MOCK_UID=4242 opq record-evidence && fail 'record-evidence as non-root'
 reset; opq record-evidence && fail 'record-evidence with no operation'
 [[ ! -e $fix/main/cellular-evidence ]] || fail 'a refused record wrote evidence'

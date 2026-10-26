@@ -354,6 +354,17 @@ if [[ $boot_policy == main ]]; then
   [[ $(debugfs -R 'cat /usr/local/sbin/myron-cellular-reboot-failsafe' "$out" 2>/dev/null | sha256sum) == \
     "$(sha256sum <device/myron/main-overlay/usr/local/sbin/myron-cellular-reboot-failsafe)" ]] ||
     die 'cellular reboot failsafe differs from the repository'
+  # The operation code must be exactly the reviewed overlays too; ownership
+  # and executable mode alone do not detect a stale base-image copy.
+  for spec in \
+    '/usr/local/sbin/myron-cellular-op|device/myron/main-overlay/usr/local/sbin/myron-cellular-op' \
+    '/usr/local/bin/myron-mobile-data|device/myron/main-overlay/usr/local/bin/myron-mobile-data' \
+    '/usr/local/sbin/myron-cellular-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage'; do
+    image_path=${spec%%|*}
+    repository_path=${spec#*|}
+    [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$repository_path")" ]] ||
+      die "cellular program differs from the repository: $image_path"
+  done
   # debugfs exits 0 for a missing path, so existence is read from its output.
   in_image() { ! debugfs -R "stat $1" "$out" 2>&1 | grep -Fq 'File not found'; }
   # The operation units: byte for byte the repository's, never enabled except

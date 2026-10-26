@@ -95,6 +95,7 @@ state_file=$op_dir/state
 confirm_file=$op_dir/confirm
 nonce_file=$op_dir/ssh-nonce
 lifecycle_file=$op_dir/lifecycle
+watch_stopped_file=$op_dir/watch-stopped
 reboot_flag=$op_dir/reboot-requested
 public_file=$public_dir/state
 evidence=$main_state/cellular-evidence
@@ -292,7 +293,10 @@ require_committed_main() {
 # --- the timer ----------------------------------------------------------------
 timer_active() { timeout -k 1 5 systemctl --quiet is-active "$timer_unit" 2>/dev/null; }
 watch_active() { timeout -k 1 2 systemctl --quiet is-active "$watch_unit" 2>/dev/null; }
-observer_ready() { watch_active && [ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ]; }
+observer_ready() {
+	[ ! -e "$watch_stopped_file" ] && watch_active &&
+		[ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ]
+}
 
 timer_remaining() {
 	timer_active || return 1
@@ -313,11 +317,15 @@ publish() {
 	absent|refused) mapped=idle ;;
 	armed|attempting|activating|active|ready) mapped=starting ;;
 	sealed)
-		case "$(cat "$lifecycle_file" 2>/dev/null || true)" in
-		up) mapped=on ;;
-		lost) mapped=restart ;;
-		*) mapped=starting ;;
-		esac ;;
+		if [ -e "$watch_stopped_file" ]; then
+			mapped=restart
+		else
+			case "$(cat "$lifecycle_file" 2>/dev/null || true)" in
+			up) mapped=on ;;
+			lost) mapped=restart ;;
+			*) mapped=starting ;;
+			esac
+		fi ;;
 	esac
 	mkdir -p "$public_dir"
 	chmod 0755 "$public_dir"
@@ -338,7 +346,7 @@ cmd_begin() {
 	transition_allowed armed || fail "an operation is already $state this boot"
 	! timer_active || fail 'the operation timer is already active'
 	write_state armed "$want_kind"
-	rm -f "$reboot_flag" "$lifecycle_file"
+	rm -f "$reboot_flag" "$lifecycle_file" "$watch_stopped_file"
 	unlock
 	timeout -k 1 "$stop_seconds" systemctl start "$timer_unit" >/dev/null 2>&1 || cmd_refuse 'the operation timer did not start'
 	left=$(timer_remaining) || cmd_refuse 'the operation deadline is unreadable'
@@ -470,7 +478,11 @@ cmd_ssh_proof() {
 	live=$(timeout -k 1 5 ss -H -tn state established 'sport = :22' 2>/dev/null | sed 's/\[::ffff:\([0-9.]*\)\]/\1/g' |
 		awk -v l="$server_ip:22" -v p="$client_ip:$client_port" '$(NF - 1) == l && $NF == p { found = 1 } END { print found + 0 }')
 	[ "$live" = 1 ] || fail 'the SSH connection is not in the socket table'
-	if grep -Fxq "session $server_ip:22 $client_ip:$client_port" "$rescue_before"; then
+	if awk -v server="$server_ip:22" -v mapped_server="[::ffff:$server_ip]:22" \
+		-v client="$client_ip:$client_port" -v mapped_client="[::ffff:$client_ip]:$client_port" '
+		NF == 3 && $1 == "session" && ($2 == server || $2 == mapped_server) &&
+			($3 == client || $3 == mapped_client) { found = 1 }
+		END { exit !found }' "$rescue_before"; then
 		fail 'this SSH connection existed before the activation'
 	fi
 	devs=$(timeout -k 1 5 ip -4 -o addr show 2>/dev/null | awk -v a="$server_ip" '{ split($4, x, "/"); if (x[1] == a) print $2 }')
@@ -659,6 +671,7 @@ cmd_watch() {
 	lock
 	read_state
 	[ "$state" = sealed ] || fail 'the operation is not sealed'
+	[ ! -e "$watch_stopped_file" ] || fail 'the cellular observer has already stopped'
 	case $(cat "$lifecycle_file" 2>/dev/null || true) in
 	starting) put_runtime_file "$lifecycle_file" up ;;
 	up) ;;
@@ -696,7 +709,17 @@ cmd_watch() {
 cmd_watch_stopped() {
 	require_root
 	read_boot_id
-	lock
+	# Record the exit before waiting for the transition lock. The marker makes
+	# every publisher and late observer fail closed even if the lock holder is
+	# stuck beyond the bounded wait.
+	mkdir -p "$op_dir"
+	chmod 0700 "$op_dir"
+	put_runtime_file "$watch_stopped_file" stopped
+	if ! lock_nofail; then
+		publish || true
+		persist 'stage=watch result=stopped lock=unavailable'
+		return 0
+	fi
 	read_state
 	changed=0
 	if [ "$state" = sealed ]; then
