@@ -36,9 +36,38 @@ are not baked into images, committed, or logged. The import is idempotent and
 tested against private, cellular, mixed, symlinked and insecure fixtures.
 
 The v48 test was explicitly restored to postmarketOS with readback verification
-of `init_boot_a`; `boot_a` remained unchanged. The revised v49 candidate still
-needs live cellular qualification. Bluetooth discovery, airplane mode and
-cellular reconnect remain unqualified.
+of `init_boot_a`; `boot_a` remained unchanged.
+
+### v49 one-shot cellular success
+
+The revised v49 image imported one saved Wi-Fi profile automatically and
+reached a connected Wi-Fi network, a registered home LTE/5G modem and a clean
+IPA guard. Two parser mismatches were corrected in the repository and, with
+backups, in the temporary running root before any data mutation:
+
+- The installed ModemManager reported `sim-pin2`. Its pinned source treats
+  PIN2/PUK2 as operational states, unlike blocking PIN/PUK. The stage now
+  follows that distinction without submitting any SIM code.
+- An empty ordinary bearer array was printed as `modem.generic.bearers : --`,
+  with no `.length` key. Only that exact empty representation is normalized
+  to zero; unknown or nonempty values remain refused. The LTE default-attach
+  bearer had no data interface or IP configuration and was not an ordinary
+  data bearer.
+
+At 19:52 UTC the stage took its single mutation lock, created a temporary
+profile, activated it once and completed:
+
+```text
+result=ready ipv4_addresses=1 default_routes=1 policy=main dns=2 link_dns_matches=2 dns_query=ok https=204 tx_delta=15 rx_delta=8 rescue_addresses=2 rescue_routes=3 ssh_listeners=2 ssh_sessions=3 rescue_peers=2 rescue=preserved ipa_guard=clean
+```
+
+Fresh host-initiated USB and Wi-Fi SSH logins both passed afterwards. The
+guard reported one up, zero down, zero fatal lines, zero gaps and zero
+restarts. No disconnect, reconnect, radio-power, SMS or call action was run.
+The independent 900-second watchdog remained armed. Bluetooth discovery,
+airplane mode and cellular reconnect remain unqualified; this does not claim
+a stable reconnect-capable modem implementation. Audio and Bluetooth were
+intentionally inactive in this modem-only test profile.
 
 ## r4 live evidence
 

@@ -170,7 +170,12 @@ modem_count() {
 }
 
 sim_ready() {
-	[ "$(mm_key modem.generic.unlock-required)" = -- ] || return 1
+	# Match ModemManager's operational lock states: PIN2/PUK2 do not block
+	# ordinary modem operation. Never submit or change a SIM PIN here.
+	case "$(mm_key modem.generic.unlock-required)" in
+	--|none|sim-pin2|sim-puk2) ;;
+	*) return 1 ;;
+	esac
 	sim=$(mm_key modem.generic.sim)
 	[ -n "$sim" ] && [ "$sim" != -- ] || return 1
 	case "$(mm_key modem.generic.state)" in failed|locked|disabled|'') return 1 ;; esac
@@ -440,6 +445,8 @@ require_isolated_profile() {
 	competing=$(printf '%s\n' "$autoconnect" | awk -F: '($2 == "gsm" || $2 == "cdma") && $3 != "no"' | wc -l)
 	[ "$competing" -eq 0 ] || fail 'a cellular profile with autoconnect enabled exists'
 	bearers=$(mm_key modem.generic.bearers.length)
+	# An empty bearer array is a scalar "--", without .length.
+	if [ -z "$bearers" ] && [ "$(mm_key modem.generic.bearers)" = -- ]; then bearers=0; fi
 	[ "$bearers" = 0 ] || fail 'a modem bearer already exists'
 }
 

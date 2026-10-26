@@ -36,7 +36,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | USB networking / SSH | VERIFIED_WORKING | USB NCM rescue and key-based SSH proven; WLAN SSH also works. Arch needs an independent rescue link. |
 | SIM detection | VERIFIED_WORKING | ModemManager exposes an active registered modem without recording identifiers. |
 | LTE / 5G registration | VERIFIED_WORKING | Home registration with LTE and 5G NR observed. |
-| Mobile data | VERIFIED_WORKING | One-shot boot activation, IPv4 browsing, streaming, and a 64 MiB transfer passed. Reconnect is unsafe. |
+| Mobile data | VERIFIED_WORKING | Reference: one-shot IPv4 browsing, streaming and 64 MiB transfer. Omarchy on 2026-10-26: one activation, link-scoped DNS, interface-bound HTTPS 204 and moving packet counters passed; fresh USB/WLAN SSH remained usable. Reconnect is unsafe. |
 | Mobile reconnect | BROKEN | Reopening stock IPA can panic `ipam.ko`; reboot is the current recovery. |
 | SMS | BROKEN | Not implemented. |
 | Voice calls | BROKEN | Telephony and call audio are not implemented. |

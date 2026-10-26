@@ -41,6 +41,7 @@ modem.generic.power-state                   : $power
 modem.generic.unlock-required               : $unlock
 modem.generic.sim                           : /org/freedesktop/ModemManager1/SIM/0
 modem.generic.bearers.length                : $bearers
+modem.generic.bearers                       : ${bearers_scalar:-}
 modem.generic.access-technologies.length    : $access_len
 modem.generic.access-technologies.value[1]  : $access1
 modem.generic.access-technologies.value[2]  : $access2

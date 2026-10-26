@@ -156,7 +156,7 @@ reset() {
   active_units=' myron-hardware-watchdog.service ModemManager.service myron-ipa-guard.service '
   guard_rc=0 guard_log=$work/guard-log; : >"$guard_log"
   hci=0 modems=1 unlock=-- reg=home packet=attached power=on state=registered
-  access_len=2 access1=lte access2=5gnr bearers=0
+  access_len=2 access1=lte access2=5gnr bearers=0 bearers_scalar=
   nm_ok=0 m_profile_exists=0 autoconnect_reply=no up_rc=0 up_activates=1 activated=0
   gsm_state=disconnected gsm_boot=unmanaged gsm_devices=1 m_active_gsm=0 m_active_after=0 m_busy_state=activating
   m_rows='' m_auto='' m_own_auto=no m_homeonly=yes m_initial_eps=no m_id_reply=myron-cellular m_uuid_by_name=$secret_uuid
@@ -214,6 +214,15 @@ no_secrets_anywhere() { no_identity "$(cat "$log" "$runtime_dir"/data.state "$ca
 nm_untouched() { ! grep -q nmcli "$calls" || tfail "$1: NetworkManager was mutated"; }
 armed() { mkdir -p "$runtime_dir"; printf 'boot_id=boot-X\n' >"$arm_marker"; }
 TOKEN=ONE-SHOT-CELLULAR-DATA-REBOOT-REQUIRED
+
+for lock in -- none sim-pin2 sim-puk2; do
+  reset; unlock=$lock; read_modem; sim_ready || tfail "operational SIM lock $lock was refused"
+done
+for lock in sim-pin sim-puk unknown; do
+  reset; unlock=$lock; read_modem
+  if sim_ready; then tfail "blocking SIM lock $lock was accepted"; fi
+done
+pass 'SIM readiness matches ModemManager operational PIN2/PUK2 states without unlocking'
 
 # -- identity -----------------------------------------------------------------------
 reset
@@ -377,6 +386,8 @@ gates() {
   gate 'tied-priority main-table hijack' 'could redirect a rescue connection' 'm_pre_rule="32766:\tfrom all lookup 1430"' "$c" "$t"
 }
 gates cmd_qualify
+reset; bearers= bearers_scalar=--
+expect_ok 'mmcli scalar empty bearer array' cmd_qualify >/dev/null
 reset; m_sessions="0 0 [::ffff:172.16.42.1]:22 [::ffff:172.16.42.2]:51000\\n0 0 [::ffff:$secret_wifi_ip]:22 [::ffff:192.168.50.9]:51001\\n"
 expect_ok 'IPv4-mapped dual-stack SSH session' cmd_qualify >/dev/null
 reset; m_sessions="0 0 172.16.42.1:22 172.16.42.2:51000\\n0 0 172.16.42.1:22 172.16.42.2:51001\\n0 0 $secret_wifi_ip:22 192.168.50.9:51002\\n"
