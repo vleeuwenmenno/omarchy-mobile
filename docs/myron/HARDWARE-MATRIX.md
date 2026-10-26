@@ -61,7 +61,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | Feature | Status | Evidence and Arch acceptance |
 | --- | --- | --- |
 | Battery percentage | VERIFIED_WORKING | Live battery supply reports capacity, temperature, voltage, and current. UPower may label the battery device discharging from instantaneous current while correctly reporting external power globally. |
-| Charging | VERIFIED_WORKING | Battery authentication and about 45 W from a 65 W PD source were proven on the reference system. Exact manifest-pinned authentication and a read-only Omarchy qualification stage are now packaged; Omarchy execution remains pending. |
+| Charging | VERIFIED_WORKING | Reference: authentication and about 45 W from a 65 W PD source. Omarchy on 2026-10-26: authentication active, Charging/Good health, USB power online and UPower line-power recognition passed the read-only stage. High-power charging was not remeasured in Omarchy. |
 | USB-C power detection | VERIFIED_WORKING | USB_PD supply online with voltage/current readings. |
 | Thermal sensors | VERIFIED_WORKING | GPU qualification gates track named CPU/GPU/battery sensors and enforce limits. |
 | CPU/GPU scaling | PRESENT_UNTESTED | Required GPU governor modules exist; no Arch policy or full scaling matrix yet. |

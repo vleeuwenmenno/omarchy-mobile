@@ -69,6 +69,20 @@ airplane mode and cellular reconnect remain unqualified; this does not claim
 a stable reconnect-capable modem implementation. Audio and Bluetooth were
 intentionally inactive in this modem-only test profile.
 
+The same boot reported native `DSI-1` at 1200x2608, scale 2, and the Wayland
+EGL client again reported Adreno 840 Turnip for core, compatibility and GLES.
+The read-only battery stage qualified charging, active authentication, good
+health and USB line power recognized by UPower. The presence-only peripheral
+audit found two ADC IIO devices but no motion IIO, one haptics input with force
+feedback capability, and two fingerprint nodes. No camera nodes were loaded.
+Voice/Messaging D-Bus interfaces were present; no calls, SMS, fingerprint
+enrollment, camera capture or haptic actuation was tested.
+
+The final cellular regression suite passed with the two live parser formats.
+An offline v50 payload and `init_boot_a` were rebuilt from those exact final
+repository sources; its stage readback SHA-256 matched the repository. This
+artifact has not yet had a separate clean boot and is not a release installer.
+
 ## r4 live evidence
 
 The r4 Arch root booted the existing
