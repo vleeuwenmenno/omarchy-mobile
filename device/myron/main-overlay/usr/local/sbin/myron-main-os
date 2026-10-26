@@ -7,6 +7,9 @@
 #                                  root: set the recovery latch, normal reboot
 #   myron-main-os resume           root, from postmarketOS: clear latch, reboot
 #   myron-main-os commit           root, in Omarchy: mark this boot qualified
+#   myron-main-os reboot-normal [--reason WORD]
+#                                  root, in a qualified Omarchy boot: normal
+#                                  reboot, no latch, so the next boot is Omarchy
 #   myron-main-os guard-preflight  (unit) refuse to start unless this boot is pending
 #   myron-main-os guard            (unit) deadline guard, never writes a partition
 #
@@ -208,6 +211,31 @@ cmd_recover() {
 	request_reboot
 }
 
+# A normal reboot for a failed operation of an already qualified boot. It never
+# sets the latch and never writes a partition: the selector then picks Omarchy
+# again, which must qualify on its own. An uncommitted boot is refused, since
+# only `recover` may decide about that one.
+cmd_reboot_normal() {
+	reason=explicit
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--reason) reason=${2:-}; shift 2 || die '--reason needs a word' ;;
+			*) die "unknown reboot-normal option: $1" ;;
+		esac
+	done
+	case $reason in ''|*[!a-z0-9-]*) die 'reason must be lowercase letters, digits and dashes' ;; esac
+	[ "${#reason}" -le 40 ] || die 'reason is too long'
+	require_root
+	in_omarchy || die 'reboot-normal is only valid in the Omarchy main boot'
+	trust_state
+	lock
+	committed_current || die 'refusing: this boot is not committed'
+	log_line "reboot-normal reason=$reason"
+	say "result=reboot-requested reason=$reason reboot=normal"
+	unlock
+	request_reboot
+}
+
 cmd_resume() {
 	require_root
 	! in_omarchy || die 'resume runs from postmarketOS, not from the Omarchy boot'
@@ -343,7 +371,8 @@ case $cmd in
 	recover) cmd_recover "$@" ;;
 	resume) cmd_resume ;;
 	commit) cmd_commit ;;
+	reboot-normal) cmd_reboot_normal "$@" ;;
 	guard-preflight) cmd_guard_preflight ;;
 	guard) cmd_guard ;;
-	*) die 'usage: myron-main-os status|recover [--reason WORD] [--unless-committed]|resume|commit' ;;
+	*) die 'usage: myron-main-os status|recover [--reason WORD] [--unless-committed]|resume|commit|reboot-normal [--reason WORD]' ;;
 esac

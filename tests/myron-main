@@ -284,6 +284,35 @@ reset pmos; : >"$m/latch"; echo 'ID_LIKE="arch"' >"$fix/os-release"; ctl resume 
 reset pmos; ctl_has already-main resume || fail 'resume without latch'
 pass 'recover/resume: latch ordering, reboot, repeat safety, identity, no reboot after commit-ignore'
 
+# reboot-normal: a qualified boot may ask for a normal reboot, which must never latch
+reset; pend; ctl commit >/dev/null; : >"$fix/calls"; before=$(cat "$m/success")
+ctl reboot-normal --reason cellular-op-failed >"$work/o" 2>&1 || { cat "$work/o"; fail 'reboot-normal after commit'; }
+grep -Fq 'result=reboot-requested reason=cellular-op-failed reboot=normal' "$work/o" || fail 'reboot-normal result line'
+[[ ! -e $m/latch && ! -e $m/pending && $(cat "$m/success") == "$before" ]] || fail 'reboot-normal changed the latch, pending or success state'
+grep -Fq 'systemctl --no-block reboot' "$fix/calls" || fail 'reboot-normal does not request a normal reboot'
+grep -Fxq 'reboot -f' "$fix/calls" || fail 'reboot-normal lacks the bounded forced plain reboot'
+grep -Eq 'bootloader|dd |fastboot' "$fix/calls" && fail 'reboot-normal touched the bootloader or a partition tool'
+grep -Fq 'reboot-normal reason=cellular-op-failed' "$m/guard.log" || fail 'reboot-normal is not logged'
+for bad in 'Bad Reason' '' "$(printf 'x%.0s' $(seq 1 41))"; do
+  : >"$fix/calls"; ctl reboot-normal --reason "$bad" >/dev/null 2>&1 && fail "reboot-normal accepted reason '$bad'"
+  [[ ! -s $fix/calls ]] || fail 'reboot-normal with a bad reason acted'
+done
+ctl reboot-normal --bogus >/dev/null 2>&1 && fail 'reboot-normal accepted an unknown option'
+reset; pend; : >"$fix/calls"
+ctl reboot-normal >"$work/o" 2>&1 && fail 'reboot-normal accepted an uncommitted boot'
+grep -Fq 'not committed' "$work/o" || fail 'uncommitted reason'
+[[ ! -e $m/latch && ! -s $fix/calls ]] || fail 'refused reboot-normal latched or rebooted'
+reset; pend; ctl commit >/dev/null; : >"$fix/calls"; MOCK_UID=4242 ctl reboot-normal >/dev/null 2>&1 && fail 'reboot-normal as non-root'
+reset pmos; ctl reboot-normal >/dev/null 2>&1 && fail 'reboot-normal outside Omarchy'
+reset; pend; ctl commit >/dev/null; chmod 755 "$m"; : >"$fix/calls"; ctl reboot-normal >/dev/null 2>&1 && fail 'reboot-normal with an unsafe state directory'
+[[ ! -s $fix/calls ]] || fail 'unsafe state reboot-normal acted'
+# an operator latch set after the commit stays exactly as it was
+reset; pend; ctl commit >/dev/null; printf 'reason=manual\n' >"$m/latch"; ctl reboot-normal >/dev/null 2>&1 || fail 'reboot-normal with an existing latch'
+grep -Fxq 'reason=manual' "$m/latch" || fail 'reboot-normal rewrote an existing latch'
+# a stale success (older boot) does not count as committed
+reset; pend; ctl commit >/dev/null; sed -i "s/^boot_id=.*/boot_id=$other/" "$m/success"; ctl reboot-normal >/dev/null 2>&1 && fail 'reboot-normal accepted another boot success'
+pass 'reboot-normal: committed boots only, root, Omarchy, bounded normal reboot, never a latch, state untouched'
+
 # full cycle through the selector
 reset omarchy
 real_boot=$(cat /proc/sys/kernel/random/boot_id)
