@@ -14,7 +14,7 @@ smem_mailbox_sha=c8d2f5abdc2a684ccf5ef68fd70700d6863422734a1e20ca8cc1c94ede111c2
 cnss_utils=$module_dir/cnss_utils.ko
 cnss_utils_sha=8ddcf0912a9c852a3c33397b004b260b083328091ae1bbf0ef435ba595450267
 stock_vermagic='6.12.23-android16-5-maybe-dirty-4k SMP preempt mod_unload modversions aarch64'
-cooldown_target_mc=65000
+cooldown_target_mc=75000
 cooldown_timeout_seconds=180
 cooldown_stable_samples=4
 

@@ -378,7 +378,7 @@ run_bounded_scan() {
 	mkfifo -m 0600 "$scan_command_fifo" || return 1
 	client_status=0
 	writer_status=0
-	timeout -k 2 15 sh -c '
+	timeout -k 2 35 sh -c '
 		umask 077
 		printf "%s\n" "$$" >"$1"
 		exec bluetoothctl <"$2"
@@ -393,12 +393,12 @@ run_bounded_scan() {
 		scan_supervisor_pid=
 		return 1
 	fi
-	timeout -k 1 12 sh -c '
+	timeout -k 1 30 sh -c '
 		umask 077
 		printf "%s\n" "$$" >"$1"
 		exec 3>"$2"
-		printf "%s\n" "scan on" >&3
-		sleep 8
+		printf "%s\n" "scan bredr" >&3
+		sleep 20
 		printf "%s\n" "scan off" >&3
 		sleep 1
 		printf "%s\n" quit >&3

@@ -13,6 +13,13 @@ trap 'rm -rf -- "$tmp"' EXIT
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 equal() { [[ $1 == "$2" ]] || fail "$3: expected $2, got $1"; }
 
+mock_bin=$tmp/bin
+mkdir -p "$mock_bin"
+printf '%s\n' '#!/bin/sh' \
+  'if [ "${MYRON_TEST_SLEEP_DELAY:-0}" = 1 ]; then exec /usr/bin/sleep 0.05; fi' \
+  'exit 0' >"$mock_bin/sleep"
+chmod 0755 "$mock_bin/sleep"
+
 dd if=/dev/zero of="$tmp/nvm" bs=1 count=98 status=none
 printf '\x06\x05\x04\x03\x02\x01' |
   dd of="$tmp/nvm" bs=1 seek=92 conv=notrunc status=none
@@ -47,18 +54,11 @@ timeout() {
       cat "$scan_fixture"
       return "$scan_status"
   fi
-  if [[ $1 == sh && $2 == -c && $3 == *'printf "%s\n" "scan on"'* ]]; then
-      pid_file=${@: -2:1}
-      command_fifo=${!#}
-      printf '%s\n' "$BASHPID" >"$pid_file"
-      exec 3>"$command_fifo"
-      printf '%s\n' 'scan on' >&3 || return $?
-      sleep 8
-      printf '%s\n' 'scan off' >&3 || return $?
-      sleep 1
-      printf '%s\n' quit >&3 || return $?
-      exec 3>&-
-      return "$writer_status"
+  if [[ $1 == sh && $2 == -c && $3 == *'printf "%s\n" "scan bredr"'* ]]; then
+      MYRON_TEST_SLEEP_DELAY=$test_sleep_delay PATH="$mock_bin:$PATH" command "$@"
+      production_status=$?
+      [[ $writer_status == 0 ]] || return "$writer_status"
+      return "$production_status"
   fi
   case "$*" in
     'btmgmt config'|'btmgmt --index 0 info') cat "$mgmt_fixture" ;;
@@ -97,8 +97,8 @@ show_status=0
 scan=$tmp/scan
 : >"$scan_fixture"
 run_bounded_scan "$scan" || fail 'same-client scan transaction failed'
-equal "$(cat "$scan_commands")" "$(printf 'scan on\nscan off\nquit')" \
-  'scan on/off command sequence'
+equal "$(cat "$scan_commands")" "$(printf 'scan bredr\nscan off\nquit')" \
+  'Classic BR/EDR scan on/off command sequence'
 scan_status=124
 if run_bounded_scan "$scan"; then
   fail 'bounded same-client scan accepted a timeout'

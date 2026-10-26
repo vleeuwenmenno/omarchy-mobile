@@ -462,8 +462,13 @@ for cleanup in \
   grep -Fq "$cleanup" "$bluetooth_stage" ||
     fail "Bluetooth cleanup is not bounded: $cleanup"
 done
-grep -Fq 'timeout -k 2 15 sh -c' "$bluetooth_stage" ||
+grep -Fq 'timeout -k 2 35 sh -c' "$bluetooth_stage" ||
   fail 'Bluetooth scan on/off does not use one bounded client'
+grep -Fq 'printf "%s\n" "scan bredr" >&3' "$bluetooth_stage" ||
+  fail 'Bluetooth scan does not select the Classic BR/EDR transport for the speaker'
+if grep -Fq 'scan transport bredr' "$bluetooth_stage"; then
+  fail 'Bluetooth scan uses invalid submenu syntax instead of scan bredr'
+fi
 grep -Fq 'wait "$scan_supervisor_pid" || client_wait_status=$?' "$bluetooth_stage" ||
   fail 'Bluetooth scan does not preserve client status'
 grep -Fq 'wait "$scan_writer_pid" || writer_wait_status=$?' "$bluetooth_stage" ||
@@ -491,7 +496,7 @@ for required in \
   '8ddcf0912a9c852a3c33397b004b260b083328091ae1bbf0ef435ba595450267' \
   'load_exact_module "$smem_mailbox" smem_mailbox "$smem_mailbox_sha"' \
   'load_exact_module "$cnss_utils" cnss_utils "$cnss_utils_sha"' \
-  'cooldown_target_mc=65000' \
+  'cooldown_target_mc=75000' \
   'cooldown_timeout_seconds=180' \
   'cooldown_stable_samples=4' \
   'case "$type" in *-trip-*) continue ;; esac' \

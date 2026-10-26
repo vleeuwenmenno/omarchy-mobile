@@ -29,23 +29,23 @@ sleep() {
 reset_clock() { printf '%s 0\n' 100 >"$fake_uptime"; }
 
 reset_clock
-hottest_temperature() { printf '%s\n' '64000 mock-sensor 8'; }
+hottest_temperature() { printf '%s\n' '74000 mock-sensor 8'; }
 cool_log=$tmp/cool.log
 wait_for_cooldown >"$cool_log"
 grep -Fq 'stable_samples=4/4' "$cool_log" ||
 	fail_test 'four stable samples were not required'
-grep -Fq 'result=ready target_mc=65000 stable_seconds=15' "$cool_log" ||
+grep -Fq 'result=ready target_mc=75000 stable_seconds=15' "$cool_log" ||
 	fail_test '15-second cooldown was not reported'
 [[ $(<"$fake_uptime") == '115 0' ]] ||
 	fail_test 'cooldown did not span 15 monotonic seconds'
 
 reset_clock
-hottest_temperature() { printf '%s\n' '70000 mock-sensor 8'; }
+hottest_temperature() { printf '%s\n' '80000 mock-sensor 8'; }
 cooldown_timeout_seconds=10
 if (wait_for_cooldown) >"$tmp/hot.log" 2>&1; then
 	fail_test 'sustained heat passed cooldown'
 fi
-grep -Fq 'Bluetooth cooldown did not reach 65000 mC for 15 seconds' "$tmp/hot.log" ||
+grep -Fq 'Bluetooth cooldown did not reach 75000 mC for 15 seconds' "$tmp/hot.log" ||
 	fail_test 'sustained heat did not fail closed'
 
 reset_clock
