@@ -1,0 +1,54 @@
+From: Menno van Leeuwen <menno@vleeuwen.me>
+Subject: [PATCH] Bluetooth: qca: configure preinitialized Myron without reset
+
+The Xiaomi Myron WCN786x is initialized by a userspace loader before the
+QCA line discipline is attached.  Repeated HCI commands work after that
+handoff, but HCI Reset leaves the controller accepting IBS wake handshakes
+without returning later HCI command responses.  Both BlueZ discovery and a
+raw UART reproducer hit this boundary.
+
+Set HCI_QUIRK_RESET_ON_CLOSE before hci_register_dev() only for the
+explicit non-serdev qca_preinitialized path.  Mark that controller as
+requiring a public address and expose QCA's set_bdaddr callback from the
+preinitialized setup path.  The Bluetooth management API can then program
+the address from the already downloaded, hash-pinned NVM without issuing
+the HCI Reset that wedges this controller.  Every default QCA path is
+unchanged.
+
+This remains an experimental one-shot path.  Reset-on-close may leave this
+controller unusable until the existing btpower cleanup power-cycles it.
+---
+ drivers/bluetooth/hci_qca.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/bluetooth/hci_qca.c b/drivers/bluetooth/hci_qca.c
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -599,6 +599,17 @@ static int qca_open(struct hci_uart *hu)
+ 	qca->vote_last_jif = jiffies;
+ 
+ 	hu->priv = qca;
++	if (!hu->serdev && READ_ONCE(qca_preinitialized)) {
++		/* The Myron userspace handoff has already initialized the
++		 * controller. HCI Reset makes that firmware stop answering
++		 * later commands, so defer Reset until this one-shot transport
++		 * closes and the guarded cleanup power-cycles the controller.
++		 */
++		set_bit(HCI_QUIRK_RESET_ON_CLOSE, &hu->hdev->quirks);
++		set_bit(HCI_QUIRK_USE_BDADDR_PROPERTY, &hu->hdev->quirks);
++		bt_dev_info(hu->hdev,
++			    "preinitialized controller; skipping opening HCI Reset");
++	}
+ 
+ 	if (hu->serdev) {
+ 		qcadev = serdev_device_get_drvdata(hu->serdev);
+@@ -1874,6 +1885,7 @@ static int qca_setup(struct hci_uart *hu)
+ 		qca->tty_pm = true;
+ 		clear_bit(QCA_IBS_DISABLED, &qca->flags);
+ 		set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
++		hdev->set_bdaddr = qca_set_bdaddr;
+ 		qca_debugfs_init(hdev);
+ 
+ 		return 0;
+-- 
+2.51.0

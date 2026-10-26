@@ -4,16 +4,20 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
-base= rollback= payload= out= watchdog_seconds=900
+base= rollback= payload= out= candidate_boot= rollback_boot= expected_candidate_boot_sha= watchdog_seconds=900
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 Usage: tools/myron-build-test-init-boot \
   --base-init-boot FILE --rollback-init-boot FILE --payload-image FILE \
-  --out FILE [--watchdog-seconds 900]
+  --out FILE [--watchdog-seconds 900] \
+  [--candidate-boot FILE --candidate-boot-sha256 SHA256 --rollback-boot FILE]
 
 Builds only an offline candidate. Base and rollback must both be the exact,
-reviewed systemd release-v3 image. Deployment is a separate recovery-only operation.
+reviewed systemd release-v3 image. When all three boot options are supplied,
+the watchdog also hash-guards and restores slot-A boot before init_boot. The
+independent expected hash prevents binding rollback to another candidate file.
+Deployment is a separate recovery-only operation.
 EOF
 }
 while (($#)); do
@@ -21,6 +25,9 @@ while (($#)); do
     --base-init-boot) base=${2:?}; shift 2 ;;
     --rollback-init-boot) rollback=${2:?}; shift 2 ;;
     --payload-image) payload=${2:?}; shift 2 ;;
+    --candidate-boot) candidate_boot=${2:?}; shift 2 ;;
+    --candidate-boot-sha256) expected_candidate_boot_sha=${2:?}; shift 2 ;;
+    --rollback-boot) rollback_boot=${2:?}; shift 2 ;;
     --out) out=${2:?}; shift 2 ;;
     --watchdog-seconds) watchdog_seconds=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -35,6 +42,34 @@ out=$(realpath -m "$out")
 for path in "$base" "$rollback" "$payload"; do
   [[ -f $path && ! -L $path ]] || die "missing or linked input: $path"
 done
+[[ (-z $candidate_boot && -z $rollback_boot && -z $expected_candidate_boot_sha) ||
+   (-n $candidate_boot && -n $rollback_boot && -n $expected_candidate_boot_sha) ]] ||
+  die '--candidate-boot, --candidate-boot-sha256 and --rollback-boot must be supplied together'
+boot_rollback_enabled=0
+candidate_boot_sha=disabled
+rollback_boot_sha=disabled
+if [[ -n $candidate_boot ]]; then
+  candidate_boot=$(realpath "$candidate_boot")
+  rollback_boot=$(realpath "$rollback_boot")
+  for path in "$candidate_boot" "$rollback_boot"; do
+    [[ -f $path && ! -L $path ]] || die "missing or linked boot input: $path"
+    [[ $(stat -c %s "$path") == 100663296 ]] || die "boot input is not 96 MiB: $path"
+    [[ $(od -An -tc -N8 "$path" | tr -d ' \n') == ANDROID! ]] ||
+      die "boot input lacks Android boot magic: $path"
+  done
+  readonly systemd_boot_rollback_sha=def61369f915cfe3327f73391056290027565d172d9786c75fe373f61e2ffe08
+  candidate_boot_sha=$(sha256sum "$candidate_boot" | awk '{print $1}')
+  rollback_boot_sha=$(sha256sum "$rollback_boot" | awk '{print $1}')
+  [[ $expected_candidate_boot_sha =~ ^[0-9a-f]{64}$ ]] ||
+    die 'candidate boot expected SHA-256 is malformed'
+  [[ $candidate_boot_sha == "$expected_candidate_boot_sha" ]] ||
+    die "candidate boot differs from explicit expected hash: $candidate_boot_sha"
+  [[ $rollback_boot_sha == "$systemd_boot_rollback_sha" ]] ||
+    die "boot rollback is not exact reviewed slot-A image: $rollback_boot_sha"
+  [[ $candidate_boot_sha != "$rollback_boot_sha" ]] ||
+    die 'candidate boot is identical to rollback boot'
+  boot_rollback_enabled=1
+fi
 [[ ! -e $out && ! -L $out ]] || die "refusing to replace $out"
 [[ $watchdog_seconds =~ ^[0-9]+$ ]] && ((watchdog_seconds >= 300 && watchdog_seconds <= 1800)) ||
   die 'watchdog seconds must be 300..1800'
@@ -83,10 +118,16 @@ sed \
   -e "s/@PAYLOAD_SHA256@/$payload_sha/g" \
   -e "s/@PAYLOAD_SIZE@/$payload_size/g" \
   -e "s/@WATCHDOG_SECONDS@/$watchdog_seconds/g" \
+  -e "s/@BOOT_ROLLBACK_ENABLED@/$boot_rollback_enabled/g" \
+  -e "s/@CANDIDATE_BOOT_SHA256@/$candidate_boot_sha/g" \
+  -e "s/@ROLLBACK_BOOT_SHA256@/$rollback_boot_sha/g" \
   "$tmp/init.template" >"$tmp/init"
 sed \
   -e "s/@ROLLBACK_SHA256@/$rollback_sha/g" \
   -e "s/@WATCHDOG_SECONDS@/$watchdog_seconds/g" \
+  -e "s/@BOOT_ROLLBACK_ENABLED@/$boot_rollback_enabled/g" \
+  -e "s/@CANDIDATE_BOOT_SHA256@/$candidate_boot_sha/g" \
+  -e "s/@ROLLBACK_BOOT_SHA256@/$rollback_boot_sha/g" \
   device/myron/hardware-test-initramfs/watchdog.sh >"$tmp/root/watchdog"
 mv "$tmp/init" "$tmp/root/init"
 chmod 0755 "$tmp/root/init" "$tmp/root/watchdog"
@@ -106,5 +147,6 @@ mkdir -p "$(dirname -- "$out")"
 candidate_sha=$(sha256sum "$out" | awk '{print $1}')
 printf '%s\n' "$candidate_sha" >"$out.expected-sha256"
 chmod 0600 "$out" "$ramdisk" "$out.expected-sha256"
-printf 'status=built\ncandidate=%s\nsha256=%s\nrollback_sha256=%s\nwatchdog_seconds=%s\n' \
-  "$out" "$candidate_sha" "$rollback_sha" "$watchdog_seconds"
+printf 'status=built\ncandidate=%s\nsha256=%s\nrollback_sha256=%s\nwatchdog_seconds=%s\nboot_rollback=%s\ncandidate_boot_sha256=%s\nrollback_boot_sha256=%s\n' \
+  "$out" "$candidate_sha" "$rollback_sha" "$watchdog_seconds" \
+  "$boot_rollback_enabled" "$candidate_boot_sha" "$rollback_boot_sha"

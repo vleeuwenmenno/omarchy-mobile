@@ -12,10 +12,19 @@ input_stage=$overlay/usr/local/sbin/myron-input-stage
 battery_start=$overlay/usr/local/sbin/myron-batterysecret-start
 battery_stage=$overlay/usr/local/sbin/myron-battery-stage
 peripheral_audit=$overlay/usr/local/sbin/myron-peripheral-audit
+bluetooth_experiment=device/myron/kernel-experiments/bluetooth-no-open-reset
+bluetooth_compose=$bluetooth_experiment/compose-payload.sh
+bluetooth_selector=$bluetooth_experiment/module-dir-selector.sh
+bluetooth_boot_builder=$bluetooth_experiment/build-boot.py
+bluetooth_only_start=$bluetooth_experiment/bluetooth-only-start.sh
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
-bash -n "$compose" "$initboot" || fail 'image builders parse'
+bash -n "$compose" "$initboot" "$bluetooth_compose" || fail 'image builders parse'
+sh -n "$bluetooth_selector" "$bluetooth_only_start" || fail 'Bluetooth experiment scripts parse'
+python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
+  "$bluetooth_boot_builder" || fail 'Bluetooth boot builder parses'
+tests/myron-bluetooth-logic || fail 'Bluetooth executable logic checks failed'
 for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
   sh -n "$fragment" || fail "$fragment parses"
 done
@@ -77,6 +86,23 @@ prepare=$overlay/usr/local/sbin/myron-omarchy-prepare
 qualify=$overlay/usr/local/sbin/myron-omarchy-qualify
 grep -Fq '8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608' "$prepare" ||
   fail 'prepare does not pin exact kernel notes'
+grep -Fq 'dadfc0372f028cd5c9810415167af6c182e79fbf2954e7c555a8a1108cf33e1e' "$prepare" ||
+  fail 'prepare does not allow the exact no-opening-reset candidate notes'
+grep -Fq '0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8' "$prepare" ||
+  fail 'prepare does not allow the exact public-address candidate notes'
+grep -Fq 'install -m0755 /omarchy-prepare' "$bluetooth_compose" ||
+  fail 'Bluetooth experiment composer does not install candidate-aware preparation'
+grep -Fq -- '--firmware-dir' "$bluetooth_compose" ||
+  fail 'Bluetooth experiment composer does not require a private firmware input'
+grep -Fq 'myron-bluetooth-firmware' "$bluetooth_compose" ||
+  fail 'Bluetooth experiment composer does not install private firmware into the payload'
+for required in \
+  'BASE_SHA256 = "def61369f915cfe3327f73391056290027565d172d9786c75fe373f61e2ffe08"' \
+  'KERNEL_SHA256 = "cd0a641d9290b1287fa4d4260b368c8d147dc8a11ee8d11d32008b7ea6389ff9"' \
+  'refusing to replace output' 'candidate kernel readback differs'; do
+  grep -Fq "$required" "$bluetooth_boot_builder" ||
+    fail "Bluetooth boot builder lacks: $required"
+done
 for required in card0-DSI-1 /dev/dri/card0 /dev/dri/renderD128 /dev/kgsl-3d0 \
   /dev/dma_heap/system /dev/dri/dmaheap-sys '/usr/lib/omamobile/myron-gpu/' \
   enable_touch_raw hardware-test.disarm; do
@@ -363,13 +389,19 @@ for required in \
   '6.12.23-android16-5-maybe-dirty-4k SMP preempt mod_unload modversions aarch64' \
   '6631fe3562dbb329e2be19f157c55ae8600e24643de3dd8feb2524e21af77b0a' \
   '669b8a7e03660fad976b48a58871759a8e5188f2b3b32e73419fd170710af763' \
-  'mount -t vfat -o ro,nosuid,nodev,noexec' \
+  'myron-bluetooth-firmware' \
   'ModemManager or GNSS must not run in the Bluetooth boot' \
   'AudioReach must not run in the Bluetooth boot' \
   'myron-attempt79-module-dir' \
   'Do not retry Bluetooth in this boot' \
   'Bluetooth test was already armed or started in this boot' \
   'Bluetooth module was already loaded' \
+  'dadfc0372f028cd5c9810415167af6c182e79fbf2954e7c555a8a1108cf33e1e' \
+  'f8cb374be40f03b504426025c45ec898dffcf7668ccb5ed8026b07d60d6596cb' \
+  '0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8' \
+  '676f88f5cdf0f2cddcdc12c3d0b91748c341b74f0f195ca9c40216c8f3e515c5' \
+  'unreviewed Bluetooth kernel notes' \
+  'GKI module selector returned a directory for different kernel notes' \
   'identities=not-persisted' \
   'cleanup=powered-off' \
   'sensor=$sensor' \
@@ -389,13 +421,43 @@ for module in rfkill.ko pwrseq-core.ko bluetooth.ko btbcm.ko btqca.ko hci_uart.k
 done
 grep -Fq 'systemctl start bluetooth.service' "$bluetooth_stage" ||
   fail 'Bluetooth runner does not use the Arch BlueZ service'
+grep -Fq "+ 20 ))" "$bluetooth_stage" ||
+  fail 'Bluetooth controller publication wait is not bounded to 20 seconds'
+grep -Fq '/proc/uptime' "$bluetooth_stage" ||
+  fail 'Bluetooth controller publication wait is not monotonic'
+for required in \
+  'HCI_QUIRK_USE_BDADDR_PROPERTY' \
+  'hdev->set_bdaddr = qca_set_bdaddr' \
+  "btmgmt config" \
+  'btmgmt --index 0 public-addr "$public_address"' \
+  'btmgmt --index 0 info' \
+  'source=exact-nvm-tag-2 identity=not-logged' \
+  'myron-bluetooth-state "$bluez_state_dir"' \
+  'state=bluez-volatile identities=not-persisted' \
+  'scan produced no fresh event from the expected peer' \
+  'Bluetooth discovery did not stop after scanner exit'; do
+  grep -Fq "$required" "$bluetooth_experiment/0003-bluetooth-qca-skip-open-reset.patch" \
+    "$bluetooth_stage" || fail "Bluetooth address/discovery gate lacks: $required"
+done
+! grep -Fq '/sys/class/bluetooth/hci0/address' "$bluetooth_stage" ||
+  fail 'Bluetooth address gate reads a nonexistent sysfs attribute'
+for required in 'expected_peer=${1:-}' '/^\[NEW\] Device /' '/^\[CHG\] Device /' \
+  'configured MGMT index did not publish the NVM public address' \
+  'gsub(/\033\[[0-9;]*m/, "")' 'install -d -m0700 "$runtime_dir"' \
+  'ManufacturerData.Key:' 'ServiceData.Key:'; do
+  grep -Fq "$required" "$bluetooth_stage" ||
+    fail "Bluetooth fresh-event/MGMT verification lacks: $required"
+done
+if grep -Fq 'bluetooth_b' "$bluetooth_stage"; then
+  fail 'Bluetooth runtime still reads Android slot B'
+fi
 for cleanup in \
   'timeout 3 bluetoothctl scan off' \
   'timeout 3 bluetoothctl power off' \
   'systemctl mask --runtime bluetooth.service' \
   'timeout 10 systemctl stop bluetooth.service' \
   'timeout 5 "$probe" --set-power off' \
-  'timeout 5 umount'; do
+  'timeout 5 umount "$bluez_state_dir"'; do
   grep -Fq "$cleanup" "$bluetooth_stage" ||
     fail "Bluetooth cleanup is not bounded: $cleanup"
 done
@@ -404,6 +466,49 @@ grep -Fq 'if systemctl --quiet is-active bluetooth.service; then cleanup_ok=0; f
 if grep -Fq 'rc-service' "$bluetooth_stage"; then
   fail 'Bluetooth runner contains an Alpine/OpenRC service command'
 fi
+for required in \
+  '[ "$(cat "$profile" 2>/dev/null || true)" = bluetooth ]' \
+  'ModemManager must remain stopped' \
+  'AudioReach must remain stopped' \
+  'c8d2f5abdc2a684ccf5ef68fd70700d6863422734a1e20ca8cc1c94ede111c2c' \
+  '8ddcf0912a9c852a3c33397b004b260b083328091ae1bbf0ef435ba595450267' \
+  'load_exact_module "$smem_mailbox" smem_mailbox "$smem_mailbox_sha"' \
+  'load_exact_module "$cnss_utils" cnss_utils "$cnss_utils_sha"' \
+  'radio foundation must remain stopped' \
+  'radio/Wi-Fi readiness marker must remain absent' \
+  '/usr/local/sbin/myron-bluetooth-stage start' \
+  'watchdog=armed'; do
+  grep -Fq "$required" "$bluetooth_only_start" ||
+    fail "Bluetooth-only transaction lacks: $required"
+done
+for required in \
+  'install -m0755 /bluetooth-only-start "$root/usr/local/sbin/myron-coexistence-start"' \
+  'printf "%s\n" bluetooth >"$root/etc/omamobile/myron-test-profile"' \
+  'ln -sfnT /dev/null "$root/etc/systemd/system/myron-omarchy-qualify.service"' \
+  'ln -sfnT /dev/null "$root/etc/systemd/system/myron-reference-radio.service"' \
+  'ln -sfnT /dev/null "$root/etc/systemd/system/myron-reference-audio-foundation.service"' \
+  'ln -sfnT /dev/null "$root/etc/systemd/system/myron-speaker-bridge.service"' \
+  '"Storage=volatile"' '"RuntimeMaxUse=8M"'; do
+  grep -Fq "$required" "$bluetooth_compose" ||
+    fail "Bluetooth-only payload isolation lacks: $required"
+done
+for forbidden in \
+  'systemctl start myron-reference-radio.service' \
+  'radio-backup-verified' \
+  'modem_b' \
+  'modemfirmware_b'; do
+  ! grep -Fq "$forbidden" "$bluetooth_only_start" ||
+    fail "Bluetooth-only transaction retains forbidden radio/slot-B dependency: $forbidden"
+done
+for required in \
+  'minimal Bluetooth foundation is not ready' \
+  'radio foundation must remain inactive in the Bluetooth boot' \
+  'radio/Wi-Fi readiness must remain absent in the Bluetooth boot' \
+  'wlan0 must remain absent in the Bluetooth boot' \
+  'foundation=minimal foundation_stable_seconds=10'; do
+  grep -Fq "$required" "$bluetooth_stage" ||
+    fail "Bluetooth stage lacks isolated minimal-foundation gate: $required"
+done
 grep -Fq -- '--bluetooth-probe ABSOLUTE_FILE' "$compose" ||
   fail 'composer does not require the reviewed Bluetooth probe explicitly'
 grep -Fq -- '--speaker-reference-repo ABSOLUTE_DIR' "$compose" ||
@@ -622,6 +727,10 @@ grep -Fq 'readonly systemd_release_sha=535d8e2fe0db2b35dc003e329fafc2b76dd82705d
   "$initboot" || fail 'builder does not pin exact systemd release-v3 rollback'
 grep -Fq "watchdog_seconds=900" "$initboot" || fail 'default watchdog is not 15 minutes'
 grep -Fq 'refusing to replace' "$initboot" || fail 'init_boot builder can replace an output'
+for required in '--candidate-boot' '--candidate-boot-sha256' '--rollback-boot' \
+  'systemd_boot_rollback_sha=def61369f915cfe3327f73391056290027565d172d9786c75fe373f61e2ffe08'; do
+  grep -Fq -- "$required" "$initboot" || fail "dual rollback builder lacks: $required"
+done
 if grep -REq '/dev/block/by-name/(boot_b|init_boot_b|recovery_b|vendor_boot_b)' "$initramfs"; then
   fail 'initramfs references a slot-B partition'
 fi
@@ -630,7 +739,14 @@ if grep -REq '(mkfs|wipefs|sgdisk|parted)' "$initramfs"; then
 fi
 for required in hardware-test-init-boot.sha256 myron-init_boot_a-rollback-20261025.img \
   'sha256sum "$target"' 'dd if="$rollback" of="$target"' 'hardware-test.disarm' \
-  myron-omarchy-initramfs-failure.log; do
+  myron-omarchy-initramfs-failure.log myron-boot_a-rollback-20261026.img \
+  'find_partition boot_a' '@CANDIDATE_BOOT_SHA256@' '@ROLLBACK_BOOT_SHA256@' \
+  'dd if="$boot_rollback" of="$boot_target"' 'hardware-test.rollback-complete' \
+  'rm -f "$state/hardware-test.armed"'; do
   grep -RFq "$required" "$initramfs" || fail "rollback contract lacks $required"
 done
-pass 'watchdog is slot-A-only, hash-guarded and never formats storage'
+grep -Fq 'make_unique_partition_node init_boot_a "$target" init-boot' "$initramfs/watchdog.sh" ||
+  fail 'watchdog init_boot_a fallback is not uniqueness-checked'
+grep -Fq 'make_unique_partition_node boot_a "$boot_target" boot' "$initramfs/watchdog.sh" ||
+  fail 'watchdog boot_a fallback is not uniqueness-checked'
+pass 'watchdog hash-guards slot-A boot/init_boot, never touches slot B and never formats storage'

@@ -5,7 +5,9 @@ set -eu
 log=/var/log/myron-omarchy-hardware-test.log
 gpu=/usr/local/lib/myron-gpu
 touch=/usr/local/lib/myron-touch
-expected_notes=8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608
+reviewed_kernel_notes=8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608
+no_reset_kernel_notes=dadfc0372f028cd5c9810415167af6c182e79fbf2954e7c555a8a1108cf33e1e
+address_kernel_notes=0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8
 
 say() { printf '%s\n' "$*" | tee -a "$log"; }
 die() { say "ERROR: $*" >&2; exit 1; }
@@ -79,7 +81,10 @@ classify_key() {
 [ "$(id -u)" = 0 ] || die 'must run as root'
 : >"$log"
 notes=$(sha256sum /sys/kernel/notes | awk '{print $1}')
-[ "$notes" = "$expected_notes" ] || die "kernel notes differ: $notes"
+case "$notes" in
+  "$reviewed_kernel_notes"|"$no_reset_kernel_notes"|"$address_kernel_notes") ;;
+  *) die "kernel notes differ: $notes" ;;
+esac
 [ "$(cat /sys/class/drm/card0-DSI-1/status 2>/dev/null || true)" = connected ] ||
   die 'DSI-1 is not connected'
 /usr/bin/omamobile-myron-gpu-verify verify-layout >>"$log" 2>&1 ||
