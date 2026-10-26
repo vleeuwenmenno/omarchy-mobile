@@ -289,9 +289,9 @@ grep -q 'alarm_fetch rootfs' tools/build-rootfs || fail "tools/build-rootfs does
 if grep -n 'ALARM_DOCKER_QEMU_ARGS' tools/build-rootfs rootfs/build-inside; then
   fail "the rootfs build must never mount an emulator"
 fi
-[[ $(grep -c '"${ALARM_DOCKER_QEMU_ARGS\[@\]}"' tools/build-packages) == 1 ]] || fail "tools/build-packages's container run lacks the qemu arguments"
+[[ $(grep -c '"${ALARM_DOCKER_QEMU_ARGS\[@\]}"' tools/build-packages) == 2 ]] || fail "tools/build-packages's build or repo-add container run lacks the qemu arguments"
 [[ $(grep -c '"${ALARM_DOCKER_QEMU_ARGS\[@\]}"' tools/lib/alarm.sh) == 1 ]] || fail "alarm_build_image's container run lacks the qemu arguments"
-[[ $(grep -c 'docker run' tools/build-packages tools/lib/alarm.sh tools/build-rootfs | awk -F: '{s+=$2} END {print s}') == 3 ]] ||
+[[ $(grep -c 'docker run' tools/build-packages tools/lib/alarm.sh tools/build-rootfs | awk -F: '{s+=$2} END {print s}') == 4 ]] ||
   fail "a new docker run call site needs a binfmt decision here"
 pass "every docker run call site is accounted for"
 

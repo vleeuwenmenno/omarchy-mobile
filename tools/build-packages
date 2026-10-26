@@ -340,7 +340,7 @@ sign_and_index() {
   else
     # Not an Arch machine: pacman's repo-add from the Arch Linux ARM image,
     # as this user, with the same key.
-    docker run --rm --platform linux/arm64 -u "$(id -u):$(id -g)" \
+    docker run --rm --platform linux/arm64 "${ALARM_DOCKER_QEMU_ARGS[@]}" -u "$(id -u):$(id -g)" \
       -v "$ROOT/$repo:/repo" -v "$GNUPGHOME:/gnupg" -e GNUPGHOME=/gnupg -e HOME=/tmp -w /repo \
       "$(alarm_base_image)" repo-add --quiet --sign --key "$key" omamobile.db.tar.gz "${packages[@]}"
   fi
