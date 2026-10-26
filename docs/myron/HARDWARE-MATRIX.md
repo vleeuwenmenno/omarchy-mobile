@@ -51,7 +51,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | Earpiece | UNKNOWN | No verified call/earpiece route. |
 | Microphones | PARTIAL | Omarchy AudioReach captured one second at 48 kHz with 41,615 nonzero samples, discarded the recording, and restored mixer state. PipeWire app path and quality remain open. |
 | Headphones / USB audio | PRESENT_UNTESTED | No attended route test recorded. |
-| Bluetooth audio | PRESENT_UNTESTED | Controller discovery works, but pairing and PipeWire Bluetooth routing remain untested. |
+| Bluetooth audio | BROKEN | The controller appears, but discovery and pairing are not working; Bluetooth audio cannot be qualified yet. |
 | Audio routing | EXPERIMENTAL | Pulse bridge and speaker graph work on the live reference; transitions, mute, suspend/resume, and clean build remain open. |
 | Qualcomm DSP / AudioReach | PARTIAL | Checkpointed Omarchy bring-up passed mapper, transport, ADSP/Q6, codecs, ALSA devnodes and FastRPC. Canoe ACDB system-path packaging was fixed; suspend/restart stability remains open. |
 | PipeWire / WirePlumber | PARTIAL | Installed, but SSH `wpctl` showed no sink/source in that remote context; application playback evidence comes from dedicated tests. |
