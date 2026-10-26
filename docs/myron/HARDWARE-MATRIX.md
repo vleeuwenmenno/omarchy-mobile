@@ -32,7 +32,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | Feature | Status | Evidence and Arch acceptance |
 | --- | --- | --- |
 | Wi-Fi | VERIFIED_WORKING | Connected, DHCP/DNS/IPv4 internet and full NetworkManager connectivity. Preserve stock-extracted modules/firmware and service order. |
-| Bluetooth controller | VERIFIED_WORKING | Exact WCN786x firmware/NVM, hci0, powered BlueZ controller, and a bounded discovery event passed; pairing remains untested. |
+| Bluetooth controller | PARTIAL | Exact WCN786x firmware/NVM, hci0 and a powered BlueZ controller pass. A bounded run once counted one anonymous event, but an attended JBL scan found no devices and HCI scan commands timed out. Discovery, pairing and reconnect are not working. |
 | USB networking / SSH | VERIFIED_WORKING | USB NCM rescue and key-based SSH proven; WLAN SSH also works. Arch needs an independent rescue link. |
 | SIM detection | VERIFIED_WORKING | ModemManager exposes an active registered modem without recording identifiers. |
 | LTE / 5G registration | VERIFIED_WORKING | Home registration with LTE and 5G NR observed. |
@@ -96,9 +96,10 @@ reference statuses above:
   modem discovery and home LTE/5G registration, and a bounded six-satellite
   GNSS fix, raw built-in microphone capture, a guarded low-volume physical
   speaker graph, and WCN786x firmware/NVM initialization with a powered BlueZ
-  controller and bounded discovery. Nautilus and GNOME Maps mapped without
+  controller. Nautilus and GNOME Maps mapped without
   the r4 swapchain failure.
-- **Partially verified on Omarchy:** battery and USB-PD reporting; backlight
+- **Partially verified on Omarchy:** Bluetooth controller publication but not
+  discovery or pairing; battery and USB-PD reporting; backlight
   writes with a broken zero `actual_brightness` readback; low-intensity torch
   activation; power/volume input nodes and shell bindings without attended
   physical key events.

@@ -29,6 +29,10 @@ qualify_profile() {
       say 'profile=coexistence state=qualified'
       ;;
     cellular)
+      systemctl --quiet is-active myron-cellular.service ||
+        die 'cellular profile service is not active'
+      [ -s /run/myron-cellular-ready ] ||
+        die 'cellular profile readiness marker is missing'
       systemctl --quiet is-active myron-reference-radio.service ||
         die 'cellular radio foundation is not active'
       [ -s /run/myron-wireless-ready ] ||

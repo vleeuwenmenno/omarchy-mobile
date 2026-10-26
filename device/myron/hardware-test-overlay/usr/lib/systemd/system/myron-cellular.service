@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Guarded Myron cellular-profile bring-up
+Requires=myron-omarchy-prepare.service myron-hardware-watchdog.service
+After=myron-omarchy-prepare.service myron-hardware-watchdog.service
+Before=NetworkManager.service display-manager.service myron-omarchy-qualify.service
+Conflicts=myron-coexistence.service
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-cellular-start
+RemainAfterExit=yes
+TimeoutStartSec=4min
+
+[Install]
+WantedBy=multi-user.target

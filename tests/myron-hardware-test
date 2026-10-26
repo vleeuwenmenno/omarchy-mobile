@@ -27,6 +27,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/bin/omamobile-gnss" \
   "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
+  "$overlay/usr/local/sbin/myron-cellular-start" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
   "$overlay/usr/local/sbin/myron-coexistence-start" \
   "$overlay/usr/local/sbin/myron-audio-stage" \
@@ -142,8 +143,10 @@ grep -Fq 'mask ModemManager.service' "$compose" ||
   fail 'coexistence profile does not mask ModemManager'
 grep -Fq 'unmask ModemManager.service' "$compose" ||
   fail 'cellular profile does not unmask ModemManager'
-grep -Fq 'enable ModemManager.service' "$compose" ||
-  fail 'cellular profile does not enable ModemManager'
+grep -Fq 'disable ModemManager.service' "$compose" ||
+  fail 'cellular profile does not keep ModemManager behind its guarded transaction'
+grep -Fq 'enable myron-cellular.service' "$compose" ||
+  fail 'cellular profile does not enable its guarded transaction'
 grep -Fq 'Session=myron-omarchy.desktop' "$overlay/etc/sddm.conf.d/zz-myron-test.conf" ||
   fail 'late SDDM override does not select the isolated Myron session'
 grep -Fq 'TimeoutStartSec=3min' \
@@ -193,6 +196,8 @@ pass 'services require explicit arm marker and preserve USB rescue address'
 
 coexist=$overlay/usr/local/sbin/myron-coexistence-start
 coexist_unit=$overlay/usr/lib/systemd/system/myron-coexistence.service
+cellular=$overlay/usr/local/sbin/myron-cellular-start
+cellular_unit=$overlay/usr/lib/systemd/system/myron-cellular.service
 previous=0
 for required in \
   'systemctl start myron-reference-radio.service' \
@@ -211,11 +216,35 @@ grep -Fq 'myron-hardware-watchdog.service' "$coexist" ||
   fail 'coexistence bring-up does not require the rollback watchdog'
 grep -Fq 'Before=NetworkManager.service display-manager.service myron-omarchy-qualify.service' "$coexist_unit" ||
   fail 'coexistence service is not ordered before networking, graphics, and qualification'
+previous=0
+for required in \
+  'systemctl start myron-reference-radio.service' \
+  'udevadm settle --timeout=30' \
+  'systemctl start ModemManager.service'; do
+  line=$(grep -nF "$required" "$cellular" | cut -d: -f1)
+  [[ -n $line && $line -gt $previous ]] ||
+    fail "cellular order is missing or invalid at: $required"
+  previous=$line
+done
+for required in \
+  'cellular hardware-test profile is not selected' \
+  'myron-hardware-watchdog.service' \
+  'AudioReach must remain inactive' \
+  'Bluetooth controller must remain absent' \
+  '/run/myron-cellular-ready'; do
+  grep -Fq "$required" "$cellular" || fail "guarded cellular transaction lacks: $required"
+done
+grep -Fq 'Before=NetworkManager.service display-manager.service myron-omarchy-qualify.service' "$cellular_unit" ||
+  fail 'cellular service is not ordered before networking, graphics, and qualification'
+grep -Fxq 'Conflicts=myron-coexistence.service' "$cellular_unit" ||
+  fail 'cellular and coexistence profiles are not mutually exclusive'
 grep -Fxq 'Requires=myron-omarchy-prepare.service' \
   "$overlay/usr/lib/systemd/system/myron-omarchy-qualify.service" ||
   fail 'graphical qualification does not require hardware preparation'
 for required in \
   'systemctl --quiet is-active myron-coexistence.service' \
+  'systemctl --quiet is-active myron-cellular.service' \
+  'cellular profile readiness marker is missing' \
   'systemctl --quiet is-active myron-reference-radio.service' \
   'systemctl --quiet is-active ModemManager.service' \
   'ModemManager did not publish a modem within 180 seconds' \

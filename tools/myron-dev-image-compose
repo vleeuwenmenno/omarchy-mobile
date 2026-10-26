@@ -223,6 +223,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/bin/omamobile-microphone" \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
       "$root/usr/local/sbin/myron-reference-radio-start" \
+      "$root/usr/local/sbin/myron-cellular-start" \
       "$root/usr/local/sbin/myron-reference-audio-start" \
       "$root/usr/local/sbin/myron-coexistence-start" \
       "$root/usr/local/sbin/myron-audio-stage" \
@@ -254,9 +255,9 @@ docker run --rm --privileged --platform linux/arm64 \
         ;;
       cellular)
         systemctl --root="$root" disable myron-coexistence.service >/dev/null 2>&1 || true
-        systemctl --root="$root" add-wants multi-user.target myron-reference-radio.service >/dev/null
         systemctl --root="$root" unmask ModemManager.service >/dev/null
-        systemctl --root="$root" enable ModemManager.service >/dev/null
+        systemctl --root="$root" disable ModemManager.service >/dev/null 2>&1 || true
+        systemctl --root="$root" enable myron-cellular.service >/dev/null
         ;;
     esac
     sync
@@ -293,10 +294,12 @@ case $profile in
       "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'coexistence bring-up is not enabled'
     ;;
   cellular)
+    debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-cellular.service' \
+      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'guarded cellular transaction is not enabled'
     debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-reference-radio.service' \
-      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'cellular radio foundation is not enabled'
+      "$out" 2>&1 | grep -Fq 'File not found' || die 'radio foundation is enabled outside the guarded cellular transaction'
     debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/ModemManager.service' \
-      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'cellular ModemManager is not enabled'
+      "$out" 2>&1 | grep -Fq 'File not found' || die 'ModemManager is enabled outside the guarded cellular transaction'
     ;;
 esac
 hash=$(sha256sum <"$out" | cut -d" " -f1)

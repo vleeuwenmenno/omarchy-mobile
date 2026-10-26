@@ -308,10 +308,39 @@ Bluetooth hardware result.
 The corrected v10 run loaded all six rebuilt GKI modules and the exact stock
 `btpower.ko`, initialized WCN786x from the hash-pinned board-ID-00 firmware and
 NVM, created `hci0`, and reached a powered BlueZ controller. Its bounded scan
-recorded one discovery event while persisting no nearby identity. Cleanup
+recorded one anonymous event while persisting no nearby identity. That count
+was not sufficient discovery evidence. A later attended scan with a JBL
+speaker in pairing mode listed no devices; LE scan opcodes timed out. Bluetooth
+therefore remains partial: controller publication passes, but discovery,
+pairing, reconnect and Bluetooth audio do not. Cleanup
 removed `hci0`, unmounted `bluetooth_b`, powered the controller off and
 disarmed rollback. The exact postmarketOS `init_boot_a` was then restored;
 Plasma, Wi-Fi and the cellular interface returned.
+
+The reference raw-UART experiments localize the failure below BlueZ: repeated
+HCI commands work before `HCI Reset`, but the first command after Reset times
+out even with UART clocks held on and IBS wake acknowledged. The next bounded
+candidate sets `HCI_QUIRK_RESET_ON_CLOSE` before controller registration only
+for the explicit userspace-preinitialized WCN786x path. This skips the opening
+Reset while leaving every default QCA path unchanged. It requires a newly
+built, exact-release `hci_uart.ko` and must pass controller initialization,
+known-peer discovery, cleanup and a fresh-boot retry before promotion.
+
+## Cellular profile startup transaction
+
+The first v15 cellular boot exposed an ordering race: enabling
+`myron-reference-radio.service` directly caused its marker condition to be
+evaluated before any service created the marker. ModemManager then started
+without the radio foundation. A guarded live recovery created the marker,
+started radio, settled udev and started ModemManager; modem publication and
+raw/NMEA location capabilities then qualified without a bearer, SMS or call.
+
+`myron-cellular.service` now owns that exact transaction. It requires the
+hardware arm and independent watchdog, rejects Bluetooth and AudioReach,
+creates the radio marker, starts the radio foundation, settles udev, starts
+ModemManager and writes a readiness marker. Neither the radio foundation nor
+ModemManager is independently enabled in a cellular image, removing the boot
+race while keeping the rollback watchdog authoritative.
 
 ## Battery and charging stage
 

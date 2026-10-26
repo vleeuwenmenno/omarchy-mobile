@@ -1,0 +1,47 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Guarded cellular-profile transaction: radio foundation, then ModemManager.
+set -eu
+umask 077
+
+runtime=/run/omamobile-myron
+ready=/run/myron-cellular-ready
+profile_file=/etc/omamobile/myron-test-profile
+
+fail() {
+	printf 'ERROR: Myron cellular bring-up: %s\n' "$*" >&2
+	exit 1
+}
+
+[ "$(id -u)" = 0 ] || fail 'must run as root'
+[ -f /run/myron-host/var/lib/omarchy-mobile/hardware-test.armed ] ||
+	fail 'temporary hardware-test arm is absent'
+systemctl --quiet is-active myron-hardware-watchdog.service ||
+	fail 'independent rollback watchdog is not active'
+[ "$(cat "$profile_file" 2>/dev/null || true)" = cellular ] ||
+	fail 'cellular hardware-test profile is not selected'
+! systemctl --quiet is-active myron-coexistence.service ||
+	fail 'coexistence profile must remain inactive'
+! systemctl --quiet is-active myron-reference-audio-foundation.service ||
+	fail 'AudioReach must remain inactive in the cellular profile'
+! systemctl --quiet is-active myron-speaker-bridge.service ||
+	fail 'speaker bridge must remain inactive in the cellular profile'
+[ ! -e /sys/class/bluetooth/hci0 ] ||
+	fail 'Bluetooth controller must remain absent in the cellular profile'
+! pgrep -x btattach >/dev/null 2>&1 ||
+	fail 'Bluetooth transport must remain inactive in the cellular profile'
+[ ! -e "$ready" ] || exit 0
+
+install -d -m0700 "$runtime"
+printf '%s\n' verified-read-only-backup >"$runtime/radio-backup-verified"
+systemctl start myron-reference-radio.service
+[ -s /run/myron-wireless-ready ] || fail 'radio foundation did not become ready'
+
+udevadm settle --timeout=30 || fail 'radio devices did not settle'
+systemctl start ModemManager.service
+systemctl --quiet is-active ModemManager.service ||
+	fail 'ModemManager did not remain active'
+
+printf 'radio=ready\nmodem-manager=active\nbluetooth=absent\naudio=inactive\n' >"$ready"
+chmod 0600 "$ready"
+printf '%s\n' 'result=ready radio=wifi modem-manager=active bluetooth=absent audio=inactive'
