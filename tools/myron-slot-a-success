@@ -391,6 +391,12 @@ def persistent_backup_dir(directory):
     uevent = read_text(f"{sys_dev}/uevent").splitlines()
     if os.path.exists(f"{sys_dev}/loop") or "DEVTYPE=partition" not in uevent or "PARTNAME=pmos_root" not in uevent:
         raise Refuse("the state directory is not on the physical pmos_root partition")
+    disk = os.path.dirname(os.path.realpath(sys_dev))
+    disk_events = read_text(f"{disk}/uevent").splitlines()
+    if ("/virtual/" in disk or os.path.exists(f"{disk}/loop") or
+            os.path.basename(disk).startswith(("loop", "ram", "dm-", "md")) or
+            "DEVTYPE=disk" not in disk_events or not os.path.exists(f"{disk}/device")):
+        raise Refuse("the physical pmos_root partition has a virtual or unproven disk parent")
 
 
 def make_backup(directory, original, plan):

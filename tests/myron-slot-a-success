@@ -343,7 +343,7 @@ ok("baseline must be protected, single-link, exact size and hash; ancestors must
 import ctypes
 import types
 from unittest import mock
-media = bytearray(t.LUN_BLOCKS * t.BLOCK)
+media = bytearray(t.CAPTURE_BYTES)
 cache = bytearray(len(media))
 log = []
 def fake_open(path, flags, *a):
@@ -351,7 +351,7 @@ def fake_open(path, flags, *a):
 def fake_fstat(fd):
     return types.SimpleNamespace(st_mode=stat.S_IFBLK | 0o600, st_rdev=os.makedev(8, 0))
 def fake_ioctl(fd, req, buf):
-    return {0x1268: struct.pack("i", 4096), 0x80081272: struct.pack("Q", len(media)), 0x125E: struct.pack("i", 0)}[req]
+    return {0x1268: struct.pack("i", 4096), 0x80081272: struct.pack("Q", t.LUN_BLOCKS * t.BLOCK), 0x125E: struct.pack("i", 0)}[req]
 def fake_getfl(fd, cmd, *a):
     return flags_seen[0] if cmd == fcntl.F_GETFL else 0
 def addr(view):
@@ -360,13 +360,15 @@ def fake_preadv(fd, bufs, offset):
     assert offset % 4096 == 0 and len(bufs[0]) % 4096 == 0 and addr(bufs[0]) % 4096 == 0, ("unaligned read", offset, len(bufs[0]))
     log.append(("preadv", offset, len(bufs[0])))
     n = min(len(bufs[0]), 8192)  # a short read forces the loop
-    bufs[0][:n] = media[offset:offset + n]
+    start = t.edge_slice(offset // t.BLOCK)[0]
+    bufs[0][:n] = media[start:start + n]
     return n
 def fake_pwritev(fd, bufs, offset):
     assert offset % 4096 == 0 and len(bufs[0]) % 4096 == 0 and addr(bufs[0]) % 4096 == 0, ("unaligned write", offset, len(bufs[0]))
     log.append(("pwritev", offset, len(bufs[0])))
-    media[offset:offset + len(bufs[0])] = bytes(bufs[0])
-    cache[offset:offset + len(bufs[0])] = bytes(bufs[0])
+    start = t.edge_slice(offset // t.BLOCK)[0]
+    media[start:start + len(bufs[0])] = bytes(bufs[0])
+    cache[start:start + len(bufs[0])] = bytes(bufs[0])
     return len(bufs[0])
 def forbidden(*a, **k):
     raise AssertionError("buffered page-cache IO used on the device")
@@ -392,9 +394,10 @@ with _cl.ExitStack() as stack:
     assert all(entry[0] == "open" or (entry[1] % 4096 == 0 and entry[2] % 4096 == 0) for entry in log)
     block = os.urandom(4096)
     device.write_block(t.BACKUP_HEADER, block)
-    assert bytes(media[t.BACKUP_HEADER * 4096:(t.BACKUP_HEADER + 1) * 4096]) == block
+    backup_offset = t.edge_slice(t.BACKUP_HEADER)[0]
+    assert bytes(media[backup_offset:backup_offset + 4096]) == block
     # a media that diverges from what was written (a cache would hide this) is seen by the readback
-    media[t.BACKUP_HEADER * 4096] ^= 1
+    media[backup_offset] ^= 1
     assert device.read_edges()[-4096:] != block, "readback must reflect the media, not the written data"
     for bad_offset, bad_length in [(1, 4096), (0, 100), (0, 0), (t.LUN_BLOCKS * 4096, 4096)]:
         refuses(lambda o=bad_offset, n=bad_length: device._read(o, n), "unaligned", "unaligned or out-of-range read")
@@ -426,7 +429,10 @@ def persistence(**over):
     state = f"{base}/state"; os.makedirs(state, mode=0o700); os.makedirs(f"{base}/sysdev/8:5")
     dev = os.stat(state).st_dev
     majmin = f"{os.major(dev)}:{os.minor(dev)}"
-    os.makedirs(f"{base}/sysdev/{majmin}")
+    disk = f"{base}/devices/platform/mock/block/sda"
+    os.makedirs(f"{disk}/sda5"); os.makedirs(f"{disk}/device")
+    open(f"{disk}/uevent", "w").write("DEVTYPE=disk\nDEVNAME=sda\n")
+    os.symlink(f"{disk}/sda5", f"{base}/sysdev/{majmin}")
     open(f"{base}/sysdev/{majmin}/uevent", "w").write("DEVTYPE=partition\nPARTNAME=pmos_root\n")
     open(f"{base}/mountinfo", "w").write(f"1 0 {majmin} / {t.HOST_MOUNT} rw,noatime - ext4 /dev/sda5 rw\n")
     t.PATHS.update(state=state, sysdev=f"{base}/sysdev", mountinfo=f"{base}/mountinfo")
@@ -436,6 +442,12 @@ def persistence(**over):
     return base, state
 def uevent_of(base, majmin, text):
     open(f"{base}/sysdev/{majmin}/uevent", "w").write(text)
+def virtual_parent(base, majmin, name="loop0"):
+    disk = f"{base}/devices/virtual/block/{name}"
+    os.makedirs(f"{disk}/{name}p1"); os.makedirs(f"{disk}/loop")
+    open(f"{disk}/uevent", "w").write(f"DEVTYPE=disk\nDEVNAME={name}\n")
+    open(f"{disk}/{name}p1/uevent", "w").write("DEVTYPE=partition\nPARTNAME=pmos_root\n")
+    os.unlink(f"{base}/sysdev/{majmin}"); os.symlink(f"{disk}/{name}p1", f"{base}/sysdev/{majmin}")
 base, state = persistence()
 t.persistent_backup_dir = persistent_real
 persistent_real(f"{state}/backup")
@@ -445,6 +457,8 @@ cases = {
     "tmpfs source": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 {m} / {t.HOST_MOUNT} rw - tmpfs tmpfs rw\n"), None),
     "ramdisk partition name": (lambda b, m: uevent_of(b, m, "DEVTYPE=disk\nDEVNAME=ram0\n"), None),
     "loop backed": (lambda b, m: os.makedirs(f"{b}/sysdev/{m}/loop"), None),
+    "loop partition parent": (virtual_parent, None),
+    "RAM partition parent": (lambda b, m: virtual_parent(b, m, "ram0"), None),
     "another partition": (lambda b, m: uevent_of(b, m, "DEVTYPE=partition\nPARTNAME=userdata\n"), None),
     "read-only mount": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 {m} / {t.HOST_MOUNT} ro - ext4 /dev/sda5 ro\n"), None),
     "different device than the mount": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 9:9 / {t.HOST_MOUNT} rw - ext4 /dev/sda5 rw\n"), None),
@@ -452,7 +466,8 @@ cases = {
     "mount root is a subdirectory": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 {m} /x {t.HOST_MOUNT} rw - ext4 /dev/sda5 rw\n"), None),
 }
 reasons = {"outside the state directory": "inside the persistent", "tmpfs source": "ext4 pmOS root", "ramdisk partition name": "physical pmos_root",
-           "loop backed": "physical pmos_root", "another partition": "physical pmos_root", "read-only mount": "ext4 pmOS root",
+           "loop backed": "physical pmos_root", "loop partition parent": "physical pmos_root", "RAM partition parent": "physical pmos_root",
+           "another partition": "physical pmos_root", "read-only mount": "ext4 pmOS root",
            "different device than the mount": "ext4 pmOS root", "host root not mounted": "not mounted", "mount root is a subdirectory": "ext4 pmOS root"}
 for label, (mutate_fn, where) in cases.items():
     base, state = persistence(x=mutate_fn)
