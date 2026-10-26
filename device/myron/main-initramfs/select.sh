@@ -169,3 +169,12 @@ main_begin_attempt() {
 		mv -f "$main_dir/pending.new" "$main_dir/pending" &&
 		sync
 }
+
+# The durable pending token is exactly this boot's and image's, and no recovery
+# latch has appeared since the selection.
+main_verify_attempt() {
+	main_safe_file "$main_dir/pending" || return 1
+	[ "$(main_kv "$main_dir/pending" boot_id)" = "$main_id" ] || return 1
+	[ "$(main_kv "$main_dir/pending" image_id)" = "$main_image_id" ] || return 1
+	[ ! -e "$main_dir/pending.new" ] && [ ! -e "$main_dir/latch" ] && [ ! -L "$main_dir/latch" ]
+}

@@ -57,6 +57,19 @@ final name, set mode 600 and owner root, `fsync`, then `mv` it into place.
 5. Copy BusyBox and its musl loader to `/run/myron-main/`, create the NCM-only
    USB rescue gadget (no ACM, no console, no shell), write the compatibility arm
    marker `hardware-test.armed` with `mode=main`, and move the mounts.
+   The original init does not run under `set -e`, so every one of these
+   operations is checked explicitly and routes to `fail_boot`: the arm file's
+   write, flush and rename (a missing arm would make every guard, prepare,
+   cellular and qualify unit skip on its `ConditionPathExists=`, leaving an
+   unqualified boot with no independent recovery), the runtime copies (size and
+   executable proof, BusyBox run, control parse), the token files with
+   readback, and the gadget. Immediately before the first mount move the arm,
+   tokens, pending token and absence of a latch are verified again. The stage
+   also refuses a payload in which a critical main unit (guard, recover,
+   qualify, prepare, cellular, battery-secret) is shadowed by a unit or drop-in
+   in `/etc`, `/usr/local/lib` or `/run`, or has any `/usr/lib` drop-in other
+   than the provided `90-myron-main.conf`; the composer checks the same on the
+   image and compares the drop-ins byte for byte.
 6. A failure up to step 5's moves unwinds everything (moved mounts, payload,
    loop device, gadget, runtime files, marker) and hands the SAME init to the
    preserved pmOS root. No partition is written. After `switch_root` there is no
@@ -78,6 +91,10 @@ with the main guard (same name, different job):
   stopped and no 900 s timer remains. At the deadline it takes the lock,
   re-checks for a commit, otherwise sets the latch durably and asks systemd for a
   normal reboot (never the bootloader), with a forced plain reboot after 120 s.
+* If the latch is already set while this boot is still uncommitted (whoever set
+  it died before rebooting), the guard does not exit: after 30 s it requests the
+  same bounded normal reboot, then the forced plain reboot, keeping the original
+  reason. A committed boot is left alone.
 * `myron-main-recover.service` is `OnFailure=` of the guard, the qualifier,
   the cellular unit, the preparation unit and the battery-secret unit. It
   latches and reboots once; after a commit it does nothing.
@@ -88,7 +105,9 @@ with the main guard (same name, different job):
   `usb0` rescue address; NetworkManager; the Wi-Fi import service; the
   battery-secret service with a valid capacity and `Good` health. It does not
   require a USB cable, a charger, internet, a nearby access point or cellular
-  data. Its unit bound is 1100 s, under the 1200 s guard.
+  data. Its unit bound is 1100 s, under the 1200 s guard. Just before the commit
+  it rechecks that the same Hyprland process is still alive (the 90 s stability
+  window ends before the EGL and radio probes).
 
 Only the cellular profile is supported. The main boot starts the modem and
 Wi-Fi baseline but does not activate cellular data. `myron-cellular-stage`

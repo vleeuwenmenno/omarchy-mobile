@@ -331,6 +331,28 @@ if [[ $boot_policy == main ]]; then
     grep -Fq 'myron-main-os guard' || die 'main guard unit is not installed'
   debugfs -R 'cat /usr/lib/systemd/system/myron-hardware-watchdog.service' "$out" 2>/dev/null |
     grep -Fq '/run/myron-watchdog' && die 'temporary watchdog unit survived in the main payload'
+  # debugfs exits 0 for a missing path, so existence is read from its output.
+  in_image() { ! debugfs -R "stat $1" "$out" 2>&1 | grep -Fq 'File not found'; }
+  # No higher-priority location may shadow a critical main unit, and the only
+  # drop-ins in /usr/lib are the provided main ones, byte for byte.
+  for unit in myron-hardware-watchdog myron-main-recover myron-omarchy-qualify myron-omarchy-prepare \
+    myron-cellular myron-batterysecret; do
+    for dir in /etc/systemd/system /etc/systemd/system.control /usr/local/lib/systemd/system; do
+      for path in "$dir/$unit.service" "$dir/$unit.service.d"; do
+        ! in_image "$path" || die "critical main unit is shadowed: $path"
+      done
+    done
+    expected=device/myron/main-overlay/usr/lib/systemd/system/$unit.service.d/90-myron-main.conf
+    actual_dir=/usr/lib/systemd/system/$unit.service.d
+    if [[ -f $expected ]]; then
+      [[ $(debugfs -R "ls -p $actual_dir" "$out" 2>/dev/null | awk -F/ '$6 != "." && $6 != ".." && $6 != "" {print $6}') == 90-myron-main.conf ]] ||
+        die "unexpected drop-ins for $unit"
+      [[ $(debugfs -R "cat $actual_dir/90-myron-main.conf" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$expected")" ]] ||
+        die "main drop-in differs from the repository: $unit"
+    else
+      ! in_image "$actual_dir" || die "unexpected drop-in directory for $unit"
+    fi
+  done
 fi
 for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot.conf \
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \

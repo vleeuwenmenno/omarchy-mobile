@@ -31,6 +31,7 @@ root_gid=0
 guard_deadline_seconds=1200
 guard_poll_seconds=5
 reboot_grace_seconds=120
+latch_settle_seconds=30
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -301,6 +302,21 @@ guard_timeout() {
 	request_reboot
 }
 
+# The latch is durable but this boot was never committed: whoever set it (a
+# recover call, a failing unit) is expected to reboot, but may have died before
+# doing so. Give that reboot a settle period, then request it here. The original
+# reason stays untouched; the request is the same bounded normal reboot with a
+# forced plain fallback. The guard only reads state here, so no lock is needed.
+guard_latched() {
+	log_line "guard latch present, boot uncommitted; supervising reboot after ${latch_settle_seconds}s"
+	waited=0
+	while [ "$waited" -lt "$latch_settle_seconds" ]; do
+		sleep "$guard_poll_seconds"
+		waited=$((waited + guard_poll_seconds))
+	done
+	request_reboot
+}
+
 cmd_guard() {
 	log_line "guard-start deadline=${guard_deadline_seconds}s"
 	start=$(uptime_s)
@@ -310,7 +326,7 @@ cmd_guard() {
 			exit 0
 		fi
 		if has_latch; then
-			log_line 'guard-done latch set elsewhere'
+			guard_latched
 			exit 0
 		fi
 		now=$(uptime_s)

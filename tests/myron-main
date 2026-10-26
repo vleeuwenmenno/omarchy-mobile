@@ -82,7 +82,10 @@ refuse_line=$(grep -n '/run/myron-main/boot-id' "$cellular_stage" | head -1 | cu
 gates_line=$(grep -n '^require_runtime_gates()' "$cellular_stage" | cut -d: -f1)
 [[ -n $refuse_line && $refuse_line -gt $gates_line && $refuse_line -lt $((gates_line + 6)) ]] ||
   fail 'cellular stage does not refuse the main runtime first in require_runtime_gates'
-pass 'qualifier commits after profile checks before keep-armed, bounded hyprctl, monotonic modem wait; stage refuses main'
+[[ $(grep -n 'Hyprland exited or restarted before the main boot commit' "$qualify" | head -1 | cut -d: -f1) -gt $(grep -n '^qualify_profile$' "$qualify" | cut -d: -f1) &&
+  $(grep -n 'Hyprland exited or restarted before the main boot commit' "$qualify" | head -1 | cut -d: -f1) -lt $(grep -n 'myron-main-os commit' "$qualify" | head -1 | cut -d: -f1) ]] ||
+  fail 'compositor liveness must be rechecked after the profile qualification and immediately before the commit'
+pass 'qualifier commits after profile checks before keep-armed, rechecks the same Hyprland PID before the commit, bounded hyprctl, monotonic modem wait; stage refuses main'
 
 # ---- selector --------------------------------------------------------------
 uid=$(id -u) gid=$(id -g)
@@ -191,7 +194,7 @@ patch_control() {
   sh_patch "$control" "$control_copy" "runtime_dir=$fix/run" "os_release=$fix/os-release" "apk_database=$fix/apk" \
     "omarchy_state=$fix/state" "pmos_state=$fix/state" "proc_boot_id=$fix/bootid" "proc_uptime=$fix/uptime" \
     "lock_file=$fix/lock" "battery=$fix/battery" "root_uid=$uid" "root_gid=$gid" \
-    "guard_deadline_seconds=${1:-30}" 'guard_poll_seconds=5' 'reboot_grace_seconds=10'
+    "guard_deadline_seconds=${1:-30}" 'guard_poll_seconds=5' 'reboot_grace_seconds=10' 'latch_settle_seconds=10'
 }
 mock() { printf '#!/bin/sh\nfix=%s\n%s\n' "$fix" "$2" >"$bin/$1"; chmod +x "$bin/$1"; }
 mock id 'echo ${MOCK_UID:-'"$uid"'}'
@@ -333,10 +336,27 @@ printf 'printf "boot_id=%s\\nimage_id=%s\\n" >%s/success\nrm -f %s/pending\n' "$
 ctl guard >/dev/null 2>&1 || fail 'guard race run'
 [[ ! -e $m/latch ]] || fail 'a commit that landed during the timeout was latched'
 grep -Fq 'systemctl --no-block reboot' "$fix/calls" && fail 'rebooted despite a commit under the lock'
-# latched elsewhere: guard stops, no second reboot
-reset omarchy 30; pend; : >"$m/latch"; ctl guard >/dev/null 2>&1 || fail 'guard under latch'
-grep -Fq reboot "$fix/calls" && fail 'guard rebooted under an existing latch'
-pass 'guard: deadline latch + normal reboot, commit wins, no reboot after commit, no loop once latched, no partition or bootloader call'
+# latch durable but the caller died before it rebooted: the guard keeps supervising an uncommitted boot,
+# preserves the original reason, requests the normal reboot and then the forced plain fallback
+reset omarchy 30; pend; printf 'reason=caller-died\n' >"$m/latch"; ctl guard >"$work/o" 2>&1 || { cat "$work/o"; fail 'guard under latch'; }
+grep -Fxq 'reason=caller-died' "$m/latch" || fail 'guard rewrote the original latch reason'
+grep -Fq 'systemctl --no-block reboot' "$fix/calls" || fail 'guard did not request a normal reboot under a durable latch'
+grep -Fxq 'reboot -f' "$fix/calls" || fail 'guard did not force a plain reboot when systemd did not act'
+grep -Eq 'bootloader|dd |fastboot' "$fix/calls" && fail 'guard under a latch touched the bootloader or a partition tool'
+[[ $(grep -c '^sleep' "$fix/calls") -ge 4 ]] || fail 'guard did not wait for the latch holder before acting'
+# a latch that appears while the guard waits is picked up on the next poll
+reset omarchy 30; pend
+printf 'printf "reason=late\\n" >%s/latch\n' "$m" >"$fix/hook-sleep-2"
+ctl guard >/dev/null 2>&1 || fail 'guard with a late latch'
+grep -Fxq 'reason=late' "$m/latch" && grep -Fxq 'reboot -f' "$fix/calls" || fail 'late latch was not supervised to a reboot'
+# a committed boot with a latch stays the operator's explicit recovery: the guard does not intervene
+reset omarchy 30; pend; ctl commit >/dev/null; : >"$m/latch"; : >"$fix/calls"
+ctl guard >/dev/null 2>&1 || fail 'guard with a committed boot and a latch'
+grep -Fq reboot "$fix/calls" && fail 'guard rebooted a committed boot'
+# the unit stays active after a committed boot (RemainAfterExit), so nothing that requires it is stopped
+reset omarchy 30; pend; ctl commit >/dev/null
+ctl guard >/dev/null 2>&1 || fail 'guard exit after commit'
+pass 'guard: deadline latch + normal reboot, commit wins, no reboot after commit, a durable latch on an uncommitted boot is supervised to a normal then forced reboot with the reason kept'
 
 # a held lock blocks another mutation, which then changes nothing
 reset; pend
@@ -344,6 +364,153 @@ reset; pend
 grep -Fq 'holds the lock' "$work/o" || fail 'lock refusal reason'
 [[ -f $m/pending && ! -e $m/success ]] || fail 'locked-out commit changed state'
 pass 'mutations are serialized by the lock'
+
+# ---- the real stage, run against a fake root --------------------------------
+# The templates run unchanged under /bin/sh with every absolute path moved under a scratch directory and
+# every system tool replaced by a logging wrapper that can fail on demand. Nothing real is mounted.
+real_tool() { command -v "$1"; }
+make_stage() { # NAME: scratch root, wrappers, fixtures; sets R
+  R=$work/st.$1; rm -rf "$R"
+  mkdir -p "$R/bin" "$R/lib" "$R/run" "$R/sys/class/usb_role/a600000.ssusb-role-switch" "$R/sys/class/udc/fake-udc" \
+    "$R/sys/class/net/usb0" "$R/sys/class/block" "$R/proc/sys/kernel/random" "$R/mnt" "$R/dev" "$R/config" \
+    "$R/newroot/usr/lib/systemd/system" "$R/newroot/usr/local/sbin" "$R/newroot/etc/omamobile" "$R/newroot/etc/systemd/system" \
+    "$R/newroot/var/lib/omamobile/repo/aarch64" "$R/newroot/var/log" "$R/newroot/sbin"
+  : >"$R/sys/class/usb_role/a600000.ssusb-role-switch/role"
+  echo '11111111-2222-3333-4444-555555555555' >"$R/proc/sys/kernel/random/boot_id"; echo '10.00 1.00' >"$R/proc/uptime"
+  printf 'ID=omarchy\n' >"$R/newroot/etc/os-release"
+  printf 'development-only: unsigned package repository\n' >"$R/newroot/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned"
+  echo cellular >"$R/newroot/etc/omamobile/myron-test-profile"
+  cp -r "$units/." "$R/newroot/usr/lib/systemd/system/"
+  cp "$control" "$R/newroot/usr/local/sbin/myron-main-os"; chmod 755 "$R/newroot/usr/local/sbin/myron-main-os"
+  mkdir -p "$R/newroot/usr/lib/systemd"; printf '#!/bin/sh\n' >"$R/newroot/usr/lib/systemd/systemd"; chmod 755 "$R/newroot/usr/lib/systemd/systemd"
+  ln -s ../lib/systemd/systemd "$R/newroot/sbin/init"
+  local w; w=$(world "st-$1"); mv "$w" "$R/hostroot"
+  mkdir -p "$R/hostroot/usr/lib/systemd" "$R/hostroot/sbin"
+  printf '#!/bin/sh\n' >"$R/hostroot/usr/lib/systemd/systemd"; chmod 755 "$R/hostroot/usr/lib/systemd/systemd"
+  ln -s ../lib/systemd/systemd "$R/hostroot/sbin/init"
+  printf 'busybox' >"$R/lib/ld-musl-aarch64.so.1"; chmod 755 "$R/lib/ld-musl-aarch64.so.1"
+  cp "$control" "$R/myron-main-os"
+  : >"$R/calls"; : >"$R/markers"; : >"$R/fault"
+  local tool real header
+  header='#!/bin/sh
+name=${0##*/}
+echo "$name $*" >>"'$R'/calls"
+while read -r ft fp; do
+  [ "$ft" = "$name-once" ] && case "$*" in $fp) : >"'$R'/fault"; exit 1 ;; esac
+  [ "$ft" = "$name" ] || continue; case "$*" in $fp) exit 1 ;; esac; done <"'$R'/fault"'
+  for tool in cp mv rm rmdir mkdir ln chmod cat sed grep readlink tr tac stat; do
+    printf '%s\nwhile read -r ft fp; do [ "$ft" = "$name-trunc" ] || continue; case "$*" in $fp) %s "$@"; for last; do :; done; : >"$last"; exit 0 ;; esac; done <"%s/fault"\nexec %s "$@"\n' \
+      "$header" "$(real_tool "$tool")" "$R" "$(real_tool "$tool")" >"$R/bin/$tool"
+  done
+  for tool in sleep sync umount mknod ifconfig reboot-to-bootloader; do printf '%s\nexit 0\n' "$header" >"$R/bin/$tool"; done
+  printf '%s\ncase "$*" in *"-t configfs"*) mkdir -p "%s/config/usb_gadget/g1/functions"; [ ! -e "%s/udc-dir" ] || mkdir -p "%s/config/usb_gadget/g1/UDC" ;; esac\nexit 0\n' "$header" "$R" "$R" "$R" >"$R/bin/mount"
+  printf '%s\ncase "$1" in -f) echo /dev/loop7 ;; esac\nexit 0\n' "$header" >"$R/bin/losetup"
+  printf '%s\n[ -x "$1/$2" ] || exit 1\nexit 0\n' "$header" >"$R/bin/chroot"
+  printf '%s\ncase "$1" in --install|true) exit 0 ;; sh) [ -f "$3" ] || exit 1; exit 0 ;; esac\nexit 1\n' "$header" >"$R/bin/busybox"
+  printf '%s\nexit 0\n' "$header" >"$R/bin/switch_root"
+  chmod +x "$R"/bin/*
+}
+stage_src() { # SRC DST: path-rewrite a template into the scratch root
+  sed -E -e "s#(^|[[:space:]\"'=(<>])/(bin|hostroot|newroot|run|sys|config|dev|proc|lib|mnt|myron-main-os|main-select\.sh)([/ \"')]|\$)#\1$R/\2\3#g" \
+    -e "s#(^|[[:space:]\"'=(<>])/(bin|hostroot|newroot|run|sys|config|dev|proc|lib|mnt|myron-main-os|main-select\.sh)([/ \"')]|\$)#\1$R/\2\3#g" \
+    -e "s#$R(/run/myron-main/bin/busybox sh )$R(/run/myron-main/myron-main-os guard)#\1\2#" \
+    -e "s#'$R(/run/myron-watchdog)'#'\1'#" "$1" >"$2"
+}
+run_stage() { # NAME: runs the stage; the result is in $R/calls, $R/markers and the exit status
+  stage_src "$init_dir/fail-boot.sh" "$R/fail-boot.sh"
+  sh_patch "$init_dir/select.sh" "$R/select0.sh" "main_root_uid=$uid" "main_root_gid=$gid"
+  stage_src "$R/select0.sh" "$R/main-select.sh"
+  stage_src "$init_dir/stage.sh" "$R/stage.sh"
+  # Safety: no absolute system path may survive the rewrite, or the stage would act on the real machine.
+  if grep -nE "(^|[[:space:]\"'=(<>])/(bin|hostroot|newroot|run|sys|config|dev|proc|lib|mnt|myron-main-os|main-select\.sh)([/ \"')]|\$)" \
+    "$R/fail-boot.sh" "$R/main-select.sh" "$R/stage.sh" | grep -Ev '^[0-9]*:[[:space:]]*#|ExecStart=|/run/myron-watchdog'; then
+    fail 'stage fixture left a real absolute path in a rewritten template'
+  fi
+  cat >"$R/driver.sh" <<SH
+logfs_mounted=0
+wait_partition() { found_device=/dev/fakeroot; }
+valid_rootfs_identity() { return 0; }
+write_marker() { printf '%s\n' "\$1" >>"$R/markers"; }
+. "$R/fail-boot.sh"
+. "$R/stage.sh"
+SH
+  PATH=$R/bin:$PATH timeout 60 sh "$R/driver.sh" >"$R/out" 2>&1
+}
+armed=var/lib/omarchy-mobile/hardware-test.armed
+# A fault must end in the pmOS fallback: the named reason recorded, the pmOS root handed over, and no
+# switch_root into the payload, no bootloader, no armed marker left behind for the temporary units.
+expect_fallback() { # REASON
+  local r=$1 n
+  grep -Fxq "$r" "$R/markers" || { cat "$R/out" "$R/markers"; fail "stage: reason '$r' not recorded"; }
+  n=$(grep -c '^switch_root' "$R/calls")
+  [[ $n == 1 ]] || fail "stage($r): switch_root ran $n times"
+  grep -Fxq "switch_root $R/newroot /sbin/init" "$R/calls" || fail "stage($r): unexpected switch_root arguments"
+  [[ $(grep -n "^mount -o move $R/hostroot $R/newroot\$" "$R/calls" | tail -1 | cut -d: -f1) -lt $(grep -n '^switch_root' "$R/calls" | cut -d: -f1) ]] ||
+    fail "stage($r): switch_root without the pmOS root handed over first"
+  grep -q 'reboot-to-bootloader' "$R/calls" && fail "stage($r): rebooted to the bootloader although pmOS was ready"
+  [[ ! -e $R/hostroot/$armed && ! -e $R/hostroot/$armed.new ]] || fail "stage($r): armed marker survived the unwind"
+  [[ ! -e $R/run/myron-main ]] || fail "stage($r): the runtime survived the unwind"
+}
+stage_never_moved() { # a fault before the first move: the only move before switch_root is the pmOS handoff
+  local line; line=$(grep -n "^mount -o move $R/hostroot $R/newroot\$" "$R/calls" | tail -1 | cut -d: -f1)
+  [[ $(head -n "$line" "$R/calls" | grep -c '^mount -o move') == 1 ]] || fail "stage($1): mounts moved before the fault"
+}
+
+make_stage ok; run_stage ok || { cat "$R/out" "$R/markers"; fail 'stage fixture does not reach switch_root'; }
+grep -Fxq "switch_root $R/newroot /sbin/init" "$R/calls" || fail 'stage ok: no switch_root into the payload'
+grep -Fxq omarchy-switch-root-ready "$R/markers" || fail 'stage ok: no ready marker'
+printf 'mode=main\nboot_id=11111111-2222-3333-4444-555555555555\nimage_id=%s\n' "$uuid_hex" >"$R/armed.expect"
+cmp -s "$R/armed.expect" "$R/hostroot/$armed" || fail 'stage ok: armed file is not exact'
+[[ $(cat "$R/run/myron-main/boot-id") == 11111111-2222-3333-4444-555555555555 && $(cat "$R/run/myron-main/image-id") == "$uuid_hex" ]] ||
+  fail 'stage ok: runtime tokens'
+grep -Fxq 'boot_id=11111111-2222-3333-4444-555555555555' "$R/hostroot/var/lib/omarchy-mobile/main/pending" || fail 'stage ok: pending token'
+pass 'stage runs to switch_root against the fake root: exact armed marker, runtime tokens and pending token'
+
+# fault -> reason (the fault is a wrapper failure; "-trunc" makes a copy succeed but leave an empty file)
+stage_fault() { # NAME FAULT_LINE REASON [PREP...]
+  local name=$1 line=$2 reason=$3; shift 3
+  make_stage "$name"
+  [[ -z $line ]] || printf '%s\n' "${line//@R@/$R}" >"$R/fault"
+  local prep; for prep in "$@"; do eval "${prep//@R@/$R}"; done
+  run_stage "$name" || { cat "$R/out"; fail "stage($name): the driver itself failed"; }
+  expect_fallback "$reason"
+}
+st=@R@/hostroot/var/lib/omarchy-mobile
+stage_fault arm-open '' main-arm-write-failed ": >$st/hardware-test.armed.new; chmod 0 $st/hardware-test.armed.new"
+stage_never_moved arm-open
+stage_fault arm-rename 'mv -f *hardware-test.armed.new *' main-arm-rename-failed
+stage_never_moved arm-rename
+stage_fault arm-sync-after-write 'sync *' main-pending-write-failed
+stage_fault guard-copy-busybox 'cp @R@/bin/busybox @R@/run/*' main-runtime-busybox-copy-failed
+stage_fault guard-copy-control 'cp @R@/myron-main-os *' main-runtime-control-copy-failed
+stage_fault guard-copy-truncated 'cp-trunc @R@/myron-main-os *' main-runtime-control-invalid
+stage_fault busybox-copy-truncated 'cp-trunc @R@/bin/busybox @R@/run/*' main-runtime-busybox-invalid
+stage_fault musl-copy 'cp @R@/lib/ld-musl-aarch64.so.1 *' main-musl-copy-failed
+stage_fault runtime-chmod 'chmod 0755 @R@/run/myron-main/bin/busybox *' main-runtime-chmod-failed
+stage_fault runtime-mkdir 'mkdir -p @R@/run/myron-main/bin *' main-runtime-mkdir-failed
+stage_fault musl-link 'ln -snf *' main-musl-link-failed
+stage_fault probe-chroot 'chroot *' main-runtime-invalid
+stage_fault token-write '' main-runtime-boot-id-failed "mkdir -p @R@/run/myron-main/boot-id"
+stage_fault token-readback 'cat @R@/run/myron-main/boot-id' main-runtime-boot-id-mismatch
+stage_fault gadget-ncm 'mkdir @R@/config/usb_gadget/g1/functions/ncm.usb0' ncm-create-failed
+stage_fault gadget-bind '' gadget-bind-failed "touch @R@/udc-dir"
+stage_fault shadow-etc '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/etc/systemd/system/myron-hardware-watchdog.service.d"
+stage_fault shadow-mask '' omarchy-critical-unit-shadowed "ln -s /dev/null @R@/newroot/etc/systemd/system/myron-omarchy-qualify.service"
+stage_fault shadow-usrlocal '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/usr/local/lib/systemd/system; : >@R@/newroot/usr/local/lib/systemd/system/myron-cellular.service"
+stage_fault shadow-extra-dropin '' omarchy-critical-unit-shadowed "echo x >@R@/newroot/usr/lib/systemd/system/myron-cellular.service.d/50-x.conf"
+stage_fault shadow-guard-dropin '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/usr/lib/systemd/system/myron-hardware-watchdog.service.d; : >@R@/newroot/usr/lib/systemd/system/myron-hardware-watchdog.service.d/90-myron-main.conf"
+stage_fault shadow-wide '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/etc/systemd/system/service.d"
+# a partial unwind: the first four mounts are already moved when the device move fails
+stage_fault dev-move 'mount-once -o move @R@/dev *' dev-move-failed
+for what in proc sys config run; do
+  grep -Fq "mount -o move $R/newroot/$what" "$R/calls" || grep -Fq "mount -o move $R/newroot/sys/kernel/config $R/config" "$R/calls" || fail "partial unwind did not move $what back"
+done
+[[ $(grep -n "^mount -o move $R/newroot/run $R/run" "$R/calls" | cut -d: -f1) -lt $(grep -n "^mount -o move $R/newroot/proc $R/proc" "$R/calls" | cut -d: -f1) ]] ||
+  fail 'partial unwind must move the newest mount back first'
+grep -Fq "mount -o move $R/run/myron-host $R/hostroot" "$R/calls" || fail 'partial unwind did not move the host root back'
+stage_fault sys-move 'mount-once -o move @R@/sys *' sys-move-failed
+grep -Fq "mount -o move $R/newroot/proc $R/proc" "$R/calls" || fail 'sys-move fault did not unwind the proc move'
+pass 'real stage under fault injection: arm open/rename/sync, guard/control/BusyBox/musl copy, truncated copy, chmod/mkdir/ln, token write/readback, gadget, unit shadowing and partial mount moves all fall back to pmOS and never switch_root into the payload'
 
 # ---- composer and builder refusals ------------------------------------------
 out=$(tools/myron-dev-image-compose --boot-policy bogus 2>&1) && fail 'composer accepted a bogus policy'

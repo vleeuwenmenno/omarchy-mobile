@@ -195,6 +195,10 @@ qualify_profile
 # rescue address, NetworkManager, the Wi-Fi import, the battery authentication
 # and this boot's pending token. No legacy disarm marker is written.
 if [ -f /run/myron-main/boot-id ]; then
+  # The 90 s stability window ended before the EGL and radio probes; the same
+  # compositor must still be the one that is alive at the moment of the commit.
+  [ "$(pgrep -xo Hyprland 2>/dev/null || true)" = "$pid" ] ||
+    die 'Hyprland exited or restarted before the main boot commit'
   /usr/local/sbin/myron-main-os commit >>"$log" 2>&1 || die 'main boot commit refused'
   say "result=qualified dsi=DSI-1 renderer=isolated-zink-turnip client_egl=adreno840 dma_heap=ready stable_seconds=$stable_seconds main=committed"
   exit 0
