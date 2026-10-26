@@ -158,6 +158,60 @@ ssh root@<pmos-address> myron-main-os resume                 # clear latch, rebo
 A failed or unqualified boot leaves the latch set: the phone comes up in
 postmarketOS, and a later `resume` is the only way back.
 
+## Marking slot A successful (`tools/myron-slot-a-success`)
+
+Slot A has two boot attempts left, and the bootloader keeps decrementing them
+until `boot_a` is marked successful. The tool sets exactly one bit, success
+(byte 54 of the `boot_a` GPT entry, `1 << 6`, as in the Qualcomm bootctl
+source), on the boot LUN, and nothing else. It does not use `qbootctl -m`, which
+updates every A-slot firmware entry. This is the Android slot state; the
+userland proof that the main boot qualified is separate and required first.
+
+The primary table is the truth. The backup table on this LUN is known to be
+stale (older boot_a retry counter, so its array CRC does not match its header).
+The tool repairs only that, and only with `--repair-stale-backup`: the backup
+and primary arrays must differ in nothing but the `boot_a` retry bits (`0x38`
+of that byte). Any other difference, CRC failure, geometry, name, extent or
+slot-state mismatch is refused.
+
+Read-only by default: no flag, or `--inspect-capture FILE` for an offline plan.
+It prints the old and planned SHA-256 of the 256 KiB (first and last 32 blocks)
+so the plan can be reviewed before anything is written.
+
+`--apply` needs all of `--baseline-capture`, `--expected-sha256` and
+`--backup-dir` (a new directory under a root-only tree), and refuses unless:
+
+* kernel, notes and device compatible match, the boot is slot A, and
+  `/run/myron-main/boot-id` equals the kernel boot id;
+* `main/success` is for this boot and image, there is no latch or pending
+  attempt, the guard unit is active, and the root filesystem is loop-backed by
+  the main image;
+* exactly one `boot_a` exists, on a whole LUN of the pinned size and extents,
+  and the opened device matches sysfs (major:minor, 4096-byte sectors, size,
+  not read-only);
+* the current first and last 128 KiB equal the baseline byte for byte (the
+  baseline must be a root-only, mode 600, single-link file whose hash you pass).
+
+Order: the original 256 KiB goes to the new backup directory (700, files 600,
+fsynced with the directory). Then, under the `myron-main-os` lock and after a
+final byte comparison: backup array sector, backup header sector, fsync and a
+full backup readback; only then the primary array sector and primary header
+sector, each fsynced, then a final readback of everything. Four 4 KiB sectors
+are the only writes. A failure stops where it is: no retry and no restore;
+`phases.log` in the backup directory says how far it got. Capture a baseline
+AFTER the first qualified main boot (the retry counter has moved):
+
+```fish
+set cap /root/gpt-edges-after-main.bin
+tools/myron-slot-a-success --inspect-capture $cap --repair-stale-backup
+sudo tools/myron-slot-a-success                                    # read-only live check
+sudo tools/myron-slot-a-success --apply --repair-stale-backup \
+  --baseline-capture $cap --expected-sha256 <sha256 of $cap> \
+  --backup-dir /root/slot-a-success-backup-1
+```
+
+Run it once, by hand. It is not an automatic service.
+
 ## Limitations
 
 * Not a release configuration. The payload is the unsigned development image.
@@ -168,8 +222,8 @@ postmarketOS, and a later `resume` is the only way back.
   kernel needs the human's force-restart.
 * The latch and pending files are trusted only if the state tree passes the
   ownership checks; otherwise pmOS is chosen.
-* Slot-A boot-attempt counters, partition metadata repair and marking a slot
-  successful are outside this change.
+* Marking slot A successful is the separate, manual step above; the main
+  boot itself writes no partition metadata.
 * The NCM host interface profile is the operator's, as before.
 * Tests: `tests/myron-main` (also run by `tests/all`). It uses fixtures and
   mocks, plus the original AArch64 BusyBox under `qemu-aarch64-static` when the

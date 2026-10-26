@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Mark Myron boot_a successful in the GPT after the first qualified main boot.
+
+Narrow on purpose: it sets exactly one bit (success, byte 54 of the boot_a
+entry, 1 << 6) and repairs exactly one known inconsistency (the backup array
+still holding the older boot_a retry counter). It is not a GPT repair tool.
+Default is read-only. Writes need --apply with a baseline capture, its SHA-256
+and a new backup directory. Only four 4 KiB sectors can ever change: backup
+array, backup header, primary array, primary header, in that order. Android
+slot state is separate from the userland proof of a qualified main boot."""
+
+import argparse
+import fcntl
+import hashlib
+import os
+import stat
+import struct
+import subprocess
+import sys
+import zlib
+
+sys.dont_write_bytecode = True
+
+BLOCK = 4096
+LUN_BLOCKS = 494592
+EDGE = 32
+EDGE_BYTES = EDGE * BLOCK
+CAPTURE_BYTES = 2 * EDGE_BYTES
+ARRAY_BLOCKS = 4
+ENTRY_SIZE = 128
+ENTRIES = 128
+PRIMARY_HEADER, PRIMARY_ARRAY = 1, 2
+BACKUP_HEADER = LUN_BLOCKS - 1
+BACKUP_ARRAY = BACKUP_HEADER - ARRAY_BLOCKS
+BOOT_A, BOOT_B = 13, 56
+BOOT_BLOCKS = 24576
+BOOT_EXTENTS = {BOOT_A: (123558, 148133), BOOT_B: (362062, 386637)}
+FLAG_OFFSET = BOOT_A * ENTRY_SIZE + 48 + 6
+ACTIVE, SUCCESS, UNBOOTABLE, TRIES = 0x04, 0x40, 0x80, 0x38
+EXPECTED_KERNEL = "6.12.23-android16-5-g5a0e85dd9db0-dirty-4k"
+EXPECTED_NOTES = "8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608"
+EXPECTED_COMPATIBLE = "qcom,canoe-mtp"
+ROOT_UID = 0
+TRUST_TOP = "/"
+LOCK_FILE = "/run/myron-main.lock"
+PATHS = {
+    "uname": "/proc/sys/kernel/osrelease", "notes": "/sys/kernel/notes",
+    "compatible": "/proc/device-tree/compatible", "cmdline": "/proc/cmdline",
+    "boot_id": "/proc/sys/kernel/random/boot_id", "runtime": "/run/myron-main",
+    "state": "/run/myron-host/var/lib/omarchy-mobile/main", "mountinfo": "/proc/self/mountinfo",
+    "sysfs": "/sys/class/block", "sysdev": "/sys/dev/block", "dev": "/dev",
+}
+
+
+class Refuse(Exception):
+    pass
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def edge_slice(lba, count=1):
+    if lba + count <= EDGE:
+        start = lba * BLOCK
+    elif lba >= LUN_BLOCKS - EDGE and lba + count <= LUN_BLOCKS:
+        start = EDGE_BYTES + (lba - (LUN_BLOCKS - EDGE)) * BLOCK
+    else:
+        raise Refuse(f"LBA {lba} is outside the captured edges")
+    return start, start + count * BLOCK
+
+
+def read_lba(buf, lba, count=1):
+    start, end = edge_slice(lba, count)
+    return bytes(buf[start:end])
+
+
+def parse_header(block):
+    (sig, rev, size, crc, _, mine, alt, first, last, guid, entries_lba, count, esize,
+     array_crc) = struct.unpack_from("<8sIIIIQQQQ16sQIII", block)
+    ok = (sig == b"EFI PART" and rev == 0x10000 and size == 92 and
+          zlib.crc32(block[:16] + b"\0" * 4 + block[20:92]) == crc)
+    return dict(ok=ok, mine=mine, alt=alt, first=first, last=last, guid=guid, entries_lba=entries_lba,
+                count=count, esize=esize, array_crc=array_crc)
+
+
+def header_with_array_crc(block, array_crc):
+    out = bytearray(block)
+    struct.pack_into("<I", out, 88, array_crc)
+    struct.pack_into("<I", out, 16, 0)
+    struct.pack_into("<I", out, 16, zlib.crc32(bytes(out[:92])))
+    return bytes(out)
+
+
+def entry(array, index):
+    return array[index * ENTRY_SIZE:(index + 1) * ENTRY_SIZE]
+
+
+def entry_name(array, index):
+    return entry(array, index)[56:].decode("utf-16-le", "replace").split("\0")[0]
+
+
+def analyse(buf, repair=False):
+    """The one plan this tool will ever make, or Refuse. Pure function of the 256 KiB capture."""
+    if len(buf) != CAPTURE_BYTES:
+        raise Refuse("capture is not first+last 128 KiB")
+    primary = parse_header(read_lba(buf, PRIMARY_HEADER))
+    backup = parse_header(read_lba(buf, BACKUP_HEADER))
+    for header in (primary, backup):
+        if not header["ok"] or header["count"] != ENTRIES or header["esize"] != ENTRY_SIZE:
+            raise Refuse("a GPT header is invalid or has an unexpected shape")
+    if (primary["mine"], primary["alt"], primary["entries_lba"]) != (PRIMARY_HEADER, BACKUP_HEADER, PRIMARY_ARRAY) or \
+            (backup["mine"], backup["alt"], backup["entries_lba"]) != (BACKUP_HEADER, PRIMARY_HEADER, BACKUP_ARRAY):
+        raise Refuse("header geometry differs from the pinned layout")
+    if any(primary[key] != backup[key] for key in ("first", "last", "guid")) or \
+            primary["first"] != PRIMARY_ARRAY + ARRAY_BLOCKS or primary["last"] != BACKUP_ARRAY - 1:
+        raise Refuse("primary and backup disagree on usable range or disk identity")
+    parray = read_lba(buf, PRIMARY_ARRAY, ARRAY_BLOCKS)
+    barray = read_lba(buf, BACKUP_ARRAY, ARRAY_BLOCKS)
+    if zlib.crc32(parray) != primary["array_crc"]:
+        raise Refuse("primary partition array CRC is invalid")
+    names = [entry_name(parray, i) for i in range(ENTRIES)]
+    if names[BOOT_A] != "boot_a" or names[BOOT_B] != "boot_b" or names.count("boot_a") != 1 or \
+            names.count("boot_b") != 1:
+        raise Refuse("partition table layout differs from the pinned boot LUN layout")
+    for index, extent in BOOT_EXTENTS.items():
+        if struct.unpack_from("<QQ", entry(parray, index), 32) != extent or extent[1] - extent[0] + 1 != BOOT_BLOCKS:
+            raise Refuse("boot_a/boot_b extents differ from the pinned layout")
+    boot_a_first = BOOT_EXTENTS[BOOT_A][0]
+    flag = parray[FLAG_OFFSET]
+    if not flag & ACTIVE or flag & UNBOOTABLE:
+        raise Refuse("boot_a is not the active, bootable slot")
+    differing = [i for i in range(len(parray)) if parray[i] != barray[i]]
+    backup_ok = zlib.crc32(barray) == backup["array_crc"]
+    stale = False
+    if differing or not backup_ok:
+        if backup_ok or differing != [FLAG_OFFSET] or (parray[FLAG_OFFSET] ^ barray[FLAG_OFFSET]) & ~TRIES & 0xFF:
+            raise Refuse("backup differs from primary beyond the known stale boot_a retry counter")
+        if not repair:
+            raise Refuse("known stale backup table: rerun with --repair-stale-backup")
+        stale = True
+    info = dict(boot_a_first=boot_a_first, flag=flag, stale_backup=stale, old_sha256=sha256(buf))
+    if flag & SUCCESS:
+        if stale:
+            raise Refuse("boot_a is already successful but the backup is stale: unexpected state")
+        return dict(info, state="already-success", changes=[], new=bytes(buf))
+    new_array = bytearray(parray)
+    new_array[FLAG_OFFSET] |= SUCCESS
+    array_crc = zlib.crc32(bytes(new_array))
+    first_block = bytes(new_array[:BLOCK])
+    steps = [(BACKUP_ARRAY, first_block),
+             (BACKUP_HEADER, header_with_array_crc(read_lba(buf, BACKUP_HEADER), array_crc)),
+             (PRIMARY_ARRAY, first_block),
+             (PRIMARY_HEADER, header_with_array_crc(read_lba(buf, PRIMARY_HEADER), array_crc))]
+    new = bytearray(buf)
+    for lba, data in steps:
+        start, end = edge_slice(lba)
+        new[start:end] = data
+    changed = sorted({i // BLOCK for i in range(len(buf)) if buf[i] != new[i]})
+    if changed != sorted(edge_slice(lba)[0] // BLOCK for lba, _ in steps):
+        raise Refuse("internal: the plan does not change exactly the four planned sectors")
+    again = analyse(bytes(new))
+    if again["state"] != "already-success" or again["stale_backup"]:
+        raise Refuse("internal: the planned tables do not validate as successful")
+    return dict(info, state="needs-success", changes=steps, new=bytes(new), new_sha256=sha256(bytes(new)))
+
+
+def trusted_chain(path):
+    """Absolute canonical path whose every ancestor is root-owned, not a link, not group/world writable."""
+    if not path.startswith("/") or os.path.realpath(path) != path:
+        raise Refuse(f"path is not absolute and canonical: {path}")
+    top = TRUST_TOP.rstrip("/")
+    if path != top and not path.startswith(top + "/"):
+        raise Refuse(f"path is outside the trusted tree: {path}")
+    current = top or "/"
+    for part in [""] + path[len(top):].split("/")[1:-1]:
+        current = os.path.join(current, part) if part else current
+        st = os.lstat(current)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != ROOT_UID or st.st_mode & 0o022:
+            raise Refuse(f"unsafe ancestor: {current}")
+
+
+def load_baseline(path, expected):
+    trusted_chain(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != ROOT_UID or st.st_mode & 0o077 or \
+                st.st_size != CAPTURE_BYTES:
+            raise Refuse("baseline capture must be a root-owned, mode-600, single-link, 256 KiB regular file")
+        data = os.read(fd, CAPTURE_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) != CAPTURE_BYTES or sha256(data) != expected:
+        raise Refuse("baseline capture does not match the expected SHA-256")
+    return data
+
+
+def read_text(path):
+    with open(path, encoding="ascii", errors="replace") as handle:
+        return handle.read()
+
+
+def prove_main():
+    """Userland proof that this is the qualified main boot (not pmOS, the test boot or a pre-qualified one)."""
+    if os.geteuid() != ROOT_UID:
+        raise Refuse("must run as root")
+    if read_text(PATHS["uname"]).strip() != EXPECTED_KERNEL:
+        raise Refuse("unexpected kernel release")
+    with open(PATHS["notes"], "rb") as handle:
+        if sha256(handle.read()) != EXPECTED_NOTES:
+            raise Refuse("kernel notes differ")
+    with open(PATHS["compatible"], "rb") as handle:
+        if handle.read().split(b"\0")[0].decode() != EXPECTED_COMPATIBLE:
+            raise Refuse("device compatible differs")
+    if "androidboot.slot_suffix=_a" not in read_text(PATHS["cmdline"]).split():
+        raise Refuse("not booted from slot A")
+    boot_id = read_text(PATHS["boot_id"]).strip()
+    runtime, state = PATHS["runtime"], PATHS["state"]
+    if read_text(f"{runtime}/boot-id").strip() != boot_id:
+        raise Refuse("not the main boot (runtime boot id differs)")
+    trusted_chain(f"{state}/success")
+    st = os.lstat(f"{state}/success")
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != ROOT_UID or st.st_mode & 0o077:
+        raise Refuse("main success file is not a protected regular file")
+    if os.path.lexists(f"{state}/latch") or os.path.lexists(f"{state}/pending"):
+        raise Refuse("main state has a latch or a pending attempt")
+    success = dict(line.split("=", 1) for line in read_text(f"{state}/success").splitlines() if "=" in line)
+    if success.get("boot_id") != boot_id or success.get("image_id") != read_text(f"{runtime}/image-id").strip():
+        raise Refuse("main boot is not committed for this boot and image")
+    if subprocess.run(["systemctl", "is-active", "--quiet", "myron-hardware-watchdog.service"]).returncode:
+        raise Refuse("main guard is not active")
+    source = None
+    for line in read_text(PATHS["mountinfo"]).splitlines():
+        fields = line.split(" - ")[0].split()
+        if fields[4] == "/":
+            source = fields[2]
+    backing = f"{PATHS['sysdev']}/{source}/loop/backing_file" if source else ""
+    if not source or not os.path.exists(backing):
+        raise Refuse("root is not loop-backed")
+    image = os.stat(f"{state}/rootfs.img")
+    path = read_text(backing).strip()
+    for candidate in (path, "/run/myron-host" + path):
+        if os.path.exists(candidate) and os.path.samestat(os.stat(candidate), image):
+            return
+    raise Refuse("root is not backed by the main image")
+
+
+def find_disk():
+    """The one whole LUN holding the unique boot_a partition, by sysfs only."""
+    root = PATHS["sysfs"]
+    matches = [n for n in sorted(os.listdir(root)) if "PARTNAME=boot_a" in read_text(f"{root}/{n}/uevent").splitlines()]
+    if len(matches) != 1:
+        raise Refuse(f"expected exactly one boot_a, found {len(matches)}")
+    part = os.path.realpath(f"{root}/{matches[0]}")
+    disk = os.path.dirname(part)
+    if not os.path.exists(f"{part}/partition") or "DEVTYPE=disk" not in read_text(f"{disk}/uevent").splitlines():
+        raise Refuse("boot_a is not a partition of a whole disk")
+    if int(read_text(f"{disk}/size")) != LUN_BLOCKS * 8 or int(read_text(f"{part}/size")) != BOOT_BLOCKS * 8:
+        raise Refuse("LUN or boot_a size differs from the pinned layout")
+    return os.path.basename(disk), read_text(f"{disk}/dev").strip(), int(read_text(f"{part}/start"))
+
+
+class Device:
+    """The opened whole LUN. Reads the edges, writes whole blocks, fsyncs. No ioctl writes."""
+
+    def __init__(self, name, majmin, writable):
+        flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
+        self.fd = os.open(f"{PATHS['dev']}/{name}", flags)
+        st = os.fstat(self.fd)
+        if not stat.S_ISBLK(st.st_mode) or f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}" != majmin:
+            raise Refuse("opened device differs from the sysfs disk")
+        sector = struct.unpack("i", fcntl.ioctl(self.fd, 0x1268, b"\0" * 4))[0]
+        size = struct.unpack("Q", fcntl.ioctl(self.fd, 0x80081272, b"\0" * 8))[0]
+        readonly = struct.unpack("i", fcntl.ioctl(self.fd, 0x125E, b"\0" * 4))[0]
+        if sector != BLOCK or size != LUN_BLOCKS * BLOCK or (writable and readonly):
+            raise Refuse("device sector size, size or read-only flag differs")
+
+    def _read(self, offset, length):
+        data = b""
+        while len(data) < length:
+            chunk = os.pread(self.fd, length - len(data), offset + len(data))
+            if not chunk:
+                raise Refuse("short read")
+            data += chunk
+        return data
+
+    def read_edges(self):
+        return self._read(0, EDGE_BYTES) + self._read((LUN_BLOCKS - EDGE) * BLOCK, EDGE_BYTES)
+
+    def write_block(self, lba, data):
+        if os.pwrite(self.fd, data, lba * BLOCK) != len(data):
+            raise Refuse("short write")
+
+    def sync(self):
+        os.fsync(self.fd)
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def put(directory, name, data, mode=0o600, append=False):
+    fd = os.open(os.path.join(directory, name),
+                 os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_EXCL) | os.O_NOFOLLOW, mode)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    sync_dir(directory)
+
+
+def make_backup(directory, original, plan):
+    trusted_chain(directory)
+    if os.path.lexists(directory):
+        raise Refuse("backup directory already exists")
+    os.mkdir(directory, 0o700)
+    put(directory, "original-edges.bin", original)
+    meta = (f"original_sha256={sha256(original)}\nplanned_sha256={plan['new_sha256']}\n"
+            f"sectors={','.join(str(lba) for lba, _ in plan['changes'])}\nstale_backup={plan['stale_backup']}\n")
+    put(directory, "metadata.txt", meta.encode())
+    put(directory, "phases.log", b"prepared\n")
+
+
+def transaction(device, baseline, plan, directory):
+    """Cooperating lock, recheck of the exact bytes, four ordered writes with readback. No retry, no restore."""
+    lock = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise Refuse("another main-os operation holds the lock")
+    try:
+        prove_main()
+        if device.read_edges() != baseline:
+            raise Refuse("device bytes changed since the baseline capture: nothing written")
+        new_array = read_lba(plan["new"], PRIMARY_ARRAY, ARRAY_BLOCKS)
+        for number, (lba, data) in enumerate(plan["changes"], 1):
+            device.write_block(lba, data)
+            device.sync()
+            if lba == BACKUP_HEADER:
+                edges = device.read_edges()
+                header = parse_header(read_lba(edges, BACKUP_HEADER))
+                if not header["ok"] or read_lba(edges, BACKUP_ARRAY, ARRAY_BLOCKS) != new_array or \
+                        zlib.crc32(new_array) != header["array_crc"]:
+                    raise Refuse("backup readback is not the valid new table: primary NOT written")
+            put(directory, "phases.log", f"written {number}/4 lba={lba}\n".encode(), append=True)
+        if device.read_edges() != plan["new"]:
+            raise Refuse("final readback differs from the planned tables")
+        put(directory, "phases.log", b"done\n", append=True)
+    finally:
+        os.close(lock)
+
+
+def report(plan):
+    print(f"state={plan['state']} boot_a_flag=0x{plan['flag']:02x} stale_backup={'yes' if plan['stale_backup'] else 'no'}")
+    print(f"sectors={','.join(str(lba) for lba, _ in plan['changes']) or 'none'} old_sha256={plan['old_sha256']}"
+          + (f" new_sha256={plan['new_sha256']}" if plan.get("new_sha256") else ""))
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--inspect-capture", metavar="FILE", help="offline: plan from a 256 KiB capture")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--baseline-capture", metavar="FILE")
+    parser.add_argument("--expected-sha256", metavar="HEX")
+    parser.add_argument("--backup-dir", metavar="NEW_DIR")
+    parser.add_argument("--repair-stale-backup", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if args.inspect_capture:
+            with open(args.inspect_capture, "rb") as handle:
+                report(analyse(handle.read(), args.repair_stale_backup))
+            return 0
+        if args.apply and not (args.baseline_capture and args.expected_sha256 and args.backup_dir):
+            raise Refuse("--apply needs --baseline-capture, --expected-sha256 and --backup-dir")
+        baseline = load_baseline(args.baseline_capture, args.expected_sha256) if args.baseline_capture else None
+        prove_main()
+        name, majmin, start = find_disk()
+        device = Device(name, majmin, args.apply)
+        current = device.read_edges()
+        if baseline is not None and current != baseline:
+            raise Refuse("device bytes differ from the baseline capture")
+        plan = analyse(current, args.repair_stale_backup)
+        if plan["boot_a_first"] * 8 != start:
+            raise Refuse("boot_a start differs between the table and sysfs")
+        report(plan)
+        if args.apply and plan["state"] == "needs-success":
+            make_backup(args.backup_dir, current, plan)
+            transaction(device, baseline, plan, args.backup_dir)
+            print("result=marked-successful")
+        elif args.apply:
+            print("result=unchanged")
+        return 0
+    except (Refuse, OSError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

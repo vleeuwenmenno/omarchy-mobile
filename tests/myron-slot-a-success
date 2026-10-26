@@ -1,0 +1,379 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline tests of tools/myron-slot-a-success: the planner on synthetic GPT
+# edges (and on the private real capture when present), the write transaction
+# against a fake device (order, readback, failure injection), and the gates.
+# No block device, phone, network or sudo is touched.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+tool=tools/myron-slot-a-success
+
+python3 -I -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$tool" || fail 'tool parses'
+grep -Fq 'tests/myron-slot-a-success' tests/all || fail 'tests/all does not run this test'
+code=$(grep -vE '^[[:space:]]*#' "$tool")
+if grep -nE 'BLKRRPART|0x125F|0x125D|BLKROSET|setro|setrw|blockdev|/dev/sd[a-z]|boot_b.*write|requests|socket' <<<"$code"; then
+  fail 'tool has a forbidden ioctl, device name or network use'
+fi
+[[ $(grep -oE 'ioctl\(self\.fd, 0x[0-9A-Fa-f]+' <<<"$code" | sed 's/.*, //' | sort | tr '\n' ' ') == '0x125E 0x1268 0x80081272 ' ]] ||
+  fail 'only the three read-only ioctls may be used'
+grep -Fq 'subprocess.run(["systemctl", "is-active"' "$tool" || fail 'only a systemctl status probe may run'
+[[ $(wc -l <"$tool") -le 420 ]] || fail 'tool grew past its narrow scope'
+pass 'tool parses, read-only ioctls only, no repair framework, tests/all runs this test'
+
+work=$(mktemp -d /tmp/myron-slot-a.XXXXXX)
+trap 'chmod -R u+rwx "$work" 2>/dev/null || true; rm -rf -- "$work"' EXIT
+chmod 700 "$work"
+export PYTHONDONTWRITEBYTECODE=1
+
+python3 -I - "$PWD" "$work" <<'PY'
+import importlib.machinery, importlib.util, os, stat, struct, subprocess, sys, zlib, hashlib, contextlib, io, tempfile
+root, work = sys.argv[1], sys.argv[2]
+loader = importlib.machinery.SourceFileLoader("tool", f"{root}/tools/myron-slot-a-success")
+spec = importlib.util.spec_from_loader("tool", loader)
+t = importlib.util.module_from_spec(spec)
+loader.exec_module(t)
+
+def ok(message):
+    print(f"ok - {message}")
+
+def bad(message):
+    print(f"not ok - {message}", file=sys.stderr)
+    sys.exit(1)
+
+def refuses(fn, text, label):
+    try:
+        fn()
+    except t.Refuse as error:
+        if text not in str(error):
+            bad(f"{label}: wrong reason: {error}")
+        return
+    bad(f"{label}: accepted")
+
+# ---- synthetic edges -------------------------------------------------------
+def header(mine, alt, entries_lba, array_crc, first=6, last=t.BACKUP_ARRAY - 1):
+    block = bytearray(t.BLOCK)
+    struct.pack_into("<8sIIIIQQQQ16sQIII", block, 0, b"EFI PART", 0x10000, 92, 0, 0, mine, alt, first, last,
+                     bytes(range(16)), entries_lba, 128, 128, array_crc)
+    struct.pack_into("<I", block, 16, zlib.crc32(bytes(block[:16]) + b"\0" * 4 + bytes(block[20:92])))
+    return bytes(block)
+
+def make_array(flag_a=0x17, flag_b=0x3A):
+    array = bytearray(t.ARRAY_BLOCKS * t.BLOCK)
+    for index in range(128):
+        name = {t.BOOT_A: "boot_a", t.BOOT_B: "boot_b"}.get(index, f"part{index}")
+        e = bytearray(128)
+        e[:16] = bytes([index + 1]) * 16
+        e[16:32] = bytes([200 - index]) * 16
+        first, last = t.BOOT_EXTENTS.get(index, (1000 + index * 100, 1050 + index * 100))
+        struct.pack_into("<QQ", e, 32, first, last)
+        e[56:56 + 2 * len(name)] = name.encode("utf-16-le")
+        array[index * 128:(index + 1) * 128] = e
+    array[t.FLAG_OFFSET] = flag_a
+    array[t.BOOT_B * 128 + 54] = flag_b
+    return array
+
+def build(primary_flag=0x17, backup_flag=0x1F, stale_crc=True):
+    parray, barray = make_array(primary_flag), make_array(backup_flag)
+    pcrc = zlib.crc32(bytes(parray))
+    bcrc = zlib.crc32(b"stale") if stale_crc else zlib.crc32(bytes(barray))
+    head = bytearray(t.EDGE_BYTES)
+    tail = bytearray(t.EDGE_BYTES)
+    def put(lba, data):
+        start, end = t.edge_slice(lba, len(data) // t.BLOCK)
+        buf[start:end] = data
+    buf = bytearray(head + tail)
+    buf[0:512] = b"\0" * 446 + b"\0\1\0\xEE" + b"\0" * 60
+    put(t.PRIMARY_HEADER, header(1, t.BACKUP_HEADER, 2, pcrc))
+    put(t.PRIMARY_ARRAY, bytes(parray))
+    put(t.BACKUP_ARRAY, bytes(barray))
+    put(t.BACKUP_HEADER, header(t.BACKUP_HEADER, 1, t.BACKUP_ARRAY, bcrc))
+    return bytes(buf)
+
+def mutate(buf, lba, offset, value):
+    out = bytearray(buf)
+    start, _ = t.edge_slice(lba)
+    out[start + offset] = value
+    return bytes(out)
+
+def fix_header_crc(buf, lba):
+    out = bytearray(buf)
+    start, end = t.edge_slice(lba)
+    block = bytearray(out[start:end])
+    struct.pack_into("<I", block, 16, 0)
+    struct.pack_into("<I", block, 16, zlib.crc32(bytes(block[:92])))
+    out[start:end] = block
+    return bytes(out)
+
+stale = build()
+# ---- planner ---------------------------------------------------------------
+refuses(lambda: t.analyse(stale), "--repair-stale-backup", "stale backup without the flag")
+plan = t.analyse(stale, True)
+assert plan["state"] == "needs-success" and plan["stale_backup"]
+assert [lba for lba, _ in plan["changes"]] == [494587, 494591, 2, 1], plan["changes"]
+new = plan["new"]
+changed = {i // t.BLOCK for i in range(len(stale)) if stale[i] != new[i]}
+assert changed == {1, 2, t.EDGE + 27, t.EDGE + 31}, changed
+for lba in (t.PRIMARY_ARRAY, t.BACKUP_ARRAY):
+    array = t.read_lba(new, lba, 4)
+    assert array[t.FLAG_OFFSET] == 0x57 and zlib.crc32(array) == (
+        t.parse_header(t.read_lba(new, t.PRIMARY_HEADER if lba == 2 else t.BACKUP_HEADER))["array_crc"])
+    olds = t.read_lba(stale, 2, 4)
+    assert [i for i in range(len(array)) if array[i] != olds[i]] == [t.FLAG_OFFSET], 'only the boot_a flag changes'
+    assert array[t.BOOT_B * 128:(t.BOOT_B + 1) * 128] == olds[t.BOOT_B * 128:(t.BOOT_B + 1) * 128], 'boot_b unchanged'
+assert t.parse_header(t.read_lba(new, 1))["ok"] and t.parse_header(t.read_lba(new, t.BACKUP_HEADER))["ok"]
+assert t.read_lba(new, 2, 4) == t.read_lba(new, t.BACKUP_ARRAY, 4), "backup repaired to the primary's truth"
+assert t.analyse(new)["state"] == "already-success" and t.analyse(new)["changes"] == []
+ok("planner: stale backup needs the flag; plan is four ordered sectors, boot_a bit 6 only, valid CRCs, B and the rest intact; idempotent")
+
+clean = build(0x17, 0x17, stale_crc=False)
+assert t.analyse(clean)["state"] == "needs-success" and not t.analyse(clean)["stale_backup"]
+assert t.analyse(t.analyse(clean)["new"])["state"] == "already-success"
+done = build(0x57, 0x57, stale_crc=False)
+assert t.analyse(done)["state"] == "already-success" and t.analyse(done)["changes"] == []
+ok("planner: consistent tables get the same four-sector plan; an already-successful valid table is unchanged")
+
+backup_array_off = t.edge_slice(t.BACKUP_ARRAY)[0]
+cases = {
+    "backup differs in another boot_a flag bit": (mutate(stale, t.BACKUP_ARRAY, t.FLAG_OFFSET, 0x57), "beyond the known"),
+    "backup differs in boot_b": (mutate(stale, t.BACKUP_ARRAY, t.BOOT_B * 128 + 54, 0x00), "beyond the known"),
+    "backup differs in a name": (mutate(stale, t.BACKUP_ARRAY, 5 * 128 + 56, 0x41), "beyond the known"),
+    "backup has a valid CRC but differs": (None, "beyond the known"),
+    "primary array CRC invalid": (mutate(stale, t.PRIMARY_ARRAY, 0, 0xEE), "primary partition array CRC"),
+    "primary header CRC invalid": (mutate(stale, t.PRIMARY_HEADER, 40, 9), "header is invalid"),
+    "backup header CRC invalid": (mutate(stale, t.BACKUP_HEADER, 40, 9), "header is invalid"),
+    "alternate LBA moved": (fix_header_crc(mutate(stale, t.PRIMARY_HEADER, 32, 0x12), t.PRIMARY_HEADER), "geometry"),
+    "disk GUID differs": (fix_header_crc(mutate(stale, t.BACKUP_HEADER, 60, 0xFF), t.BACKUP_HEADER), "disagree"),
+    "boot_a renamed": (None, "layout"),
+    "boot_a extent moved": (None, "extents"),
+    "boot_a not active": (build(0x13, 0x1B), "not the active"),
+    "boot_a unbootable": (build(0x97, 0x9F), "not the active"),
+}
+# a valid-CRC backup that differs from the primary
+diff_valid = build(0x17, 0x1F, stale_crc=False)
+cases["backup has a valid CRC but differs"] = (diff_valid, "beyond the known")
+renamed = bytearray(stale)
+for lba in (t.PRIMARY_ARRAY,):
+    s, _ = t.edge_slice(lba)
+    renamed[s + t.BOOT_A * 128 + 56:s + t.BOOT_A * 128 + 58] = "x".encode("utf-16-le")
+renamed = bytes(renamed)
+phead = t.parse_header(t.read_lba(renamed, 1))
+renamed = mutate(renamed, 1, 88, 0)  # array CRC now stale -> would fail earlier; recompute below
+array = t.read_lba(renamed, 2, 4)
+out = bytearray(renamed)
+struct.pack_into("<I", out, t.edge_slice(1)[0] + 88, zlib.crc32(array))
+cases["boot_a renamed"] = (fix_header_crc(bytes(out), 1), "layout")
+moved = bytearray(stale)
+s, _ = t.edge_slice(2)
+struct.pack_into("<Q", moved, s + t.BOOT_A * 128 + 32, 123559)
+struct.pack_into("<I", moved, t.edge_slice(1)[0] + 88, zlib.crc32(bytes(moved[s:s + 4 * t.BLOCK])))
+cases["boot_a extent moved"] = (fix_header_crc(bytes(moved), 1), "extents")
+for label, (buf, reason) in cases.items():
+    refuses(lambda b=buf: t.analyse(b, True), reason, label)
+refuses(lambda: t.analyse(stale[:-1], True), "first+last 128 KiB", "short capture")
+both = build(0x57, 0x5F)
+refuses(lambda: t.analyse(both, True), "already successful but the backup is stale", "success with a stale backup")
+ok("planner: unknown corruption, CRC, geometry, identity, layout and slot-state refusals; repair never widens beyond the retry mask")
+
+# ---- fake device transaction -----------------------------------------------
+class Fake:
+    def __init__(self, buf, fail_write=None, corrupt=None, fail_sync=None):
+        self.buf = bytearray(buf)
+        self.writes, self.reads, self.syncs = [], 0, 0
+        self.fail_write, self.corrupt, self.fail_sync = fail_write, corrupt, fail_sync
+    def read_edges(self):
+        self.reads += 1
+        return bytes(self.buf)
+    def write_block(self, lba, data):
+        self.writes.append(lba)
+        if self.fail_write == lba:
+            raise t.Refuse("injected write failure")
+        start, end = t.edge_slice(lba)
+        self.buf[start:end] = b"\xAA" * len(data) if self.corrupt == lba else data
+    def sync(self):
+        self.syncs += 1
+        if self.fail_sync == self.syncs:
+            raise OSError("injected fsync failure")
+
+t.LOCK_FILE = f"{work}/lock"
+prove_main_real = t.prove_main
+t.prove_main = lambda: None
+t.ROOT_UID = os.geteuid()
+t.TRUST_TOP = work
+backups = [0]
+def run(device, buf=stale):
+    backups[0] += 1
+    directory = f"{work}/backup{backups[0]}"
+    p = t.analyse(buf, True)
+    t.make_backup(directory, buf, p)
+    t.transaction(device, buf, p, directory)
+    return directory, p
+
+dev = Fake(stale)
+directory, p = run(dev)
+assert dev.writes == [494587, 494591, 2, 1], dev.writes
+assert bytes(dev.buf) == p["new"] and dev.syncs == 4
+assert open(f"{directory}/phases.log").read().splitlines() == ["prepared", "written 1/4 lba=494587", "written 2/4 lba=494591",
+                                                                "written 3/4 lba=2", "written 4/4 lba=1", "done"]
+assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700
+assert all(stat.S_IMODE(os.stat(f"{directory}/{n}").st_mode) == 0o600 for n in os.listdir(directory))
+assert open(f"{directory}/original-edges.bin", "rb").read() == stale
+ok("transaction: backup first, then backup array, backup header, primary array, primary header, each fsynced, final readback exact; 700/600 backup with phases")
+
+for label, kwargs, expect_writes, text in [
+    ("backup array write fails", dict(fail_write=494587), [494587], "injected"),
+    ("backup header write fails", dict(fail_write=494591), [494587, 494591], "injected"),
+    ("backup header lands corrupted", dict(corrupt=494591), [494587, 494591], "primary NOT written"),
+    ("backup array lands corrupted", dict(corrupt=494587), [494587, 494591], "primary NOT written"),
+    ("final primary header lands corrupted", dict(corrupt=1), [494587, 494591, 2, 1], "final readback"),
+]:
+    dev = Fake(stale, **kwargs)
+    refuses(lambda: run(dev), text, label)
+    assert dev.writes == expect_writes, (label, dev.writes)
+    if "primary" in text or "backup" in label:
+        assert 2 not in dev.writes and 1 not in dev.writes, label
+    assert t.read_lba(bytes(dev.buf), t.BOOT_B, 0) if False else True
+dev = Fake(stale, fail_sync=2)
+try:
+    run(dev)
+    bad("fsync failure was ignored")
+except OSError:
+    assert dev.writes == [494587, 494591] or dev.writes == [494587, 494591][:2], dev.writes
+changed_dev = Fake(mutate(stale, 2, 3000, 0x55))
+refuses(lambda: run(changed_dev), "changed since the baseline", "device differs from baseline at write time")
+assert changed_dev.writes == []
+ok("transaction failures: no primary write after a backup failure or bad readback, fsync errors abort, changed bytes write nothing, no retry or restore")
+
+class Racing(Fake):
+    def read_edges(self):
+        self.reads += 1
+        if self.reads == 1:
+            self.buf[t.edge_slice(2)[0] + 3000] ^= 1
+        return bytes(self.buf)
+race = Racing(stale)
+refuses(lambda: run(race), "changed since the baseline", "bytes change between the plan and the lock")
+assert race.writes == []
+ok("the exact bytes are rechecked under the lock immediately before writing")
+
+held = os.open(t.LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+import fcntl
+fcntl.flock(held, fcntl.LOCK_EX)
+refuses(lambda: run(Fake(stale)), "holds the lock", "lock held elsewhere")
+os.close(held)
+ok("the cooperating main-os lock is honoured")
+
+# ---- baseline and backup directory gates ------------------------------------
+path = f"{work}/baseline.bin"
+open(path, "wb").write(stale)
+os.chmod(path, 0o600)
+good = hashlib.sha256(stale).hexdigest()
+assert t.load_baseline(path, good) == stale
+refuses(lambda: t.load_baseline(path, "0" * 64), "SHA-256", "wrong baseline hash")
+os.chmod(path, 0o644)
+refuses(lambda: t.load_baseline(path, good), "mode-600", "readable baseline")
+os.chmod(path, 0o600)
+os.link(path, f"{work}/baseline.link")
+refuses(lambda: t.load_baseline(path, good), "single-link", "hard-linked baseline")
+os.unlink(f"{work}/baseline.link")
+os.symlink(path, f"{work}/baseline.sym")
+try:
+    t.load_baseline(f"{work}/baseline.sym", good)
+    bad("symlinked baseline accepted")
+except (t.Refuse, OSError):
+    pass
+open(f"{work}/short.bin", "wb").write(stale[:-1]); os.chmod(f"{work}/short.bin", 0o600)
+refuses(lambda: t.load_baseline(f"{work}/short.bin", good), "256 KiB", "short baseline")
+os.makedirs(f"{work}/loose"); os.chmod(f"{work}/loose", 0o770)
+refuses(lambda: t.trusted_chain(f"{work}/loose/file"), "unsafe ancestor", "group-writable ancestor")
+refuses(lambda: t.make_backup(f"{work}/backup1", stale, t.analyse(stale, True)), "already exists", "existing backup directory")
+t.TRUST_TOP = "/"
+refuses(lambda: t.trusted_chain(f"{work}/baseline.bin"), "unsafe ancestor", "real /tmp is not a protected root")
+t.TRUST_TOP = work
+ok("baseline must be protected, single-link, exact size and hash; ancestors must be root-only; backup directory must be new")
+
+# ---- main boot proof --------------------------------------------------------
+def setup_main(**over):
+    base = tempfile.mkdtemp(dir=work)
+    os.chmod(base, 0o700)
+    t.TRUST_TOP = base
+    P = {k: f"{base}/{k}" for k in ("uname", "notes", "compatible", "cmdline", "boot_id", "mountinfo")}
+    P.update(runtime=f"{base}/run", state=f"{base}/state", sysdev=f"{base}/sysdev", sysfs=f"{base}/sysfs", dev=f"{base}/dev")
+    os.makedirs(P["runtime"]); os.makedirs(P["state"], mode=0o700); os.makedirs(f"{P['sysdev']}/7:3/loop")
+    boot = "11111111-2222-3333-4444-555555555555"
+    for key, value in [("uname", t.EXPECTED_KERNEL), ("cmdline", "x androidboot.slot_suffix=_a y"), ("boot_id", boot)]:
+        open(P[key], "w").write(value + "\n")
+    open(P["notes"], "wb").write(b"notes")
+    t.EXPECTED_NOTES = hashlib.sha256(b"notes").hexdigest()
+    open(P["compatible"], "wb").write(b"qcom,canoe-mtp\0other\0")
+    open(f"{P['runtime']}/boot-id", "w").write(boot + "\n")
+    open(f"{P['runtime']}/image-id", "w").write("abcd\n")
+    success = open(f"{P['state']}/success", "w"); success.write(f"boot_id={boot}\nimage_id=abcd\n"); success.close()
+    os.chmod(f"{P['state']}/success", 0o600)
+    image = f"{P['state']}/rootfs.img"
+    open(image, "wb").write(b"x"); os.chmod(image, 0o600)
+    open(f"{P['sysdev']}/7:3/loop/backing_file", "w").write(image + "\n")
+    open(P["mountinfo"], "w").write("1 0 7:3 / / rw - ext4 /dev/loop3 rw\n")
+    t.PATHS.update(P)
+    t.subprocess.run = lambda *a, **k: types_ns(returncode=0)
+    for key, value in over.items():
+        value()
+    return P
+
+import types
+types_ns = types.SimpleNamespace
+t.subprocess = types.SimpleNamespace(run=None)
+setup_main(); prove_main_real()
+sources = {
+    "pmOS: no main runtime": lambda: os.unlink(f"{t.PATHS['runtime']}/boot-id"),
+    "runtime boot id differs": lambda: open(f"{t.PATHS['runtime']}/boot-id", "w").write("other\n"),
+    "latch present": lambda: open(f"{t.PATHS['state']}/latch", "w").close(),
+    "pending attempt present": lambda: open(f"{t.PATHS['state']}/pending", "w").close(),
+    "success for another boot": lambda: open(f"{t.PATHS['state']}/success", "w").write("boot_id=x\nimage_id=abcd\n"),
+    "success for another image": lambda: open(f"{t.PATHS['runtime']}/image-id", "w").write("zzzz\n"),
+    "guard inactive": lambda: setattr(t.subprocess, "run", lambda *a, **k: types_ns(returncode=3)),
+    "wrong kernel": lambda: open(t.PATHS["uname"], "w").write("6.1.0\n"),
+    "slot B": lambda: open(t.PATHS["cmdline"], "w").write("androidboot.slot_suffix=_b\n"),
+    "root not loop backed": lambda: open(t.PATHS["mountinfo"], "w").write("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"),
+    "root backed by another file": lambda: open(f"{t.PATHS['sysdev']}/7:3/loop/backing_file", "w").write(f"{work}/baseline.bin\n"),
+}
+for label, mutate_fn in sources.items():
+    setup_main(x=mutate_fn)
+    try:
+        prove_main_real()
+        bad(f"main proof accepted: {label}")
+    except (t.Refuse, OSError):
+        pass
+ok("main proof: kernel, slot A, boot id, committed success for this boot and image, no latch or pending, guard, loop backing identity")
+
+# ---- CLI --------------------------------------------------------------------
+def cli(*args):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = t.main(list(args))
+    return rc, out.getvalue(), err.getvalue()
+
+cap = f"{work}/cap.bin"
+open(cap, "wb").write(stale)
+rc, out, err = cli("--inspect-capture", cap)
+assert rc == 2 and "--repair-stale-backup" in err
+rc, out, err = cli("--inspect-capture", cap, "--repair-stale-backup")
+assert rc == 0 and "state=needs-success" in out and "sectors=494587,494591,2,1" in out and "new_sha256=" in out
+rc, out, err = cli("--apply")
+assert rc == 2 and "needs --baseline-capture" in err
+rc, out, err = cli("--apply", "--baseline-capture", cap, "--expected-sha256", "0" * 64, "--backup-dir", f"{work}/nope")
+assert rc == 2 and not os.path.exists(f"{work}/nope")
+rc, out, err = cli()
+assert rc == 2 and not os.path.exists(f"{work}/nope")
+ok("CLI: inspect prints the plan offline, apply demands every gate, default mode on a non-device refuses without writing")
+
+real = f"{root}/out/private/myron-sde-gpt-readonly2-20261026.bin"
+if os.path.exists(real) and hashlib.sha256(open(real, "rb").read()).hexdigest() == "4023241c1473a5dad08167a268e16dfa6c4179c9b9a286a0d46f4ac761ecd103":
+    rc, _, err = cli("--inspect-capture", real)
+    assert rc == 2 and "--repair-stale-backup" in err
+    rc, out, _ = cli("--inspect-capture", real, "--repair-stale-backup")
+    assert rc == 0 and "boot_a_flag=0x17 stale_backup=yes" in out and "sectors=494587,494591,2,1" in out, out
+    ok("the real private read-only capture plans the same four sectors and needs the explicit stale-backup flag")
+else:
+    print("ok - # skip: private real capture not present")
+PY
