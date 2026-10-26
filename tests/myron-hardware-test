@@ -491,6 +491,14 @@ for required in \
   '8ddcf0912a9c852a3c33397b004b260b083328091ae1bbf0ef435ba595450267' \
   'load_exact_module "$smem_mailbox" smem_mailbox "$smem_mailbox_sha"' \
   'load_exact_module "$cnss_utils" cnss_utils "$cnss_utils_sha"' \
+  'cooldown_target_mc=65000' \
+  'cooldown_timeout_seconds=180' \
+  'cooldown_stable_samples=4' \
+  'case "$type" in *-trip-*) continue ;; esac' \
+  '[ "$valid_sensors" -gt 0 ] || return 1' \
+  'result=waiting reason=temperature-unavailable' \
+  'wait_for_cooldown' \
+  'stage=cooldown result=ready target_mc=%s stable_seconds=15' \
   'radio foundation must remain stopped' \
   'radio/Wi-Fi readiness marker must remain absent' \
   '/usr/local/sbin/myron-bluetooth-stage start' \
@@ -498,6 +506,13 @@ for required in \
   grep -Fq "$required" "$bluetooth_only_start" ||
     fail "Bluetooth-only transaction lacks: $required"
 done
+cooldown_line=$(grep -n '^wait_for_cooldown$' "$bluetooth_only_start" | cut -d: -f1)
+arm_line=$(grep -n '^/usr/local/sbin/myron-bluetooth-stage arm$' "$bluetooth_only_start" | cut -d: -f1)
+case "$cooldown_line:$arm_line" in
+  :*|*:) fail 'Bluetooth-only cooldown/arm ordering is missing' ;;
+esac
+((cooldown_line < arm_line)) ||
+  fail 'Bluetooth-only cooldown must complete before arming the one-shot test'
 for required in \
   'install -m0755 /bluetooth-only-start "$root/usr/local/sbin/myron-coexistence-start"' \
   'printf "%s\n" bluetooth >"$root/etc/omamobile/myron-test-profile"' \

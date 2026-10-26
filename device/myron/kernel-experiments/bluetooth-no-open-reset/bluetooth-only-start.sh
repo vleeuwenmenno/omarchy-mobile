@@ -14,6 +14,9 @@ smem_mailbox_sha=c8d2f5abdc2a684ccf5ef68fd70700d6863422734a1e20ca8cc1c94ede111c2
 cnss_utils=$module_dir/cnss_utils.ko
 cnss_utils_sha=8ddcf0912a9c852a3c33397b004b260b083328091ae1bbf0ef435ba595450267
 stock_vermagic='6.12.23-android16-5-maybe-dirty-4k SMP preempt mod_unload modversions aarch64'
+cooldown_target_mc=65000
+cooldown_timeout_seconds=180
+cooldown_stable_samples=4
 
 fail() {
 	printf 'ERROR: Myron Bluetooth-only bring-up: %s\n' "$*" >&2
@@ -34,6 +37,60 @@ load_exact_module() {
 		fail "prerequisite module was already loaded: $name"
 	insmod "$path" || fail "prerequisite module insertion failed: $name"
 	[ -d "/sys/module/$name" ] || fail "prerequisite module did not remain loaded: $name"
+}
+
+hottest_temperature() {
+	hottest=0
+	hottest_type=unknown
+	valid_sensors=0
+	for file in /sys/class/thermal/thermal_zone*/temp; do
+		[ -r "$file" ] || continue
+		type=$(timeout -k 1 2 cat "${file%/temp}/type" 2>/dev/null) || continue
+		[ -n "$type" ] || continue
+		case "$type" in *-trip-*) continue ;; esac
+		value=$(timeout -k 1 2 cat "$file" 2>/dev/null) || continue
+		case "$value" in ''|*[!0-9]*) continue ;; esac
+		[ "$value" -gt 0 ] && [ "$value" -lt 200000 ] || continue
+		valid_sensors=$((valid_sensors + 1))
+		[ "$value" -le "$hottest" ] || {
+			hottest=$value
+			hottest_type=$type
+		}
+	done
+	[ "$valid_sensors" -gt 0 ] || return 1
+	printf '%s %s %s\n' "$hottest" "$hottest_type" "$valid_sensors"
+}
+
+wait_for_cooldown() {
+	deadline=$(( $(awk '{print int($1)}' /proc/uptime) + cooldown_timeout_seconds ))
+	stable=0
+	while [ "$(awk '{print int($1)}' /proc/uptime)" -lt "$deadline" ]; do
+		if ! reading=$(hottest_temperature); then
+			stable=0
+			printf 'stage=cooldown result=waiting reason=temperature-unavailable stable_samples=0/%s\n' \
+				"$cooldown_stable_samples"
+			sleep 5
+			continue
+		fi
+		value=${reading%% *}
+		reading=${reading#* }
+		sensor=${reading%% *}
+		valid_sensors=${reading#* }
+		if [ "$value" -lt "$cooldown_target_mc" ]; then
+			stable=$((stable + 1))
+		else
+			stable=0
+		fi
+		printf 'stage=cooldown maximum_mc=%s sensor=%s valid_sensors=%s stable_samples=%s/%s\n' \
+			"$value" "$sensor" "$valid_sensors" "$stable" "$cooldown_stable_samples"
+		[ "$stable" -lt "$cooldown_stable_samples" ] || {
+			printf 'stage=cooldown result=ready target_mc=%s stable_seconds=15\n' \
+				"$cooldown_target_mc"
+			return 0
+		}
+		sleep 5
+	done
+	fail "Bluetooth cooldown did not reach $cooldown_target_mc mC for 15 seconds"
 }
 
 [ "$(id -u)" = 0 ] || fail 'must run as root'
@@ -60,6 +117,7 @@ load_exact_module "$cnss_utils" cnss_utils "$cnss_utils_sha"
 printf '%s\n' minimal-bluetooth-prerequisites >"$foundation_ready"
 chmod 0600 "$foundation_ready"
 
+wait_for_cooldown
 /usr/local/sbin/myron-bluetooth-stage arm
 /usr/local/sbin/myron-bluetooth-stage start
 [ -e /sys/class/bluetooth/hci0 ] && [ -s /run/myron-bluetooth-ready ] ||
