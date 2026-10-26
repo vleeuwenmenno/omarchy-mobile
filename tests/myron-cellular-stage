@@ -45,8 +45,9 @@ if grep -nE 'connection (modify|up) ' "$stage" | grep -vE 'uuid "\$target_uuid"'
 fi
 grep -Fq 'connection.uuid "$target_uuid"' "$stage" || tfail 'profile is not created with the fixed UUID'
 grep -Fq 'gsm.home-only yes' "$stage" || tfail 'profile is not home-only'
+grep -Fq 'nmcli device set "$control" autoconnect no' "$stage" || tfail 'stage does not suppress device autoconnect'
 grep -Fq 'nmcli device set "$control" managed yes' "$stage" || tfail 'stage does not manage the control device explicitly'
-[[ $(grep -c 'device set' "$stage") == 1 ]] || tfail 'stage changes device management in more than one place'
+[[ $(grep -c 'nmcli device set' "$stage") == 2 ]] || tfail 'stage changes device properties outside the two reviewed mutations'
 grep -Fq 'ipv4.routing-rules ""' "$stage" || tfail 'stage does not clear inherited routing rules'
 if grep -nE 'ipv4\.routing-rules +(priority|from)|from all table' "$stage"; then tfail 'stage installs its own from-all routing rule'; fi
 # Failure logs never carry variables: persist only the fixed message.
@@ -130,12 +131,14 @@ payload_sha=$(printf payload | sha256sum | awk '{print $1}')
 
 reset() {
   rm -rf "$runtime_dir" "$calls" "$log" "$apn_config" "$net_root" "$bluetooth_hci" "$host_state" \
-    "$sys_module" "$thermal_root" "$work/activated" "$work/managed" "$work/profile-created" "$work/auto-activated" "$work/late-autoconnect" "$work"/arrive.* "$work/dtmodel" \
-    "$init_boot_rollback" "$boot_rollback" "$work"/real* "$arm_marker"
+    "$sys_module" "$thermal_root" "$work/activated" "$work/managed" "$work/profile-created" "$work/profile-modified" \
+    "$work/device-autoconnect-off" "$work/auto-activated" "$work/late-autoconnect" "$work"/arrive.* "$work/dtmodel" \
+    "$init_boot_rollback" "$boot_rollback" "$work"/real* "$arm_marker" "$work/peer-route-calls"
   : >"$calls"
   mkdir -p "$net_root/rmnet_data0" "$net_root/rmnet_ipa0" "$net_root/wlan0" "$net_root/usb0" "$host_state" "$dt_root" \
     "$thermal_root/thermal_zone0"
   echo up >"$net_root/wlan0/operstate"; echo unknown >"$net_root/usb0/operstate"
+  echo 4 >"$net_root/wlan0/ifindex"; echo 5 >"$net_root/usb0/ifindex"; echo 3 >"$net_root/rmnet_data0/ifindex"
   for m in rmnet rmnet_mem gsim ipam ipanetm rmnet_ctl; do mkdir -p "$sys_module/$m"; done
   echo battery >"$thermal_root/thermal_zone0/type"; echo 60000 >"$thermal_root/thermal_zone0/temp"
   : >"$cellular_ready"; echo ready >"$wireless_ready"; echo cellular >"$profile_file"
@@ -156,14 +159,23 @@ reset() {
   access_len=2 access1=lte access2=5gnr bearers=0
   nm_ok=0 m_profile_exists=0 autoconnect_reply=no up_rc=0 up_activates=1 activated=0
   gsm_state=disconnected gsm_boot=unmanaged gsm_devices=1 m_active_gsm=0 m_active_after=0 m_busy_state=activating
-  m_rows='' m_auto='' m_own_auto=no m_homeonly=yes m_id_reply=myron-cellular m_uuid_by_name=$secret_uuid
+  m_rows='' m_auto='' m_own_auto=no m_homeonly=yes m_initial_eps=no m_id_reply=myron-cellular m_uuid_by_name=$secret_uuid
+  m_profile_routes='' m_profile_addresses='' m_profile_gateway='' m_secondaries='' m_profile_metric=700
   m_bound=ttyMODEM0 m_wifi=connected m_wifi_after=connected m_listeners_after='LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n'
-  m_listeners='LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n' m_sessions='0 0 x:22 y:1\n' m_sessions_after='0 0 x:22 y:1\n'
+  m_listeners='LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n' \
+  m_sessions="0 0 172.16.42.1:22 172.16.42.2:51000\\n0 0 $secret_wifi_ip:22 192.168.50.9:51001\\n"
+  m_sessions_after=$m_sessions
   curl_code=204 curl_local=$secret_ip dns_lines=1 addr_lines=1 m_default_lines=1 m_route_table=1430
   rule_line="100:	from all oif rmnet_data0 lookup 1430 proto kernel"
   m_pre_rule='' m_post_rule='' m_usb=1 m_usb_addr_after=same m_wifi_addr=$secret_wifi_ip m_wifi_addr_after=same
-  m_usb_route_lost=0 m_profile_rules='' m_profile_table=0 m_profile_never=no cell_dns_ok=1 cell_dns_ip=203.0.113.80
+  m_usb_route_lost=0 m_profile_rules='' m_profile_table=0 m_profile_never=no cell_dns_ok=1 cell_dns_ip=8.8.4.4
   wifi_dns_ok=1 up_delay=0 sleep_advance=0 managed_state_after=disconnected autoactivate=0
+  m_device_auto=yes device_autoconnect_set_ok=1
+  timeout_advance_after_marker=0 timeout_advance_after_activation=0 heat_after_activation=0 m_usb_ifindex_after=
+  m_peer_dev=usb0 m_peer_src=172.16.42.1 m_peer_via= m_peer_table=
+  m_peer_dev_after=usb0 m_peer_src_after=172.16.42.1 m_peer_via_after= m_peer_table_after=
+  m_wifi_peer_dev=wlan0 m_wifi_peer_src=$secret_wifi_ip m_wifi_peer_via= m_wifi_peer_table=
+  m_wifi_peer_dev_after=wlan0 m_wifi_peer_src_after=$secret_wifi_ip m_wifi_peer_via_after= m_wifi_peer_table_after=
   m_main_default='default via 192.168.1.1 dev wlan0 metric 600'
   m_link_dns_data=$secret_dns m_link_dns_control='' m_counter_move=both
   route_get_dev=rmnet_data0
@@ -335,7 +347,7 @@ gates() {
   gate 'gsm active myron' 'active, activating or deactivating' ': >"$work/activated"' "$c" "$t"
   gate 'inactive gsm profile not busy but competing' 'autoconnect enabled exists' 'm_rows="dddddddd-0000-4000-8000-000000000001:idle:gsm:"; m_auto="dddddddd-0000-4000-8000-000000000001:gsm:yes"' "$c" "$t"
   gate 'competing autoconnect' 'autoconnect enabled exists' 'm_auto="dddddddd-0000-4000-8000-000000000001:gsm:yes"' "$c" "$t"
-  gate 'own profile autoconnect' 'autoconnect enabled exists' 'm_profile_exists=1 m_own_auto=yes' "$c" "$t"
+  gate 'own profile autoconnect' 'target profile already exists' 'm_profile_exists=1 m_own_auto=yes' "$c" "$t"
   gate 'unset autoconnect' 'autoconnect enabled exists' 'm_auto="dddddddd-0000-4000-8000-000000000001:gsm:"' "$c" "$t"
   gate 'duplicate target profile' 'target profile is duplicated' 'm_profile_exists=1; m_rows="$secret_uuid:myron-cellular:gsm:"' "$c" "$t"
   gate 'same name, Wi-Fi profile' 'belongs to another profile' 'm_rows="dddddddd-0000-4000-8000-000000000002:myron-cellular:802-11-wireless:"' "$c" "$t"
@@ -352,11 +364,24 @@ gates() {
   gate 'Wi-Fi rescue link absent' 'Wi-Fi rescue link is not usable' m_wifi=disconnected "$c" "$t"
   gate 'Wi-Fi rescue link down' 'Wi-Fi rescue link is not usable' 'echo down >"$net_root/wlan0/operstate"' "$c" "$t"
   gate 'no SSH listener' 'no SSH listener is usable' "m_listeners=''" "$c" "$t"
-  gate 'priority 100 from-all conflict' 'unqualified policy rule precedes' 'm_pre_rule="100:\tfrom all lookup 1430"' "$c" "$t"
-  gate 'from-all blackhole conflict' 'unqualified policy rule precedes' 'm_pre_rule="50:\tfrom all unreachable"' "$c" "$t"
-  gate 'from-0.0.0.0/0 conflict' 'unqualified policy rule precedes' 'm_pre_rule="100:\tfrom 0.0.0.0/0 lookup 1430"' "$c" "$t"
+  gate 'no rescue default route' 'no IPv4 rescue default route' 'm_main_default=' "$c" "$t"
+  gate 'rescue default would lose to cellular' 'cellular route metric would outrank' \
+    'm_main_default="default via 192.168.1.1 dev wlan0 metric 800"' "$c" "$t"
+  gate 'genuine IPv6 SSH session' 'IPv6 SSH session is present' \
+    'm_sessions="0 0 [2001:db8::1]:22 [2001:db8::2]:51000\\n"' "$c" "$t"
+  gate 'priority 100 from-all conflict' 'could redirect a rescue connection' 'm_pre_rule="100:\tfrom all lookup 1430"' "$c" "$t"
+  gate 'from-all blackhole conflict' 'could redirect a rescue connection' 'm_pre_rule="50:\tfrom all unreachable"' "$c" "$t"
+  gate 'from-0.0.0.0/0 conflict' 'could redirect a rescue connection' 'm_pre_rule="100:\tfrom 0.0.0.0/0 lookup 1430"' "$c" "$t"
+  gate 'USB source-rule conflict' 'could redirect a rescue connection' 'm_pre_rule="10:\tfrom 172.16.42.1 lookup 1430"' "$c" "$t"
+  gate 'Wi-Fi subnet-rule conflict' 'could redirect a rescue connection' 'm_pre_rule="11:\tfrom 192.168.50.0/24 lookup 1431"' "$c" "$t"
+  gate 'tied-priority main-table hijack' 'could redirect a rescue connection' 'm_pre_rule="32766:\tfrom all lookup 1430"' "$c" "$t"
 }
 gates cmd_qualify
+reset; m_sessions="0 0 [::ffff:172.16.42.1]:22 [::ffff:172.16.42.2]:51000\\n0 0 [::ffff:$secret_wifi_ip]:22 [::ffff:192.168.50.9]:51001\\n"
+expect_ok 'IPv4-mapped dual-stack SSH session' cmd_qualify >/dev/null
+reset; m_sessions="0 0 172.16.42.1:22 172.16.42.2:51000\\n0 0 172.16.42.1:22 172.16.42.2:51001\\n0 0 $secret_wifi_ip:22 192.168.50.9:51002\\n"
+expect_ok 'duplicate SSH route pairs are deduplicated' cmd_qualify >/dev/null
+[[ $(wc -l <"$work/peer-route-calls") == 2 ]] || tfail 'duplicate SSH sessions repeated route lookups'
 # LTE-only, 5G-only and mixed pass.
 for tech in 'access_len=1 access1=lte' 'access_len=1 access1=5gnr' 'access1=lte access2=umts' 'access1=umts access2=5gnr'; do
   reset; eval "$tech"; expect_ok "access $tech" cmd_qualify >/dev/null
@@ -420,14 +445,15 @@ grep -E 'connection add' "$calls" | grep -qF 'ifname ttyMODEM0' || tfail 'profil
 grep -Fq 'gsm.apn internet' "$calls" || tfail 'default APN is not internet'
 grep -Fq 'ipv4.routing-rules ' "$calls" && grep -E 'connection (add|modify)' "$calls" | grep -qE 'ipv4\.routing-rules (priority|from)' && tfail 'profile installs its own routing rule'
 grep -E 'connection modify' "$calls" | grep -qF 'ipv4.routing-rules  ipv6' || tfail 'profile modify does not clear inherited routing rules'
-order=$(grep -nE 'connection (add|modify)|device set|connection up' "$calls" | sed -E 's/^[0-9]+:nmcli marker=yes //; s/ (type|uuid|ttyMODEM0).*//' | tr '\n' ';')
-[[ $order == 'connection add;connection modify;device set;connection up;' ]] || tfail "NetworkManager call order: $order"
+order=$(grep -nE 'connection (add|modify)|device set|connection up' "$calls" | sed -E 's/^[0-9]+:nmcli marker=yes //; s/ (type|--temporary|uuid|ttyMODEM0).*//' | tr '\n' ';')
+[[ $order == 'connection add;connection modify;device set;device set;connection up;' ]] || tfail "NetworkManager call order: $order"
 grep -Fq 'nmcli marker=yes device set ttyMODEM0 managed yes' "$calls" || tfail 'control device was managed outside the lock'
-[[ $(grep -c 'device set' "$calls") == 1 ]] || tfail 'control device managed more than once'
+[[ $(grep -c 'device set ttyMODEM0 autoconnect no' "$calls") == 1 &&
+   $(grep -c 'device set ttyMODEM0 managed yes' "$calls") == 1 ]] || tfail 'device admission mutations did not run exactly once'
 grep -F 'resolvectl query' "$calls" | grep -qF -- '--cache=no' && grep -F 'resolvectl query' "$calls" | grep -qF -- '-i rmnet_data0 connectivitycheck.gstatic.com' ||
   tfail 'DNS was not queried uncached through the cellular link'
 [[ $(grep -c 'resolvectl query' "$calls") == 1 ]] || tfail 'more than one DNS query'
-grep -Fq -- '--resolve connectivitycheck.gstatic.com:443:203.0.113.80' "$calls" || tfail 'curl does not connect to the validated cellular answer'
+grep -Fq -- '--resolve connectivitycheck.gstatic.com:443:8.8.4.4' "$calls" || tfail 'curl does not connect to the validated cellular answer'
 grep -Fq 'https://connectivitycheck.gstatic.com/generate_204' "$calls" || tfail 'curl no longer uses the real host name'
 grep -Eq 'connection (down|delete|reapply)|disconnect|--enable|systemctl|mmcli|radio' "$calls" && tfail 'data disconnected, stopped or touched radio'
 curl_line=$(grep '^curl ' "$calls")
@@ -436,8 +462,8 @@ curl_line=$(grep '^curl ' "$calls")
    $curl_line == *'--tlsv1.2'* && $curl_line == *'connectivitycheck.gstatic.com/generate_204' ]] ||
   tfail "HTTPS probe is not curl -q first, m_bound, bounded and HTTPS-only: $curl_line"
 [[ $(grep -c '^curl ' "$calls") == 1 ]] || tfail 'more than one probe'
-guards=$(sed 's/^guard //' "$guard_log" | tr '\n' ',')
-[[ $guards == 'plain,pristine,plain,pristine,pristine,pristine,plain,plain,' ]] || tfail "guard checks before/after: $guards"
+[[ $(grep -c '^guard pristine$' "$guard_log") -ge 3 && $(grep -c '^guard plain$' "$guard_log") -ge 8 ]] ||
+  tfail "guard checks missing before/after boundaries: $(tr '\n' ',' <"$guard_log")"
 before=$(wc -l <"$calls")
 expect_fail 'second attempt' 'already taken this boot' cmd_data "$TOKEN"
 [[ $(wc -l <"$calls") == "$before" ]] || tfail 'second attempt ran commands'
@@ -449,7 +475,7 @@ pass 'data takes the shared lock before NM mutation, binds UUID and device, sets
 # activates by itself. The device is unmanaged at boot, so every refusal below must
 # happen before the device is ever managed, and no bearer or data may appear.
 no_auto() { [[ ! -e $work/managed && ! -e $work/auto-activated && ! -e $work/activated ]] || tfail "$1: the control device was managed or activated"
-  grep -Eq 'device set|connection up' "$calls" && tfail "$1: managed or activated" || true; }
+  grep -Eq 'device set .* managed yes|connection up' "$calls" && tfail "$1: managed or activated" || true; }
 for case in 'competing gsm autoconnect|m_auto="dddddddd-0000-4000-8000-000000000001:gsm:yes"' \
   'inherited (unset) autoconnect|m_auto="dddddddd-0000-4000-8000-000000000001:gsm:"' \
   'own profile autoconnect|m_profile_exists=1 m_own_auto=yes' \
@@ -468,6 +494,16 @@ expect_fail 'autoconnect profile appears at the last instant' 'autoconnect enabl
 pre_managed_hook() { :; }
 no_auto 'late autoconnect'
 [[ -d $mutation_marker ]] || tfail 'late autoconnect did not keep the lock'
+# Appearing inside the former check-to-managed race: device autoconnect is
+# already off, so management cannot auto-open it; the second isolation pass
+# refuses before the one explicit activation.
+reset; armed
+pre_manage_transition_hook() { : >"$work/late-autoconnect"; }
+expect_fail 'autoconnect profile races the management transition' 'autoconnect enabled exists' cmd_data "$TOKEN"
+pre_manage_transition_hook() { :; }
+[[ ! -e $work/managed && -e $work/device-autoconnect-off && ! -e $work/auto-activated ]] ||
+  tfail 'management-boundary race was not contained'
+grep -Fq 'connection up' "$calls" && tfail 'management-boundary race reached explicit activation'
 # Staleness between the gates and the management step.
 last_case() { local what=$1 want=$2 hook=$3
   reset; armed
@@ -481,7 +517,7 @@ last_case() { local what=$1 want=$2 hook=$3
 last_case 'temperature' 'temperature safety limit' 'echo 99000 >"$thermal_root/thermal_zone0/temp"'
 last_case 'registration' 'registration changed' 'reg=searching'
 last_case 'roaming' 'registration changed' 'reg=roaming'
-last_case 'deadline' 'deadline is too close' 'mock_time 150'
+last_case 'deadline' 'too close to the rollback deadline' 'mock_time 150'
 last_case 'guard' 'IPA guard is not clean' 'guard_rc=1'
 last_case 'bearer' 'modem bearer already exists' 'bearers=1'
 pass 'P1-1: an unmanaged GSM device cannot auto-activate; every gate fails before it is managed'
@@ -501,14 +537,33 @@ expect_fail 'delayed success near expiry' 'too close for the post-activation che
 grep -q '^curl ' "$calls" && tfail 'probe ran with no deadline left'
 grep -Eq 'connection (down|delete|reapply)|disconnect' "$calls" && tfail 'delayed success disconnected'
 [[ $(cat "$data_state") == activated ]] || tfail 'delayed success state'
-reset; armed; up_delay=270 sleep_advance=1
+reset; armed; up_delay=190 sleep_advance=1
 expect_ok 'delayed success with enough time' cmd_data "$TOKEN" >/dev/null
+# Time consumed inside bounded reads is charged too; it cannot leave a stale
+# gate authorizing the device-management mutation.
+reset; armed; timeout_advance_after_marker=10
+expect_fail 'reads consume the mutation budget' 'deadline is too close' cmd_data "$TOKEN"
+[[ ! -e $work/managed && ! -e $work/activated ]] || tfail 'a stale read-time gate authorized device management'
+# Post-activation command time is rechecked throughout; failure keeps the
+# one-shot latch and never attempts unsafe cleanup.
+reset; armed; timeout_advance_after_activation=20
+expect_fail 'post checks consume the deadline' 'cannot read the rescue link state' cmd_data "$TOKEN"
+[[ -d $mutation_marker ]] || tfail 'post deadline failure lost the one-shot latch'
+grep -Eq 'connection (down|delete|reapply)|disconnect' "$calls" && tfail 'post deadline failure cleaned up'
 # Late polling is bound by the deadline too.
 reset; armed; up_activates=0 up_rc=1 up_delay=100 sleep_advance=1 late_steps=1000
 rc=0; out=$(run cmd_data "$TOKEN") || rc=$?
 [[ $rc -ne 0 && $out == *'activation failed'* ]] || tfail "late polling: $out"
 [[ $(cut -d. -f1 "$uptime_file") -le 785 ]] || tfail 'late polling ran past the post-activation budget'
 pass 'P2-1: deadline is absolute; polling, late activation and post-activation checks are bounded by it'
+
+# A snapshot is one bounded batch, even when every individual read is slow.
+reset; armed; take_marker data; timeout_advance_after_marker=2
+bounded_snapshot() { rescue_snapshot >"$work/slow-snapshot" || fail 'snapshot rejected'; }
+expect_fail 'snapshot enforces its internal deadline under suppressed errexit' 'snapshot rejected' bounded_snapshot
+[[ $(cut -d. -f1 "$uptime_file") -le 530 ]] || tfail 'rescue snapshot exceeded its 30-second batch deadline'
+[[ ! -e $work/managed && ! -e $work/activated ]] || tfail 'bounded snapshot mutated the modem'
+pass 'snapshot checks each producer result and its shared absolute batch deadline'
 
 # Concurrency: two simultaneous data commands, exactly one reaches NetworkManager.
 reset; armed
@@ -546,11 +601,11 @@ for case in 'm_id_reply=other-name|name and identifier disagree' \
   expect_fail "profile check ${case%%|*}" "${case##*|}" cmd_data "$TOKEN"
   grep -Fq 'connection up' "$calls" && tfail 'activated although the profile name and UUID disagree'
 done
-# An existing exact profile is modified by UUID, never re-added.
+# An existing exact profile is refused before the mutation latch: retaining it
+# could retain initial-EPS settings that make ModemManager power-cycle radio.
 reset; armed; m_profile_exists=1
-expect_ok 'existing exact profile' cmd_data "$TOKEN" >/dev/null
-grep -Fq 'connection add' "$calls" && tfail 'existing exact profile was added again'
-grep -Fq "connection modify uuid $secret_uuid" "$calls" || tfail 'existing profile was not modified by UUID'
+expect_fail 'existing exact profile' 'target profile already exists' cmd_data "$TOKEN"
+[[ ! -d $mutation_marker && ! -s $calls ]] || tfail 'existing exact profile reached mutation'
 pass 'failures keep the lock and never reconnect'
 
 post_fail() { local what=$1 want=$2 setup=$3
@@ -564,10 +619,8 @@ post_fail 'wrong device' 'not on the selected modem device' 'm_bound=ttyMODEM9'
 post_fail 'two gsm active' 'more than one cellular connection' 'm_active_after=1'
 post_fail 'no address' 'no IPv4 address' addr_lines=0
 post_fail 'no default route in any table' 'no default route' m_default_lines=0
-post_fail 'table route without policy rule' 'no policy rule safely selects' 'rule_line="100:	from all oif wlan0 lookup 1430"'
-post_fail 'rule for another table' 'no policy rule safely selects' 'rule_line="100:	from all oif rmnet_data0 lookup 1431"'
-post_fail 'from-all rule, no other main default' 'no policy rule safely selects' 'rule_line="32768:	from all lookup 1430" m_main_default=""'
-post_fail 'from-all rule, main default is cellular' 'no policy rule safely selects' 'rule_line="32768:	from all lookup 1430" m_main_default="default via 10.0.0.1 dev rmnet_data0"'
+post_fail 'table route without policy rule' 'could redirect a rescue connection' 'rule_line="100:	from all oif wlan0 lookup 1430"'
+post_fail 'rule for another table' 'could redirect a rescue connection' 'rule_line="100:	from all oif rmnet_data0 lookup 1431"'
 post_fail 'from-all rule for another table' 'no policy rule safely selects' 'rule_line="32768:	from all lookup 1431"'
 post_fail 'no DNS on the modem device' 'no DNS server' dns_lines=0
 post_fail 'link DNS missing' 'link-scoped DNS' 'm_link_dns_data='
@@ -585,16 +638,22 @@ post_fail 'unmanaged USB address replaced, same count' "$changed" 'm_usb_addr_af
 post_fail 'USB route lost' "$changed" 'm_usb_route_lost=1'
 post_fail 'SSH listener lost' "$changed" 'm_listeners_after='
 post_fail 'SSH listener replaced, same count' "$changed" "m_listeners_after='LISTEN 0 128 0.0.0.0:2222 0.0.0.0:*\\n'"
-post_fail 'SSH session lost' "$changed" 'm_sessions_after='
-post_fail 'SSH session replaced, same count' "$changed" "m_sessions_after='0 0 x:22 z:9\\n'"
-post_fail 'unqualified from-all rule appears at priority 100' 'unqualified policy rule precedes' 'rule_line="100:	from all lookup 1430"'
-post_fail 'unqualified from-all rule appears later but before main' 'unqualified policy rule precedes' 'm_post_rule="32000:\tfrom all lookup 77"'
-post_fail 'unexpected scoped rule appears' 'unexpected policy rule was added' 'm_post_rule="90:\tfrom all oif wlan0 lookup 99"'
+post_fail 'SSH session lost' 'cannot read the rescue link state' 'm_sessions_after='
+post_fail 'SSH session replaced, same count' "$changed" "m_sessions_after='0 0 172.16.42.1:2222 172.16.42.2:51000\\n'"
+post_fail 'SSH peer route changes interface' "$changed" 'm_peer_dev_after=wlan0'
+post_fail 'SSH peer route changes table' "$changed" 'm_peer_table_after=1431'
+post_fail 'SSH peer route changes source' 'cannot read the rescue link state' 'm_peer_src_after=172.16.42.9'
+post_fail 'rescue device replaced under same name' "$changed" 'm_usb_ifindex_after=55'
+post_fail 'unqualified from-all rule appears at priority 100' 'could redirect a rescue connection' 'rule_line="100:	from all lookup 1430"'
+post_fail 'unqualified from-all rule appears later but before main' 'could redirect a rescue connection' 'm_post_rule="32000:\tfrom all lookup 77"'
+post_fail 'unexpected scoped rule appears' 'could redirect a rescue connection' 'm_post_rule="90:\tfrom all oif wlan0 lookup 99"'
 post_fail 'cell DNS broken while Wi-Fi DNS works' 'DNS query through the cellular link failed' 'cell_dns_ok=0 wifi_dns_ok=1'
 post_fail 'cell DNS answer is private' 'not a public IPv4' 'cell_dns_ip=192.168.1.1'
 post_fail 'cell DNS answer is CGNAT' 'not a public IPv4' 'cell_dns_ip=100.77.1.1'
 post_fail 'cell DNS answer is loopback' 'not a public IPv4' 'cell_dns_ip=127.0.0.1'
 post_fail 'cell DNS answer is unspecified' 'not a public IPv4' 'cell_dns_ip=0.0.0.0'
+post_fail 'cell DNS answer is documentation range' 'not a public IPv4' 'cell_dns_ip=203.0.113.1'
+post_fail 'cell DNS answer is benchmarking range' 'not a public IPv4' 'cell_dns_ip=198.18.0.1'
 post_fail 'cell DNS answer is not an address' 'not a public IPv4' 'cell_dns_ip=notanaddress'
 post_fail 'delayed activation leaves no time for post checks' 'too close for the post-activation checks' 'up_delay=300 sleep_advance=1'
 post_fail 'DNS routed elsewhere' 'not routed through the cellular interface' 'route_get_dev=wlan0'
@@ -607,7 +666,11 @@ reset; armed
 guard_check() { echo "guard ${*:-plain}" >>"$guard_log"; [[ -e $work/activated ]] && return 1; return 0; }
 expect_fail 'guard dirty after activation' 'IPA guard is not clean' cmd_data "$TOKEN"
 [[ -d $mutation_marker && $(grep -c 'connection up' "$calls") == 1 ]] || tfail 'guard-dirty path lost the lock'
+! grep -Eq 'resolvectl query|^curl ' "$calls" || tfail 'network probe ran after the post-activation guard became dirty'
 guard_check() { echo "guard ${*:-plain}" >>"$guard_log"; return "$guard_rc"; }
+reset; armed; heat_after_activation=1
+expect_fail 'temperature rises after activation' 'temperature safety limit' cmd_data "$TOKEN"
+! grep -Eq 'resolvectl query|^curl ' "$calls" || tfail 'network probe ran after the post-activation thermal limit'
 reset; armed; echo 99000 >"$thermal_root/thermal_zone0/temp"
 expect_fail 'hot' 'temperature safety limit' cmd_data "$TOKEN"
 nm_untouched hot
@@ -633,14 +696,15 @@ expect_ok 'control-link DNS' cmd_data "$TOKEN" >/dev/null
 reset; armed; m_link_dns_data="203.0.113.9 $secret_dns"
 expect_ok 'data-link DNS among several' cmd_data "$TOKEN" >/dev/null
 # Counters and rescue state are aggregate and unchanged-or-better passes.
-reset; armed; m_sessions_after='ESTAB 0 0 x:22 y:1\nESTAB 0 0 x:22 y:2\n'
+reset; armed; m_sessions_after="$m_sessions"'0 0 172.16.42.1:22 172.16.42.2:51003\n'
 out=$(expect_ok 'more sessions are fine' cmd_data "$TOKEN")
-[[ $out == *'dns_query=ok'*'tx_delta=5 rx_delta=5'*'rescue_addresses=2 rescue_routes=3 ssh_listeners=1 ssh_sessions=2 rescue=preserved'* ]] || tfail "aggregate output: $out"
+[[ $out == *'dns_query=ok'*'tx_delta=5 rx_delta=5'*'rescue_addresses=2 rescue_routes=3 ssh_listeners=1 ssh_sessions=3 rescue_peers=2 rescue=preserved'* ]] || tfail "aggregate output: $out"
 pass 'route shapes, data/control DNS, packet counters and rescue-state aggregates'
 
 # Route contract inputs: an inherited or pre-existing profile cannot carry its own routing.
-for case in "m_profile_rules='priority 32768 from 0.0.0.0/0 table 1430'" 'm_profile_table=1430' 'm_profile_never=yes'; do
-  reset; armed; m_profile_exists=1; eval "$case"
+for case in "m_profile_rules='priority 32768 from 0.0.0.0/0 table 1430'" 'm_profile_table=1430' 'm_profile_never=yes' \
+  "m_profile_routes='192.0.2.0/24'" "m_secondaries='11111111-2222-4333-8444-555555555555'"; do
+  reset; armed; eval "$case"
   expect_fail "inherited profile: $case" 'carries its own routing configuration' cmd_data "$TOKEN"
   no_auto "inherited profile $case"
   [[ -d $mutation_marker ]] || tfail 'inherited profile check did not keep the lock'
@@ -793,10 +857,22 @@ sh_fail 'broken cellular DNS' 'DNS query through the cellular link failed' data 
 grep -q '^curl ' "$calls" && tfail 'sh probe ran with broken cellular DNS'
 reset; armed; m_usb_addr_after=other
 sh_fail 'equal-count USB replacement' "$changed" data "$TOKEN"
+reset; armed; rm -f "$net_root/usb0/ifindex"
+sh_fail 'route evidence failure is not pipeline-masked' 'cannot read the rescue link state' qualify
+reset; armed; m_peer_dev=missing
+sh_fail 'peer ifindex failure is not pipeline-masked' 'cannot read the rescue link state' qualify
+reset; armed; m_sessions=''
+sh_fail 'empty SSH evidence' 'cannot read the rescue link state' qualify
+reset; armed; m_sessions='0 0 172.16.42.1:22 172.16.42.2:51000\n'
+sh_fail 'Wi-Fi SSH proof absent' 'no established SSH session is routed over Wi-Fi rescue' qualify
+reset; armed; m_pre_rule='10:\tfrom all to 172.16.42.0/24 lookup 1430'
+sh_fail 'empty-table destination hijack' 'could redirect a rescue connection' data "$TOKEN"
+reset; armed; m_pre_rule='32766:\tfrom all lookup 1430'
+sh_fail 'tied-priority main-table hijack' 'could redirect a rescue connection' data "$TOKEN"
 reset; armed
 out=$(sh_ok 'data' data "$TOKEN")
 [[ $out == *'result=ready'*'policy=oif-rule'*'dns_query=ok'*'https=204'*'rescue=preserved'*'fresh SSH login'* ]] || tfail "sh data: $out"
-[[ $(grep -c 'connection up' "$calls") == 1 && $(grep -c 'device set' "$calls") == 1 ]] || tfail 'sh data did not manage and activate exactly once'
+[[ $(grep -c 'connection up' "$calls") == 1 && $(grep -c 'device set' "$calls") == 2 ]] || tfail 'sh data did not inhibit, manage and activate exactly once'
 [[ $(grep -E 'nmcli marker=' "$calls" | grep -vc 'marker=yes') == 0 ]] || tfail 'sh data mutated NetworkManager before the lock'
 sh_fail 'second data' 'already taken this boot' data "$TOKEN"
 rc=0; out=$(sh_stage radio-off) || rc=$?; [[ $rc -eq 1 && $out == *'radio-off is unavailable'* ]] || tfail "sh radio-off: $rc $out"

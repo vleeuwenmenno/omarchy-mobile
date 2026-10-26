@@ -83,6 +83,8 @@ starts, runs the read-only `myron-ipa-guard` (corroborating evidence) before
 ModemManager, and gates ModemManager behind a boot-scoped
 `/run/omamobile-myron/modem-manager-allowed` and the one-start
 `myron-modemmanager-start` wrapper. NetworkManager holds GSM devices unmanaged
-until the stage's one-shot step. The
+and permits only the stage's fixed connection UUID; the stage disables device
+autoconnect before releasing management. The composer rejects cellular profiles
+from all supported NetworkManager keyfile stores. The
 guarded `myron-cellular-stage` allows exactly one data activation per boot
 and never disarms rollback; see `docs/myron/HARDWARE-TEST.md`.

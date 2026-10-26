@@ -123,6 +123,7 @@ docker run --rm --privileged --platform linux/arm64 \
   -v "$bluetooth_probe:/bluetooth-probe.py:ro" \
   -v "$speaker_reference:/speaker-reference:ro" \
   -v "$ROOT/packages/omamobile-shell:/shell-source:ro" \
+  -v "$ROOT/tools/myron-networkmanager-keyfile-audit:/keyfile-audit:ro" \
   -v "$ROOT/device/myron/hardware-test-overlay:/test-overlay:ro" \
   -v "$firstboot:/firstboot.conf:ro" \
   -v "$ssh_key:/owner.pub:ro" \
@@ -254,13 +255,9 @@ docker run --rm --privileged --platform linux/arm64 \
       myron-omarchy-prepare.service \
       myron-omarchy-qualify.service sshd.service \
       systemd-networkd.service >/dev/null
-    # No cellular profile may ship in the payload: a GSM keyfile with autoconnect
-    # would activate the modem by itself. The stage creates its one profile.
-    if test -d "$root/etc/NetworkManager/system-connections" &&
-      grep -rEq "^(type=(gsm|cdma)|\[gsm\])" "$root/etc/NetworkManager/system-connections"; then
-      echo "unexpected GSM or CDMA NetworkManager keyfile in the payload" >&2
-      exit 1
-    fi
+    # No cellular profile may ship in any supported NetworkManager keyfile
+    # store. The parser also rejects links, special files and malformed input.
+    /keyfile-audit "$root"
     # D-Bus activation names the ModemManager alias; where it exists it must be
     # the canonical unit (so the one-start drop-in applies), never a copy.
     mm_alias="$root/etc/systemd/system/dbus-org.freedesktop.ModemManager1.service"

@@ -46,13 +46,16 @@ net_root=$work/net
 boot_id_file=$work/boot-id
 uptime_file=$work/uptime
 poll_seconds=0
-stale_seconds=15
+stale_seconds=5
 mkdir -p "$net_root/rmnet_ipa0"
 
 secret_line='kernel: rmnet_ipa0 owner=IMEI358240051111110 addr=100.77.88.99'
 journal_text=
 journal_rc=0
 cursor_ok=1
+journal_advance=0
+clock_advance_file=$work/clock-advance
+echo 0 >"$clock_advance_file"
 flags=0x1002
 flags_present=1
 carrier_val=1
@@ -65,16 +68,18 @@ read_carrier() { [[ -n $carrier_val ]] || return 1; printf '%s\n' "$carrier_val"
 journal_batch() {
   [[ $journal_rc == 0 ]] || return 1
   mkdir -p "$state_dir"; [[ $cursor_ok == 0 ]] || echo c1 >"$cursor_file"
+  echo "$journal_advance" >"$clock_advance_file"
   printf '%s' "$journal_text"; journal_text=
 }
-now_seconds() { echo "$now"; }
+now_seconds() { echo $((now + $(cat "$clock_advance_file"))); }
 
 reset_vars() { boot_id=; samples=0 up=0 down=0 fatal=0 info=0 gaps=0 restarts=0 transitions=0 carrier=na tick=0 last=absent; }
 fresh() {
   rm -rf "$state_dir" "$log"
   echo boot-A >"$boot_id_file"
   reset_vars
-  flags=0x1002 flags_present=1 journal_text= journal_rc=0 cursor_ok=1 carrier_val=1 now=100
+  echo 0 >"$clock_advance_file"
+  flags=0x1002 flags_present=1 journal_text= journal_rc=0 cursor_ok=1 journal_advance=0 carrier_val=1 now=100
 }
 # One more sample of the running guard; after restart_guard it is a fresh process (which resumes state).
 run_once() { if [[ -z $boot_id ]]; then max_iterations=1 cmd_run; else sample; fi; }
@@ -119,7 +124,9 @@ gap_case 'interface missing' interface-absent 'flags_present=0'
 gap_case 'flags malformed' flags-unreadable 'flags=garbage'
 gap_case 'journal read failed' journal-failed 'journal_rc=1'
 gap_case 'journal cursor lost' cursor-lost 'rm -f "$cursor_file"; cursor_ok=0'
+gap_case 'journal cursor deletion before recreation' cursor-lost 'rm -f "$cursor_file"'
 gap_case 'sampling stall' stall 'now=130'
+gap_case 'slow sample' sample-slow 'journal_advance=6'
 fresh; warm; flags=0x1003; run_once; flags_present=0; run_once
 [[ $(state_get down) == 1 && $(state_get last) == absent && $(state_get gaps) -ge 1 ]] || fail 'removal after up is not a down and a gap'
 # A guard restart is a gap: nothing watched the port while it was gone.
@@ -235,7 +242,7 @@ shrun 3 >/dev/null || fail 'sh guard run failed'
 out=$(shcheck pristine) || fail "sh guard is not clean: $out"
 [[ $out == *'samples=3'*'gaps=0'*'enforcement=networkmanager-admission'* ]] || fail "sh guard aggregate: $out"
 echo 1 >"$work/journal-rc"; shrun 3 >/dev/null || fail 'sh guard run with a failing journal exited'
-out=$(shcheck) && fail 'sh guard accepts a failing journal'; [[ $out == *guard=dirty*gaps=3* ]] || fail "sh journal failure: $out"
+out=$(shcheck) && fail 'sh guard accepts a failing journal'; [[ $out == *guard=dirty*gaps=5* ]] || fail "sh journal failure: $out"
 echo 0 >"$work/journal-rc"; echo 0 >"$work/cursor-ok"; shrun 3 >/dev/null
 shcheck >/dev/null && fail 'sh guard accepts a lost cursor'
 echo 1 >"$work/cursor-ok"; rm -f "$work/shnet/rmnet_ipa0/flags"; shrun 3 >/dev/null

@@ -5,9 +5,10 @@
 # boot gets at most one data activation, and nothing here ever disconnects,
 # reconnects, stops, restarts or re-enables a radio-path component. Reboot to
 # retry. NetworkManager holds the GSM control device unmanaged from boot (see
-# etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf), so no profile can
-# auto-activate it; this stage manages it only inside the one-shot mutation,
-# immediately before the single explicit activation. There is deliberately no finish or disarm command: the rollback
+# etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf). That policy also
+# allows only the fixed stage UUID, and this stage disables device autoconnect
+# before it releases management inside the one-shot mutation. There is
+# deliberately no finish or disarm command: the rollback
 # watchdog restores postmarketOS. Radio-off and radio-on are refused until a
 # supported transition is separately proven. Output and logs carry aggregates
 # only, never identities, addresses, APNs or interface names.
@@ -27,8 +28,14 @@ max_temperature_mc=95000
 # arm needs room for a full data attempt plus operator time; activation needs
 # the worst-case nmcli wait (95) + late polling (35) + post-activation checks.
 min_remaining_arm=480
-min_remaining_activate=360
-post_need=220
+min_remaining_activate=420
+post_need=300
+post_step_need=40
+snapshot_step_need=10
+snapshot_max_seconds=30
+snapshot_command_need=7
+max_rescue_links=4
+max_ssh_sessions=8
 managed_steps=10
 
 runtime_dir=/run/myron-cellular-stage
@@ -64,6 +71,7 @@ probe_host=connectivitycheck.gstatic.com
 probe_url=https://$probe_host/generate_204
 cell_table=1430
 cell_priority=100
+cell_metric=700
 usb_iface=usb0
 rescue_before=$runtime_dir/rescue.before
 rescue_after=$runtime_dir/rescue.after
@@ -79,6 +87,8 @@ control=
 iface=
 deadline_abs=
 probe_ip=
+deadline_candidate=
+snapshot_deadline_abs=
 
 persist() {
 	mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
@@ -130,6 +140,7 @@ take_marker() {
 # final gates and before the control device is managed.
 pre_marker_hook() { :; }
 pre_managed_hook() { :; }
+pre_manage_transition_hook() { :; }
 
 mm_key() {
 	printf '%s\n' "$info" | awk -F' *: *' -v key="$1" '$1 == key { print $2; exit }'
@@ -191,12 +202,14 @@ monotonic_seconds() { awk '{ print int($1) }' "$uptime_file"; }
 hottest_temperature() {
 	hottest=0
 	valid_sensors=0
+	scan_stop=$(($(monotonic_seconds) + 10))
 	for file in "$thermal_root"/thermal_zone*/temp; do
+		[ "$(monotonic_seconds)" -lt "$scan_stop" ] || return 1
 		[ -r "$file" ] || continue
-		type=$(timeout -k 1 2 cat "${file%/temp}/type" 2>/dev/null) || continue
+		type=$(timeout -k 1 1 cat "${file%/temp}/type" 2>/dev/null) || continue
 		[ -n "$type" ] || continue
 		case "$type" in *-trip-*) continue ;; esac
-		value=$(timeout -k 1 2 cat "$file" 2>/dev/null) || continue
+		value=$(timeout -k 1 1 cat "$file" 2>/dev/null) || continue
 		case "$value" in ''|*[!0-9]*) continue ;; esac
 		[ "$value" -gt 0 ] && [ "$value" -lt 200000 ] || continue
 		valid_sensors=$((valid_sensors + 1))
@@ -237,7 +250,12 @@ require_watchdog_time() {
 # check is bounded against it, never against a count of steps alone.
 set_deadline() {
 	remaining=$(watchdog_remaining) || fail 'rollback watchdog deadline is unavailable'
-	deadline_abs=$(($(monotonic_seconds) + remaining))
+	deadline_candidate=$(($(monotonic_seconds) + remaining))
+	# A service restart or changed timestamp must never grant this process more
+	# time than the first watchdog deadline it observed.
+	if [ -z "$deadline_abs" ] || [ "$deadline_candidate" -lt "$deadline_abs" ]; then
+		deadline_abs=$deadline_candidate
+	fi
 }
 
 time_left() { printf '%s\n' $((deadline_abs - $(monotonic_seconds))); }
@@ -246,7 +264,37 @@ require_time() {
 	[ "$(time_left)" -ge "$1" ] || fail "$2"
 }
 
-guard_check() { "$guard" check "$@" >/dev/null 2>&1; }
+guard_check() { timeout -k 1 5 "$guard" check "$@" >/dev/null 2>&1; }
+
+require_mutation_room() {
+	cost=$1 message=$2
+	set_deadline
+	require_time $((cost + post_need)) "$message"
+	require_temperature
+	set_deadline
+	require_time $((cost + post_need)) "$message"
+}
+
+require_post_step() {
+	set_deadline
+	require_time "$post_step_need" 'the post-activation checks are out of rollback deadline budget; reboot'
+	require_temperature
+	require_guard
+	set_deadline
+	require_time "$post_step_need" 'the post-activation checks are out of rollback deadline budget; reboot'
+}
+
+# Keep each rescue-state read inside the same absolute watchdog deadline.  The
+# post-activation path retains the larger reserve because it cannot clean up or
+# retry safely; read-only qualification needs only enough room for one bounded
+# command.  Temperature and IPA freshness are checked by require_post_step at
+# the boundary of every post-activation operation batch.
+require_snapshot_room() {
+	set_deadline
+	now=$(monotonic_seconds)
+	[ -n "$snapshot_deadline_abs" ] || return 1
+	[ $((snapshot_deadline_abs - now)) -ge "$snapshot_command_need" ] || return 1
+}
 
 require_guard() {
 	systemctl --quiet is-active myron-ipa-guard.service || fail 'IPA guard is not active'
@@ -364,6 +412,7 @@ select_control() {
 # must be free across every profile type, the UUID must be unused or already
 # this exact gsm profile, and no gsm profile may be in any live state.
 require_isolated_profile() {
+	profile_mode=${1:-absent}
 	rows=$(timeout -k 1 5 nmcli -t -f UUID,NAME,TYPE,STATE connection show 2>/dev/null) ||
 		fail 'cannot list connection profiles'
 	survey=$(printf '%s\n' "$rows" | awk -F: -v want="$connection_name" -v id="$target_uuid" '
@@ -381,8 +430,11 @@ require_isolated_profile() {
 	[ "$1" = 0 ] || fail 'a cellular connection is active, activating or deactivating'
 	[ "$3" = 0 ] || fail 'the cellular target name or identifier belongs to another profile'
 	[ "$2" -le 1 ] || fail 'the cellular target profile is duplicated'
-	profile_exists=no
-	[ "$2" = 0 ] || profile_exists=yes
+	if [ "$profile_mode" = absent ]; then
+		[ "$2" = 0 ] || fail 'the cellular target profile already exists; reboot with a clean payload'
+	else
+		[ "$2" = 1 ] || fail 'the stage-owned cellular target profile is absent'
+	fi
 	autoconnect=$(timeout -k 1 5 nmcli -t -f UUID,TYPE,AUTOCONNECT connection show 2>/dev/null) ||
 		fail 'cannot list connection profiles'
 	competing=$(printf '%s\n' "$autoconnect" | awk -F: '($2 == "gsm" || $2 == "cdma") && $3 != "no"' | wc -l)
@@ -395,28 +447,50 @@ require_isolated_profile() {
 # profile cannot carry a routing rule, table or never-default of its own; the
 # route contract is verified after activation (verify_network).
 prepare_profile() {
-	if [ "$profile_exists" = no ]; then
-		timeout -k 1 15 nmcli connection add type gsm ifname "$control" con-name "$connection_name" \
-			connection.uuid "$target_uuid" apn "$apn" connection.autoconnect no gsm.home-only yes \
-			ipv4.method auto ipv4.route-metric 700 ipv6.method disabled >/dev/null 2>&1 ||
-			fail 'cellular profile creation failed'
-	fi
-	timeout -k 1 15 nmcli connection modify uuid "$target_uuid" \
+	require_mutation_room 30 'profile creation is too close to the rollback deadline; reboot'
+	timeout -k 1 15 nmcli connection add type gsm ifname "$control" con-name "$connection_name" \
+		connection.uuid "$target_uuid" apn "$apn" connection.autoconnect no gsm.home-only yes \
+		gsm.initial-eps-bearer-configure no ipv4.method auto ipv4.route-metric "$cell_metric" \
+		ipv6.method disabled save no >/dev/null 2>&1 || fail 'cellular profile creation failed'
+	require_mutation_room 20 'profile normalization is too close to the rollback deadline; reboot'
+	timeout -k 1 15 nmcli connection modify --temporary uuid "$target_uuid" \
 		connection.autoconnect no connection.interface-name "$control" gsm.apn "$apn" gsm.home-only yes \
-		ipv4.method auto ipv4.route-metric 700 ipv4.route-table 0 ipv4.never-default no \
-		ipv4.ignore-auto-routes no ipv4.routing-rules "" ipv6.method disabled >/dev/null 2>&1 ||
+		gsm.initial-eps-bearer-configure no connection.secondaries "" \
+		ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns "" ipv4.dns-search "" \
+		ipv4.dns-options "" ipv4.routes "" ipv4.route-metric "$cell_metric" ipv4.route-table 0 \
+		ipv4.never-default no ipv4.ignore-auto-routes no ipv4.ignore-auto-dns no \
+		ipv4.routing-rules "" ipv6.method disabled >/dev/null 2>&1 ||
 		fail 'cellular profile update failed'
 	[ "$(timeout -k 1 5 nmcli -g connection.autoconnect connection show uuid "$target_uuid" 2>/dev/null)" = no ] ||
 		fail 'cellular profile autoconnect is not disabled'
 	[ "$(timeout -k 1 5 nmcli -g gsm.home-only connection show uuid "$target_uuid" 2>/dev/null)" = yes ] ||
 		fail 'cellular profile is not home-only'
+	[ "$(timeout -k 1 5 nmcli -g gsm.initial-eps-bearer-configure connection show uuid "$target_uuid" 2>/dev/null)" = no ] ||
+		fail 'cellular profile could change the initial EPS bearer'
 	[ -z "$(timeout -k 1 5 nmcli -g ipv4.routing-rules connection show uuid "$target_uuid" 2>/dev/null)" ] &&
+		[ -z "$(timeout -k 1 5 nmcli -g ipv4.routes connection show uuid "$target_uuid" 2>/dev/null)" ] &&
+		[ -z "$(timeout -k 1 5 nmcli -g ipv4.addresses connection show uuid "$target_uuid" 2>/dev/null)" ] &&
+		[ -z "$(timeout -k 1 5 nmcli -g ipv4.gateway connection show uuid "$target_uuid" 2>/dev/null)" ] &&
+		[ -z "$(timeout -k 1 5 nmcli -g connection.secondaries connection show uuid "$target_uuid" 2>/dev/null)" ] &&
+		[ "$(timeout -k 1 5 nmcli -g ipv4.route-metric connection show uuid "$target_uuid" 2>/dev/null)" = "$cell_metric" ] &&
 		[ "$(timeout -k 1 5 nmcli -g ipv4.route-table connection show uuid "$target_uuid" 2>/dev/null)" = 0 ] &&
 		[ "$(timeout -k 1 5 nmcli -g ipv4.never-default connection show uuid "$target_uuid" 2>/dev/null)" = no ] ||
 		fail 'cellular profile carries its own routing configuration'
 	[ "$(timeout -k 1 5 nmcli -g connection.id connection show uuid "$target_uuid" 2>/dev/null)" = "$connection_name" ] &&
 		[ "$(timeout -k 1 5 nmcli -g connection.uuid connection show id "$connection_name" 2>/dev/null)" = "$target_uuid" ] ||
 		fail 'cellular profile name and identifier disagree'
+}
+
+require_device_autoconnect_off() {
+	[ "$(timeout -k 1 5 nmcli -g GENERAL.AUTOCONNECT device show "$control" 2>/dev/null)" = no ] ||
+		fail 'modem control device autoconnect is not disabled'
+}
+
+disable_device_autoconnect() {
+	require_mutation_room 20 'device autoconnect change is too close to the rollback deadline; reboot'
+	timeout -k 1 15 nmcli device set "$control" autoconnect no >/dev/null 2>&1 ||
+		fail 'modem control device autoconnect could not be disabled'
+	require_device_autoconnect_off
 }
 
 # "busy_gsm target_state" from the full profile list.
@@ -452,6 +526,78 @@ count_lines() {
 	printf '%s\n' "$n"
 }
 
+ipv4_literal() {
+	printf '%s\n' "$1" | awk -F. '
+		BEGIN { valid = 1 }
+		NF != 4 { valid = 0 }
+		{ for (i = 1; i <= 4; i++) if ($i == "" || length($i) > 3 || $i ~ /[^0-9]/ || $i + 0 > 255) valid = 0 }
+		END { exit !valid }'
+}
+
+endpoint_ipv4() {
+	endpoint=$1
+	case "$endpoint" in
+	\[*\]:*)
+		address=${endpoint#\[}
+		address=${address%%\]:*}
+		port=${endpoint##*]:}
+		;;
+	*)
+		address=${endpoint%:*}
+		port=${endpoint##*:}
+		;;
+	esac
+	case "$port" in ''|*[!0-9]*) return 1 ;; esac
+	case "$address" in ::ffff:*) address=${address#::ffff:} ;; *:*) return 2 ;; esac
+	ipv4_literal "$address" || return 1
+	printf '%s\n' "$address"
+}
+
+peer_route_line() {
+	local_address=$1 peer_address=$2
+	require_snapshot_room || return 1
+	selection=$(timeout -k 1 5 ip -4 -o route get "$peer_address" from "$local_address" 2>/dev/null) || return 1
+	selection=$(printf '%s\n' "$selection" | sed -n '1p')
+	[ -n "$selection" ] || return 1
+	set -- $selection
+	peer_dev='' peer_src=$local_address peer_via=- peer_table=main
+	while [ "$#" -gt 0 ]; do
+		key=$1
+		shift
+		case "$key" in
+		dev|src|from|via|table|lookup)
+			[ "$#" -gt 0 ] || return 1
+			value=$1
+			shift
+			case "$key" in
+			dev) peer_dev=$value ;;
+			src|from) peer_src=$value ;;
+			via) peer_via=$value ;;
+			table|lookup) peer_table=$value ;;
+			esac ;;
+		esac
+	done
+	case "$peer_dev" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$peer_table" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	ipv4_literal "$peer_src" || return 1
+	[ "$peer_src" = "$local_address" ] || return 1
+	if [ "$peer_via" != - ]; then ipv4_literal "$peer_via" || return 1; fi
+	require_snapshot_room || return 1
+	peer_ifindex=$(timeout -k 1 2 cat "$net_root/$peer_dev/ifindex" 2>/dev/null) || return 1
+	case "$peer_ifindex" in ''|*[!0-9]*) return 1 ;; esac
+	printf 'peer source %s remote %s dev %s ifindex %s table %s src %s via %s\n' \
+		"$local_address" "$peer_address" "$peer_dev" "$peer_ifindex" "$peer_table" "$peer_src" "$peer_via"
+}
+
+ssh_peer_routes() {
+	pairs=$1
+	for pair in $pairs; do
+		local_address=${pair%|*}
+		peer_address=${pair#*|}
+		peer_route_line "$local_address" "$peer_address" || return 1
+	done
+}
+
 # The exact private state of every rescue path, one fact per line: the USB
 # link (unmanaged by NetworkManager, so it is read from the kernel) and each
 # connected Wi-Fi link with their operational state, global IPv4 addresses and
@@ -459,60 +605,184 @@ count_lines() {
 # listener endpoints and established SSH session endpoints. Observed only,
 # never repaired. It stays in /run, mode 0600; only counts are ever logged.
 rescue_snapshot() {
+	set_deadline
+	now=$(monotonic_seconds)
+	reserve=$snapshot_step_need
+	[ ! -d "$mutation_marker" ] || reserve=$post_step_need
+	snapshot_deadline_abs=$((now + snapshot_max_seconds))
+	watchdog_snapshot_limit=$((deadline_abs - reserve))
+	[ "$snapshot_deadline_abs" -le "$watchdog_snapshot_limit" ] || snapshot_deadline_abs=$watchdog_snapshot_limit
+	require_snapshot_room || return 1
 	devices=$(timeout -k 1 5 nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null) || return 1
 	wifi_ifaces=$(printf '%s\n' "$devices" | awk -F: '$2 == "wifi" && $3 == "connected" { print $1 }' | sort)
+	link_count=$(printf '%s\n' "$wifi_ifaces" | grep -c . || true)
+	link_count=$((link_count + 1))
+	[ "$link_count" -le "$max_rescue_links" ] || return 1
 	for name in $usb_iface $wifi_ifaces; do
 		case "$name" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
-		state=$(cat "$net_root/$name/operstate" 2>/dev/null) || state=missing
-		printf 'link %s %s\n' "$name" "$state"
+		require_snapshot_room || return 1
+		state=$(timeout -k 1 2 cat "$net_root/$name/operstate" 2>/dev/null) || state=missing
+		require_snapshot_room || return 1
+		ifindex=$(timeout -k 1 2 cat "$net_root/$name/ifindex" 2>/dev/null) || return 1
+		case "$ifindex" in ''|*[!0-9]*) return 1 ;; esac
+		printf 'link %s %s ifindex %s\n' "$name" "$state" "$ifindex"
+		require_snapshot_room || return 1
 		addrs=$(timeout -k 1 5 ip -4 -o addr show dev "$name" scope global 2>/dev/null) || return 1
 		printf '%s\n' "$addrs" | awk 'NF >= 4 { print "addr", $2, $4 }'
+		require_snapshot_room || return 1
 		routes=$(timeout -k 1 5 ip -4 route show table main dev "$name" 2>/dev/null) || return 1
 		printf '%s\n' "$routes" | awk -v n="$name" 'NF { print "route", n, $0 }'
 	done
+	require_snapshot_room || return 1
+	defaults=$(timeout -k 1 5 ip -4 route show table main default 2>/dev/null) || return 1
+	printf '%s\n' "$defaults" | awk 'NF { print "default", $0 }'
+	require_snapshot_room || return 1
 	rules=$(timeout -k 1 5 ip -4 rule show 2>/dev/null) || return 1
-	printf '%s\n' "$rules" | awk '{ p = $1; sub(":", "", p); if (p + 0 < 32766) { sub(/^[0-9]+:[ \t]*/, ""); print "rule", p, $0 } }'
+	printf '%s\n' "$rules" | awk '{ p = $1; sub(":", "", p); if (p + 0 <= 32766) { sub(/^[0-9]+:[ \t]*/, ""); print "rule", p, $0 } }'
+	require_snapshot_room || return 1
 	listeners=$(timeout -k 1 5 ss -H -ltn 'sport = :22' 2>/dev/null) || return 1
 	printf '%s\n' "$listeners" | awk 'NF >= 2 { print "listen", $(NF - 1) }'
+	require_snapshot_room || return 1
 	sessions=$(timeout -k 1 5 ss -H -tn state established 'sport = :22' 2>/dev/null) || return 1
 	printf '%s\n' "$sessions" | awk 'NF >= 2 { print "session", $(NF - 1), $NF }'
+	pairs=
+	unsupported=0
+	for row in $(printf '%s\n' "$sessions" | awk 'NF >= 2 { print $(NF - 1) "|" $NF }'); do
+		local_endpoint=${row%|*}
+		peer_endpoint=${row#*|}
+		status=0
+		local_address=$(endpoint_ipv4 "$local_endpoint") || status=$?
+		if [ "$status" = 2 ]; then unsupported=1; continue; fi
+		[ "$status" = 0 ] || return 1
+		status=0
+		peer_address=$(endpoint_ipv4 "$peer_endpoint") || status=$?
+		if [ "$status" = 2 ]; then unsupported=1; continue; fi
+		[ "$status" = 0 ] || return 1
+		pairs="${pairs}${pairs:+
+}$local_address|$peer_address"
+	done
+	[ "$unsupported" = 0 ] || printf '%s\n' 'unsupported ipv6'
+	pairs=$(printf '%s\n' "$pairs" | sed '/^$/d' | sort -u) || return 1
+	pair_count=$(printf '%s\n' "$pairs" | grep -c . || true)
+	if [ "$pair_count" = 0 ]; then
+		[ "$unsupported" = 1 ] && return 0
+		return 1
+	fi
+	[ "$pair_count" -le "$max_ssh_sessions" ] || return 1
+	peer_rows=$(ssh_peer_routes "$pairs") || return 1
+	peer_count=$(printf '%s\n' "$peer_rows" | grep -c '^peer ' || true)
+	[ "$peer_count" = "$pair_count" ] || return 1
+	printf '%s\n' "$peer_rows"
+}
+
+require_rescue_route_contract() {
+	printf '%s\n' "$rescue_snap" | grep -Fxq 'unsupported ipv6' &&
+		fail 'an IPv6 SSH session is present; reconnect over IPv4 and reboot'
+	links=$(printf '%s\n' "$rescue_snap" | awk '$1 == "link" { print $2 }')
+	printf '%s\n' "$rescue_snap" | while IFS= read -r line; do
+		case "$line" in 'peer '*) ;; *) continue ;; esac
+		set -- $line
+		case "$3" in 127.*) continue ;; esac
+		[ "$3" = "${13}" ] || exit 1
+		for link in $links; do [ "$7" = "$link" ] && continue 2; done
+		exit 1
+	done || fail 'an established SSH peer is not routed over a rescue link'
+	printf '%s\n' "$rescue_snap" | awk -v u="$usb_iface" '$1 == "peer" && $7 == u { found = 1 } END { exit !found }' ||
+		fail 'no established SSH session is routed over USB rescue'
+	wifi_session=0
+	for link in $links; do
+		[ "$link" = "$usb_iface" ] && continue
+		printf '%s\n' "$rescue_snap" | awk -v n="$link" '$1 == "peer" && $7 == n { found = 1 } END { exit !found }' && wifi_session=1
+	done
+	[ "$wifi_session" = 1 ] || fail 'no established SSH session is routed over Wi-Fi rescue'
+	set -- $(printf '%s\n' "$rescue_snap" | awk -v links="$links" '
+		BEGIN { n = split(links, a, " "); for (i = 1; i <= n; i++) rescue[a[i]] = 1 }
+		$1 == "default" {
+			dev = ""; metric = 0
+			for (i = 2; i <= NF; i++) { if ($i == "dev") dev = $(i + 1); if ($i == "metric") metric = $(i + 1) }
+			if (rescue[dev]) { count++; if (metric > highest) highest = metric }
+		}
+		END { print count + 0, highest + 0 }')
+	[ "$1" -gt 0 ] || fail 'no IPv4 rescue default route is present'
+	[ "$cell_metric" -gt "$2" ] || fail 'the cellular route metric would outrank a rescue default route'
 }
 
 # Both rescue paths and SSH must be usable before anything is activated: USB
 # with an address, a connected Wi-Fi link with an address, an SSH listener.
 require_rescue_usable() {
 	snap=$(rescue_snapshot) || fail 'cannot read the rescue link state'
-	{ printf '%s\n' "$snap" | grep -Eq "^link $usb_iface (up|unknown)\$" &&
+	{ printf '%s\n' "$snap" | grep -Eq "^link $usb_iface (up|unknown) ifindex [0-9]+\$" &&
 		printf '%s\n' "$snap" | grep -q "^addr $usb_iface "; } ||
 		fail 'the USB rescue link is not usable'
 	wifi_ok=0
 	for name in $(printf '%s\n' "$snap" | awk -v u="$usb_iface" '$1 == "link" && $2 != u { print $2 }'); do
-		{ printf '%s\n' "$snap" | grep -Fxq "link $name up" &&
+		{ printf '%s\n' "$snap" | grep -Eq "^link $name up ifindex [0-9]+\$" &&
 			printf '%s\n' "$snap" | grep -q "^addr $name "; } && wifi_ok=1
 	done
 	[ "$wifi_ok" = 1 ] || fail 'the Wi-Fi rescue link is not usable'
 	printf '%s\n' "$snap" | grep -q '^listen ' || fail 'no SSH listener is usable'
 	rescue_snap=$snap
+	require_rescue_route_contract
 }
 
 # An unqualified from-all rule before the main table would override every
-# rescue route. Qualified rules (to, iif, oif, fwmark, ...) and rules that look
-# up main or the kernel's own reserved table are not conflicts.
+# rescue route.  A source-specific rule to another table is also refused even
+# when that table is currently empty: activation may populate it and redirect
+# an established SSH reply.  Destination-scoped from-all rules and lookups of
+# main or the kernel's reserved table remain safe.
 require_no_rule_conflicts() {
 	raw=$(timeout -k 1 5 ip -4 rule show 2>/dev/null) || fail 'cannot read the policy rules'
-	conflicts=$(printf '%s\n' "$raw" | awk '
+	# A tied rule may precede main in kernel insertion order. Include every
+	# priority-32766 rule, and require the canonical main rule as our boundary.
+	canonical_main=$(printf '%s\n' "$raw" | grep -Ec '^32766:[[:space:]]+from all lookup main[[:space:]]*$' || true)
+	[ "$canonical_main" = 1 ] || fail 'the canonical main policy rule is unavailable'
+	rescue_sources=$(printf '%s\n' "$rescue_snap" | awk '$1 == "addr" { split($3, a, "/"); print a[1] }')
+	[ -n "$rescue_sources" ] || fail 'rescue addresses are unavailable for policy validation'
+	conflicts=$(printf '%s\n' "$raw" | awk -v device="$iface" -v table="$cell_table" -v priority="$cell_priority" '
 		{
 			p = $1; sub(":", "", p)
-			if (p + 0 >= 32766 || $2 != "from" || ($3 != "all" && $3 != "0.0.0.0/0")) next
-			qualified = 0; lookup = ""
+			if (p + 0 > 32766) next
+			if ($2 != "from") { print "all"; next }
+			from = $3
+			qualified = 0; lookup = ""; output = ""
 			for (i = 4; i <= NF; i++) {
 				if ($i ~ /^(to|iif|oif|fwmark|uidrange|ipproto|sport|dport|tos|l3mdev)$/) qualified = 1
+				if ($i == "oif") output = $(i + 1)
 				if ($i == "lookup" || $i == "table") lookup = $(i + 1)
 			}
-			if (!qualified && lookup != "local" && lookup != "main" && lookup != "255" && lookup != "254") n++
+			safe = (lookup == "local" || lookup == "main" || lookup == "255" || lookup == "254")
+			if (safe) next
+			if (from == "all" || from == "0.0.0.0/0") {
+				if (!(device != "" && output == device && lookup == table && p == priority && $4 == "oif" && $6 == "lookup")) print "all"
+				next
+			}
+			print from
 		}
-		END { print n + 0 }')
-	[ "$conflicts" = 0 ] || fail 'an unqualified policy rule precedes the main table'
+		')
+	for selector in $conflicts; do
+		[ "$selector" != all ] || fail 'a policy rule could redirect a rescue connection'
+		for source in $rescue_sources; do
+			printf '%s\n' "$selector $source" | awk '
+				{
+					n = split($1, p, "/"); if (n > 2) exit 2
+					bits = (n == 2 ? p[2] : 32); if (bits !~ /^[0-9]+$/ || bits + 0 > 32) exit 2
+					if (split(p[1], a, ".") != 4 || split($2, b, ".") != 4) exit 2
+					for (i = 1; i <= 4; i++) {
+						if (a[i] == "" || b[i] == "" || a[i] ~ /[^0-9]/ || b[i] ~ /[^0-9]/ || a[i] + 0 > 255 || b[i] + 0 > 255) exit 2
+					}
+					base = (((a[1] + 0) * 256 + a[2]) * 256 + a[3]) * 256 + a[4]
+					value = (((b[1] + 0) * 256 + b[2]) * 256 + b[3]) * 256 + b[4]
+					block = 2 ^ (32 - bits)
+					exit !(int(base / block) == int(value / block))
+				}' || result=$?
+			case "${result:-0}" in
+			0) fail 'a policy rule could redirect a rescue connection' ;;
+			1) ;;
+			*) fail 'a policy rule could redirect a rescue connection' ;;
+			esac
+			result=
+		done
+	done
 }
 
 # Taken at the last moment before activation: the exact state to preserve.
@@ -526,12 +796,17 @@ take_rescue_before() {
 require_rescue_preserved() {
 	rescue_snapshot >"$rescue_after" || fail 'cannot read the rescue link state'
 	chmod 0600 "$rescue_after"
+	grep -Fxq 'unsupported ipv6' "$rescue_after" &&
+		fail 'an IPv6 SSH session is present; reconnect over IPv4 and reboot'
 	lost=$(grep -Fvxf "$rescue_after" "$rescue_before" | grep -c . || true)
 	[ "$lost" = 0 ] || fail 'a rescue link, route, rule or SSH endpoint changed'
+	rescue_snap=$(cat "$rescue_after")
+	require_rescue_route_contract
 	rescue_addrs=$(grep -c '^addr ' "$rescue_before" || true)
 	rescue_routes=$(grep -c '^route ' "$rescue_before" || true)
 	rescue_listeners=$(grep -c '^listen ' "$rescue_after" || true)
 	rescue_sessions=$(grep -c '^session ' "$rescue_after" || true)
+	rescue_peers=$(grep -c '^peer ' "$rescue_after" || true)
 }
 
 # IPv4, DNS from NetworkManager's modem device, resolver state on the data or
@@ -547,6 +822,7 @@ require_rescue_preserved() {
 # main table may only gain that one rule (or ones scoped to the cellular
 # interface or its own address).
 verify_network() {
+	require_post_step
 	addresses=$(timeout -k 1 5 ip -4 -o addr show dev "$iface" scope global 2>/dev/null | count_lines)
 	[ "$addresses" -ge 1 ] || fail 'cellular interface has no IPv4 address'
 	default_lines=$(timeout -k 1 5 ip -4 route show table all default dev "$iface" 2>/dev/null) || default_lines=
@@ -567,6 +843,7 @@ verify_network() {
 		;;
 	*) fail 'cellular default route uses an unreviewed routing table' ;;
 	esac
+	require_post_step
 	require_rescue_preserved
 	added=$(grep -Fvxf "$rescue_before" "$rescue_after" | grep '^rule ' || true)
 	cell_addrs=$(timeout -k 1 5 ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{ sub("/.*", "", $4); print $4 }')
@@ -587,6 +864,7 @@ verify_network() {
 		grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || true)
 	dns=$(printf '%s\n' "$dns_list" | grep -c . || true)
 	[ "$dns" -ge 1 ] || fail 'cellular modem device has no DNS server'
+	require_post_step
 	link_dns=$({ timeout -k 1 5 resolvectl dns "$iface" 2>/dev/null; timeout -k 1 5 resolvectl dns "$control" 2>/dev/null; } |
 		sed 's/^Link [0-9]* ([^)]*): *//' | tr ' ' '\n' | grep -E '^[0-9]' || true)
 	matched=0
@@ -607,18 +885,17 @@ verify_network() {
 # A public IPv4 unicast address: not unspecified, private, CGNAT, loopback,
 # link-local, multicast or reserved.
 public_ipv4() {
+	ipv4_literal "$1" || return 1
 	case "$1" in ''|*[!0-9.]*) return 1 ;; esac
 	set -- $(printf '%s\n' "$1" | tr '.' ' ')
-	[ "$#" = 4 ] || return 1
-	for octet in "$@"; do
-		case "$octet" in ''|*[!0-9]*) return 1 ;; esac
-		[ "${#octet}" -le 3 ] && [ "$octet" -le 255 ] || return 1
-	done
 	[ "$1" -ge 1 ] && [ "$1" -lt 224 ] || return 1
 	case "$1" in 10|127) return 1 ;; esac
 	[ "$1.$2" != 169.254 ] && [ "$1.$2" != 192.168 ] || return 1
 	{ [ "$1" = 172 ] && [ "$2" -ge 16 ] && [ "$2" -le 31 ]; } && return 1
 	{ [ "$1" = 100 ] && [ "$2" -ge 64 ] && [ "$2" -le 127 ]; } && return 1
+	{ [ "$1" = 192 ] && [ "$2" = 0 ] && { [ "$3" = 0 ] || [ "$3" = 2 ]; }; } && return 1
+	{ [ "$1" = 198 ] && { [ "$2" = 18 ] || [ "$2" = 19 ] || { [ "$2" = 51 ] && [ "$3" = 100 ]; }; }; } && return 1
+	{ [ "$1" = 203 ] && [ "$2" = 0 ] && [ "$3" = 113 ]; } && return 1
 	return 0
 }
 
@@ -627,6 +904,7 @@ public_ipv4() {
 # connects to exactly that address with --resolve, so the host name, TLS
 # validation and certificate check still use the real name.
 resolve_probe_host() {
+	require_post_step
 	answer=$(timeout -k 1 8 resolvectl query --cache=no --legend=no --protocol=dns -4 -i "$iface" "$probe_host" 2>/dev/null) ||
 		fail 'DNS query through the cellular link failed'
 	printf '%s\n' "$answer" | grep -Fq "link: $iface" ||
@@ -636,8 +914,8 @@ resolve_probe_host() {
 }
 
 read_packets() {
-	tx=$(cat "$net_root/$iface/statistics/tx_packets" 2>/dev/null) || tx=
-	rx=$(cat "$net_root/$iface/statistics/rx_packets" 2>/dev/null) || rx=
+	tx=$(timeout -k 1 2 cat "$net_root/$iface/statistics/tx_packets" 2>/dev/null) || tx=
+	rx=$(timeout -k 1 2 cat "$net_root/$iface/statistics/rx_packets" 2>/dev/null) || rx=
 	case "$tx$rx" in ''|*[!0-9]*) fail 'cellular interface packet counters are unavailable' ;; esac
 }
 
@@ -645,6 +923,7 @@ read_packets() {
 # only an HTTP code and the socket's source address (checked, never logged) are
 # read back. The data interface's packet counters must move in both directions.
 probe() {
+	require_post_step
 	read_packets
 	tx_before=$tx rx_before=$rx
 	reply=$(timeout -k 5 30 curl -q --interface "$iface" -4 --silent --noproxy '*' --proto =https \
@@ -681,19 +960,23 @@ refresh_gates() {
 	require_guard pristine
 	require_registered_now
 	select_control
-	require_isolated_profile
-	require_no_rule_conflicts
+	require_isolated_profile target
 	require_rescue_usable
+	require_no_rule_conflicts
 }
 
 # Immediately before the single activation, after the device is managed: the
 # same time, temperature, guard, registration and isolation checks again.
 last_gates() {
-	require_time "$min_remaining_activate" 'rollback watchdog deadline is too close; reboot and start again'
-	require_temperature
+	require_arm_gates
+	require_runtime_gates
 	require_guard pristine
 	require_registered_now
-	require_isolated_profile
+	require_isolated_profile target
+	require_rescue_usable
+	require_no_rule_conflicts
+	set_deadline
+	require_time "$min_remaining_activate" 'rollback watchdog deadline is too close; reboot and start again'
 }
 
 # Bounded, read-only wait for NetworkManager to finish managing the device and
@@ -753,7 +1036,7 @@ check_identity() {
 		[ -n "$(sed -n 's/^payload_sha256=\([0-9a-f]\{64\}\)$/\1/p' "$host_armed")" ] ||
 		fail 'hardware-test arm metadata is invalid'
 	seconds=$(sed -n 's/^watchdog_seconds=\([0-9]\{3,4\}\)$/\1/p' "$host_armed")
-	[ -n "$seconds" ] && [ "$seconds" -ge 600 ] && [ "$seconds" -le 1800 ] ||
+	[ -n "$seconds" ] && [ "$seconds" -ge 900 ] && [ "$seconds" -le 1800 ] ||
 		fail 'rollback watchdog duration metadata is invalid'
 	[ ! -e "$rollback_complete" ] || fail 'a rollback already completed; reboot into a fresh candidate'
 	regular "$init_boot_sha_file" && [ "$(grep -c . "$init_boot_sha_file")" = 1 ] ||
@@ -799,8 +1082,8 @@ cmd_qualify() {
 	wait_for_modem
 	select_control
 	require_isolated_profile
-	require_no_rule_conflicts
 	require_rescue_usable
+	require_no_rule_conflicts
 	persist "stage=qualify result=ready $(summary)"
 	printf 'result=ready profile=cellular watchdog=active bluetooth=absent audio=inactive ipa_guard=clean isolation=clean rescue=usable control=unmanaged %s\n' "$(summary)"
 }
@@ -821,8 +1104,8 @@ cmd_data() {
 	# the one-open invariant itself rests on NetworkManager holding the GSM
 	# device unmanaged until the explicit step below.
 	require_guard pristine
-	require_no_rule_conflicts
 	require_rescue_usable
+	require_no_rule_conflicts
 	pre_marker_hook
 	# The lock lands before any NetworkManager mutation or activation.
 	take_marker data || fail 'a cellular mutation was already taken this boot; reboot to retry'
@@ -837,13 +1120,21 @@ cmd_data() {
 	# From here to the activation nothing may be interleaved: the final gates
 	# once more, then manage the device, wait (read-only, bounded) until idle,
 	# the final gates again and the one activation. A profile created by
-	# something else inside this last instant is caught by the second pass.
+	# something else cannot activate: the device permits only the fixed UUID,
+	# and device-level autoconnect is disabled before management is released.
+	disable_device_autoconnect
+	pre_manage_transition_hook
+	require_mutation_room 110 'device management is too close to the rollback deadline; reboot'
 	last_gates
+	require_device_autoconnect_off
 	write_file "$data_state" activating
 	timeout -k 1 15 nmcli device set "$control" managed yes >/dev/null 2>&1 ||
 		fail 'modem control device could not be managed'
 	wait_managed_idle
+	require_device_autoconnect_off
 	last_gates
+	require_mutation_room 95 'cellular activation is too close to the rollback deadline; reboot'
+	require_device_autoconnect_off
 	status=0
 	timeout -k 5 90 nmcli connection up uuid "$target_uuid" ifname "$control" >/dev/null 2>&1 || status=$?
 	step=0
@@ -855,20 +1146,29 @@ cmd_data() {
 	persist "stage=activation result=active command_status=$status late_steps=$step"
 	write_file "$data_state" activated
 	require_time "$post_need" 'rollback watchdog deadline is too close for the post-activation checks; reboot'
+	require_post_step
 	set -- $(gsm_states)
 	[ "$1" = 1 ] || fail 'more than one cellular connection is active'
+	require_post_step
 	resolve_interface
+	require_post_step
 	require_guard
+	require_post_step
 	verify_network
+	require_post_step
 	probe
+	require_post_step
 	require_guard
+	require_post_step
 	require_rescue_preserved
+	require_post_step
 	require_temperature
+	require_post_step
 	write_file "$data_state" ready
 	persist "stage=data result=ready ipv4_addresses=$addresses default_routes=$default_routes dns=$dns https=$code tx_delta=$tx_delta rx_delta=$rx_delta"
-	printf 'result=ready ipv4_addresses=%s default_routes=%s policy=%s dns=%s link_dns_matches=%s dns_query=ok https=%s tx_delta=%s rx_delta=%s rescue_addresses=%s rescue_routes=%s ssh_listeners=%s ssh_sessions=%s rescue=preserved ipa_guard=clean\n' \
+	printf 'result=ready ipv4_addresses=%s default_routes=%s policy=%s dns=%s link_dns_matches=%s dns_query=ok https=%s tx_delta=%s rx_delta=%s rescue_addresses=%s rescue_routes=%s ssh_listeners=%s ssh_sessions=%s rescue_peers=%s rescue=preserved ipa_guard=clean\n' \
 		"$addresses" "$default_routes" "$policy" "$dns" "$matched" "$code" "$tx_delta" "$rx_delta" \
-		"$rescue_addrs" "$rescue_routes" "$rescue_listeners" "$rescue_sessions"
+		"$rescue_addrs" "$rescue_routes" "$rescue_listeners" "$rescue_sessions" "$rescue_peers"
 	printf '%s\n' 'Reboot required before any further cellular data attempt. Leave the modem path untouched.'
 	printf '%s\n' 'Now open a fresh SSH login over USB and over Wi-Fi from the host to confirm both rescue paths.'
 }

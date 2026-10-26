@@ -39,7 +39,7 @@ boot_id_file=/proc/sys/kernel/random/boot_id
 uptime_file=/proc/uptime
 poll_seconds=1
 max_iterations=0
-stale_seconds=15
+stale_seconds=5
 stall_seconds=5
 min_samples=2
 fatal_pattern='Kernel panic|Unable to handle kernel|Internal error:|BUG:|Oops:'
@@ -120,9 +120,9 @@ gap() {
 	persist "event=gap count=$gaps reason=$1"
 }
 
-read_flags() { cat "$net_root/$port/flags" 2>/dev/null; }
+read_flags() { timeout -k 1 2 cat "$net_root/$port/flags" 2>/dev/null; }
 
-read_carrier() { cat "$net_root/$port/carrier_changes" 2>/dev/null; }
+read_carrier() { timeout -k 1 2 cat "$net_root/$port/carrier_changes" 2>/dev/null; }
 
 # Exit status is the journal's: a failed or timed-out read is a gap, not a
 # quiet interval.
@@ -176,6 +176,11 @@ sample_carrier() {
 }
 
 sample_journal() {
+	# journalctl creates a missing cursor file. Check continuity before it can
+	# hide the observation gap; the first sample has no prior cursor by design.
+	if [ "$samples" -gt 0 ] && [ ! -s "$cursor_file" ]; then
+		gap cursor-lost
+	fi
 	if ! batch=$(journal_batch); then
 		gap journal-failed
 		return 0
@@ -195,14 +200,19 @@ sample_journal() {
 
 sample() {
 	now=$(now_seconds)
+	sample_started=$now
 	if [ "$samples" -gt 0 ] && [ $((now - tick)) -gt $((poll_seconds + stall_seconds)) ]; then
 		gap stall
 	fi
 	sample_flags
 	sample_carrier
 	sample_journal
+	sample_finished=$(now_seconds)
+	if [ $((sample_finished - sample_started)) -gt "$stall_seconds" ]; then
+		gap sample-slow
+	fi
 	samples=$((samples + 1))
-	tick=$(now_seconds)
+	tick=$sample_finished
 	publish
 }
 

@@ -12,6 +12,7 @@ expected_kernel=6.12.23-android16-5-g5a0e85dd9db0-dirty-4k
 expected_notes=8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608
 rmnet_sha=351ee168950591a3a9c35ea2c35b23678dd6ed8a2b0d0c218eb3c4a13a60dff3
 max_temperature_mc=95000
+target_uuid=7c3b1d52-6f0e-4a84-9d2a-4d59a0c1e5f3
 
 runtime=/run/omamobile-myron
 ready=/run/myron-cellular-ready
@@ -20,6 +21,7 @@ profile_file=/etc/omamobile/myron-test-profile
 host_arm=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
 rmnet_marker=/etc/myron/use-in-tree-rmnet
 nm_inhibit=/etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf
+networkmanager=/usr/bin/NetworkManager
 mm_wrapper=/usr/local/sbin/myron-modemmanager-start
 boot_id_file=/proc/sys/kernel/random/boot_id
 notes_file=/sys/kernel/notes
@@ -88,8 +90,28 @@ check_rmnet_assets() {
 	[ -f "$rmnet_marker" ] && [ ! -L "$rmnet_marker" ] ||
 		fail 'in-tree rmnet selection marker is not a regular file'
 	[ -f "$nm_inhibit" ] && [ ! -L "$nm_inhibit" ] &&
-		grep -Fxq 'match-device=type:gsm' "$nm_inhibit" && grep -Fxq 'managed=0' "$nm_inhibit" ||
+		grep -Fxq 'match-device=type:gsm' "$nm_inhibit" &&
+		grep -Fxq 'managed=0' "$nm_inhibit" &&
+		grep -Fxq "allowed-connections=uuid:$target_uuid" "$nm_inhibit" &&
+		grep -Fxq 'stop-match=yes' "$nm_inhibit" ||
 		fail 'NetworkManager GSM boot inhibit is missing'
+	[ -x "$networkmanager" ] || fail 'NetworkManager binary is missing'
+	effective=$(timeout -k 1 5 "$networkmanager" --print-config 2>/dev/null) ||
+		fail 'NetworkManager effective configuration is unavailable'
+	printf '%s\n' "$effective" | awk -v id="$target_uuid" '
+		/^[[:space:]]*\[/ {
+			line = $0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", line); section = line
+			next
+		}
+		section == "device-myron-cellular" {
+			line = $0; sub(/^[[:space:]]*/, "", line); sub(/[[:space:]]*$/, "", line)
+			if (line == "match-device=type:gsm") matched = 1
+			if (line == "managed=0") unmanaged = 1
+			if (line == "allowed-connections=uuid:" id) allowed = 1
+			if (line == "stop-match=yes") stopped = 1
+		}
+		END { exit !(matched && unmanaged && allowed && stopped) }' ||
+		fail 'NetworkManager effective GSM boot inhibit is missing'
 	[ -f "$mm_wrapper" ] && [ -x "$mm_wrapper" ] && [ ! -L "$mm_wrapper" ] ||
 		fail 'ModemManager admission wrapper is missing'
 	[ "$(uname -r)" = "$expected_kernel" ] ||

@@ -21,7 +21,8 @@ if grep -vE '^[[:space:]]*#' "$wrapper" | grep -nE 'systemctl|\bkill\b|restart|n
 grep -Fq 'mkdir "$admission"' "$wrapper" || fail 'admission is not an atomic mkdir'
 [[ $(grep -c '^exec ' "$wrapper") == 1 ]] || fail 'wrapper does not exec exactly once'
 for line in 'ExecStart=' 'ExecStart=/usr/local/sbin/myron-modemmanager-start' 'Restart=no' \
-  'ConditionPathExists=/run/omamobile-myron/modem-manager-allowed' 'ConditionPathExists=/run/myron-wireless-ready'; do
+  'ConditionPathExists=/run/omamobile-myron/modem-manager-allowed' 'ConditionPathExists=/run/myron-wireless-ready' \
+  'RestrictAddressFamilies=AF_INET'; do
   grep -Fxq "$line" "$dropin" || fail "drop-in lacks: $line"
 done
 [[ $(grep -c '^ExecStart=' "$dropin") == 2 ]] || fail 'drop-in must clear then set a single ExecStart'
@@ -101,6 +102,7 @@ BusName=org.freedesktop.ModemManager1
 ExecStart=/usr/bin/ModemManager
 StandardError=null
 Restart=on-abort
+RestrictAddressFamilies=AF_NETLINK AF_UNIX AF_QIPCRTR
 [Install]
 WantedBy=multi-user.target
 Alias=dbus-org.freedesktop.ModemManager1.service

@@ -17,7 +17,16 @@ systemctl() {
   echo "systemctl $*" >>"$calls"
   return 0
 }
-timeout() { while [[ $1 == -k ]]; do shift 2; done; shift; "$@"; }
+timeout() {
+  while [[ $1 == -k ]]; do shift 2; done
+  shift
+  if [[ -d ${mutation_marker:-/nonexistent} && ${timeout_advance_after_marker:-0} -gt 0 ]]; then mock_time "$timeout_advance_after_marker"; fi
+  if [[ -e ${work:-/nonexistent}/activated && ${timeout_advance_after_activation:-0} -gt 0 ]]; then mock_time "$timeout_advance_after_activation"; fi
+  if [[ -e ${work:-/nonexistent}/activated && ${heat_after_activation:-0} == 1 ]]; then
+    echo 99000 >"$thermal_root/thermal_zone0/temp"
+  fi
+  "$@"
+}
 stat() { printf '%s\n' "$stat_reply"; }
 leak() { [[ $noisy == 1 ]] && printf 'raw %s %s %s %s\n' "$secret_imei" "$secret_iccid" "$secret_ip" "$secret_apn" >&2 || true; }
 mmcli() {
@@ -73,6 +82,12 @@ nmcli() {
     return 0 ;;
   "-g connection.autoconnect connection show uuid $secret_uuid") echo "$autoconnect_reply"; return ;;
   "-g gsm.home-only connection show uuid $secret_uuid") echo "$m_homeonly"; return ;;
+  "-g gsm.initial-eps-bearer-configure connection show uuid $secret_uuid") echo "$m_initial_eps"; return ;;
+  "-g ipv4.routes connection show uuid $secret_uuid") echo "$m_profile_routes"; return ;;
+  "-g ipv4.addresses connection show uuid $secret_uuid") echo "$m_profile_addresses"; return ;;
+  "-g ipv4.gateway connection show uuid $secret_uuid") echo "$m_profile_gateway"; return ;;
+  "-g connection.secondaries connection show uuid $secret_uuid") echo "$m_secondaries"; return ;;
+  "-g ipv4.route-metric connection show uuid $secret_uuid") echo "$m_profile_metric"; return ;;
   "-g ipv4.routing-rules connection show uuid $secret_uuid") echo "$m_profile_rules"; return ;;
   "-g ipv4.route-table connection show uuid $secret_uuid") echo "$m_profile_table"; return ;;
   "-g ipv4.never-default connection show uuid $secret_uuid") echo "$m_profile_never"; return ;;
@@ -80,6 +95,9 @@ nmcli() {
   '-g connection.uuid connection show id myron-cellular') echo "$m_uuid_by_name"; return ;;
   "-g GENERAL.DEVICES connection show uuid $secret_uuid") echo "$m_bound"; return ;;
   '-g GENERAL.IP-IFACE device show ttyMODEM0') echo rmnet_data0; return ;;
+  '-g GENERAL.AUTOCONNECT device show ttyMODEM0')
+    if [[ -e $work/device-autoconnect-off ]]; then echo no; else echo "$m_device_auto"; fi
+    return ;;
   '-t -f IP4.DNS device show ttyMODEM0')
     for ((i = 0; i < dns_lines; i++)); do echo "IP4.DNS[$((i + 1))]:$secret_dns"; done
     return 0 ;;
@@ -90,10 +108,14 @@ nmcli() {
   leak
   case "$*" in
   'connection add '*) : >"$work/profile-created" ;;
+  'connection modify '*) : >"$work/profile-modified" ;;
+  'device set ttyMODEM0 autoconnect no')
+    [[ $device_autoconnect_set_ok == 1 ]] || return 1
+    : >"$work/device-autoconnect-off" ;;
   'device set ttyMODEM0 managed yes')
     : >"$work/managed"
     # What NetworkManager would do to a managed device with an autoconnect profile.
-    if [[ $autoactivate == 1 || -n $m_auto || $m_own_auto == yes ]]; then : >"$work/auto-activated"; fi ;;
+    if [[ ! -e $work/device-autoconnect-off && ( $autoactivate == 1 || -n $m_auto || $m_own_auto == yes ) ]]; then : >"$work/auto-activated"; fi ;;
   "connection up uuid $secret_uuid ifname ttyMODEM0")
     [[ $up_delay == 0 ]] || mock_time "$up_delay"
     [[ $up_activates == 0 ]] || : >"$work/activated"
@@ -129,6 +151,20 @@ ip() {
       else echo "default via 10.0.0.1 dev rmnet_data0 table $m_route_table metric 700"; fi
     done ;;
   '-4 route show table main default') [[ -z $m_main_default ]] || printf '%b\n' "$m_main_default" ;;
+  '-4 -o route get 172.16.42.2 from 172.16.42.1')
+    echo usb >>"$work/peer-route-calls"
+    if [[ -e $work/activated ]]; then
+      echo "172.16.42.2 from 172.16.42.1 dev $m_peer_dev_after src $m_peer_src_after ${m_peer_via_after:+via $m_peer_via_after }${m_peer_table_after:+table $m_peer_table_after }uid 0"
+    else
+      echo "172.16.42.2 from 172.16.42.1 dev $m_peer_dev src $m_peer_src ${m_peer_via:+via $m_peer_via }${m_peer_table:+table $m_peer_table }uid 0"
+    fi ;;
+  "-4 -o route get 192.168.50.9 from $secret_wifi_ip")
+    echo wifi >>"$work/peer-route-calls"
+    if [[ -e $work/activated ]]; then
+      echo "192.168.50.9 from $secret_wifi_ip dev $m_wifi_peer_dev_after src $m_wifi_peer_src_after ${m_wifi_peer_via_after:+via $m_wifi_peer_via_after }${m_wifi_peer_table_after:+table $m_wifi_peer_table_after }uid 0"
+    else
+      echo "192.168.50.9 from $secret_wifi_ip dev $m_wifi_peer_dev src $m_wifi_peer_src ${m_wifi_peer_via:+via $m_wifi_peer_via }${m_wifi_peer_table:+table $m_wifi_peer_table }uid 0"
+    fi ;;
   '-4 rule show')
     printf '0:\tfrom all lookup local\n'
     [[ -z $m_pre_rule ]] || printf '%b\n' "$m_pre_rule"
@@ -170,6 +206,7 @@ curl() {
   # A curl that loads a hostile config because -q was not first prints garbage.
   if [[ $1 != -q ]]; then printf '999 %s' "$secret_ip"; return 0; fi
   local dir=$net_root/rmnet_data0/statistics
+  [[ -z ${m_usb_ifindex_after:-} ]] || echo "$m_usb_ifindex_after" >"$net_root/usb0/ifindex"
   case "$m_counter_move" in
   both|tx) echo $(( $(cat "$dir/tx_packets") + 5 )) >"$dir/tx_packets" ;;
   esac

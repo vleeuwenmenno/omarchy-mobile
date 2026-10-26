@@ -6,6 +6,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 overlay=device/myron/hardware-test-overlay
 compose=tools/myron-dev-image-compose
+keyfile_audit=tools/myron-networkmanager-keyfile-audit
 initboot=tools/myron-build-test-init-boot
 initramfs=device/myron/hardware-test-initramfs
 input_stage=$overlay/usr/local/sbin/myron-input-stage
@@ -20,7 +21,8 @@ bluetooth_only_start=$bluetooth_experiment/bluetooth-only-start.sh
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
-bash -n "$compose" "$initboot" "$bluetooth_compose" || fail 'image builders parse'
+bash -n "$compose" "$keyfile_audit" "$initboot" "$bluetooth_compose" || fail 'image builders parse'
+[[ -x $keyfile_audit ]] || fail 'NetworkManager keyfile audit is not executable'
 sh -n "$bluetooth_selector" "$bluetooth_only_start" || fail 'Bluetooth experiment scripts parse'
 python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
   "$bluetooth_boot_builder" || fail 'Bluetooth boot builder parses'
@@ -67,6 +69,46 @@ python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(),
 [[ -x $input_stage ]] || fail "$input_stage is not executable"
 [[ -x $initboot ]] || fail 'init_boot builder is executable'
 pass 'composer, initramfs and hardware-test scripts parse'
+
+(
+  keywork=$(mktemp -d /tmp/myron-keyfiles.XXXXXX)
+  trap 'rm -rf -- "$keywork"' EXIT
+  for store in etc/NetworkManager/system-connections usr/lib/NetworkManager/system-connections run/NetworkManager/system-connections; do
+    rm -rf "$keywork/root"
+    mkdir -p "$keywork/root/$store"
+    printf '[connection]\nid=wifi\ntype=wifi\n' >"$keywork/root/$store/wifi.nmconnection"
+    "$keyfile_audit" "$keywork/root" >/dev/null || fail "valid keyfile rejected in $store"
+    printf ' [ connection ] \nid=test\n Type = GSM \n' >"$keywork/root/$store/cell.nmconnection"
+    out=$("$keyfile_audit" "$keywork/root" 2>&1) && fail "cellular keyfile accepted in $store"
+    [[ $out == *'unexpected GSM or CDMA'* ]] || fail "wrong cellular rejection in $store: $out"
+  done
+  rm -rf "$keywork/root"; mkdir -p "$keywork/root/etc/NetworkManager/system-connections"
+  printf '[ gsm ]\napn=internet\n' >"$keywork/root/etc/NetworkManager/system-connections/cell"
+  "$keyfile_audit" "$keywork/root" >/dev/null 2>&1 && fail 'spaced GSM section accepted'
+  printf 'type=gsm\n' >"$keywork/root/etc/NetworkManager/system-connections/bad"
+  out=$("$keyfile_audit" "$keywork/root" 2>&1) && fail 'malformed keyfile accepted'
+  [[ $out == *'malformed NetworkManager keyfile'* ]] || fail "wrong malformed rejection: $out"
+  rm -f "$keywork/root/etc/NetworkManager/system-connections/bad" "$keywork/root/etc/NetworkManager/system-connections/cell"
+  printf '[connection]\nid=hidden\ntype=gsm\0hidden\n' >"$keywork/root/etc/NetworkManager/system-connections/nul"
+  out=$("$keyfile_audit" "$keywork/root" 2>&1) && fail 'NUL-hidden cellular keyfile accepted'
+  [[ $out == *'malformed NetworkManager keyfile'* ]] || fail "wrong NUL rejection: $out"
+  rm -rf "$keywork/root"; mkdir -p "$keywork/root/etc/NetworkManager" "$keywork/real-store"
+  ln -s "$keywork/real-store" "$keywork/root/etc/NetworkManager/system-connections"
+  out=$("$keyfile_audit" "$keywork/root" 2>&1) && fail 'linked keyfile store accepted'
+  [[ $out == *'invalid NetworkManager keyfile store'* ]] || fail "wrong linked-store rejection: $out"
+  rm -rf "$keywork/root"; mkdir -p "$keywork/root" "$keywork/real-etc/NetworkManager/system-connections"
+  ln -s "$keywork/real-etc" "$keywork/root/etc"
+  out=$("$keyfile_audit" "$keywork/root" 2>&1) && fail 'keyfile store with linked ancestor accepted'
+  [[ $out == *'invalid NetworkManager keyfile store'* ]] || fail "wrong linked-ancestor rejection: $out"
+  rm -rf "$keywork/root"; mkdir -p "$keywork/root/etc/NetworkManager/system-connections"
+  printf '[connection]\nid=unsafe\ntype=ethernet\ninterface-name=rmnet_ipa0\n' >"$keywork/root/etc/NetworkManager/system-connections/unsafe"
+  out=$("$keyfile_audit" "$keywork/root" 2>&1) && fail 'rmnet-bound ethernet keyfile accepted'
+  [[ $out == *'unsafe modem-interface'* ]] || fail "wrong modem-interface rejection: $out"
+  printf '[keyfile]\npath=/etc/NetworkManager/system-connections/other\n' >"$keywork/root/etc/NetworkManager/system-connections/unsafe"
+  out=$("$keyfile_audit" "$keywork/root" 2>&1) && fail '[keyfile] path accepted'
+  [[ $out == *'unsafe modem-interface'* ]] || fail "wrong keyfile-path rejection: $out"
+)
+pass 'all NetworkManager stores reject cellular, malformed and linked keyfiles'
 
 profile=$overlay/etc/uwsm/env.d/20-myron-gpu
 for exact in \
@@ -243,21 +285,25 @@ grep -Fq '"$root/usr/local/sbin/myron-ipa-guard"' "$compose" ||
 dropin=$overlay/etc/systemd/system/ModemManager.service.d/20-myron-radio.conf
 for line in 'Requires=myron-reference-radio.service' 'After=myron-reference-radio.service' \
   'ConditionPathExists=/run/myron-wireless-ready' \
-  'ConditionPathExists=/run/omamobile-myron/modem-manager-allowed' 'Restart=no'; do
+  'ConditionPathExists=/run/omamobile-myron/modem-manager-allowed' 'Restart=no' \
+  'RestrictAddressFamilies=AF_INET'; do
   grep -Fxq "$line" "$dropin" || fail "ModemManager drop-in lacks: $line"
 done
 for line in 'ExecStart=' 'ExecStart=/usr/local/sbin/myron-modemmanager-start'; do
   grep -Fxq "$line" "$dropin" || fail "ModemManager drop-in lacks the one-start wrapper: $line"
 done
 nm_conf=$overlay/etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf
-grep -Fxq '[device-myron-cellular]' "$nm_conf" && grep -Fxq 'match-device=type:gsm' "$nm_conf" && grep -Fxq 'managed=0' "$nm_conf" ||
+grep -Fxq '[device-myron-cellular]' "$nm_conf" && grep -Fxq 'match-device=type:gsm' "$nm_conf" && grep -Fxq 'managed=0' "$nm_conf" &&
+  grep -Fxq 'allowed-connections=uuid:7c3b1d52-6f0e-4a84-9d2a-4d59a0c1e5f3' "$nm_conf" && grep -Fxq 'stop-match=yes' "$nm_conf" ||
   fail 'NetworkManager does not hold GSM devices unmanaged at boot'
-[[ $(grep -c '^[a-z]' "$nm_conf") == 2 ]] || fail 'unexpected extra NetworkManager inhibit settings'
+[[ $(grep -c '^[a-z]' "$nm_conf") == 4 ]] || fail 'unexpected extra NetworkManager inhibit settings'
 # qmapmux* is the data interface NetworkManager configures during activation: never unmanaged.
 if grep -rnE 'unmanaged-devices.*(qmapmux|rmnet)|interface-name:(qmapmux|rmnet)' "$overlay/etc/NetworkManager"; then
   fail 'NetworkManager is told to leave a modem data interface unmanaged'
 fi
-grep -Fq 'unexpected GSM or CDMA NetworkManager keyfile' "$compose" || fail 'composer does not reject a shipped GSM keyfile'
+grep -Fq 'unexpected GSM or CDMA NetworkManager keyfile' "$keyfile_audit" || fail 'keyfile audit does not reject a shipped GSM keyfile'
+grep -Fq 'myron-networkmanager-keyfile-audit:/keyfile-audit:ro' "$compose" &&
+  grep -Fq '/keyfile-audit "$root"' "$compose" || fail 'composer does not run the keyfile audit in the payload'
 grep -Fq 'ModemManager D-Bus alias is not the canonical unit' "$compose" || fail 'composer does not check the ModemManager alias'
 guard_unit=$overlay/usr/lib/systemd/system/myron-ipa-guard.service
 grep -Fxq 'ExecStart=/usr/local/sbin/myron-ipa-guard run' "$guard_unit" && grep -Fxq 'Restart=no' "$guard_unit" ||

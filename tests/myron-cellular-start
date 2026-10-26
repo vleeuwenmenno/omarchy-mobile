@@ -43,6 +43,7 @@ net_root=$work/net
 thermal_root=$work/thermal
 bluetooth_hci=$work/hci0
 nm_inhibit=$work/nm-inhibit.conf
+networkmanager=$work/NetworkManager
 mm_wrapper=$work/mm-wrapper
 boot_id_file=$work/boot-id
 guard_wait_steps=2
@@ -55,7 +56,7 @@ module_dir_expected=$module_set_root/$expected_notes
 reset() {
   expected_notes=$real_notes
   rm -rf "$runtime" "$calls" "$ready" "$wireless_ready" "$sys_module" "$net_root" "$thermal_root" \
-    "$module_set_root" "$bluetooth_hci" "$rmnet_marker" "$selector" "$guard" "$nm_inhibit" "$mm_wrapper"
+    "$module_set_root" "$bluetooth_hci" "$rmnet_marker" "$selector" "$guard" "$nm_inhibit" "$mm_wrapper" "$networkmanager" "$work/nm-effective"
   : >"$calls"
   mkdir -p "$module_dir_expected" "$thermal_root/thermal_zone0" "$net_root/rmnet_ipa0"
   printf 'rmnet' >"$module_dir_expected/rmnet.ko"
@@ -64,7 +65,9 @@ reset() {
   printf '#!/bin/sh\necho "%s"\n' "$module_dir_expected" >"$selector"; chmod +x "$selector"
   printf '#!/bin/sh\nexit "${GUARD_RC:-0}"\n' >"$guard"; chmod +x "$guard"
   : >"$host_arm"; echo cellular >"$profile_file"
-  printf '[device-myron-cellular]\nmatch-device=type:gsm\nmanaged=0\n' >"$nm_inhibit"
+  printf '[device-myron-cellular]\nmatch-device=type:gsm\nmanaged=0\nallowed-connections=uuid:%s\nstop-match=yes\n' "$target_uuid" >"$nm_inhibit"
+  cp "$nm_inhibit" "$work/nm-effective"
+  printf '#!/bin/sh\ncat %s\n' "$work/nm-effective" >"$networkmanager"; chmod +x "$networkmanager"
   printf '#!/bin/sh\n' >"$mm_wrapper"; chmod +x "$mm_wrapper"; echo boot-K >"$boot_id_file"
   for m in rmnet rmnet_mem gsim ipam ipanetm rmnet_ctl; do mkdir -p "$sys_module/$m"; done
   echo battery >"$thermal_root/thermal_zone0/type"; echo 60000 >"$thermal_root/thermal_zone0/temp"
@@ -145,7 +148,11 @@ gate 'marker directory' 'selection marker' 'rm -f "$rmnet_marker"; mkdir "$rmnet
 gate 'NetworkManager inhibit missing' 'NetworkManager GSM boot inhibit is missing' 'rm -f "$nm_inhibit"'
 gate 'NetworkManager inhibit not unmanaged' 'NetworkManager GSM boot inhibit is missing' 'printf "[device-myron-cellular]\nmatch-device=type:gsm\nmanaged=1\n" >"$nm_inhibit"'
 gate 'NetworkManager inhibit not gsm' 'NetworkManager GSM boot inhibit is missing' 'printf "[device-myron-cellular]\nmatch-device=type:wifi\nmanaged=0\n" >"$nm_inhibit"'
+gate 'NetworkManager inhibit allows wrong profile' 'NetworkManager GSM boot inhibit is missing' 'sed -i "s/$target_uuid/00000000-0000-0000-0000-000000000000/" "$nm_inhibit"'
+gate 'NetworkManager inhibit lacks stop-match' 'NetworkManager GSM boot inhibit is missing' 'sed -i "/stop-match=/d" "$nm_inhibit"'
 gate 'NetworkManager inhibit symlink' 'NetworkManager GSM boot inhibit is missing' 'mv "$nm_inhibit" "$work/real.conf"; ln -s "$work/real.conf" "$nm_inhibit"'
+gate 'NetworkManager effective inhibit missing' 'effective GSM boot inhibit is missing' 'sed -i "/allowed-connections=/d" "$work/nm-effective"'
+gate 'NetworkManager print-config fails' 'effective configuration is unavailable' 'printf "#!/bin/sh\nexit 1\n" >"$networkmanager"'
 gate 'ModemManager wrapper missing' 'admission wrapper is missing' 'rm -f "$mm_wrapper"'
 gate 'ModemManager wrapper not executable' 'admission wrapper is missing' 'chmod -x "$mm_wrapper"'
 gate 'kernel release' 'unexpected kernel release' 'kernel=6.12.23-other'
@@ -220,6 +227,7 @@ shstart() { # runs the real script as a /bin/sh process
   sh_patch "$start" "$work/start.sh" "expected_kernel=$expected_kernel" "expected_notes=$expected_notes" "rmnet_sha=$rmnet_sha" \
     "runtime=$runtime" "ready=$ready" "wireless_ready=$wireless_ready" "profile_file=$profile_file" "host_arm=$host_arm" \
     "rmnet_marker=$rmnet_marker" "nm_inhibit=$nm_inhibit" "mm_wrapper=$mm_wrapper" "boot_id_file=$boot_id_file" \
+	    "networkmanager=$networkmanager" \
     "notes_file=$notes_file" "selector=$selector" "module_set_root=$module_set_root" "guard=$guard" "sys_module=$sys_module" \
     "net_root=$net_root" "thermal_root=$thermal_root" "bluetooth_hci=$bluetooth_hci" "guard_wait_steps=2"
   ( cd / && PATH="$shbin:$PATH" sh "$work/start.sh" ) 2>&1

@@ -1,0 +1,67 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Reject cellular profiles from every NetworkManager keyfile store in ROOT.
+set -euo pipefail
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+[[ $# == 1 && $1 == /* && -d $1 && ! -L $1 ]] ||
+  die 'usage: myron-networkmanager-keyfile-audit ABSOLUTE_ROOT'
+root=${1%/}
+[[ $(realpath -e -- "$root") == "$root" ]] || die 'invalid NetworkManager root'
+keyfile_list=$(mktemp)
+trap 'rm -f -- "$keyfile_list"' EXIT
+
+for relative in \
+  etc/NetworkManager/system-connections \
+  usr/lib/NetworkManager/system-connections \
+  run/NetworkManager/system-connections; do
+  store=$root/$relative
+  if [[ -e $store || -L $store ]]; then
+    [[ -d $store && ! -L $store ]] || die 'invalid NetworkManager keyfile store'
+    [[ $(realpath -e -- "$store") == "$store" ]] || die 'invalid NetworkManager keyfile store'
+  else
+    continue
+  fi
+  : >"$keyfile_list"
+  find -P "$store" -mindepth 1 -maxdepth 1 -print0 >"$keyfile_list" ||
+    die 'cannot enumerate NetworkManager keyfile store'
+  while IFS= read -r -d '' keyfile; do
+    [[ -f $keyfile && ! -L $keyfile ]] || die 'invalid NetworkManager keyfile entry'
+    # NetworkManager uses GLib strings and accepts the prefix before a NUL.
+    # awk can retain the suffix, so reject binary/NUL input before text parsing.
+    # Both commands only read this file; neither writes it.
+    # shellcheck disable=SC2094
+    LC_ALL=C tr -d '\000' <"$keyfile" | cmp -s -- "$keyfile" - ||
+      die 'malformed NetworkManager keyfile in the payload'
+    status=0
+    LC_ALL=C awk '
+      function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+      /^[[:space:]]*($|[#;])/ { next }
+      /^[[:space:]]*\[/ {
+        line = trim($0)
+        if (line !~ /^\[[^][]+\]$/) exit 2
+        section = tolower(trim(substr(line, 2, length(line) - 2)))
+        if (section == "gsm" || section == "cdma") exit 3
+        if (section == "keyfile") exit 4
+        next
+      }
+      {
+        if (section == "") exit 2
+        pos = index($0, "=")
+        if (!pos) exit 2
+        key = tolower(trim(substr($0, 1, pos - 1)))
+        value = tolower(trim(substr($0, pos + 1)))
+        if (key == "") exit 2
+        if (section == "connection" && key == "type" && (value == "gsm" || value == "cdma")) exit 3
+        if (section == "connection" && key == "interface-name" && value ~ /^(rmnet|qmapmux|wwan)/) exit 4
+      }
+    ' "$keyfile" || status=$?
+    case $status in
+      0) ;;
+      3) die 'unexpected GSM or CDMA NetworkManager keyfile in the payload' ;;
+      4) die 'unsafe modem-interface NetworkManager keyfile in the payload' ;;
+      *) die 'malformed NetworkManager keyfile in the payload' ;;
+    esac
+  done <"$keyfile_list"
+done
