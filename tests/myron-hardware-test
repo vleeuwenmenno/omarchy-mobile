@@ -134,8 +134,16 @@ grep -Fq 'enable myron-hardware-watchdog.service' "$compose" ||
   fail 'rollback watchdog is not enabled in the payload'
 grep -Fq 'myron-coexistence.service' "$compose" ||
   fail 'guarded coexistence bring-up is not enabled in the payload'
-grep -Fq 'mask ModemManager.service systemd-firstboot.service' "$compose" ||
+grep -Fq 'coexistence|cellular' "$compose" ||
+  fail 'composer does not restrict the hardware-test profile'
+grep -Fq 'mask systemd-firstboot.service' "$compose" ||
   fail 'interactive stock firstboot is not masked'
+grep -Fq 'mask ModemManager.service' "$compose" ||
+  fail 'coexistence profile does not mask ModemManager'
+grep -Fq 'unmask ModemManager.service' "$compose" ||
+  fail 'cellular profile does not unmask ModemManager'
+grep -Fq 'enable ModemManager.service' "$compose" ||
+  fail 'cellular profile does not enable ModemManager'
 grep -Fq 'Session=myron-omarchy.desktop' "$overlay/etc/sddm.conf.d/zz-myron-test.conf" ||
   fail 'late SDDM override does not select the isolated Myron session'
 grep -Fq 'TimeoutStartSec=3min' \
@@ -203,9 +211,28 @@ grep -Fq 'myron-hardware-watchdog.service' "$coexist" ||
   fail 'coexistence bring-up does not require the rollback watchdog'
 grep -Fq 'Before=NetworkManager.service display-manager.service myron-omarchy-qualify.service' "$coexist_unit" ||
   fail 'coexistence service is not ordered before networking, graphics, and qualification'
-grep -Fq 'Requires=myron-omarchy-prepare.service myron-coexistence.service' \
+grep -Fxq 'Requires=myron-omarchy-prepare.service' \
   "$overlay/usr/lib/systemd/system/myron-omarchy-qualify.service" ||
-  fail 'graphical qualification can disarm rollback before coexistence succeeds'
+  fail 'graphical qualification does not require hardware preparation'
+for required in \
+  'systemctl --quiet is-active myron-coexistence.service' \
+  'systemctl --quiet is-active myron-reference-radio.service' \
+  'systemctl --quiet is-active ModemManager.service' \
+  'ModemManager did not publish a modem within 180 seconds' \
+  'cellular modem does not advertise raw GPS' \
+  'cellular modem does not advertise NMEA GPS'; do
+  grep -Fq "$required" "$qualify" ||
+    fail "profile qualification lacks: $required"
+done
+grep -Fq 'Requires=myron-reference-radio.service' \
+  "$overlay/etc/systemd/system/ModemManager.service.d/20-myron-radio.conf" ||
+  fail 'ModemManager is not ordered behind the radio foundation'
+grep -Fq 'Requires=myron-omarchy-prepare.service myron-hardware-watchdog.service' \
+  "$overlay/usr/lib/systemd/system/myron-reference-radio.service" ||
+  fail 'radio foundation can start before hardware preparation or without watchdog'
+grep -Fq 'Before=NetworkManager.service ModemManager.service display-manager.service myron-omarchy-qualify.service' \
+  "$overlay/usr/lib/systemd/system/myron-reference-radio.service" ||
+  fail 'radio foundation is not ordered before cellular, networking, graphics, and qualification'
 grep -Fq 'systemctl --user start myron-speaker-sink.service' \
   "$overlay/usr/local/bin/myron-omarchy-setup-user" ||
   fail 'graphical session does not publish the protected speaker sink'

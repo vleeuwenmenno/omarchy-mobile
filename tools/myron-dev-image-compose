@@ -11,6 +11,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 Usage: tools/myron-dev-image-compose \
+  [--profile coexistence|cellular] \
   --base-image ABSOLUTE_RAW_EXT4 \
   --module-stage ABSOLUTE_DIR \
   --runtime-stage ABSOLUTE_DIR \
@@ -28,9 +29,11 @@ and audio activation remain disabled until an attended, separately gated test.
 EOF
 }
 
+profile=coexistence
 base= modules= runtime= bluetooth_probe= speaker_reference= firstboot= ssh_key= out=
 while (($#)); do
   case $1 in
+    --profile) profile=${2:?}; shift 2 ;;
     --base-image) base=${2:?}; shift 2 ;;
     --module-stage) modules=${2:?}; shift 2 ;;
     --runtime-stage) runtime=${2:?}; shift 2 ;;
@@ -43,6 +46,10 @@ while (($#)); do
     *) die "unknown argument: $1" ;;
   esac
 done
+case $profile in
+  coexistence|cellular) ;;
+  *) die "unsupported hardware-test profile: $profile" ;;
+esac
 for value in base modules runtime bluetooth_probe speaker_reference firstboot ssh_key out; do
   [[ -n ${!value} ]] || die "--${value//_/-} is required"
 done
@@ -109,6 +116,7 @@ chmod 0600 "$out"
 alarm_fetch package
 image=$(alarm_build_image "$ROOT")
 docker run --rm --privileged --platform linux/arm64 \
+  -e MYRON_TEST_PROFILE="$profile" \
   -v "$out:/payload.img" \
   -v "$modules:/module-stage:ro" \
   -v "$runtime:/runtime-stage:ro" \
@@ -135,6 +143,10 @@ docker run --rm --privileged --platform linux/arm64 \
     cp -a /module-stage/. "$root/"
     cp -a /runtime-stage/. "$root/"
     tar -C /test-overlay -cf - . | tar --no-same-owner -C "$root" -xf -
+    install -d -m0755 "$root/etc/omamobile"
+    printf "%s\n" "$MYRON_TEST_PROFILE" >"$root/etc/omamobile/myron-test-profile"
+    chown 0:0 "$root/etc/omamobile/myron-test-profile"
+    chmod 0644 "$root/etc/omamobile/myron-test-profile"
     # The three inputs are host bind mounts.  Their directory entries carry
     # the invoking developer uid, and both cp(1) and tar(1) may apply that
     # metadata to pre-existing directories such as / and /usr.  Normalize
@@ -229,12 +241,24 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-omarchy-qualify"
     systemctl --root="$root" enable myron-hardware-watchdog.service \
       myron-batterysecret.service \
-      myron-omarchy-prepare.service myron-coexistence.service \
+      myron-omarchy-prepare.service \
       myron-omarchy-qualify.service sshd.service \
       systemd-networkd.service >/dev/null
     # Omarchy Mobile has its own non-interactive first-boot service.  Arch
     # stock prompt otherwise blocks sysinit.target behind Plymouth forever.
-    systemctl --root="$root" mask ModemManager.service systemd-firstboot.service >/dev/null
+    systemctl --root="$root" mask systemd-firstboot.service >/dev/null
+    case $MYRON_TEST_PROFILE in
+      coexistence)
+        systemctl --root="$root" enable myron-coexistence.service >/dev/null
+        systemctl --root="$root" mask ModemManager.service >/dev/null
+        ;;
+      cellular)
+        systemctl --root="$root" disable myron-coexistence.service >/dev/null 2>&1 || true
+        systemctl --root="$root" add-wants multi-user.target myron-reference-radio.service >/dev/null
+        systemctl --root="$root" unmask ModemManager.service >/dev/null
+        systemctl --root="$root" enable ModemManager.service >/dev/null
+        ;;
+    esac
     sync
     umount /mnt/payload
     losetup -d "$loop"
@@ -263,10 +287,20 @@ debugfs -R 'stat /etc/systemd/system/systemd-firstboot.service' "$out" 2>/dev/nu
   grep -Fq 'Fast link dest: "/dev/null"' || die 'stock interactive systemd-firstboot is not masked'
 debugfs -R 'stat /etc/systemd/system/sysinit.target.wants/myron-hardware-watchdog.service' \
   "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'hardware watchdog is not enabled'
-debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-coexistence.service' \
-  "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'coexistence bring-up is not enabled'
+case $profile in
+  coexistence)
+    debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-coexistence.service' \
+      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'coexistence bring-up is not enabled'
+    ;;
+  cellular)
+    debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-reference-radio.service' \
+      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'cellular radio foundation is not enabled'
+    debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/ModemManager.service' \
+      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'cellular ModemManager is not enabled'
+    ;;
+esac
 hash=$(sha256sum <"$out" | cut -d" " -f1)
 printf '%s  %s\n' "$hash" "$(basename -- "$out")" >"$out.sha256"
 chmod 0600 "$out.sha256"
-printf 'status=composed\nimage=%s\nsha256=%s\nactivation=temporary-hardware-test\ndeployment_authorized=false\n' \
-  "$out" "$hash"
+printf 'status=composed\nimage=%s\nsha256=%s\nprofile=%s\nactivation=temporary-hardware-test\ndeployment_authorized=false\n' \
+  "$out" "$hash" "$profile"

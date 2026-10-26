@@ -67,3 +67,12 @@ qualification tools, not the final standalone Arch implementation.
 Audio additionally refuses to start unless the radio bridge completed cleanly
 and no ModemManager process exists. Its qualification therefore requires a
 fresh, separate boot before modem or GNSS testing.
+
+The image composer therefore has two mutually exclusive profiles. The default
+`coexistence` profile starts radio, Bluetooth, AudioReach and the protected
+speaker path while keeping ModemManager masked. The `cellular` profile starts
+only the radio foundation and ModemManager; Bluetooth and every AudioReach
+bridge remain stopped. In either profile the rollback watchdog stays armed
+until native DSI/GPU qualification and the selected profile checks succeed.
+For `cellular`, qualification requires a published modem with raw and NMEA GPS
+capabilities, but it does not enable GNSS, mobile data, SMS or voice calls.

@@ -2,8 +2,9 @@
 [Unit]
 Description=Attended Myron radio and Wi-Fi foundation test
 ConditionPathExists=/run/omamobile-myron/radio-backup-verified
-After=local-fs.target systemd-udevd.service
-Before=NetworkManager.service
+Requires=myron-omarchy-prepare.service myron-hardware-watchdog.service
+After=local-fs.target systemd-udevd.service myron-omarchy-prepare.service myron-hardware-watchdog.service
+Before=NetworkManager.service ModemManager.service display-manager.service myron-omarchy-qualify.service
 
 [Service]
 Type=oneshot

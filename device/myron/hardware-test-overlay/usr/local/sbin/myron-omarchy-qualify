@@ -4,6 +4,7 @@ set -eu
 
 log=/var/log/myron-omarchy-hardware-test.log
 host_state=/run/myron-host/var/lib/omarchy-mobile
+profile_file=/etc/omamobile/myron-test-profile
 stable_seconds=90
 deadline_seconds=600
 
@@ -15,6 +16,53 @@ has_fd() {
     [ "$(readlink "$fd" 2>/dev/null || true)" = "$wanted" ] && return 0
   done
   return 1
+}
+
+qualify_profile() {
+  profile=$(cat "$profile_file" 2>/dev/null || true)
+  case "$profile" in
+    coexistence)
+      systemctl --quiet is-active myron-coexistence.service ||
+        die 'coexistence profile service is not active'
+      [ -s /run/myron-coexistence-ready ] ||
+        die 'coexistence profile readiness marker is missing'
+      say 'profile=coexistence state=qualified'
+      ;;
+    cellular)
+      systemctl --quiet is-active myron-reference-radio.service ||
+        die 'cellular radio foundation is not active'
+      [ -s /run/myron-wireless-ready ] ||
+        die 'cellular radio readiness marker is missing'
+      systemctl --quiet is-active ModemManager.service ||
+        die 'cellular ModemManager service is not active'
+      ! systemctl --quiet is-active myron-reference-audio-foundation.service ||
+        die 'cellular profile unexpectedly started AudioReach'
+      ! systemctl --quiet is-active myron-speaker-bridge.service ||
+        die 'cellular profile unexpectedly started speaker bridge'
+      [ ! -e /sys/class/bluetooth/hci0 ] ||
+        die 'cellular profile unexpectedly created a Bluetooth controller'
+      ! pgrep -x btattach >/dev/null 2>&1 ||
+        die 'cellular profile unexpectedly started Bluetooth transport'
+      modem_ready=no
+      elapsed=0
+      while [ "$elapsed" -lt 180 ]; do
+        if timeout 5 mmcli -L 2>/dev/null | grep -Fq '/Modem/'; then
+          modem_ready=yes
+          break
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+      done
+      [ "$modem_ready" = yes ] || die 'ModemManager did not publish a modem within 180 seconds'
+      location=$(timeout 10 mmcli -m any --location-status --output-keyvalue 2>/dev/null || true)
+      printf '%s\n' "$location" | grep -Fq ': gps-raw' ||
+        die 'cellular modem does not advertise raw GPS'
+      printf '%s\n' "$location" | grep -Fq ': gps-nmea' ||
+        die 'cellular modem does not advertise NMEA GPS'
+      say "profile=cellular modem=published location=raw+nmea discovery_seconds=$elapsed state=qualified"
+      ;;
+    *) die 'unknown or missing Myron hardware-test profile' ;;
+  esac
 }
 
 [ -f /run/myron-omarchy-hardware-ready ] || die 'hardware preparation marker missing'
@@ -126,6 +174,8 @@ if grep -Eqi 'llvmpipe|swrast' "$client_wayland_log"; then
 fi
 [ "$client_status" -eq 0 ] ||
   say "client_egl_exit=$client_status state=unrelated-platform-failure-accepted"
+
+qualify_profile
 
 mkdir -p "$host_state"
 printf 'qualified_pid=%s\nstable_seconds=%s\n' "$pid" "$stable_seconds" \
