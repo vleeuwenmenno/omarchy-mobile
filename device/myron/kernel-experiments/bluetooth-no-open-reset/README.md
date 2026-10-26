@@ -94,3 +94,36 @@ rollback. BlueZ state is mounted on a private bounded tmpfs and the diagnostic
 journal is volatile, so discovered identities do not enter the payload
 filesystem. Pass requires a fresh bounded event from the named peer, clean
 controller power-off, and automatic postmarketOS rollback if any gate fails.
+
+## First powered discovery result (v44, 2026-10-26)
+
+The exact v44 candidate completed firmware loading, public-address setup and
+BlueZ publication. A bounded 20-second BR/EDR scan then failed closed because
+Inquiry Cancel (`0x0402`) returned `-16` and BlueZ remained in
+`Discovering: yes`. Controller cleanup repeated that error before the guarded
+power cut. The 900-second watchdog restored the exact postmarketOS `boot_a`
+and `init_boot_a` hashes; slot B was not read or written.
+
+The next diagnostic stops the first 10.24-second Classic inquiry at seven
+seconds instead of spanning multiple inquiry intervals. Patch 0004 also lets a
+later Inquiry Complete finish a stuck management stop without interrupting an
+active LE scan. That recovery logs an identity-free kernel warning. The stage
+waits at most 15 seconds, records only fresh expected-peer count, Inquiry
+Cancel failure count, recovery count and monotonic timestamps, and still
+requires `Discovering: no`, a fresh peer, zero cancel failures, zero recovery,
+bounded power-off and exact rollback disarm.
+Raw `bluetoothctl` output is discarded so peer names and addresses never enter
+the persistent diagnostic log.
+
+## Inquiry-stop candidate (offline, 2026-10-26)
+
+The rebuilt candidate has kernel-notes SHA-256
+`1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea`
+and kernel `Image` SHA-256
+`672808b1277b583fdc398986bfe8d100b2ebbf1c2cfbb9d14dd257366d1a5937`.
+Its protected-ABI report is empty, its generated configuration is byte-for-byte
+identical to the public-address candidate, and `bluetooth.ko` contains the
+reviewed inquiry-stop recovery diagnostic. Its release remains
+`6.12.23-android16-5-g5a0e85dd9db0-dirty-4k`. The composer pins the entire
+rebuilt module set, checks both changed modules' release and diagnostics before
+image composition, and installs the modules under the new notes-hash directory.

@@ -34,7 +34,7 @@ out=$(realpath -m "$out")
 [[ -d $(dirname -- "$out") && ! -L $(dirname -- "$out") ]] || die 'output parent is unsafe'
 
 readonly base_sha=744cfdb0f3e16657ddf369c4c6130689c5a25a52ce612dc8dff33fafb438ff3d
-readonly notes=0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8
+readonly notes=1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea
 [[ $(sha256sum "$base" | awk '{print $1}') == "$base_sha" ]] || die 'base is not exact qualified v14b coexistence image'
 [[ $(stat -c %s "$base") == 11945377792 ]] || die 'base image size differs'
 [[ ! -s $dist/abi_stgdiff/abi.report.plain ]] || die 'candidate has a protected ABI difference'
@@ -53,27 +53,32 @@ for name in "${!firmware_files[@]}"; do
 done
 
 declare -A files=(
-  [Image]=cd0a641d9290b1287fa4d4260b368c8d147dc8a11ee8d11d32008b7ea6389ff9
+  [Image]=672808b1277b583fdc398986bfe8d100b2ebbf1c2cfbb9d14dd257366d1a5937
   [kernel_aarch64_dot_config]=33b6eaf87b7ca2d0d06dd10dbe2a4ce3d58e50ad804d6b385cd5f953e2fe3b95
   [vmlinux.symvers]=aaf3fa84f4ccbab54327eee5a7fed7903e3f79af9ab53fdffe5165b27f2fa9f1
   [kernel_aarch64_Module.symvers]=d5507f9cfb0ba26541dd7c76e077601da89e0ab650ec69acaf854b62ee247f37
-  [bluetooth.ko]=5919b022e564c869fcb8eb9e00f4c6f4a2a88e9d04471396dc4b137a3145e269
-  [btbcm.ko]=23b81995ffd03242fb12b35d9cd5d756de5aeb3851d6df27c7550ddc6f4647b6
-  [btqca.ko]=9f6e1feeb4b74a0f1b2cbf45c5fa09feabd663d8601999b27627d5807e34e164
-  [hci_uart.ko]=676f88f5cdf0f2cddcdc12c3d0b91748c341b74f0f195ca9c40216c8f3e515c5
-  [pwrseq-core.ko]=162ca5072e040d0690a12b863eef837f0b74a5f6d9380484f32106b883b37c12
-  [rfkill.ko]=e2f17221a319f2234a49b4cf809a84867e3e3ef14e22d9bfd393f547e290c47d
-  [rmnet.ko]=d372847d3b1bc7e3089e2c1c0b5ea2bd3848437eb24d15e3788a903eff8912a1
+  [bluetooth.ko]=c69bd2a120843f33983bcd53e93f12eecfe53c8d6c65e1952111f352bf0d6ca2
+  [btbcm.ko]=9042c46a7b350ee70bcb49cfb12c9111f6a47dfcf3f9ca176533875b8483970c
+  [btqca.ko]=395a40611e6510910d8a069b32eef631cf7cf56a1f2ff526a03c8e0772b166ef
+  [hci_uart.ko]=8a032d5ebb174ff81c0aa01d6ecc34fd9718723ffa432c0ae56416918a6772a9
+  [pwrseq-core.ko]=93ee7bc34a78303d569944d177832e3519ba7fb8f283a32fa6baea7f97c11104
+  [rfkill.ko]=7e3caceca204611bf88495b5554e7ff9de693d2551fcb25cfb83356cbe134f34
+  [rmnet.ko]=3b3f75d3738e77a3afd572a83f8cdce8aab9022409b3c9b2830860304a2990a0
 )
 for name in "${!files[@]}"; do
   [[ -f $dist/$name && ! -L $dist/$name ]] || die "missing regular candidate artifact: $name"
   [[ $(sha256sum "$dist/$name" | awk '{print $1}') == "${files[$name]}" ]] ||
     die "candidate artifact hash differs: $name"
 done
-[[ $(modinfo -F vermagic "$dist/hci_uart.ko" | awk '{print $1}') == \
-  6.12.23-android16-5-g5a0e85dd9db0-dirty-4k ]] || die 'candidate module release differs'
+readonly expected_release=6.12.23-android16-5-g5a0e85dd9db0-dirty-4k
+for name in hci_uart bluetooth; do
+  [[ $(modinfo -F vermagic "$dist/$name.ko" | awk '{print $1}') == "$expected_release" ]] ||
+    die "candidate module release differs: $name"
+done
 grep -aFq 'preinitialized controller; skipping opening HCI Reset' "$dist/hci_uart.ko" ||
   die 'candidate hci_uart lacks no-opening-reset diagnostic'
+grep -aFq 'recovering discovery stop on Inquiry Complete' "$dist/bluetooth.ko" ||
+  die 'candidate bluetooth module lacks inquiry-stop recovery diagnostic'
 
 cp --reflink=auto --sparse=always -- "$base" "$out"
 chmod 0600 "$out"

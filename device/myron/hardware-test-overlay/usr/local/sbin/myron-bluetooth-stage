@@ -29,6 +29,7 @@ readonly maximum_safe_temperature_mc=80000
 readonly reviewed_kernel_notes=8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608
 readonly no_reset_kernel_notes=dadfc0372f028cd5c9810415167af6c182e79fbf2954e7c555a8a1108cf33e1e
 readonly address_kernel_notes=0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8
+readonly inquiry_stop_kernel_notes=1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea
 boot_id=
 profile_name=
 module_dir=
@@ -169,6 +170,14 @@ select_modules() {
 			btbcm_sha=23b81995ffd03242fb12b35d9cd5d756de5aeb3851d6df27c7550ddc6f4647b6
 			btqca_sha=9f6e1feeb4b74a0f1b2cbf45c5fa09feabd663d8601999b27627d5807e34e164
 			hci_uart_sha=676f88f5cdf0f2cddcdc12c3d0b91748c341b74f0f195ca9c40216c8f3e515c5
+			;;
+		"$inquiry_stop_kernel_notes")
+			rfkill_sha=7e3caceca204611bf88495b5554e7ff9de693d2551fcb25cfb83356cbe134f34
+			pwrseq_sha=93ee7bc34a78303d569944d177832e3519ba7fb8f283a32fa6baea7f97c11104
+			bluetooth_sha=c69bd2a120843f33983bcd53e93f12eecfe53c8d6c65e1952111f352bf0d6ca2
+			btbcm_sha=9042c46a7b350ee70bcb49cfb12c9111f6a47dfcf3f9ca176533875b8483970c
+			btqca_sha=395a40611e6510910d8a069b32eef631cf7cf56a1f2ff526a03c8e0772b166ef
+			hci_uart_sha=8a032d5ebb174ff81c0aa01d6ecc34fd9718723ffa432c0ae56416918a6772a9
 			;;
 		*) fail "unreviewed Bluetooth kernel notes: $notes" ;;
 	esac
@@ -363,6 +372,65 @@ bluetooth_discovering() {
 		LC_ALL=C awk '$1 == "Discovering:" { print $2; exit }'
 }
 
+monotonic_seconds() {
+	awk '{ print int($1) }' /proc/uptime
+}
+
+wait_for_discovery_stop() {
+	wait_seconds=$1
+	deadline=$(( $(monotonic_seconds) + wait_seconds ))
+	discovering=
+	while [ "$(monotonic_seconds)" -lt "$deadline" ]; do
+		discovering=$(bluetooth_discovering || true)
+		[ "$discovering" = no ] && return 0
+		sleep 0.2
+	done
+	return 1
+}
+
+kernel_log_current_boot() {
+	timeout -k 1 3 journalctl -k -b --no-pager 2>/dev/null
+}
+
+emit_kernel_log_boundary() {
+	printf '<6>%s\n' "$1" >/dev/kmsg
+}
+
+wait_for_kernel_log_boundary() {
+	boundary=$1
+	wait_seconds=$2
+	deadline=$(( $(monotonic_seconds) + wait_seconds ))
+	while [ "$(monotonic_seconds)" -lt "$deadline" ]; do
+		kernel_log=$(kernel_log_current_boot) || return $?
+		if printf '%s\n' "$kernel_log" | LC_ALL=C grep -Fq -- "$boundary"; then
+			printf '%s\n' "$kernel_log"
+			return 0
+		fi
+		sleep 0.2
+	done
+	return 1
+}
+
+kernel_log_has_opening_reset_diagnostic() {
+	kernel_log=$1
+	printf '%s\n' "$kernel_log" |
+		LC_ALL=C grep -Fq 'Bluetooth: hci0: preinitialized controller; skipping opening HCI Reset'
+}
+
+inquiry_cancel_failure_count() {
+	kernel_log=$1
+	printf '%s\n' "$kernel_log" |
+		LC_ALL=C awk 'index($0, "Bluetooth: hci0: Opcode 0x0402 failed:") { count++ }
+			END { print count + 0 }'
+}
+
+discovery_stop_recovery_count() {
+	kernel_log=$1
+	printf '%s\n' "$kernel_log" |
+		LC_ALL=C awk 'index($0, "Bluetooth: hci0: recovering discovery stop on Inquiry Complete") { count++ }
+			END { print count + 0 }'
+}
+
 process_start_time() {
 	pid=$1
 	case "$pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -393,7 +461,7 @@ run_bounded_scan() {
 		umask 077
 		printf "%s\n" "$$" >"$1"
 		exec bluetoothctl <"$2"
-	' sh "$scan_client_pid_file" "$scan_command_fifo" >"$scan_file" 2>&1 &
+	' sh "$scan_client_pid_file" "$scan_command_fifo" >/dev/null 2>&1 &
 	scan_supervisor_pid=$!
 	if ! scan_supervisor_start=$(process_start_time "$scan_supervisor_pid"); then
 		kill "$scan_supervisor_pid" 2>/dev/null || true
@@ -409,7 +477,9 @@ run_bounded_scan() {
 		printf "%s\n" "$$" >"$1"
 		exec 3>"$2"
 		printf "%s\n" "scan bredr" >&3
-		sleep 20
+		# One BR/EDR inquiry lasts 8 * 1.28 = 10.24 seconds. Stop at
+		# seven seconds so Inquiry Cancel reaches an active inquiry.
+		sleep 7
 		printf "%s\n" "scan off" >&3
 		sleep 1
 		printf "%s\n" quit >&3
@@ -767,38 +837,60 @@ scan_test() {
 	bluez_device_paths "$scan_filter_file" >"$scan_before_file" ||
 		fail 'could not snapshot BlueZ device objects before scan'
 	chmod 0600 "$scan_before_file"
+	kernel_log=$(kernel_log_current_boot) || fail 'could not read kernel journal before scan'
+	kernel_log_has_opening_reset_diagnostic "$kernel_log" ||
+		fail 'opening-reset kernel diagnostic is absent before scan'
 	: >"$scan_raw"
 	chmod 0600 "$scan_raw"
+	scan_started_seconds=$(monotonic_seconds)
 	status=0
 	run_bounded_scan "$scan_raw" || status=$?
+	scan_client_finished_seconds=$(monotonic_seconds)
 	[ "$status" -eq 0 ] || fail "bounded Bluetooth scan failed with status $status"
-	deadline=$(( $(awk '{print int($1)}' /proc/uptime) + 5 ))
-	discovering=
-	while [ "$(awk '{print int($1)}' /proc/uptime)" -lt "$deadline" ]; do
-		discovering=$(bluetooth_discovering || true)
-		[ "$discovering" = no ] && break
-		sleep 0.2
-	done
-	[ "$discovering" = no ] || fail 'Bluetooth discovery did not stop after scanner exit'
 	scan_after_file=$runtime_dir/scan.after.$$
 	scan_new_file=$runtime_dir/scan.new.$$
 	count=$(fresh_bluez_peer_count "$expected_peer" "$scan_before_file" \
 		"$scan_after_file" "$scan_new_file" "$scan_filter_file") ||
 		fail 'could not inspect fresh BlueZ device objects'
-	[ "$count" -gt 0 ] || fail 'scan produced no fresh structured D-Bus peer object'
+	persist "stage=scan evidence discovery_objects=$count cancel_failed=pending stop_recovered=pending identities=not-persisted"
+	stop_status=0
+	wait_for_discovery_stop 15 || stop_status=$?
 	expected_peer=
 	rm -f "$scan_raw"
 	require_temperature
 	stop_internal || fail 'Bluetooth cleanup failed after scan'
+	# Write an identity-free marker only after scan teardown and controller
+	# power-off. Seeing it through journalctl proves the final snapshot advanced
+	# beyond every earlier HCI event; a missing or rotated marker fails closed.
+	journal_boundary="myron-bluetooth-stage: post-cleanup journal boundary boot=$boot_id"
+	emit_kernel_log_boundary "$journal_boundary" || fail 'could not write kernel journal boundary'
+	kernel_log=$(wait_for_kernel_log_boundary "$journal_boundary" 5) ||
+		fail 'kernel journal did not reach post-cleanup boundary'
+	kernel_log_has_opening_reset_diagnostic "$kernel_log" ||
+		fail 'opening-reset kernel diagnostic is absent after scan'
+	cancel_failed=$(inquiry_cancel_failure_count "$kernel_log") ||
+		fail 'could not inspect Inquiry Cancel failure count after scan'
+	stop_recovered=$(discovery_stop_recovery_count "$kernel_log") ||
+		fail 'could not inspect discovery-stop recovery count after scan'
+	diagnostics_finished_seconds=$(monotonic_seconds)
+	persist "stage=scan diagnostics discovery_objects=$count cancel_failed=$cancel_failed stop_recovered=$stop_recovered scan_started_s=$scan_started_seconds scan_client_finished_s=$scan_client_finished_seconds diagnostics_finished_s=$diagnostics_finished_seconds identities=not-persisted"
+	[ "$stop_status" -eq 0 ] || fail 'Bluetooth discovery did not stop after scanner exit'
+	[ "$count" -gt 0 ] || fail 'scan produced no fresh structured D-Bus peer object'
+	[ "$cancel_failed" -eq 0 ] ||
+		fail 'Inquiry Cancel failed; recovered stop does not qualify'
+	[ "$stop_recovered" -eq 0 ] ||
+		fail 'discovery stop required kernel recovery and does not qualify'
 	write_state "qualified:$boot_id"
-	persist "stage=scan result=complete discovery_objects=$count identities=not-persisted cleanup=powered-off"
+	persist "stage=scan result=complete discovery_objects=$count cancel_failed=$cancel_failed stop_recovered=$stop_recovered identities=not-persisted cleanup=powered-off"
 	tmp=$disarm.new.$$
-	printf 'bluetooth_qualified_boot=%s\ndiscovery_objects=%s\n' "$boot_id" "$count" >"$tmp"
+	printf 'bluetooth_qualified_boot=%s\ndiscovery_objects=%s\ncancel_failed=%s\nstop_recovered=%s\n' \
+		"$boot_id" "$count" "$cancel_failed" "$stop_recovered" >"$tmp"
 	chmod 0600 "$tmp"
 	mv -f "$tmp" "$disarm"
 	sync
 	trap - 0 HUP INT TERM
-	printf 'stage=scan result=complete discovery_objects=%s identities=not-persisted cleanup=powered-off rollback=disarmed\n' "$count"
+	printf 'stage=scan result=complete discovery_objects=%s cancel_failed=%s stop_recovered=%s identities=not-persisted cleanup=powered-off rollback=disarmed\n' \
+		"$count" "$cancel_failed" "$stop_recovered"
 }
 
 stop_test() {

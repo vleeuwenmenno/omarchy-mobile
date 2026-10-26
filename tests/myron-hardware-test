@@ -90,15 +90,28 @@ grep -Fq 'dadfc0372f028cd5c9810415167af6c182e79fbf2954e7c555a8a1108cf33e1e' "$pr
   fail 'prepare does not allow the exact no-opening-reset candidate notes'
 grep -Fq '0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8' "$prepare" ||
   fail 'prepare does not allow the exact public-address candidate notes'
+grep -Fq '1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea' "$prepare" ||
+  fail 'prepare does not allow the exact inquiry-stop candidate notes'
 grep -Fq 'install -m0755 /omarchy-prepare' "$bluetooth_compose" ||
   fail 'Bluetooth experiment composer does not install candidate-aware preparation'
 grep -Fq -- '--firmware-dir' "$bluetooth_compose" ||
   fail 'Bluetooth experiment composer does not require a private firmware input'
 grep -Fq 'myron-bluetooth-firmware' "$bluetooth_compose" ||
   fail 'Bluetooth experiment composer does not install private firmware into the payload'
+grep -Fq "grep -aFq 'recovering discovery stop on Inquiry Complete' \"\$dist/bluetooth.ko\"" \
+  "$bluetooth_compose" ||
+  fail 'Bluetooth composer does not verify the inquiry-stop module diagnostic'
+grep -Fq 'for name in hci_uart bluetooth; do' "$bluetooth_compose" ||
+  fail 'Bluetooth composer does not verify both changed modules'
+grep -Fq 'expected_release=6.12.23-android16-5-g5a0e85dd9db0-dirty-4k' \
+  "$bluetooth_compose" ||
+  fail 'Bluetooth composer does not require the exact stamped release'
+grep -Fq '1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea' \
+  "$bluetooth_selector" ||
+  fail 'Bluetooth module selector does not allow the inquiry-stop candidate'
 for required in \
   'BASE_SHA256 = "def61369f915cfe3327f73391056290027565d172d9786c75fe373f61e2ffe08"' \
-  'KERNEL_SHA256 = "cd0a641d9290b1287fa4d4260b368c8d147dc8a11ee8d11d32008b7ea6389ff9"' \
+  'KERNEL_SHA256 = "672808b1277b583fdc398986bfe8d100b2ebbf1c2cfbb9d14dd257366d1a5937"' \
   'refusing to replace output' 'candidate kernel readback differs'; do
   grep -Fq "$required" "$bluetooth_boot_builder" ||
     fail "Bluetooth boot builder lacks: $required"
@@ -400,6 +413,9 @@ for required in \
   'f8cb374be40f03b504426025c45ec898dffcf7668ccb5ed8026b07d60d6596cb' \
   '0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8' \
   '676f88f5cdf0f2cddcdc12c3d0b91748c341b74f0f195ca9c40216c8f3e515c5' \
+  '1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea' \
+  'c69bd2a120843f33983bcd53e93f12eecfe53c8d6c65e1952111f352bf0d6ca2' \
+  '8a032d5ebb174ff81c0aa01d6ecc34fd9718723ffa432c0ae56416918a6772a9' \
   'unreviewed Bluetooth kernel notes' \
   'GKI module selector returned a directory for different kernel notes' \
   'identities=not-persisted' \
@@ -466,6 +482,16 @@ grep -Fq 'timeout -k 2 35 sh -c' "$bluetooth_stage" ||
   fail 'Bluetooth scan on/off does not use one bounded client'
 grep -Fq 'printf "%s\n" "scan bredr" >&3' "$bluetooth_stage" ||
   fail 'Bluetooth scan does not select the Classic BR/EDR transport for the speaker'
+grep -Fq 'seven seconds so Inquiry Cancel reaches an active inquiry' "$bluetooth_stage" ||
+  fail 'Bluetooth scan lacks first-inquiry stop rationale'
+grep -Fq 'sleep 7' "$bluetooth_stage" ||
+  fail 'Bluetooth scan does not stop within the first Classic inquiry interval'
+writer_block=$(sed -n '/printf.*scan bredr/,/printf.*scan off/p' "$bluetooth_stage")
+if grep -Fq 'sleep 20' <<<"$writer_block"; then
+  fail 'Bluetooth scan still spans multiple Classic inquiry intervals'
+fi
+grep -Fq '"$scan_command_fifo" >/dev/null 2>&1 &' "$bluetooth_stage" ||
+  fail 'Bluetooth scan persists raw peer identities'
 if grep -Fq 'scan transport bredr' "$bluetooth_stage"; then
   fail 'Bluetooth scan uses invalid submenu syntax instead of scan bredr'
 fi
@@ -483,6 +509,36 @@ grep -Fq 'stop_scan_children' "$bluetooth_stage" ||
   fail 'Bluetooth failure cleanup does not tear down scan children'
 grep -Fq 'run_bounded_scan "$scan_raw" || status=$?' "$bluetooth_stage" ||
   fail 'Bluetooth scan path does not invoke the bounded same-client transaction'
+grep -Fq 'wait_for_discovery_stop 15 || stop_status=$?' "$bluetooth_stage" ||
+  fail 'Bluetooth discovery-stop observation does not cover a complete Classic inquiry interval'
+for required in \
+  'emit_kernel_log_boundary "$journal_boundary"' \
+  'wait_for_kernel_log_boundary "$journal_boundary" 5' \
+  'kernel journal did not reach post-cleanup boundary' \
+  'opening-reset kernel diagnostic is absent after scan'; do
+  grep -Fq "$required" "$bluetooth_stage" ||
+    fail "Bluetooth post-cleanup journal boundary lacks: $required"
+done
+cleanup_line=$(grep -nF "stop_internal || fail 'Bluetooth cleanup failed after scan'" \
+  "$bluetooth_stage" | cut -d: -f1)
+boundary_line=$(grep -nF 'emit_kernel_log_boundary "$journal_boundary"' \
+  "$bluetooth_stage" | cut -d: -f1)
+qualified_line=$(grep -nF 'write_state "qualified:$boot_id"' \
+  "$bluetooth_stage" | cut -d: -f1)
+disarm_line=$(grep -nF 'mv -f "$tmp" "$disarm"' "$bluetooth_stage" | cut -d: -f1)
+[[ $cleanup_line -lt $boundary_line && $boundary_line -lt $qualified_line &&
+   $qualified_line -lt $disarm_line ]] ||
+  fail 'Bluetooth cleanup, journal boundary, qualification and disarm order differs'
+grep -Fq 'stage=scan evidence discovery_objects=$count cancel_failed=pending stop_recovered=pending identities=not-persisted' "$bluetooth_stage" ||
+  fail 'Bluetooth scan can lose discovery evidence before kernel-log inspection'
+grep -Fq 'stage=scan diagnostics discovery_objects=$count cancel_failed=$cancel_failed stop_recovered=$stop_recovered scan_started_s=$scan_started_seconds' "$bluetooth_stage" ||
+  fail 'Bluetooth scan failure does not persist identity-free discovery diagnostics'
+grep -Fq '[ "$cancel_failed" -eq 0 ] ||' "$bluetooth_stage" ||
+  fail 'Bluetooth qualification accepts a failed Inquiry Cancel'
+grep -Fq 'Inquiry Cancel failed; recovered stop does not qualify' "$bluetooth_stage" ||
+  fail 'Bluetooth qualification lacks explicit recovered-stop rejection'
+grep -Fq '[ "$stop_recovered" -eq 0 ] ||' "$bluetooth_stage" ||
+  fail 'Bluetooth qualification accepts a kernel-recovered discovery stop'
 grep -Fq 'service_state=$(timeout -k 1 3 systemctl is-active bluetooth.service 2>/dev/null)' "$bluetooth_stage" ||
   fail 'Bluetooth cleanup does not verify that BlueZ stayed stopped'
 if grep -Fq 'rc-service' "$bluetooth_stage"; then

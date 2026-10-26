@@ -19,7 +19,8 @@ case "$actual" in
 	9ea04dd9f04704b2da7c0525930d53b51e3e5a99bccf78219bc202ec3dc869f8|\
 	8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608|\
 	dadfc0372f028cd5c9810415167af6c182e79fbf2954e7c555a8a1108cf33e1e|\
-	0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8)
+	0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8|\
+	1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea)
 		directory="/usr/local/lib/myron-gki-module-sets/$actual"
 		;;
 	*) die "unknown kernel notes hash: $actual" ;;

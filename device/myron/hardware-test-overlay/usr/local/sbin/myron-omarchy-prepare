@@ -8,6 +8,7 @@ touch=/usr/local/lib/myron-touch
 reviewed_kernel_notes=8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608
 no_reset_kernel_notes=dadfc0372f028cd5c9810415167af6c182e79fbf2954e7c555a8a1108cf33e1e
 address_kernel_notes=0ecd0f4eb2f6ab7c073ef2f2afd94e4185ac404b2b01a04a666188d63f029db8
+inquiry_stop_kernel_notes=1e4a036d6f8bcc2602567ec5e0ff7aaa871564af18c9c7c8dee426b110834eea
 
 say() { printf '%s\n' "$*" | tee -a "$log"; }
 die() { say "ERROR: $*" >&2; exit 1; }
@@ -82,7 +83,8 @@ classify_key() {
 : >"$log"
 notes=$(sha256sum /sys/kernel/notes | awk '{print $1}')
 case "$notes" in
-  "$reviewed_kernel_notes"|"$no_reset_kernel_notes"|"$address_kernel_notes") ;;
+  "$reviewed_kernel_notes"|"$no_reset_kernel_notes"|"$address_kernel_notes"|\
+  "$inquiry_stop_kernel_notes") ;;
   *) die "kernel notes differ: $notes" ;;
 esac
 [ "$(cat /sys/class/drm/card0-DSI-1/status 2>/dev/null || true)" = connected ] ||

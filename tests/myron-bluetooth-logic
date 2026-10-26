@@ -46,9 +46,11 @@ fi
 mock_bin=$tmp/bin
 mkdir -p "$mock_bin"
 printf '%s\n' '#!/bin/sh' \
+	'[ -z "${MYRON_TEST_SLEEP_LOG:-}" ] || printf "%s\\n" "$1" >>"$MYRON_TEST_SLEEP_LOG"' \
   'if [ "${MYRON_TEST_SLEEP_DELAY:-0}" = 1 ]; then exec /usr/bin/sleep 0.05; fi' \
   'exit 0' >"$mock_bin/sleep"
 chmod 0755 "$mock_bin/sleep"
+export MYRON_TEST_SLEEP_LOG=$tmp/sleep.log
 
 dd if=/dev/zero of="$tmp/nvm" bs=1 count=98 status=none
 printf '\x06\x05\x04\x03\x02\x01' |
@@ -61,6 +63,7 @@ bluetooth_fixture=$tmp/bluetoothctl
 scan_commands=$tmp/scan-commands
 scan_fixture=$tmp/scan-fixture
 tree_fixture=$tmp/tree
+kernel_fixture=$tmp/kernel.log
 scan_status=0
 writer_status=0
 show_status=0
@@ -94,11 +97,14 @@ timeout() {
     'btmgmt config'|'btmgmt --index 0 info') cat "$mgmt_fixture" ;;
     'bluetoothctl show') cat "$bluetooth_fixture"; return "$show_status" ;;
     'busctl --system --list tree org.bluez') cat "$tree_fixture"; return "$tree_status" ;;
+    'journalctl -k -b --no-pager') cat "$kernel_fixture" ;;
     *) return 124 ;;
   esac
 }
 sleep() {
-  if [[ $test_sleep_delay == 1 ]]; then command sleep 0.05; fi
+  # Yield to background FIFO peers. A no-op here races the writer PID file and
+  # makes the ownership test depend on scheduler timing.
+  command sleep 0.01
 }
 
 printf 'hci0:\tUnconfigured controller\n' >"$mgmt_fixture"
@@ -123,12 +129,67 @@ if bluetooth_discovering >/dev/null; then
   fail 'discovery query masked its timeout status'
 fi
 show_status=0
+printf '%s\n' \
+  'Bluetooth: hci0: preinitialized controller; skipping opening HCI Reset' \
+  'Bluetooth: hci0: Opcode 0x0402 failed: -16' \
+  'Bluetooth: hci0: recovering discovery stop on Inquiry Complete' \
+  'Bluetooth: hci0: Opcode 0x0c03 failed: -110' \
+  'Bluetooth: hci0: Opcode 0x0402 failed: -110' >"$kernel_fixture"
+kernel_log=$(kernel_log_current_boot) || fail 'current-boot kernel log fixture failed'
+kernel_log_has_opening_reset_diagnostic "$kernel_log" ||
+  fail 'opening-reset kernel diagnostic was not recognized'
+equal "$(inquiry_cancel_failure_count "$kernel_log")" 2 'Inquiry Cancel failure counter'
+equal "$(discovery_stop_recovery_count "$kernel_log")" 1 'discovery-stop recovery counter'
+printf '%s\n' 'Bluetooth: hci0: Opcode 0x0402 failed: -110' >"$kernel_fixture"
+kernel_log=$(kernel_log_current_boot) || fail 'kernel log fixture without marker failed'
+if kernel_log_has_opening_reset_diagnostic "$kernel_log"; then
+  fail 'missing opening-reset kernel diagnostic was accepted'
+fi
+sequence_pop() {
+  sequence_file=$1
+  sed -n '1p' "$sequence_file"
+  sed '1d' "$sequence_file" >"$sequence_file.next"
+  mv -f "$sequence_file.next" "$sequence_file"
+}
+monotonic_fixture=$tmp/monotonic-sequence
+discovering_fixture=$tmp/discovering-sequence
+monotonic_seconds() { sequence_pop "$monotonic_fixture"; }
+bluetooth_discovering() { sequence_pop "$discovering_fixture"; }
+printf '%s\n' 100 100 101 102 >"$monotonic_fixture"
+printf '%s\n' yes yes no >"$discovering_fixture"
+wait_for_discovery_stop 15 || fail 'discovery-stop wait rejected delayed success'
+printf '%s\n' 200 200 215 >"$monotonic_fixture"
+printf '%s\n' yes >"$discovering_fixture"
+if wait_for_discovery_stop 15; then
+  fail 'discovery-stop wait accepted state that stayed active through deadline'
+fi
+printf '%s\n' \
+  'Bluetooth: hci0: preinitialized controller; skipping opening HCI Reset' \
+  'myron-bluetooth-stage: post-cleanup journal boundary boot=test-boot' \
+  >"$kernel_fixture"
+printf '%s\n' 300 300 >"$monotonic_fixture"
+kernel_log=$(wait_for_kernel_log_boundary \
+  'myron-bluetooth-stage: post-cleanup journal boundary boot=test-boot' 5) ||
+  fail 'post-cleanup kernel journal boundary was not recognized'
+kernel_log_has_opening_reset_diagnostic "$kernel_log" ||
+  fail 'boundary snapshot lost opening-reset diagnostic'
+printf '%s\n' 'Bluetooth: hci0: preinitialized controller; skipping opening HCI Reset' \
+  >"$kernel_fixture"
+printf '%s\n' 400 400 405 >"$monotonic_fixture"
+if wait_for_kernel_log_boundary \
+  'myron-bluetooth-stage: post-cleanup journal boundary boot=test-boot' 5 >/dev/null; then
+  fail 'kernel journal boundary wait accepted a stale pre-scan snapshot'
+fi
+unset -f monotonic_seconds bluetooth_discovering
 
 scan=$tmp/scan
 : >"$scan_fixture"
+: >"$MYRON_TEST_SLEEP_LOG"
 run_bounded_scan "$scan" || fail 'same-client scan transaction failed'
 equal "$(cat "$scan_commands")" "$(printf 'scan bredr\nscan off\nquit')" \
   'Classic BR/EDR scan on/off command sequence'
+equal "$(cat "$MYRON_TEST_SLEEP_LOG")" "$(printf '7\n1')" \
+  'Classic BR/EDR scan stops inside first inquiry interval'
 scan_status=124
 if run_bounded_scan "$scan"; then
   fail 'bounded same-client scan accepted a timeout'

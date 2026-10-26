@@ -1,0 +1,44 @@
+From: Menno van Leeuwen <menno@vleeuwen.me>
+Subject: [PATCH] Bluetooth: recover stopping discovery on inquiry complete
+
+Some controllers can reject Inquiry Cancel while the host still has the
+HCI_INQUIRY flag set.  If Inquiry Complete arrives afterward, the handler
+clears HCI_INQUIRY but ignores it because discovery is no longer in
+DISCOVERY_FINDING.  The management state then remains DISCOVERY_STOPPING
+even though inquiry ended.
+
+Treat Inquiry Complete as the final stop event while discovery is stopping.
+This mirrors the existing remote-name-complete path, retains an active LE
+scan, and emits the normal management discovering-off notification.  Warn
+when this recovery path fires so tests can distinguish it from a clean
+cancel.
+
+Signed-off-by: Menno van Leeuwen <menno@vleeuwen.me>
+---
+ net/bluetooth/hci_event.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -2981,6 +2981,18 @@ static void hci_inquiry_complete_evt(struct hci_dev *hdev, void *data,
+ 
+ 	hci_dev_lock(hdev);
+ 
++	/* A rejected Inquiry Cancel can leave management in STOPPING while a
++	 * later Inquiry Complete proves that BR/EDR inquiry has ended.  Complete
++	 * that state transition without interrupting an active LE scan.
++	 */
++	if (discov->state == DISCOVERY_STOPPING &&
++	    (!hci_dev_test_flag(hdev, HCI_LE_SCAN) ||
++	     hdev->le_scan_type != LE_SCAN_ACTIVE)) {
++		bt_dev_warn(hdev, "recovering discovery stop on Inquiry Complete");
++		hci_discovery_set_state(hdev, DISCOVERY_STOPPED);
++		goto unlock;
++	}
++
+ 	if (discov->state != DISCOVERY_FINDING)
+ 		goto unlock;
+ 
+-- 
+2.51.0
