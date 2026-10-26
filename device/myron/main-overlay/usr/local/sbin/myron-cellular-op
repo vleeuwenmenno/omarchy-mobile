@@ -1,0 +1,688 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Supervision of the persistent main boot's one cellular data operation.
+#
+# The temporary hardware-test boot has an independent rollback watchdog; the
+# persistent main boot has only a commit guard, which says nothing about a
+# cellular operation. This script is that operation's own deadline and state
+# machine, run from static systemd units:
+#
+#   launch TOKEN root: confirm and start the attended operation unit.
+#   confirmed    the stage's check that launch confirmed this boot (consumes it).
+#   begin KIND   arm: state "armed", then myron-cellular-op.timer (a fixed
+#                window), before the stage mutates anything. KIND is attended
+#                or qualified.
+#   remaining    seconds left of the window, from the timer's own monotonic
+#                activation timestamp; fails when the timer is not active.
+#   mark STATE   one live transition: attempting, activating, active, ready.
+#                Fails once the operation is no longer live.
+#   nonce-new, ssh-nonce, ssh-proof NONCE, proofs-ok
+#                the attended operation's fresh-SSH proof: a one-time nonce
+#                that two NEW authenticated SSH connections, one over USB and
+#                one over Wi-Fi, present after the activation. Neither the
+#                state "ready" nor a pre-existing session proves anything.
+#   seal         ready -> sealed, cancels the timer, starts the watcher.
+#   record-evidence
+#                after the stage's standalone proof (Wi-Fi off, cellular the
+#                ordinary route): bind valid evidence to this stage, image and
+#                kernel. Only root writes it; nothing the tile sends can.
+#   abort WORD   the timer or a failed operation unit. Sealed: nothing. Before
+#                the first mutation: cancel without a reboot. After it, or in an
+#                unknown state: stop the operation unit, then a normal reboot
+#                through `myron-main-os reboot-normal` (never a latch, never a
+#                partition write).
+#   watch        after the seal: observe the connection and the IPA guard and
+#                publish up or lost. It never reconnects or changes a radio.
+#   publish      write the world-readable status, also at boot.
+#   evidence-check
+#                exit 0 only for valid evidence of the current stage, image and
+#                kernel.
+#   live         exit 0 while the operation can still progress.
+#   proof-ready  exit 0 for a sealed, live attended operation.
+#
+# One flock serializes the brief state transitions, so expiry and seal cannot
+# interleave: whichever commits a terminal state first wins, and the other
+# reads it. State lives in /run and goes with the boot. Output and logs carry
+# words and counts only, never identities, addresses or interface names.
+set -eu
+umask 077
+
+main_os=/usr/local/sbin/myron-main-os
+stage=/usr/local/sbin/myron-cellular-stage
+self=/usr/local/sbin/myron-cellular-op
+helper=/usr/local/bin/myron-mobile-data
+startup_helper=/usr/local/sbin/myron-cellular-start
+guard=/usr/local/sbin/myron-ipa-guard
+nm_conf=/etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf
+apn_config=/etc/omamobile/myron-cellular-apn
+profile_file=/etc/omamobile/myron-test-profile
+unit_dir=/usr/lib/systemd/system
+polkit_rule=/etc/polkit-1/rules.d/50-myron-cellular-enable.rules
+rescue_before=/run/myron-cellular-stage/rescue.before
+net_root=/sys/class/net
+usb_iface=usb0
+confirm_token=ONE-SHOT-CELLULAR-DATA-REBOOT-REQUIRED
+attended_unit=myron-cellular-attended.service
+units='myron-cellular-op.timer myron-cellular-op-abort.service myron-cellular-op-failed.service myron-cellular-attended.service myron-cellular-enable.service myron-cellular-watch.service myron-cellular-publish.service'
+op_dir=/run/myron-cellular-op
+public_dir=/run/myron-cellular
+lock_file=/run/myron-cellular-op.lock
+mutation_marker=/run/myron-cellular-stage/mutation
+runtime_boot_id=/run/myron-main/boot-id
+runtime_image_id=/run/myron-main/image-id
+main_state=/run/myron-host/var/lib/omarchy-mobile/main
+log=/run/myron-host/var/log/myron-omarchy-cellular-op.log
+boot_id_file=/proc/sys/kernel/random/boot_id
+uptime_file=/proc/uptime
+notes_file=/sys/kernel/notes
+timer_unit=myron-cellular-op.timer
+watch_unit=myron-cellular-watch.service
+run_units='myron-cellular-attended.service myron-cellular-enable.service'
+target_uuid=7c3b1d52-6f0e-4a84-9d2a-4d59a0c1e5f3
+window_seconds=1200
+min_remaining_begin=1140
+lock_seconds=30
+stop_seconds=15
+watch_poll_seconds=5
+watch_failures=3
+root_uid=0
+root_gid=0
+
+state_file=$op_dir/state
+confirm_file=$op_dir/confirm
+nonce_file=$op_dir/ssh-nonce
+lifecycle_file=$op_dir/lifecycle
+reboot_flag=$op_dir/reboot-requested
+public_file=$public_dir/state
+evidence=$main_state/cellular-evidence
+
+boot_id=
+state=
+kind=
+
+persist() {
+	mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+	if [ -f "$log" ] && [ "$(wc -c <"$log")" -gt 65536 ]; then
+		tail -n 100 "$log" >"$log.new" && mv -f "$log.new" "$log"
+	fi
+	printf '%s boot_id=%s %s\n' "$(date -u +%FT%TZ)" "${boot_id:-unknown}" "$*" >>"$log" 2>/dev/null || true
+}
+
+fail() {
+	persist "result=failed message=$1"
+	printf 'ERROR: %s\n' "$1" >&2
+	exit 1
+}
+
+require_root() { [ "$(id -u)" = "$root_uid" ] || fail 'must run as root'; }
+monotonic_seconds() { awk '{ print int($1) }' "$uptime_file"; }
+read_boot_id() { boot_id=$(cat "$boot_id_file" 2>/dev/null) || fail 'boot id is unreadable'; [ -n "$boot_id" ] || fail 'boot id is unreadable'; }
+
+# Value of "key=" in file, only when the key occurs exactly once.
+kv() {
+	[ "$(grep -c "^$2=" "$1" 2>/dev/null || true)" = 1 ] || return 0
+	sed -n "s/^$2=//p" "$1"
+}
+
+# Durable replace: tmp, sync, rename.
+put_file() {
+	target=$1 value=$2
+	rm -f "$target.new"
+	printf '%s\n' "$value" >"$target.new"
+	sync
+	mv -f "$target.new" "$target"
+	sync
+}
+
+# Runtime state disappears at reboot and must change while the transition lock
+# is held only briefly. Atomic replace is enough here; never run a global sync
+# while expiry and the worker are racing for that lock.
+put_runtime_file() {
+	target=$1 value=$2
+	rm -f "$target.new"
+	printf '%s\n' "$value" >"$target.new"
+	mv -f "$target.new" "$target"
+}
+
+safe_dir() {
+	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	info=$(stat -c '%u:%g:%a' "$1" 2>/dev/null) || return 1
+	[ "${info%:*}" = "$root_uid:$root_gid" ] || return 1
+	[ $((0${info##*:} & $2)) -eq 0 ]
+}
+safe_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	info=$(stat -c '%u:%g:%a:%h' "$1" 2>/dev/null) || return 1
+	case $info in "$root_uid:$root_gid":*:1) ;; *) return 1 ;; esac
+	mode=${info#*:*:}
+	[ $((0${mode%%:*} & 077)) -eq 0 ]
+}
+
+# Root-owned immutable input may be world-readable, but never writable by its
+# group or others. The effective profile marker is installed mode 0644.
+safe_root_input() {
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	info=$(stat -c '%u:%g:%a:%h' "$1" 2>/dev/null) || return 1
+	case $info in "$root_uid:$root_gid":*:1) ;; *) return 1 ;; esac
+	mode=${info#*:*:}
+	[ $((0${mode%%:*} & 022)) -eq 0 ]
+}
+
+# --- the one lock -------------------------------------------------------------
+unlock() { flock -u 9 2>/dev/null || true; }
+lock() {
+	mkdir -p "$op_dir"
+	chmod 0700 "$op_dir"
+	exec 9>"$lock_file" || fail 'cannot open the operation lock'
+	flock -w "$lock_seconds" 9 || fail 'another operation transition holds the lock'
+}
+
+# --- state --------------------------------------------------------------------
+# absent: no file. unknown: a file that is not exactly this boot's well-formed
+# state. Anything else: the state word.
+read_state() {
+	[ -e "$state_file" ] || [ -L "$state_file" ] || { state=absent; kind=; return 0; }
+	state=unknown kind=
+	safe_file "$state_file" || return 0
+	[ "$(grep -c . "$state_file")" = 3 ] || return 0
+	[ "$(kv "$state_file" boot_id)" = "$boot_id" ] || return 0
+	word=$(kv "$state_file" state)
+	case $word in
+	armed|attempting|activating|active|ready|sealed|refused|failed|expired) state=$word ;;
+	*) return 0 ;;
+	esac
+	case $(kv "$state_file" kind) in
+	attended) kind=attended ;;
+	qualified) kind=qualified ;;
+	*) state=unknown ;;
+	esac
+}
+
+write_state() { put_runtime_file "$state_file" "boot_id=$boot_id
+state=$1
+kind=$2"; }
+
+# Caller holds the lock and has read the state.
+transition_allowed() {
+	case "$state:$1" in
+	absent:armed|refused:armed) return 0 ;;
+	armed:attempting|attempting:activating|activating:active|active:ready|ready:sealed|armed:refused) return 0 ;;
+	armed:failed|attempting:failed|activating:failed|active:failed|ready:failed) return 0 ;;
+	armed:expired|attempting:expired|activating:expired|active:expired|ready:expired) return 0 ;;
+	esac
+	return 1
+}
+
+# --- identity, evidence -------------------------------------------------------
+sha_of() { sha256sum "$1" 2>/dev/null | awk '{ print $1 }'; }
+
+# One hash over everything the evidence is bound to: stage, supervisor,
+# unprivileged UI helper and actual cellular startup helper; effective profile;
+# NetworkManager GSM inhibit; polkit and unit policy; APN input; kernel notes;
+# running image, proof boot and kernel release.
+fingerprint_parts() {
+	fp_proof_boot=${1:-$boot_id}
+	fp_notes=$(sha_of "$notes_file")
+	fp_image=$(cat "$runtime_image_id" 2>/dev/null || true)
+	fp_kernel=$(uname -r)
+	{ [ -n "$fp_notes" ] && [ -n "$fp_image" ] && [ -n "$fp_kernel" ]; } || return 1
+	fp_stage=$(sha_of "$stage") fp_self=$(sha_of "$self") fp_helper=$(sha_of "$helper")
+	fp_startup=$(sha_of "$startup_helper")
+	fp_nm=$(sha_of "$nm_conf") fp_polkit=$(sha_of "$polkit_rule")
+	{ [ -n "$fp_stage" ] && [ -n "$fp_self" ] && [ -n "$fp_helper" ] && [ -n "$fp_startup" ] && [ -n "$fp_nm" ] && [ -n "$fp_polkit" ]; } || return 1
+	# Exactly "cellular" plus its terminating newline: no alternate profile,
+	# extra record, symlink or writable policy input is evidence-compatible.
+	safe_root_input "$profile_file" || return 1
+	[ "$(wc -c <"$profile_file")" = 9 ] && [ "$(cat "$profile_file")" = cellular ] || return 1
+	fp_profile=$(sha_of "$profile_file")
+	[ -n "$fp_profile" ] || return 1
+	# The unit set, and the APN the stage would use (a hash, never the name).
+	fp_units=
+	for unit in $units; do
+		unit_sha=$(sha_of "$unit_dir/$unit")
+		[ -n "$unit_sha" ] || return 1
+		fp_units="$fp_units$unit_sha"
+	done
+	fp_units=$(printf '%s' "$fp_units" | sha256sum | awk '{ print $1 }')
+	fp_apn=default
+	if [ -e "$apn_config" ] || [ -L "$apn_config" ]; then
+		safe_file "$apn_config" || return 1
+		fp_apn=$(sha_of "$apn_config")
+		[ -n "$fp_apn" ] || return 1
+	fi
+	fp_all=$(printf 'proof_boot=%s\nstage=%s\nop=%s\nhelper=%s\nstartup=%s\nprofile=%s\nnm=%s\npolkit=%s\nunits=%s\napn=%s\nnotes=%s\nimage=%s\nkernel=%s\n' \
+		"$fp_proof_boot" "$fp_stage" "$fp_self" "$fp_helper" "$fp_startup" "$fp_profile" "$fp_nm" "$fp_polkit" "$fp_units" "$fp_apn" "$fp_notes" "$fp_image" "$fp_kernel" |
+		sha256sum | awk '{ print $1 }')
+	[ -n "$fp_all" ]
+}
+
+evidence_text() {
+	printf 'schema=2\nproof_boot_id=%s\nfingerprint=%s\nkernel_notes=%s\nimage_id=%s\nkernel=%s' \
+		"$1" "$fp_all" "$fp_notes" "$fp_image" "$fp_kernel"
+}
+
+# absent, invalid or valid.
+evidence_status() {
+	{ [ -e "$evidence" ] || [ -L "$evidence" ]; } || { printf 'absent\n'; return 0; }
+	safe_dir "$main_state" 077 && safe_file "$evidence" || { printf 'invalid\n'; return 0; }
+	[ "$(grep -c . "$evidence")" = 6 ] || { printf 'invalid\n'; return 0; }
+	proof_boot=$(kv "$evidence" proof_boot_id)
+	case $proof_boot in ????????-????-????-????-????????????) ;; *) printf 'invalid\n'; return 0 ;; esac
+	case $proof_boot in *[!0-9a-f-]*) printf 'invalid\n'; return 0 ;; esac
+	fingerprint_parts "$proof_boot" || { printf 'invalid\n'; return 0; }
+	if [ "$(cat "$evidence")" = "$(evidence_text "$proof_boot")" ]; then printf 'valid\n'; else printf 'invalid\n'; fi
+}
+
+# The running image and this boot are the committed, latch-free main boot.
+require_committed_main() {
+	[ -f "$runtime_boot_id" ] && [ "$(cat "$runtime_boot_id" 2>/dev/null || true)" = "$boot_id" ] ||
+		fail 'this is not the persistent main boot'
+	[ -f "$main_os" ] && [ -x "$main_os" ] && [ ! -L "$main_os" ] || fail 'the main control is unavailable'
+	status_line=$(timeout -k 1 10 "$main_os" status 2>/dev/null) || fail 'main status is unavailable'
+	for want in os=omarchy latch=absent pending=absent success=current image=present; do
+		case " $status_line " in *" $want "*) ;; *) fail "main boot is not qualified: $want required" ;; esac
+	done
+}
+
+# --- the timer ----------------------------------------------------------------
+timer_active() { timeout -k 1 5 systemctl --quiet is-active "$timer_unit" 2>/dev/null; }
+
+timer_remaining() {
+	timer_active || return 1
+	entered=$(timeout -k 1 5 systemctl show -p ActiveEnterTimestampMonotonic --value "$timer_unit" 2>/dev/null) || return 1
+	case "$entered" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$entered" -gt 0 ] || return 1
+	printf '%s\n' $((window_seconds - ($(monotonic_seconds) - entered / 1000000)))
+}
+
+stop_timer() { timeout -k 1 "$stop_seconds" systemctl stop "$timer_unit" >/dev/null 2>&1 || true; }
+
+# --- the public status --------------------------------------------------------
+publish() {
+	read_boot_id
+	read_state
+	mapped=restart
+	case "$state" in
+	absent|refused) mapped=idle ;;
+	armed|attempting|activating|active|ready) mapped=starting ;;
+	sealed)
+		case "$(cat "$lifecycle_file" 2>/dev/null || true)" in
+		up) mapped=on ;;
+		lost) mapped=restart ;;
+		*) mapped=starting ;;
+		esac ;;
+	esac
+	mkdir -p "$public_dir"
+	chmod 0755 "$public_dir"
+	tmp=$public_file.new.$$
+	printf 'boot_id=%s\nstate=%s\nevidence=%s\n' "$boot_id" "$mapped" "$(evidence_status)" >"$tmp"
+	chmod 0644 "$tmp"
+	mv -f "$tmp" "$public_file"
+}
+
+# --- commands -----------------------------------------------------------------
+cmd_begin() {
+	require_root
+	read_boot_id
+	case "${1:-}" in attended|qualified) want_kind=$1 ;; *) fail 'begin needs attended or qualified' ;; esac
+	require_committed_main
+	lock
+	read_state
+	transition_allowed armed || fail "an operation is already $state this boot"
+	! timer_active || fail 'the operation timer is already active'
+	write_state armed "$want_kind"
+	rm -f "$reboot_flag" "$lifecycle_file"
+	unlock
+	timeout -k 1 "$stop_seconds" systemctl start "$timer_unit" >/dev/null 2>&1 || cmd_refuse 'the operation timer did not start'
+	left=$(timer_remaining) || cmd_refuse 'the operation deadline is unreadable'
+	[ "$left" -ge "$min_remaining_begin" ] || cmd_refuse 'the operation deadline is wrong'
+	publish
+	persist "stage=begin kind=$want_kind remaining_seconds=$left"
+	printf 'result=armed kind=%s remaining_seconds=%s\n' "$want_kind" "$left"
+}
+
+# A refusal before any mutation: back to refused, timer cancelled.
+cmd_refuse() {
+	lock
+	read_state
+	if [ "$state" = armed ]; then write_state refused "$kind"; fi
+	unlock
+	stop_timer
+	publish || true
+	fail "$1"
+}
+
+cmd_remaining() {
+	timer_remaining || fail 'the operation timer is not active'
+}
+
+cmd_mark() {
+	require_root
+	read_boot_id
+	case "${1:-}" in attempting|activating|active|ready) ;; *) fail 'unknown live state' ;; esac
+	lock
+	read_state
+	transition_allowed "$1" || fail 'the operation is not live'
+	write_state "$1" "$kind"
+	unlock
+	publish
+}
+
+cmd_seal() {
+	require_root
+	read_boot_id
+	lock
+	read_state
+	[ "$state" = ready ] || fail 'the operation is not ready to seal'
+	left=$(timer_remaining) || fail 'the operation deadline is unreadable'
+	[ "$left" -gt 0 ] || fail 'the operation deadline has passed'
+	if [ "$kind" = attended ]; then
+		proofs_valid || fail 'the fresh SSH proofs are missing'
+	fi
+	write_state sealed "$kind"
+	printf '%s\n' up >"$lifecycle_file"
+	unlock
+	# From here the operation is final: expiry reads "sealed" and does nothing.
+	stop_timer
+	publish
+	persist "stage=seal kind=$kind result=sealed"
+	timeout -k 1 "$stop_seconds" systemctl start --no-block "$watch_unit" >/dev/null 2>&1 || persist 'stage=seal watcher=not-started'
+	printf 'result=sealed kind=%s\n' "$kind"
+}
+
+# A new random nonce for this operation's SSH proofs; only in "ready".
+cmd_nonce_new() {
+	require_root
+	read_boot_id
+	lock
+	read_state
+	[ "$state" = ready ] || fail 'the operation is not ready for SSH proofs'
+	value=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+	[ "${#value}" = 32 ] || fail 'a nonce could not be generated'
+	rm -f "$op_dir/proof.usb" "$op_dir/proof.wifi"
+	put_runtime_file "$nonce_file" "nonce=$value"
+	unlock
+	persist 'stage=ssh-proof nonce=created'
+}
+
+cmd_ssh_nonce() {
+	require_root
+	read_boot_id
+	read_state
+	[ "$state" = ready ] || fail 'the operation is not waiting for SSH proofs'
+	safe_file "$nonce_file" || fail 'no nonce exists'
+	kv "$nonce_file" nonce
+}
+
+# One NEW SSH connection proves itself: a root command carrying the nonce,
+# arriving over the live socket table on USB or on a Wi-Fi link. A connection
+# that existed before the activation (the stage recorded those) or one that
+# arrives over the cellular link is refused.
+cmd_ssh_proof() {
+	require_root
+	read_boot_id
+	given=$1
+	case $given in ''|*[!0-9a-f]*) fail 'the nonce is malformed' ;; esac
+	read_state
+	[ "$state" = ready ] || fail 'the operation is not waiting for SSH proofs'
+	safe_file "$nonce_file" || fail 'no nonce exists'
+	# run_data always seals the exact pre-activation rescue facts here before it
+	# can reach ready. Without that root-only regular snapshot, no socket can be
+	# distinguished from one that existed before activation, so fail closed.
+	safe_file "$rescue_before" || fail 'the pre-activation rescue snapshot is unavailable'
+	[ "$(kv "$nonce_file" nonce)" = "$given" ] || fail 'the nonce does not match this operation'
+	set -- ${SSH_CONNECTION:-}
+	[ "$#" = 4 ] || fail 'this is not an SSH connection'
+	client_ip=$1 client_port=$2 server_ip=$3 server_port=$4
+	for field in "$client_ip" "$server_ip"; do
+		case $field in ''|*[!0-9.]*) fail 'the SSH connection has an unsupported address' ;; esac
+	done
+	case "$client_port$server_port" in ''|*[!0-9]*) fail 'the SSH connection is malformed' ;; esac
+	[ "$server_port" = 22 ] || fail 'the SSH connection is not on the SSH port'
+	live=$(timeout -k 1 5 ss -H -tn state established 'sport = :22' 2>/dev/null | sed 's/\[::ffff:\([0-9.]*\)\]/\1/g' |
+		awk -v l="$server_ip:22" -v p="$client_ip:$client_port" '$(NF - 1) == l && $NF == p { found = 1 } END { print found + 0 }')
+	[ "$live" = 1 ] || fail 'the SSH connection is not in the socket table'
+	if grep -Fxq "session $server_ip:22 $client_ip:$client_port" "$rescue_before"; then
+		fail 'this SSH connection existed before the activation'
+	fi
+	devs=$(timeout -k 1 5 ip -4 -o addr show 2>/dev/null | awk -v a="$server_ip" '{ split($4, x, "/"); if (x[1] == a) print $2 }')
+	[ "$(printf '%s\n' "$devs" | grep -c .)" = 1 ] || fail 'the SSH server address is not on exactly one interface'
+	if [ "$devs" = "$usb_iface" ]; then
+		proof=usb
+	elif [ -d "$net_root/$devs/wireless" ] || [ -e "$net_root/$devs/phy80211" ]; then
+		proof=wifi
+	else
+		fail 'the SSH connection did not arrive over USB or Wi-Fi'
+	fi
+	lock
+	read_state
+	[ "$state" = ready ] || fail 'the operation is no longer waiting for SSH proofs'
+		put_runtime_file "$op_dir/proof.$proof" "nonce=$given"
+	unlock
+	persist "stage=ssh-proof kind=$proof"
+	printf 'result=proof kind=%s\n' "$proof"
+}
+
+proofs_valid() {
+	safe_file "$nonce_file" || return 1
+	current=$(kv "$nonce_file" nonce)
+	[ -n "$current" ] || return 1
+	for proof in usb wifi; do
+		safe_file "$op_dir/proof.$proof" && [ "$(kv "$op_dir/proof.$proof" nonce)" = "$current" ] || return 1
+	done
+}
+
+cmd_proofs_ok() {
+	require_root
+	read_boot_id
+	read_state
+	[ "$state" = ready ] && proofs_valid
+}
+
+cmd_launch() {
+	require_root
+	read_boot_id
+	[ "${1:-}" = "$confirm_token" ] || fail 'main-op requires the exact confirmation token argument'
+	require_committed_main
+	lock
+	read_state
+	transition_allowed armed || fail "an operation is already $state this boot"
+	[ ! -d "$mutation_marker" ] || fail 'a cellular mutation was already taken this boot; reboot to retry'
+	put_runtime_file "$confirm_file" "boot_id=$boot_id"
+	unlock
+	timeout -k 1 "$stop_seconds" systemctl start --no-block "$attended_unit" >/dev/null 2>&1 || fail 'the operation unit did not start'
+	persist 'stage=launch result=started'
+	printf 'result=started unit=%s\n' "$attended_unit"
+	printf '%s\n' 'Follow it with: myron-cellular-stage status. When data_state=awaiting-ssh-proof, open two NEW SSH logins and run:'
+	# shellcheck disable=SC2016
+	printf '%s\n' '  myron-cellular-op ssh-proof $(myron-cellular-op ssh-nonce)   (once over USB, once over Wi-Fi; ControlMaster=no)'
+}
+
+cmd_confirmed() {
+	require_root
+	read_boot_id
+	safe_file "$confirm_file" && [ "$(kv "$confirm_file" boot_id)" = "$boot_id" ] || return 1
+	rm -f "$confirm_file"
+}
+
+cmd_live() {
+	read_boot_id
+	read_state
+	case "$state" in armed|attempting|activating|active|ready) return 0 ;; esac
+	return 1
+}
+
+cmd_proof_ready() {
+	require_root
+	read_boot_id
+	read_state
+	[ "$state" = sealed ] && [ "$kind" = attended ] && [ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ]
+}
+
+# Called by the stage after its standalone proof. Root, sealed attended
+# operation, lifecycle up: nothing a tile or an unprivileged user sends reaches
+# this, and the operation itself never writes evidence.
+cmd_record_evidence() {
+	require_root
+	read_boot_id
+	fingerprint_parts || fail 'evidence inputs are unavailable'
+	safe_dir "$main_state" 077 || fail 'main state directory is not root-only'
+	lock
+	read_state
+	[ "$state" = sealed ] && [ "$kind" = attended ] || fail 'no sealed attended operation exists'
+	[ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ] || fail 'the cellular connection is not up'
+	[ ! -L "$evidence" ] || fail 'the evidence file is a link'
+	put_file "$evidence" "$(evidence_text "$boot_id")"
+	unlock
+	publish
+	persist 'stage=evidence result=recorded'
+	printf 'result=evidence-recorded\n'
+}
+
+cmd_abort() {
+	require_root
+	read_boot_id
+	reason=${1:-failed}
+	case $reason in ''|*[!a-z0-9-]*) reason=failed ;; esac
+	[ "${#reason}" -le 20 ] || reason=failed
+	# Terminal state must win under the same brief lock as seal, before the
+	# worker is stopped. If even the bounded lock cannot be obtained, do not
+	# race an unlocked state write or stop the worker: request the same reviewed
+	# normal reboot directly. The worker may finish, but no retry can occur
+	# before that reboot because the per-boot mutation marker remains.
+	if ! lock_nofail; then
+		persist "stage=abort result=reboot reason=$reason lock=unavailable"
+		printf 'result=aborted reason=%s reboot=normal lock=unavailable\n' "$reason"
+		[ -x "$main_os" ] || fail 'the main control is unavailable'
+		exec "$main_os" reboot-normal --reason "cellular-op-$reason"
+	fi
+	read_state
+	case "$state" in
+	sealed)
+		persist 'stage=abort result=ignored-sealed'
+		printf 'result=ignored-sealed reboot=no\n'
+		unlock
+		return 0 ;;
+	absent)
+		unlock
+		persist 'stage=abort result=nothing-armed'
+		printf 'result=nothing-armed reboot=no\n'
+		return 0 ;;
+	armed|refused)
+		if [ ! -d "$mutation_marker" ]; then
+			if [ "$state" = armed ]; then write_state refused "$kind"; fi
+			unlock
+			stop_timer
+			publish || true
+			persist 'stage=abort result=cancelled-before-mutation'
+			printf 'result=cancelled reboot=no\n'
+			return 0
+		fi
+		state=attempting ;;
+	esac
+	# A possible mutation, or a state that cannot be trusted: fail closed.
+	# Terminal states stay as they are; a live one becomes failed or expired.
+	case "$state" in
+	failed|expired) ;;
+	*)
+		new=failed
+		[ "$reason" != deadline ] || new=expired
+		mkdir -p "$op_dir"
+		put_runtime_file "$state_file" "boot_id=$boot_id
+state=$new
+kind=${kind:-attended}" ;;
+	esac
+	already=0
+	[ ! -e "$reboot_flag" ] || already=1
+	[ "$already" = 1 ] || printf '%s\n' "$reason" >"$reboot_flag"
+	unlock
+	stop_timer
+	publish || true
+	if [ "$already" = 1 ]; then
+		persist 'stage=abort result=already-requested'
+		printf 'result=already-requested reboot=normal\n'
+		return 0
+	fi
+	for unit in $run_units; do
+		timeout -k 1 "$stop_seconds" systemctl stop "$unit" >/dev/null 2>&1 || true
+	done
+	persist "stage=abort result=reboot reason=$reason"
+	printf 'result=aborted reason=%s reboot=normal\n' "$reason"
+	[ -x "$main_os" ] || fail 'the main control is unavailable'
+	exec "$main_os" reboot-normal --reason "cellular-op-$reason"
+}
+
+# Takes the lock without failing the shell: returns 1 if it could not.
+lock_nofail() {
+	mkdir -p "$op_dir"
+	chmod 0700 "$op_dir"
+	exec 9>"$lock_file" || return 1
+	flock -w "$lock_seconds" 9 || return 1
+}
+
+cmd_watch() {
+	require_root
+	read_boot_id
+	read_state
+	[ "$state" = sealed ] || fail 'the operation is not sealed'
+	[ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ] || fail 'the operation lifecycle is not up'
+	bad=0
+	while :; do
+		sleep "$watch_poll_seconds"
+		if timeout -k 1 5 "$guard" check >/dev/null 2>&1 &&
+			[ "$(timeout -k 1 5 nmcli -t -g GENERAL.STATE connection show uuid "$target_uuid" 2>/dev/null | sed -n '1p')" = activated ]; then
+			bad=0
+			continue
+		fi
+		bad=$((bad + 1))
+		[ "$bad" -ge "$watch_failures" ] || continue
+		printf '%s\n' lost >"$lifecycle_file"
+		publish || true
+		persist 'stage=watch result=lost'
+		printf 'result=lost\n'
+		return 0
+	done
+}
+
+cmd_status() {
+	read_boot_id
+	read_state
+	printf 'state=%s kind=%s evidence=%s\n' "$state" "${kind:--}" "$(evidence_status)"
+}
+
+usage() {
+	printf 'usage: %s launch TOKEN | begin attended|qualified | remaining | mark STATE | seal | abort WORD | watch | publish | evidence-check | status | nonce-new | ssh-nonce | ssh-proof NONCE | record-evidence\n' "${0##*/}" >&2
+	exit 2
+}
+
+# --- main ---
+[ "$#" -ge 1 ] || usage
+command=$1
+shift
+case "$command" in
+launch) [ "$#" = 1 ] || usage; cmd_launch "$1" ;;
+confirmed) [ "$#" = 0 ] || usage; cmd_confirmed ;;
+nonce-new) [ "$#" = 0 ] || usage; cmd_nonce_new ;;
+ssh-nonce) [ "$#" = 0 ] || usage; cmd_ssh_nonce ;;
+ssh-proof) [ "$#" = 1 ] || usage; cmd_ssh_proof "$1" ;;
+proofs-ok) [ "$#" = 0 ] || usage; cmd_proofs_ok ;;
+live) [ "$#" = 0 ] || usage; cmd_live ;;
+proof-ready) [ "$#" = 0 ] || usage; cmd_proof_ready ;;
+record-evidence) [ "$#" = 0 ] || usage; cmd_record_evidence ;;
+begin) [ "$#" = 1 ] || usage; cmd_begin "$1" ;;
+remaining) [ "$#" = 0 ] || usage; cmd_remaining ;;
+mark) [ "$#" = 1 ] || usage; cmd_mark "$1" ;;
+seal) [ "$#" = 0 ] || usage; cmd_seal ;;
+abort) [ "$#" -le 1 ] || usage; cmd_abort "${1:-failed}" ;;
+watch) [ "$#" = 0 ] || usage; cmd_watch ;;
+publish) [ "$#" = 0 ] || usage; publish ;;
+evidence-check)
+	[ "$#" = 0 ] || usage
+	require_root
+	result=$(evidence_status)
+	printf 'evidence=%s\n' "$result"
+	[ "$result" = valid ]
+	;;
+status) [ "$#" = 0 ] || usage; cmd_status ;;
+*) usage ;;
+esac

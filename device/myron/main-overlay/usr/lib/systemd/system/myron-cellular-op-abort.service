@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# The deadline fired. A sealed operation is left alone; before the first
+# mutation the operation is cancelled; otherwise the operation unit is stopped
+# and a normal reboot is requested (no latch, no partition write).
+[Unit]
+Description=Main cellular data operation deadline
+ConditionPathExists=/run/myron-main/boot-id
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-cellular-op abort deadline
+TimeoutStartSec=300

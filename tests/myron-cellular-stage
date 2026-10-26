@@ -51,7 +51,7 @@ grep -Fq 'nmcli device set "$control" managed yes' "$stage" || tfail 'stage does
 grep -Fq 'ipv4.routing-rules ""' "$stage" || tfail 'stage does not clear inherited routing rules'
 if grep -nE 'ipv4\.routing-rules +(priority|from)|from all table' "$stage"; then tfail 'stage installs its own from-all routing rule'; fi
 # Failure logs never carry variables: persist only the fixed message.
-grep -Fq 'persist "result=failed message=$1"' "$stage" || tfail 'failure logging can persist variable detail'
+grep -Fq 'persist "result=failed message=$message"' "$stage" && grep -Fq 'message=$1' "$stage" || tfail 'failure logging can persist variable detail'
 if printf '%s\n' "$joined" | grep -E 'timeout -k [0-9]+ [0-9]+ (mmcli|nmcli|curl|resolvectl|ip)' | grep -vE '2>/dev/null|>/dev/null 2>&1'; then
   tfail 'stage lets a tool write raw stderr'
 fi
@@ -214,6 +214,22 @@ no_secrets_anywhere() { no_identity "$(cat "$log" "$runtime_dir"/data.state "$ca
 nm_untouched() { ! grep -q nmcli "$calls" || tfail "$1: NetworkManager was mutated"; }
 armed() { mkdir -p "$runtime_dir"; printf 'boot_id=boot-X\n' >"$arm_marker"; }
 TOKEN=ONE-SHOT-CELLULAR-DATA-REBOOT-REQUIRED
+
+# The shared stage keeps its temporary-watchdog messages in the hardware-test
+# boot, but every deadline message becomes operation wording in main mode.
+for message in \
+  'rollback watchdog deadline is unavailable' \
+  'the post-activation checks are out of rollback deadline budget; reboot' \
+  'cellular activation is too close to the rollback deadline; reboot'; do
+  reset; mode=main; boot_id=boot-X
+  rc=0; out=$(run fail "$message") || rc=$?
+  [[ $rc -eq 1 && $out == *'operation deadline'* && $out != *'rollback'* ]] ||
+    tfail "main failure kept temporary wording: $out"
+  grep -Fq 'message=' "$log" && ! grep -Eq 'rollback (watchdog )?deadline' "$log" ||
+    tfail "main log kept temporary deadline wording: $(cat "$log")"
+done
+mode=temp
+pass 'main-mode deadline failures and logs consistently use operation wording'
 
 for lock in -- none sim-pin2 sim-puk2; do
   reset; unlock=$lock; read_modem; sim_ready || tfail "operational SIM lock $lock was refused"

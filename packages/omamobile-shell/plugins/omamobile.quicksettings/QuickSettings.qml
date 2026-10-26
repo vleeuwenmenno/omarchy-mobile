@@ -342,15 +342,15 @@ Item {
     onTriggered: { root.optimistic = ({}); root.refreshProbe() }
   }
 
-  // Airplane mode: Wi-Fi, Bluetooth and WWAN rfkill switches together.
-  // The modem's own radio (omamobile-sit radio) is not touched: turning it
-  // back on needs a reboot today.
+  // Airplane mode: Wi-Fi, Bluetooth and WWAN rfkill switches together. Myron
+  // publishes it unavailable because its modem radio cannot be restored
+  // safely in one boot; a partial Wi-Fi/Bluetooth-only tile would be false.
   QtObject {
     id: airplane
-    readonly property bool available: root.probedHas("airplane")
+    readonly property bool available: !mobileData.myron && root.probedHas("airplane")
     readonly property bool enabled: available && root.probedOn("airplane", "airplane")
     readonly property string icon: enabled ? "󰀝" : "󰀞"
-    readonly property string status: !available ? "No radios" : enabled ? "On" : "Off"
+    readonly property string status: mobileData.myron ? "Unavailable" : !available ? "No radios" : enabled ? "On" : "Off"
     function toggle() { if (available) root.runTileAction("airplane", !enabled) }
   }
 
@@ -681,18 +681,38 @@ Item {
 
   // ---------------------------------------------------------------- stubs
 
-  // Mobile data over omamobile-modem-sit: the tile is the cellular bearer
+  // Mobile data. On the Pixel it is the omamobile-modem-sit bearer
   // (omamobile-sit data on|off, which starts or stops
-  // omamobile-sit-data.service through polkit). "No modem" until
-  // omamobile-sitd publishes its state.
+  // omamobile-sit-data.service through polkit); "No modem" until
+  // omamobile-sitd publishes its state. On Myron's persistent main boot the
+  // helper myron-mobile-data answers instead (the probe carries data_enable
+  // and data_busy): the only action is the one supported start, taken once per
+  // boot, so there is no optimistic flip and no queued opposite action. A
+  // tap while it is on, starting, lost or unknown does nothing: turning data
+  // off, reconnecting and radio changes are not supported yet.
   QtObject {
     id: mobileData
+    readonly property bool myron: root.probed.data_enable !== undefined
+    property bool myronStarting: false
     readonly property bool available: root.probedHas("data")
-    readonly property bool enabled: available && root.probedOn("mobile-data", "data")
+    readonly property bool enabled: available && (myron ? root.probed.data === "on" : root.probedOn("mobile-data", "data"))
     readonly property string icon: "󰞃"
     readonly property string status: !available ? "No modem"
+      : myron ? (myronStarting ? "Starting" : (root.probed.data_status || (enabled ? "On" : "Off")))
       : !enabled ? "Off" : (root.probed.data_status || "On")
-    function toggle() { if (available) root.runTileAction("mobile-data", !enabled) }
+    function toggle() {
+      if (!available) return
+      if (!myron) { root.runTileAction("mobile-data", !enabled); return }
+      if (enabled || myronStarting || root.probed.data_busy === "1" || root.probed.data_enable !== "1") return
+      myronStarting = true
+      myronData.command = ["sh", root.scriptPath("tile-action.sh"), "mobile-data", "on"]
+      myronData.running = true
+    }
+  }
+
+  Process {
+    id: myronData
+    onExited: { mobileData.myronStarting = false; root.refreshProbe() }
   }
 
   // Rotation lock over omamobile-autorotate (omamobile-sensors): it rotates

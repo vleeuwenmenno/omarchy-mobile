@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+# The first, attended cellular data operation of the persistent main boot,
+# started by `myron-cellular-stage main-op CONFIRMATION-TOKEN`. A unit rather
+# than a login process, so closing the initiating SSH session does not stop it.
+# Never enabled; it runs only by an explicit start, once per boot.
+[Unit]
+Description=Attended main cellular data operation
+After=myron-cellular.service NetworkManager.service
+ConditionPathExists=/run/myron-main/boot-id
+OnFailure=myron-cellular-op-failed.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-cellular-stage main-run attended
+TimeoutStartSec=1100

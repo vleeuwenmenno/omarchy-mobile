@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Started by OnFailure= of the operation units: the same abort as the deadline,
+# for a failure that happened before the deadline.
+[Unit]
+Description=Main cellular data operation failed
+ConditionPathExists=/run/myron-main/boot-id
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-cellular-op abort failed
+TimeoutStartSec=300

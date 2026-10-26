@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+# Publishes the read-only status (world-readable, words only) at boot, so the
+# quick-settings tile knows whether valid attended evidence exists.
+[Unit]
+Description=Main cellular data status
+ConditionPathExists=/run/myron-main/boot-id
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/myron-cellular-op publish
+
+[Install]
+WantedBy=multi-user.target

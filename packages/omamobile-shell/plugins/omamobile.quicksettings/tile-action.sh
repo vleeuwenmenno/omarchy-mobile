@@ -16,6 +16,10 @@ case $tile in
     # Android. Turning airplane mode off unblocks what was on before it, so a
     # radio the user had switched off stays off.
     restore="$state_dir/airplane-restore"
+    if command -v myron-mobile-data >/dev/null 2>&1; then
+      printf '%s\n' 'Airplane mode is unavailable: the Myron modem radio cannot be restored safely without a reboot.' >&2
+      exit 1
+    fi
     if [ "$want" = on ]; then
       mkdir -p "$state_dir"
       rfkill -rn -o TYPE,SOFT | awk '($1 == "wlan" || $1 == "bluetooth" || $1 == "wwan") && $2 == "unblocked" { print $1 }' \
@@ -86,6 +90,11 @@ case $tile in
     fi
     ;;
   mobile-data)
+    if command -v myron-mobile-data >/dev/null 2>&1; then
+      # Myron: only the supported start exists. Off, reconnect and radio changes
+      # are refused by the helper, never by a guessed nmcli call.
+      exec myron-mobile-data "$want"
+    fi
     exec omamobile-sit data "$want"
     ;;
   mic)

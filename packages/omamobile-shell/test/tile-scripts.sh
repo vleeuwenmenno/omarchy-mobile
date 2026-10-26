@@ -92,6 +92,33 @@ for line in "powerprofiles autodetect power-saver" "idle allow-idle" "sit data o
 done
 pass "tile-action.sh drives battery saver, stay awake, mobile data and hotspot"
 
+# Myron never falls through to Pixel SIT. Mobile data may only ask its helper
+# for the supported start, while airplane mode is unavailable because a
+# partial Wi-Fi/Bluetooth-only action would leave cellular transmitting.
+stub myron-mobile-data '
+case $1 in
+  state) printf "data=off\ndata_status=Off ·5G\ndata_enable=1\ndata_busy=0\n" ;;
+  on) echo "myron-data on" >>'"$log"' ;;
+  off) echo "myron-data off-refused" >>'"$log"'; exit 1 ;;
+  *) exit 2 ;;
+esac'
+out=$(run "$dir/tile-state.sh")
+grep -cx 'airplane=none' <<<"$out" >/dev/null || fail "Myron airplane mode is not unavailable"
+for line in data=off 'data_status=Off ·5G' data_enable=1 data_busy=0; do
+  grep -cxF "$line" <<<"$out" >/dev/null || fail "Myron tile state lacks: $line"
+done
+: >"$log"
+run "$dir/tile-action.sh" mobile-data on
+grep -cxF 'myron-data on' "$log" >/dev/null || fail "Myron mobile-data start did not use its helper"
+! grep -q '^sit ' "$log" || fail "Myron mobile data fell through to Pixel SIT"
+before=$(cat "$tmp/state/rfkill")
+if run "$dir/tile-action.sh" airplane on 2>/dev/null; then fail "Myron airplane mode was accepted"; fi
+[[ $(cat "$tmp/state/rfkill") == "$before" ]] || fail "Myron airplane refusal changed rfkill state"
+if run "$dir/tile-action.sh" mobile-data off 2>/dev/null; then fail "Myron mobile data off was accepted"; fi
+grep -cxF 'myron-data off-refused' "$log" >/dev/null || fail "Myron mobile-data off did not reach the refusing helper"
+! grep -q '^sit ' "$log" || fail "Myron refusal fell through to Pixel SIT"
+pass "Myron tile uses only its honest one-shot helper and refuses airplane/off"
+
 stub omamobile-microphone 'echo "microphone $*" >>'"$log"'; if [ "$1" = status ]; then echo off; fi; exit 0'
 grep -cx 'mic_bridge=off' <<<"$(run "$dir/tile-state.sh")" >/dev/null ||
   fail "tile-state.sh reads the optional microphone bridge"

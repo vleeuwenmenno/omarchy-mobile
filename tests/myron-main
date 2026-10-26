@@ -78,14 +78,14 @@ pass 'guard unit stays active after success, has no 900 s timer, failures call r
   fail 'commit must come after the profile qualification'
 grep -Fq 'timeout 10 hyprctl -j monitors' "$qualify" && grep -Fq 'timeout 10 hyprctl -j devices' "$qualify" || fail 'hyprctl is unbounded'
 grep -Fq 'cut -d. -f1 /proc/uptime' "$qualify" && ! grep -Fq 'date +%s' "$qualify" || fail 'modem wait must use monotonic uptime'
-refuse_line=$(grep -n '/run/myron-main/boot-id' "$cellular_stage" | head -1 | cut -d: -f1)
-gates_line=$(grep -n '^require_runtime_gates()' "$cellular_stage" | cut -d: -f1)
-[[ -n $refuse_line && $refuse_line -gt $gates_line && $refuse_line -lt $((gates_line + 6)) ]] ||
-  fail 'cellular stage does not refuse the main runtime first in require_runtime_gates'
+grep -Fq 'main_boot_id_marker=/run/myron-main/boot-id' "$cellular_stage" && grep -Fq '[ ! -e "$main_boot_id_marker" ] || mode=main' "$cellular_stage" ||
+  fail 'cellular stage does not detect the main runtime from the main boot-id marker'
+grep -Fq 'identity|arm|qualify|data)' "$cellular_stage" && grep -Fq '[ "$mode" = temp ] || cmd_refuse_in_main "$command"' "$cellular_stage" ||
+  fail 'cellular stage does not refuse the temporary commands in the main runtime'
 [[ $(grep -n 'Hyprland exited or restarted before the main boot commit' "$qualify" | head -1 | cut -d: -f1) -gt $(grep -n '^qualify_profile$' "$qualify" | cut -d: -f1) &&
   $(grep -n 'Hyprland exited or restarted before the main boot commit' "$qualify" | head -1 | cut -d: -f1) -lt $(grep -n 'myron-main-os commit' "$qualify" | head -1 | cut -d: -f1) ]] ||
   fail 'compositor liveness must be rechecked after the profile qualification and immediately before the commit'
-pass 'qualifier commits after profile checks before keep-armed, rechecks the same Hyprland PID before the commit, bounded hyprctl, monotonic modem wait; stage refuses main'
+pass 'qualifier commits after profile checks before keep-armed, rechecks the same Hyprland PID before the commit, bounded hyprctl, monotonic modem wait; stage refuses its temporary commands on main'
 
 # ---- selector --------------------------------------------------------------
 uid=$(id -u) gid=$(id -g)

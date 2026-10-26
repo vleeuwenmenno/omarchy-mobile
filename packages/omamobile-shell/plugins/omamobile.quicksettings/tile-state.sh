@@ -16,14 +16,22 @@
 #   stayawake     on while Omarchy's stay-awake indicator exists
 #   record        on while omamobile-screenrecord (wf-recorder) records
 #   data          on while omamobile-sit-data.service is active; none
-#                 without omamobile-sitd running
-#   data_status   the operator and technology, when registered
+#                 without omamobile-sitd running. Where myron-mobile-data
+#                 exists (the Myron main boot) that helper answers instead and
+#                 the Pixel SIT path is never consulted
+#   data_status   the operator and technology, when registered (Myron: the
+#                 honest state in words)
+#   data_enable   Myron only: 1 when a tap may start data
+#   data_busy     Myron only: 1 when a tap does nothing now
 
 t() { timeout 3 "$@" 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# airplane
-if have rfkill; then
+# airplane. Myron cannot safely turn its modem radio off and back on in one
+# boot, so a partial Wi-Fi/Bluetooth-only action would lie: publish unavailable.
+if have myron-mobile-data; then
+  echo "airplane=none"
+elif have rfkill; then
   t rfkill -rn -o TYPE,SOFT | awk '
     $1 == "wlan" || $1 == "bluetooth" || $1 == "wwan" { n++; if ($2 == "blocked") b++ }
     END { print "airplane=" (n == 0 ? "none" : (b == n ? "on" : "off")) }'
@@ -80,7 +88,16 @@ fi
 # data: the daemon's public state is world-readable; the bearer service's
 # state is what "data on|off" switches.
 state=/run/omamobile-sit/state.json
-if have omamobile-sit && [ -r "$state" ] && have python3; then
+if have myron-mobile-data; then
+  # The Myron backend alone: when it cannot answer the tile says so, and a
+  # missing or stale answer is never read as the Pixel's SIT state.
+  out=$(timeout 6 myron-mobile-data state 2>/dev/null) || out=
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    printf 'data=off\ndata_status=Status unavailable\ndata_enable=0\ndata_busy=1\n'
+  fi
+elif have omamobile-sit && [ -r "$state" ] && have python3; then
   if systemctl is-active --quiet omamobile-sit-data.service 2>/dev/null; then echo "data=on"; else echo "data=off"; fi
   python3 -I -c '
 import json, sys

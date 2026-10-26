@@ -175,9 +175,18 @@ docker run --rm --privileged --platform linux/arm64 \
         chown -h 0:0 "$root$relative"
         if [[ -d $path && ! -L $path ]]; then chmod 0755 "$root$relative"; fi
       done < <(find /main-overlay -mindepth 1 -print0)
-      chmod 0755 "$root/usr/local/sbin/myron-main-os"
+      chmod 0755 "$root/usr/local/sbin/myron-main-os" "$root/usr/local/sbin/myron-cellular-op" \
+        "$root/usr/local/bin/myron-mobile-data"
       chmod 0644 "$root/usr/lib/systemd/system/myron-hardware-watchdog.service" \
-        "$root/usr/lib/systemd/system/myron-main-recover.service"
+        "$root/usr/lib/systemd/system/myron-main-recover.service" \
+        "$root/usr/lib/systemd/system/myron-cellular-op.timer" \
+        "$root/usr/lib/systemd/system/myron-cellular-op-abort.service" \
+        "$root/usr/lib/systemd/system/myron-cellular-op-failed.service" \
+        "$root/usr/lib/systemd/system/myron-cellular-attended.service" \
+        "$root/usr/lib/systemd/system/myron-cellular-enable.service" \
+        "$root/usr/lib/systemd/system/myron-cellular-watch.service" \
+        "$root/usr/lib/systemd/system/myron-cellular-publish.service" \
+        "$root/etc/polkit-1/rules.d/50-myron-cellular-enable.rules"
     fi
     printf "%s\n" "$MYRON_TEST_PROFILE" >"$root/etc/omamobile/myron-test-profile"
     chown 0:0 "$root/etc/omamobile/myron-test-profile"
@@ -300,6 +309,11 @@ docker run --rm --privileged --platform linux/arm64 \
     # Omarchy Mobile has its own non-interactive first-boot service.  Arch
     # stock prompt otherwise blocks sysinit.target behind Plymouth forever.
     systemctl --root="$root" mask systemd-firstboot.service >/dev/null
+    if test "$MYRON_BOOT_POLICY" = main; then
+      # Status only: the operation units stay unenabled and start only on an
+      # explicit request, once per boot.
+      systemctl --root="$root" enable myron-cellular-publish.service >/dev/null
+    fi
     case $MYRON_TEST_PROFILE in
       coexistence)
         systemctl --root="$root" enable myron-coexistence.service >/dev/null
@@ -322,6 +336,11 @@ docker run --rm --privileged --platform linux/arm64 \
 e2fsck -fn "$out" >/dev/null
 if [[ $boot_policy == main ]]; then
   for path in /usr/local/sbin/myron-main-os /usr/lib/systemd/system/myron-hardware-watchdog.service \
+    /usr/local/sbin/myron-cellular-op /usr/local/bin/myron-mobile-data \
+    /usr/lib/systemd/system/myron-cellular-op.timer /usr/lib/systemd/system/myron-cellular-op-abort.service \
+    /usr/lib/systemd/system/myron-cellular-op-failed.service /usr/lib/systemd/system/myron-cellular-attended.service \
+    /usr/lib/systemd/system/myron-cellular-enable.service /usr/lib/systemd/system/myron-cellular-watch.service \
+    /usr/lib/systemd/system/myron-cellular-publish.service /etc/polkit-1/rules.d/50-myron-cellular-enable.rules \
     /usr/lib/systemd/system/myron-main-recover.service \
     /usr/lib/systemd/system/myron-omarchy-qualify.service.d/90-myron-main.conf; do
     debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
@@ -333,6 +352,23 @@ if [[ $boot_policy == main ]]; then
     grep -Fq '/run/myron-watchdog' && die 'temporary watchdog unit survived in the main payload'
   # debugfs exits 0 for a missing path, so existence is read from its output.
   in_image() { ! debugfs -R "stat $1" "$out" 2>&1 | grep -Fq 'File not found'; }
+  # The operation units: byte for byte the repository's, never enabled except
+  # the status publisher, and not shadowed from a higher-priority location.
+  for unit in myron-cellular-op.timer myron-cellular-op-abort.service myron-cellular-op-failed.service \
+    myron-cellular-attended.service myron-cellular-enable.service myron-cellular-watch.service \
+    myron-cellular-publish.service; do
+    [[ $(debugfs -R "cat /usr/lib/systemd/system/$unit" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"device/myron/main-overlay/usr/lib/systemd/system/$unit")" ]] ||
+      die "operation unit differs from the repository: $unit"
+    for dir in /etc/systemd/system /etc/systemd/system.control /usr/local/lib/systemd/system; do
+      ! in_image "$dir/$unit" || die "operation unit is shadowed: $dir/$unit"
+      ! in_image "$dir/$unit.d" || die "operation unit has a drop-in directory: $dir/$unit.d"
+    done
+  done
+  for unit in myron-cellular-op.timer myron-cellular-attended.service myron-cellular-enable.service myron-cellular-watch.service; do
+    ! in_image "/etc/systemd/system/multi-user.target.wants/$unit" || die "operation unit is enabled: $unit"
+  done
+  in_image /etc/systemd/system/multi-user.target.wants/myron-cellular-publish.service ||
+    die 'the cellular status publisher is not enabled'
   # No higher-priority location may shadow a critical main unit, and the only
   # drop-ins in /usr/lib are the provided main ones, byte for byte.
   for unit in myron-hardware-watchdog myron-main-recover myron-omarchy-qualify myron-omarchy-prepare \

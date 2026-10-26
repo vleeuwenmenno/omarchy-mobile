@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+# The fixed deadline of the persistent main boot's one cellular data operation.
+# myron-cellular-op begin starts it before the stage mutates anything; the seal
+# stops it. Its window is window_seconds in myron-cellular-op: the stage reads
+# the time left from this timer's own monotonic activation timestamp.
+[Unit]
+Description=Deadline of the main cellular data operation
+ConditionPathExists=/run/myron-main/boot-id
+
+[Timer]
+OnActiveSec=1200s
+AccuracySec=1s
+RemainAfterElapse=no
+Unit=myron-cellular-op-abort.service

@@ -1,0 +1,114 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unprivileged, read-mostly mobile-data interface of the persistent Myron main
+# boot, for the quick-settings tile. It tells the truth about what the main
+# boot can do today:
+#
+#   state   key=value lines for tile-state.sh: data=on|off|none, data_status,
+#           data_enable=0|1 (a tap may start the operation), data_busy=0|1
+#           (a tap does nothing now)
+#   on      starts the one user-initiated operation unit. Root re-checks the
+#           attended evidence, the supervisor and every gate; nothing here is
+#           trusted. Allowed only when state says data_enable=1.
+#   off     refused: there is no supported way to stop or reconnect cellular
+#           data in a boot yet. Restart the phone.
+#
+# The modem is read only through ModemManager keys (state, registration,
+# access technology): no identity field is read or printed. The operation's
+# state is the supervisor's world-readable public file, and a file that is
+# missing, from another boot or malformed reads as "status unavailable", never
+# as "no modem" and never as permission.
+set -u
+
+public_file=/run/myron-cellular/state
+boot_id_file=/proc/sys/kernel/random/boot_id
+enable_unit=myron-cellular-enable.service
+modem_prefix=/org/freedesktop/ModemManager1/Modem/
+
+t() { timeout 2 "$@" 2>/dev/null; }
+
+pub() { sed -n "s/^$1=//p" "$public_file" 2>/dev/null | sed -n '1p'; }
+
+# Sets: modems (count, or unknown), registered (yes|no), tech (word).
+read_modem() {
+	modems=unknown registered=no tech=
+	listing=$(t mmcli -L) || return 0
+	paths=$(printf '%s\n' "$listing" | grep -o "${modem_prefix}[0-9][0-9]*" | sort -u)
+	modems=$(printf '%s\n' "$paths" | grep -c . || true)
+	[ "$modems" = 1 ] || return 0
+	info=$(t mmcli -m "$(printf '%s\n' "$paths" | sed -n '1p')" -K) || { modems=unknown; return 0; }
+	reg=$(printf '%s\n' "$info" | awk -F' *: *' '$1 == "modem.3gpp.registration-state" { print $2; exit }')
+	[ "$reg" = home ] && registered=yes
+	techs=$(printf '%s\n' "$info" | awk -F' *: *' '$1 ~ /^modem[.]generic[.]access-technologies[.]value/ { print $2 }')
+	case " $techs " in
+	*' 5gnr '*) tech=5G ;;
+	*' lte '*) tech=LTE ;;
+	esac
+}
+
+# Sets: op (idle|starting|on|restart|unknown) and evidence (valid|absent|invalid).
+read_public() {
+	op=unknown evidence=absent
+	[ -r "$public_file" ] || return 0
+	current=$(cat "$boot_id_file" 2>/dev/null || true)
+	[ -n "$current" ] && [ "$(pub boot_id)" = "$current" ] || return 0
+	case $(pub state) in
+	idle) op=idle ;;
+	starting) op=starting ;;
+	on) op=on ;;
+	restart) op=restart ;;
+	*) return 0 ;;
+	esac
+	case $(pub evidence) in valid) evidence=valid ;; invalid) evidence=invalid ;; *) evidence=absent ;; esac
+}
+
+compute() {
+	read_modem
+	read_public
+	data=off enable=0 busy=0 note=
+	if [ "$modems" = 0 ]; then
+		data=none note='No modem'
+		return 0
+	fi
+	if [ "$modems" != 1 ]; then
+		busy=1 note='Modem status unavailable'
+		return 0
+	fi
+	label=${tech:+ $tech}
+	case $op in
+	unknown) busy=1 note='Status unavailable' ;;
+	starting) busy=1 note='Starting' ;;
+	restart) busy=1 note='Restart to retry' ;;
+	on) data=on busy=1 note="On${label:+ ·$label}" ;;
+	idle)
+		if [ "$evidence" != valid ]; then
+			note='Needs attended setup'
+		elif [ "$registered" != yes ]; then
+			note='Not registered'
+		else
+			enable=1 note="Off${label:+ ·$label}"
+		fi ;;
+	esac
+}
+
+cmd_state() {
+	compute
+	printf 'data=%s\ndata_status=%s\ndata_enable=%s\ndata_busy=%s\n' "$data" "$note" "$enable" "$busy"
+}
+
+case "${1:-}" in
+state) cmd_state ;;
+on)
+	compute
+	[ "$enable" = 1 ] || { printf 'Mobile data cannot be started now: %s\n' "${note:-unavailable}" >&2; exit 1; }
+	exec systemctl start --no-block "$enable_unit"
+	;;
+off)
+	printf '%s\n' 'Mobile data cannot be turned off yet: restart the phone to stop it.' >&2
+	exit 1
+	;;
+*)
+	printf 'usage: %s state|on|off\n' "${0##*/}" >&2
+	exit 2
+	;;
+esac

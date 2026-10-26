@@ -12,6 +12,14 @@
 # watchdog restores postmarketOS. Radio-off and radio-on are refused until a
 # supported transition is separately proven. Output and logs carry aggregates
 # only, never identities, addresses, APNs or interface names.
+#
+# The persistent main boot has no rollback watchdog. There, main-run runs the
+# same admission, data, route, DNS, HTTPS and rescue checks inside the
+# deadline and state machine of myron-cellular-op: its fixed timer is armed
+# before the first mutation, a failure or the deadline asks for a normal reboot
+# into Omarchy, and only a proven operation is sealed. The temporary commands
+# (identity, arm, qualify, data) refuse the main boot, and main-run refuses
+# the temporary one.
 set -eu
 umask 077
 
@@ -90,6 +98,20 @@ probe_ip=
 deadline_candidate=
 snapshot_deadline_abs=
 
+# temp: the temporary hardware-test boot (rollback watchdog). main: the
+# persistent Omarchy boot (myron-cellular-op owns the deadline).
+mode=temp
+main_boot_id_marker=/run/myron-main/boot-id
+op=/usr/local/sbin/myron-cellular-op
+# strict: both established USB and Wi-Fi SSH sessions are required (the first,
+# attended operation). Relaxed: only the rescue state that exists is preserved
+# (an operation after valid attended evidence).
+rescue_strict=1
+fresh_steps=60
+# Set for an operation after attended evidence: the cellular default route must
+# be an ordinary main-table route, not only an oif-selected table.
+require_main_table=0
+
 persist() {
 	mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
 	if [ -f "$log" ] && [ "$(wc -c <"$log")" -gt 131072 ]; then
@@ -113,8 +135,12 @@ write_file() {
 # fail MESSAGE [DETAIL]: only the fixed MESSAGE is persisted; DETAIL (a number
 # or a fixed module or tool name) is printed to the terminal only.
 fail() {
-	persist "result=failed message=$1"
-	printf 'ERROR: %s%s\n' "$1" "${2:+ $2}" >&2
+	message=$1
+	if [ "$mode" = main ]; then
+		message=$(printf '%s' "$1" | sed 's/rollback watchdog deadline/operation deadline/g; s/rollback deadline/operation deadline/g')
+	fi
+	persist "result=failed message=$message"
+	printf 'ERROR: %s%s\n' "$message" "${2:+ $2}" >&2
 	if [ -d "$mutation_marker" ]; then
 		printf '%s\n' 'Reboot required. Leave the modem path untouched until then.' >&2
 	fi
@@ -233,6 +259,11 @@ require_temperature() {
 # Seconds left before the watchdog's rollback deadline: its configured total
 # minus the time since the service entered the active state.
 watchdog_remaining() {
+	if [ "$mode" = main ]; then
+		# The operation's own timer, read by the supervisor.
+		timeout -k 1 10 "$op" remaining 2>/dev/null
+		return
+	fi
 	total=$(sed -n 's/^watchdog_seconds=\([0-9][0-9]*\)$/\1/p' "$host_armed" 2>/dev/null | sed -n 1p)
 	entered=$(systemctl show -p ActiveEnterTimestampMonotonic --value myron-hardware-watchdog.service 2>/dev/null || true)
 	case "$total" in ''|*[!0-9]*) return 1 ;; esac
@@ -280,7 +311,20 @@ require_mutation_room() {
 	require_time $((cost + post_need)) "$message"
 }
 
+# The persistent operation is still live: not expired, failed or sealed.
+require_op_live() {
+	[ "$mode" = main ] || return 0
+	timeout -k 1 10 "$op" live >/dev/null 2>&1 || fail 'the operation is no longer live; a normal reboot follows'
+}
+
+# Moves the persistent operation's state forward, or stops this process.
+op_mark() {
+	[ "$mode" = main ] || return 0
+	timeout -k 1 15 "$op" mark "$1" >/dev/null 2>&1 || fail 'the operation is no longer live; a normal reboot follows'
+}
+
 require_post_step() {
+	require_op_live
 	set_deadline
 	require_time "$post_step_need" 'the post-activation checks are out of rollback deadline budget; reboot'
 	require_temperature
@@ -318,13 +362,16 @@ require_modules() {
 # Static, non-polling, read-only gates shared by qualify and data.
 require_runtime_gates() {
 	require_root
-	# The persistent main boot has no temporary partition rollback or deadline
-	# budget, which this stage's time gates depend on. Refuse; never reinterpret.
-	[ ! -e /run/myron-main/boot-id ] ||
-		fail 'refused: the persistent main boot has no temporary rollback budget for this stage'
-	regular "$host_armed" || fail 'temporary hardware-test arm is absent'
-	systemctl --quiet is-active myron-hardware-watchdog.service ||
-		fail 'independent rollback watchdog is not active'
+	if [ "$mode" = main ]; then
+		# The persistent boot's deadline is the operation's timer (armed by
+		# myron-cellular-op before this runs); the guard unit only has to be up.
+		regular "$host_armed" && grep -Fxq mode=main "$host_armed" || fail 'main boot marker is absent'
+		systemctl --quiet is-active myron-hardware-watchdog.service || fail 'main boot guard is not active'
+	else
+		regular "$host_armed" || fail 'temporary hardware-test arm is absent'
+		systemctl --quiet is-active myron-hardware-watchdog.service ||
+			fail 'independent rollback watchdog is not active'
+	fi
 	[ "$(cat "$profile_file" 2>/dev/null || true)" = cellular ] ||
 		fail 'cellular hardware-test profile is not selected'
 	[ -e "$cellular_ready" ] || fail 'cellular foundation is not ready'
@@ -352,6 +399,12 @@ require_runtime_gates() {
 
 # The explicit stage arm: this boot, host disarm absent, enough deadline left.
 require_arm_gates() {
+	if [ "$mode" = main ]; then
+		require_op_live
+		set_deadline
+		require_time "$min_remaining_activate" 'rollback watchdog deadline is too close; reboot and start again'
+		return 0
+	fi
 	regular "$arm_marker" && grep -Fxq "boot_id=$boot_id" "$arm_marker" ||
 		fail 'stage is not armed for this boot; run arm first'
 	[ ! -e "$host_disarm" ] || fail 'rollback was disarmed; reboot and arm again'
@@ -677,6 +730,7 @@ rescue_snapshot() {
 	pair_count=$(printf '%s\n' "$pairs" | grep -c . || true)
 	if [ "$pair_count" = 0 ]; then
 		[ "$unsupported" = 1 ] && return 0
+		[ "$rescue_strict" = 0 ] && return 0
 		return 1
 	fi
 	[ "$pair_count" -le "$max_ssh_sessions" ] || return 1
@@ -698,14 +752,16 @@ require_rescue_route_contract() {
 		for link in $links; do [ "$7" = "$link" ] && continue 2; done
 		exit 1
 	done || fail 'an established SSH peer is not routed over a rescue link'
-	printf '%s\n' "$rescue_snap" | awk -v u="$usb_iface" '$1 == "peer" && $7 == u { found = 1 } END { exit !found }' ||
-		fail 'no established SSH session is routed over USB rescue'
-	wifi_session=0
-	for link in $links; do
-		[ "$link" = "$usb_iface" ] && continue
-		printf '%s\n' "$rescue_snap" | awk -v n="$link" '$1 == "peer" && $7 == n { found = 1 } END { exit !found }' && wifi_session=1
-	done
-	[ "$wifi_session" = 1 ] || fail 'no established SSH session is routed over Wi-Fi rescue'
+	if [ "$rescue_strict" = 1 ]; then
+		printf '%s\n' "$rescue_snap" | awk -v u="$usb_iface" '$1 == "peer" && $7 == u { found = 1 } END { exit !found }' ||
+			fail 'no established SSH session is routed over USB rescue'
+		wifi_session=0
+		for link in $links; do
+			[ "$link" = "$usb_iface" ] && continue
+			printf '%s\n' "$rescue_snap" | awk -v n="$link" '$1 == "peer" && $7 == n { found = 1 } END { exit !found }' && wifi_session=1
+		done
+		[ "$wifi_session" = 1 ] || fail 'no established SSH session is routed over Wi-Fi rescue'
+	fi
 	set -- $(printf '%s\n' "$rescue_snap" | awk -v links="$links" '
 		BEGIN { n = split(links, a, " "); for (i = 1; i <= n; i++) rescue[a[i]] = 1 }
 		$1 == "default" {
@@ -714,7 +770,7 @@ require_rescue_route_contract() {
 			if (rescue[dev]) { count++; if (metric > highest) highest = metric }
 		}
 		END { print count + 0, highest + 0 }')
-	[ "$1" -gt 0 ] || fail 'no IPv4 rescue default route is present'
+	{ [ "$1" -gt 0 ] || [ "$rescue_strict" = 0 ]; } || fail 'no IPv4 rescue default route is present'
 	[ "$cell_metric" -gt "$2" ] || fail 'the cellular route metric would outrank a rescue default route'
 }
 
@@ -722,7 +778,11 @@ require_rescue_route_contract() {
 # with an address, a connected Wi-Fi link with an address, an SSH listener.
 require_rescue_usable() {
 	snap=$(rescue_snapshot) || fail 'cannot read the rescue link state'
-	{ printf '%s\n' "$snap" | grep -Eq "^link $usb_iface (up|unknown) ifindex [0-9]+\$" &&
+	# Strict: the USB link is up with an address. Relaxed: the static USB rescue
+	# address is configured, whatever the cable's state.
+	usb_states='(up|unknown)'
+	[ "$rescue_strict" = 1 ] || usb_states='[a-z-]+'
+	{ printf '%s\n' "$snap" | grep -Eq "^link $usb_iface $usb_states ifindex [0-9]+\$" &&
 		printf '%s\n' "$snap" | grep -q "^addr $usb_iface "; } ||
 		fail 'the USB rescue link is not usable'
 	wifi_ok=0
@@ -730,7 +790,7 @@ require_rescue_usable() {
 		{ printf '%s\n' "$snap" | grep -Eq "^link $name up ifindex [0-9]+\$" &&
 			printf '%s\n' "$snap" | grep -q "^addr $name "; } && wifi_ok=1
 	done
-	[ "$wifi_ok" = 1 ] || fail 'the Wi-Fi rescue link is not usable'
+	{ [ "$wifi_ok" = 1 ] || [ "$rescue_strict" = 0 ]; } || fail 'the Wi-Fi rescue link is not usable'
 	printf '%s\n' "$snap" | grep -q '^listen ' || fail 'no SSH listener is usable'
 	rescue_snap=$snap
 	require_rescue_route_contract
@@ -854,6 +914,8 @@ verify_network() {
 		;;
 	*) fail 'cellular default route uses an unreviewed routing table' ;;
 	esac
+	{ [ "$require_main_table" = 0 ] || [ "$policy" = main ]; } ||
+		fail 'the cellular default route is not an ordinary main-table route'
 	require_post_step
 	require_rescue_preserved
 	added=$(grep -Fvxf "$rescue_before" "$rescue_after" | grep '^rule ' || true)
@@ -1028,6 +1090,7 @@ cmd_status() {
 		"$profile" "$watchdog" "$disarm" "$armed" "$manager" "$guard_state" "$attempted" "$attempted"
 	summary
 	printf 'data_state=%s radio_off=unavailable radio_on=unavailable\n' "$(cat "$data_state" 2>/dev/null || echo none)"
+	[ "$mode" = temp ] || printf 'mode=main operation=%s\n' "$(timeout -k 1 15 "$op" status 2>/dev/null || echo unavailable)"
 }
 
 check_identity() {
@@ -1042,6 +1105,12 @@ check_identity() {
 	grep -Fxq ID=omarchy "$os_release" 2>/dev/null || fail 'operating system is not Omarchy'
 	[ "$(cat "$profile_file" 2>/dev/null || true)" = cellular ] ||
 		fail 'cellular hardware-test profile is not selected'
+	if [ "$mode" = main ]; then
+		# No temporary arm metadata, rollback images or disarm marker exist in
+		# the persistent boot; the supervisor proves the committed boot.
+		regular "$host_armed" && grep -Fxq mode=main "$host_armed" || fail 'main boot marker is absent'
+		return 0
+	fi
 	regular "$host_armed" || fail 'temporary hardware-test arm is absent'
 	[ "$(grep -c . "$host_armed")" = 2 ] &&
 		[ -n "$(sed -n 's/^payload_sha256=\([0-9a-f]\{64\}\)$/\1/p' "$host_armed")" ] ||
@@ -1099,10 +1168,11 @@ cmd_qualify() {
 	printf 'result=ready profile=cellular watchdog=active bluetooth=absent audio=inactive ipa_guard=clean isolation=clean rescue=usable control=unmanaged %s\n' "$(summary)"
 }
 
-cmd_data() {
-	boot_id=$(cat "$boot_id_file")
-	[ "${1:-}" = "$confirm_token" ] ||
-		fail 'data requires the exact confirmation token argument'
+# The shared guarded activation: gates, the one-shot mutation, the single
+# activation and every post-activation check. It leaves the process on success
+# and fails closed otherwise. In the main boot op_mark moves the supervisor's
+# state forward and rejects an operation that is no longer live.
+run_data() {
 	[ ! -d "$mutation_marker" ] ||
 		fail 'a cellular mutation was already taken this boot; reboot to retry'
 	require_runtime_gates
@@ -1118,6 +1188,7 @@ cmd_data() {
 	require_rescue_usable
 	require_no_rule_conflicts
 	pre_marker_hook
+	op_mark attempting
 	# The lock lands before any NetworkManager mutation or activation.
 	take_marker data || fail 'a cellular mutation was already taken this boot; reboot to retry'
 	write_file "$data_state" attempting
@@ -1146,6 +1217,7 @@ cmd_data() {
 	last_gates
 	require_mutation_room 95 'cellular activation is too close to the rollback deadline; reboot'
 	require_device_autoconnect_off
+	op_mark activating
 	status=0
 	timeout -k 5 90 nmcli connection up uuid "$target_uuid" ifname "$control" >/dev/null 2>&1 || status=$?
 	step=0
@@ -1156,6 +1228,7 @@ cmd_data() {
 	connection_active || fail 'cellular activation failed; reboot before another attempt'
 	persist "stage=activation result=active command_status=$status late_steps=$step"
 	write_file "$data_state" activated
+	op_mark active
 	require_time "$post_need" 'rollback watchdog deadline is too close for the post-activation checks; reboot'
 	require_post_step
 	set -- $(gsm_states)
@@ -1176,12 +1249,150 @@ cmd_data() {
 	require_temperature
 	require_post_step
 	write_file "$data_state" ready
+	op_mark ready
 	persist "stage=data result=ready ipv4_addresses=$addresses default_routes=$default_routes dns=$dns https=$code tx_delta=$tx_delta rx_delta=$rx_delta"
+}
+
+cmd_data() {
+	boot_id=$(cat "$boot_id_file")
+	[ "${1:-}" = "$confirm_token" ] ||
+		fail 'data requires the exact confirmation token argument'
+	run_data
 	printf 'result=ready ipv4_addresses=%s default_routes=%s policy=%s dns=%s link_dns_matches=%s dns_query=ok https=%s tx_delta=%s rx_delta=%s rescue_addresses=%s rescue_routes=%s ssh_listeners=%s ssh_sessions=%s rescue_peers=%s rescue=preserved ipa_guard=clean\n' \
 		"$addresses" "$default_routes" "$policy" "$dns" "$matched" "$code" "$tx_delta" "$rx_delta" \
 		"$rescue_addrs" "$rescue_routes" "$rescue_listeners" "$rescue_sessions" "$rescue_peers"
 	printf '%s\n' 'Reboot required before any further cellular data attempt. Leave the modem path untouched.'
 	printf '%s\n' 'Now open a fresh SSH login over USB and over Wi-Fi from the host to confirm both rescue paths.'
+}
+
+# --- the persistent main boot ---------------------------------------------
+
+require_main_mode() {
+	[ "$mode" = main ] || fail 'main commands are only valid in the persistent main boot'
+}
+
+# Root's entry: validates the confirmation and starts the attended operation
+# unit, so closing the SSH session that asked does not stop it.
+cmd_main_op() {
+	boot_id=$(cat "$boot_id_file")
+	require_main_mode
+	require_root
+	exec "$op" launch "$1"
+}
+
+# Both established SSH sessions stay as they are. Two NEW authenticated SSH
+# connections, one over USB and one over Wi-Fi, each run
+# "myron-cellular-op ssh-proof NONCE" with this operation's one-time nonce;
+# the supervisor checks the connection against the live socket table.
+await_fresh_ssh_proofs() {
+	timeout -k 1 15 "$op" nonce-new >/dev/null 2>&1 || fail 'the SSH proof nonce could not be created'
+	write_file "$data_state" awaiting-ssh-proof
+	persist 'stage=ssh-proof result=waiting'
+	step=0
+	while :; do
+		require_post_step
+		require_rescue_preserved
+		timeout -k 1 10 "$op" proofs-ok >/dev/null 2>&1 && break
+		step=$((step + 1))
+		[ "$step" -lt "$fresh_steps" ] || fail 'fresh SSH proofs over USB and Wi-Fi were not seen'
+		sleep 2
+	done
+	persist 'stage=ssh-proof result=both'
+}
+
+# The service entry of the persistent operation: attended (the first one: both
+# SSH sessions, fresh proofs) or qualified (valid attended evidence exists).
+cmd_main_run() {
+	boot_id=$(cat "$boot_id_file")
+	require_main_mode
+	require_root
+	run_kind=$1
+	case "$run_kind" in
+	attended)
+		timeout -k 1 10 "$op" confirmed >/dev/null 2>&1 || fail 'the attended operation was not confirmed'
+		rescue_strict=1 ;;
+	qualified)
+		timeout -k 1 30 "$op" evidence-check >/dev/null 2>&1 || fail 'valid attended evidence is absent'
+		rescue_strict=0
+		require_main_table=1 ;;
+	*) usage ;;
+	esac
+	check_identity
+	timeout -k 1 30 "$op" begin "$run_kind" >/dev/null 2>&1 || fail 'the operation could not be armed'
+	persist "stage=main-run kind=$run_kind"
+	run_data
+	if [ "$run_kind" = attended ]; then await_fresh_ssh_proofs; fi
+	require_post_step
+	require_guard
+	connection_active || fail 'the cellular connection is not active at the seal'
+	require_post_step
+	require_rescue_preserved
+	require_post_step
+	timeout -k 1 60 "$op" seal >/dev/null 2>&1 || fail 'the operation could not be sealed'
+	write_file "$data_state" sealed
+	persist "stage=main-run result=sealed kind=$run_kind policy=$policy"
+	printf 'result=sealed kind=%s policy=%s dns=%s https=%s tx_delta=%s rx_delta=%s rescue=preserved ipa_guard=clean\n' \
+		"$run_kind" "$policy" "$dns" "$code" "$tx_delta" "$rx_delta"
+	printf '%s\n' 'No further cellular data attempt this boot. Lost data means restart.'
+}
+
+# Standalone proof of the sealed attended operation, run by root while Wi-Fi is
+# off (the host holds USB SSH, with its own Wi-Fi restore armed): cellular is
+# the ordinary default route in the main table, resolved's default-route link,
+# an unscoped DNS answer and an unbound HTTPS request all use it. Only then is
+# the evidence recorded that lets the tile start the operation. It has no
+# deadline and never reboots: a failure just records nothing.
+cmd_main_standalone() {
+	boot_id=$(cat "$boot_id_file")
+	require_main_mode
+	require_root
+	timeout -k 1 10 "$op" proof-ready >/dev/null 2>&1 || fail 'no sealed, live attended operation exists this boot'
+	check_identity
+	require_temperature
+	require_guard
+	control=$(timeout -k 1 5 nmcli -g GENERAL.DEVICES connection show uuid "$target_uuid" 2>/dev/null | sed -n '1p')
+	case "$control" in ''|*[!A-Za-z0-9_.-]*) fail 'the cellular connection is not bound to a modem device' ;; esac
+	connection_active || fail 'the cellular connection is not active'
+	resolve_interface
+	defaults=$(timeout -k 1 5 ip -4 route show table main default 2>/dev/null) || defaults=
+	printf '%s\n' "$defaults" | grep -Eq "[[:space:]]dev $iface([[:space:]]|\$)" ||
+		fail 'cellular has no default route in the main table'
+	best=$(printf '%s\n' "$defaults" | awk '
+		{ metric = 0; dev = ""; for (i = 1; i <= NF; i++) { if ($i == "dev") dev = $(i + 1); if ($i == "metric") metric = $(i + 1) }
+		  if (best == "" || metric + 0 < bestm + 0) { best = dev; bestm = metric } }
+		END { print best }')
+	[ "$best" = "$iface" ] || fail 'cellular is not the ordinary default route'
+	timeout -k 1 5 resolvectl status "$iface" 2>/dev/null | grep -Eq 'Default Route:[[:space:]]*yes' ||
+		fail 'resolved does not use the cellular link as its default route'
+	answer=$(timeout -k 1 8 resolvectl query --cache=no --legend=no --protocol=dns -4 "$probe_host" 2>/dev/null) ||
+		fail 'unscoped DNS query failed'
+	printf '%s\n' "$answer" | grep -Fq "link: $iface" || fail 'unscoped DNS did not answer over the cellular link'
+	probe_ip=$(printf '%s\n' "$answer" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sed -n '1p')
+	public_ipv4 "$probe_ip" || fail 'unscoped DNS answer is not a public IPv4 address'
+	timeout -k 1 5 ip -4 route get "$probe_ip" 2>/dev/null | grep -Eq "[[:space:]]dev $iface([[:space:]]|\$)" ||
+		fail 'an ordinary route to the answer does not use the cellular link'
+	read_packets
+	tx_before=$tx rx_before=$rx
+	reply=$(timeout -k 5 30 curl -q -4 --silent --noproxy '*' --proto =https --proto-redir =https \
+		--max-redirs 0 --tlsv1.2 --retry 0 --connect-timeout 10 --max-time 20 --max-filesize 4096 \
+		--output /dev/null --write-out '%{http_code} %{local_ip}' "$probe_url" 2>/dev/null) || reply='000 none'
+	code=${reply%% *}
+	local_ip=${reply#* }
+	[ "$code" = 204 ] || fail "unbound HTTPS request failed:" "$code"
+	timeout -k 1 5 ip -4 -o addr show dev "$iface" scope global 2>/dev/null | grep -Fq " $local_ip/" ||
+		fail 'the unbound HTTPS request did not leave from the cellular address'
+	read_packets
+	{ [ $((tx - tx_before)) -gt 0 ] && [ $((rx - rx_before)) -gt 0 ]; } ||
+		fail 'the unbound request did not move packets on the cellular interface'
+	timeout -k 1 5 ip -4 -o addr show dev "$usb_iface" scope global 2>/dev/null | grep -q . ||
+		fail 'the USB rescue address is not configured'
+	timeout -k 1 5 ss -H -ltn 'sport = :22' 2>/dev/null | grep -q . || fail 'no SSH listener is usable'
+	require_guard
+	timeout -k 1 20 "$op" record-evidence >/dev/null 2>&1 || fail 'the evidence could not be recorded'
+	persist 'stage=standalone result=proven evidence=recorded'
+	printf 'result=standalone-proven evidence=recorded default=main dns=cellular https=204 tx_delta=%s rx_delta=%s\n' \
+		"$((tx - tx_before))" "$((rx - rx_before))"
+	printf '%s\n' 'Restore Wi-Fi now and open fresh SSH logins to confirm both rescue paths.'
 }
 
 # ModemManager's SetPowerState requires a disabled modem, so a safe radio
@@ -1196,24 +1407,39 @@ cmd_radio_refused() {
 }
 
 usage() {
-	printf 'usage: %s status|identity|arm|qualify|data CONFIRMATION-TOKEN|radio-off|radio-on\n' "${0##*/}" >&2
+	printf 'usage: %s status|identity|arm|qualify|data CONFIRMATION-TOKEN|main-op CONFIRMATION-TOKEN|main-run attended|qualified|main-standalone-proof|radio-off|radio-on\n' "${0##*/}" >&2
 	exit 2
+}
+
+# The temporary commands assume the rollback watchdog, which the persistent
+# main boot does not have; refuse them there rather than reinterpret them.
+cmd_refuse_in_main() {
+	boot_id=$(cat "$boot_id_file" 2>/dev/null || echo unknown)
+	fail "refused: $1 is a temporary-boot command; the persistent main boot uses main-op"
 }
 
 # --- main ---
 [ "$#" -ge 1 ] || usage
 command=$1
 shift
+[ ! -e "$main_boot_id_marker" ] || mode=main
 case "$command" in
-data) [ "$#" = 1 ] || usage ;;
+data|main-op|main-run) [ "$#" = 1 ] || usage ;;
 *) [ "$#" = 0 ] || usage ;;
 esac
 case "$command" in
 status) cmd_status ;;
-identity) cmd_identity ;;
-arm) cmd_arm ;;
-qualify) cmd_qualify ;;
-data) cmd_data "$1" ;;
+identity|arm|qualify|data)
+	[ "$mode" = temp ] || cmd_refuse_in_main "$command"
+	case "$command" in
+	identity) cmd_identity ;;
+	arm) cmd_arm ;;
+	qualify) cmd_qualify ;;
+	data) cmd_data "$1" ;;
+	esac ;;
+main-op) cmd_main_op "$1" ;;
+main-run) cmd_main_run "$1" ;;
+main-standalone-proof) cmd_main_standalone ;;
 radio-off|radio-on) cmd_radio_refused "$command" ;;
 *) usage ;;
 esac

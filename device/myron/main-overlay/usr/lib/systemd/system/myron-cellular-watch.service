@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Started by the seal. Observes the cellular connection and the IPA guard and
+# publishes up or lost. It never reconnects, never changes a radio and never
+# reboots: lost means restart to retry.
+[Unit]
+Description=Main cellular data observer
+ConditionPathExists=/run/myron-main/boot-id
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/myron-cellular-op watch
+Restart=no
