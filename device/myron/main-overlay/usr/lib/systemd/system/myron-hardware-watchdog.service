@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+# Main-boot override of the temporary watchdog unit. Same unit name, because
+# the hardware units already require it, but a different job: an independently
+# supervised guard that never writes a partition. After the boot is committed
+# the guard exits 0 and the unit stays active (RemainAfterExit), so nothing
+# that requires it is ever stopped. Timeout or failure only latches recovery
+# and does a normal reboot; postmarketOS then stays selected until `resume`.
+[Unit]
+Description=Myron main-boot guard (recovery latch, normal reboot, no partition writes)
+DefaultDependencies=no
+Before=sysinit.target
+ConditionPathExists=/run/myron-main/myron-main-os
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+OnFailure=myron-main-recover.service
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+Environment=PATH=/run/myron-main/bin:/usr/bin
+ExecStartPre=/run/myron-main/bin/busybox sh /run/myron-main/myron-main-os guard-preflight
+ExecStart=/run/myron-main/bin/busybox sh /run/myron-main/myron-main-os guard
+Restart=no
+StandardOutput=append:/run/myron-host/var/lib/omarchy-mobile/main/guard.log
+StandardError=inherit
+
+[Install]
+WantedBy=sysinit.target

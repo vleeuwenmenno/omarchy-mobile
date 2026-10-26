@@ -318,6 +318,10 @@ require_modules() {
 # Static, non-polling, read-only gates shared by qualify and data.
 require_runtime_gates() {
 	require_root
+	# The persistent main boot has no temporary partition rollback or deadline
+	# budget, which this stage's time gates depend on. Refuse; never reinterpret.
+	[ ! -e /run/myron-main/boot-id ] ||
+		fail 'refused: the persistent main boot has no temporary rollback budget for this stage'
 	regular "$host_armed" || fail 'temporary hardware-test arm is absent'
 	systemctl --quiet is-active myron-hardware-watchdog.service ||
 		fail 'independent rollback watchdog is not active'

@@ -12,6 +12,7 @@ usage() {
   cat <<'EOF'
 Usage: tools/myron-dev-image-compose \
   [--profile coexistence|cellular] \
+  [--boot-policy temporary|main] \
   --base-image ABSOLUTE_RAW_EXT4 \
   --module-stage ABSOLUTE_DIR \
   --runtime-stage ABSOLUTE_DIR \
@@ -26,14 +27,21 @@ partition. The input must be the unsigned development payload from
 tools/build-rootfs --dev-payload-image. Runtime scope is GPU, Wi-Fi, touch,
 radio-base, AudioReach microphone bring-up and battery authentication. Radio
 and audio activation remain disabled until an attended, separately gated test.
+
+--boot-policy defaults to temporary (the 900 s rollback test). `main` composes
+the persistent Omarchy main root: it adds the main-only overlay (guard unit,
+recovery units, control) on top of the temporary overlay, requires the
+cellular profile and must be requested explicitly.
 EOF
 }
 
 profile=coexistence
+boot_policy=temporary
 base= modules= runtime= bluetooth_probe= speaker_reference= firstboot= ssh_key= out=
 while (($#)); do
   case $1 in
     --profile) profile=${2:?}; shift 2 ;;
+    --boot-policy) boot_policy=${2:?}; shift 2 ;;
     --base-image) base=${2:?}; shift 2 ;;
     --module-stage) modules=${2:?}; shift 2 ;;
     --runtime-stage) runtime=${2:?}; shift 2 ;;
@@ -49,6 +57,11 @@ done
 case $profile in
   coexistence|cellular) ;;
   *) die "unsupported hardware-test profile: $profile" ;;
+esac
+case $boot_policy in
+  temporary) ;;
+  main) [[ $profile == cellular ]] || die 'boot policy main supports only --profile cellular' ;;
+  *) die "unsupported boot policy: $boot_policy" ;;
 esac
 for value in base modules runtime bluetooth_probe speaker_reference firstboot ssh_key out; do
   [[ -n ${!value} ]] || die "--${value//_/-} is required"
@@ -117,6 +130,7 @@ alarm_fetch package
 image=$(alarm_build_image "$ROOT")
 docker run --rm --privileged --platform linux/arm64 \
   -e MYRON_TEST_PROFILE="$profile" \
+  -e MYRON_BOOT_POLICY="$boot_policy" \
   -v "$out:/payload.img" \
   -v "$modules:/module-stage:ro" \
   -v "$runtime:/runtime-stage:ro" \
@@ -125,6 +139,7 @@ docker run --rm --privileged --platform linux/arm64 \
   -v "$ROOT/packages/omamobile-shell:/shell-source:ro" \
   -v "$ROOT/tools/myron-networkmanager-keyfile-audit:/keyfile-audit:ro" \
   -v "$ROOT/device/myron/hardware-test-overlay:/test-overlay:ro" \
+  -v "$ROOT/device/myron/main-overlay:/main-overlay:ro" \
   -v "$firstboot:/firstboot.conf:ro" \
   -v "$ssh_key:/owner.pub:ro" \
   "$image" bash -euo pipefail -c '
@@ -151,6 +166,19 @@ docker run --rm --privileged --platform linux/arm64 \
     chown 0:0 "$root/etc/myron" "$root/etc/myron/use-in-tree-rmnet"
     chmod 0755 "$root/etc/myron"
     chmod 0644 "$root/etc/myron/use-in-tree-rmnet"
+    if test "$MYRON_BOOT_POLICY" = main; then
+      # Main-only files replace the temporary watchdog unit of the same name
+      # and add the control, the recovery unit and the failure drop-ins.
+      tar -C /main-overlay -cf - . | tar --no-same-owner -C "$root" -xf -
+      while IFS= read -r -d "" path; do
+        relative=${path#/main-overlay}
+        chown -h 0:0 "$root$relative"
+        if [[ -d $path && ! -L $path ]]; then chmod 0755 "$root$relative"; fi
+      done < <(find /main-overlay -mindepth 1 -print0)
+      chmod 0755 "$root/usr/local/sbin/myron-main-os"
+      chmod 0644 "$root/usr/lib/systemd/system/myron-hardware-watchdog.service" \
+        "$root/usr/lib/systemd/system/myron-main-recover.service"
+    fi
     printf "%s\n" "$MYRON_TEST_PROFILE" >"$root/etc/omamobile/myron-test-profile"
     chown 0:0 "$root/etc/omamobile/myron-test-profile"
     chmod 0644 "$root/etc/omamobile/myron-test-profile"
@@ -292,6 +320,18 @@ docker run --rm --privileged --platform linux/arm64 \
   '
 
 e2fsck -fn "$out" >/dev/null
+if [[ $boot_policy == main ]]; then
+  for path in /usr/local/sbin/myron-main-os /usr/lib/systemd/system/myron-hardware-watchdog.service \
+    /usr/lib/systemd/system/myron-main-recover.service \
+    /usr/lib/systemd/system/myron-omarchy-qualify.service.d/90-myron-main.conf; do
+    debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
+      die "root ownership missing: $path"
+  done
+  debugfs -R 'cat /usr/lib/systemd/system/myron-hardware-watchdog.service' "$out" 2>/dev/null |
+    grep -Fq 'myron-main-os guard' || die 'main guard unit is not installed'
+  debugfs -R 'cat /usr/lib/systemd/system/myron-hardware-watchdog.service' "$out" 2>/dev/null |
+    grep -Fq '/run/myron-watchdog' && die 'temporary watchdog unit survived in the main payload'
+fi
 for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot.conf \
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
   /usr/local/sbin/myron-omarchy-prepare /etc/myron/use-in-tree-rmnet \
@@ -338,5 +378,5 @@ esac
 hash=$(sha256sum <"$out" | cut -d" " -f1)
 printf '%s  %s\n' "$hash" "$(basename -- "$out")" >"$out.sha256"
 chmod 0600 "$out.sha256"
-printf 'status=composed\nimage=%s\nsha256=%s\nprofile=%s\nactivation=temporary-hardware-test\ndeployment_authorized=false\n' \
-  "$out" "$hash" "$profile"
+printf 'status=composed\nimage=%s\nsha256=%s\nprofile=%s\nactivation=temporary-hardware-test\ndeployment_authorized=false\nboot_policy=%s\n' \
+  "$out" "$hash" "$profile" "$boot_policy"

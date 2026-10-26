@@ -1,0 +1,409 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# shellcheck disable=SC2016,SC2154
+# Offline tests of the persistent Omarchy main boot: init selection, pending
+# attempt and recovery latch, the control/guard script, the unit set, the
+# pinned-base builder's refusals, and (when the tools and the base image are
+# present) a real build whose templates also parse and run under the original
+# AArch64 BusyBox. Nothing here touches a phone, a network or a block device.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+# shellcheck source=/dev/null
+source tests/lib/myron-sh-harness.sh
+
+init_dir=device/myron/main-initramfs
+overlay=device/myron/main-overlay
+control=$overlay/usr/local/sbin/myron-main-os
+units=$overlay/usr/lib/systemd/system
+qualify=device/myron/hardware-test-overlay/usr/local/sbin/myron-omarchy-qualify
+cellular_stage=device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage
+shellcheck_bin=$(command -v shellcheck || true)
+if [[ -z $shellcheck_bin ]] || ! "$shellcheck_bin" --version >/dev/null 2>&1; then
+  shellcheck_bin=$(ls /home/menno/.local/share/mise/installs/shellcheck/*/shellcheck-*/shellcheck 2>/dev/null | tail -n1 || true)
+fi
+
+work=$(mktemp -d /tmp/myron-main.XXXXXX)
+trap 'chmod -R u+rwx "$work" 2>/dev/null || true; rm -rf -- "$work"' EXIT
+
+# ---- static ----------------------------------------------------------------
+for f in "$init_dir"/*.sh "$control"; do
+  sh -n "$f" || fail "$f parses as POSIX sh"
+  bash -n "$f" || fail "$f parses as bash"
+  if [[ -n $shellcheck_bin ]]; then "$shellcheck_bin" -s sh -e SC2154,SC2034,SC2086,SC2317,SC2100,SC2209,SC2329,SC1091,SC2093,SC2015 "$f" || fail "shellcheck $f"; fi
+done
+bash -n tools/myron-build-main-init-boot || fail 'builder parses'
+grep -Fq 'tests/myron-main' tests/all || fail 'tests/all does not run this test'
+grep -Fq 'tools/myron-build-main-init-boot' tests/all || fail 'tests/all does not parse the builder'
+pass 'main templates, control and builder parse; tests/all runs this test'
+
+all_code=$(cat "$init_dir"/*.sh "$control")
+if grep -nE 'dd [^|]*of=|of=/dev|blockdev|setrw|mkfs|wipefs|sgdisk|rollback|fastboot|/dev/block' <<<"$all_code" |
+  grep -v '^[0-9]*:[[:space:]]*#' | grep .; then
+  fail 'main code has a partition write or temporary rollback construct'
+fi
+if grep -vE '^[[:space:]]*#' "$control" "$init_dir/select.sh" "$init_dir/stage.sh" | grep -E 'reboot-to-bootloader|bootloader'; then
+  fail 'control, selector or stage mention the bootloader'
+fi
+grep -c 'reboot-to-bootloader' "$init_dir/fail-boot.sh" | grep -qx 1 ||
+  fail 'only the dead-end fail path may reboot to the bootloader'
+if grep -nE 'ttyGS0|acm\.usb|setsid|sh -i' "$init_dir/stage.sh" "$init_dir/fail-boot.sh"; then
+  fail 'main init creates a console shell'
+fi
+grep -Fq 'ncm.usb0' "$init_dir/stage.sh" || fail 'main init lacks the NCM rescue gadget'
+grep -Fq 'reboot_grace_seconds' "$control" && grep -Fq 'reboot -f' "$control" || fail 'control lacks the bounded plain reboot fallback'
+pass 'no partition write, no bootloader reboot outside the dead end, no console shell'
+
+wd=$units/myron-hardware-watchdog.service
+grep -Fxq 'RemainAfterExit=yes' "$wd" || fail 'guard unit must stay active after exit'
+grep -Fxq 'Type=simple' "$wd" || fail 'guard unit type'
+grep -Fq 'ExecStart=/run/myron-main/bin/busybox sh /run/myron-main/myron-main-os guard' "$wd" || fail 'guard ExecStart'
+grep -Fq 'guard-preflight' "$wd" || fail 'guard preflight'
+grep -Fq 'OnFailure=myron-main-recover.service' "$wd" || fail 'guard OnFailure'
+if grep -nE '900|myron-watchdog|TimeoutStartSec|RuntimeMaxSec' "$wd"; then fail 'guard unit has a 900 s or temporary-watchdog element'; fi
+grep -Fq 'recover --reason unit-failed --unless-committed' "$units/myron-main-recover.service" || fail 'recover unit'
+for u in myron-omarchy-qualify myron-cellular myron-omarchy-prepare myron-batterysecret; do
+  grep -Fxq 'OnFailure=myron-main-recover.service' "$units/$u.service.d/90-myron-main.conf" || fail "$u lacks OnFailure"
+done
+grep -Fxq 'TimeoutStartSec=1100' "$units/myron-omarchy-qualify.service.d/90-myron-main.conf" || fail 'qualifier bound'
+grep -Fxq 'guard_deadline_seconds=1200' "$control" || fail 'guard deadline'
+pass 'guard unit stays active after success, has no 900 s timer, failures call recover, qualifier bound < guard deadline'
+
+# existing integration points
+[[ $(grep -n 'myron-main-os commit' "$qualify" | head -1 | cut -d: -f1) -lt $(grep -n 'rollback=armed-until-timeout' "$qualify" | head -1 | cut -d: -f1) ]] ||
+  fail 'main commit must precede the cellular keep-armed branch'
+[[ $(grep -n '^qualify_profile$' "$qualify" | cut -d: -f1) -lt $(grep -n 'myron-main-os commit' "$qualify" | head -1 | cut -d: -f1) ]] ||
+  fail 'commit must come after the profile qualification'
+grep -Fq 'timeout 10 hyprctl -j monitors' "$qualify" && grep -Fq 'timeout 10 hyprctl -j devices' "$qualify" || fail 'hyprctl is unbounded'
+grep -Fq 'cut -d. -f1 /proc/uptime' "$qualify" && ! grep -Fq 'date +%s' "$qualify" || fail 'modem wait must use monotonic uptime'
+refuse_line=$(grep -n '/run/myron-main/boot-id' "$cellular_stage" | head -1 | cut -d: -f1)
+gates_line=$(grep -n '^require_runtime_gates()' "$cellular_stage" | cut -d: -f1)
+[[ -n $refuse_line && $refuse_line -gt $gates_line && $refuse_line -lt $((gates_line + 6)) ]] ||
+  fail 'cellular stage does not refuse the main runtime first in require_runtime_gates'
+pass 'qualifier commits after profile checks before keep-armed, bounded hyprctl, monotonic modem wait; stage refuses main'
+
+# ---- selector --------------------------------------------------------------
+uid=$(id -u) gid=$(id -g)
+mkdir -p "$work/sel"
+sh_patch "$init_dir/select.sh" "$work/sel/select.sh" "main_root_uid=$uid" "main_root_gid=$gid"
+cat >"$work/sel/drv.sh" <<'SH'
+hostroot=$1
+. "$2"
+main_select
+printf '%s %s\n' "$main_choice" "$main_reason"
+if [ "${3:-}" = begin ]; then main_begin_attempt && printf 'begin %s\n' "$main_id"; fi
+SH
+uuid_hex=0123456789abcdef0123456789abcdef
+stamp_uuid() { python3 -I -c 'import sys; f = open(sys.argv[1], "r+b"); f.seek(1128); f.write(bytes.fromhex(sys.argv[2])); f.close()' "$1" "$uuid_hex"; }
+world() {
+  w=$work/w.$1
+  rm -rf "$w"; mkdir -p "$w/var/log" "$w/var/lib/omarchy-mobile/main"
+  chmod 755 "$w/var" "$w/var/lib" "$w/var/lib/omarchy-mobile"; chmod 700 "$w/var/lib/omarchy-mobile/main"
+  m=$w/var/lib/omarchy-mobile/main
+  truncate -s 1048576 "$m/rootfs.img"
+  stamp_uuid "$m/rootfs.img"
+  chmod 600 "$m/rootfs.img"
+  printf 'size=1048576\nfs_uuid=%s\n' "$uuid_hex" >"$m/rootfs.meta"; chmod 600 "$m/rootfs.meta"
+  printf '%s\n' "$w"
+}
+pick() { sh "$work/sel/drv.sh" "$1" "$work/sel/select.sh" "${2:-}"; }
+expect() { [[ $1 == "$2" ]] || fail "$3: got '$1', want '$2'"; }
+
+w=$(world a)
+expect "$(pick "$w" | head -1)" 'omarchy default-omarchy' 'initial deployed default is Omarchy'
+mkdir -p "$work/none/var/lib/omarchy-mobile"
+expect "$(pick "$work/none")" 'pmos main-not-deployed' 'undeployed selects pmOS'
+pass 'initial/default policy: deployed -> Omarchy, undeployed -> pmOS'
+
+# begin writes a durable current token; success + committed pending survive a normal reboot
+w=$(world b); m=$w/var/lib/omarchy-mobile/main
+out=$(pick "$w" begin); id=$(sed -n 's/^begin //p' <<<"$out")
+[[ $id == "$(cat /proc/sys/kernel/random/boot_id)" ]] || fail 'pending token is not the kernel boot id'
+[[ $(stat -c %a "$m/pending") == 600 ]] || fail 'pending mode'
+grep -Fxq "image_id=$uuid_hex" "$m/pending" || fail 'pending lacks image id'
+# an unqualified boot: pending still present at the next init
+expect "$(pick "$w" | head -1)" 'pmos stale-pending-latched' 'stale pending selects pmOS'
+[[ -f $m/latch ]] || fail 'stale pending did not set the latch'
+rm -f "$m/pending"
+expect "$(pick "$w" | head -1)" 'pmos recovery-latch' 'latch is sticky even after pending disappears'
+pass 'pending failed boot -> latch + pmOS, sticky'
+
+w=$(world c); m=$w/var/lib/omarchy-mobile/main
+printf 'boot_id=%s\nimage_id=%s\n' "$id" "$uuid_hex" >"$m/pending"; chmod 600 "$m/pending"
+printf 'boot_id=%s\nimage_id=%s\n' "$id" "$uuid_hex" >"$m/success"; chmod 600 "$m/success"
+expect "$(pick "$w" | head -1)" 'omarchy default-omarchy' 'committed boot whose pending removal was lost'
+[[ ! -e $m/pending && ! -e $m/latch ]] || fail 'committed pending was not cleaned up'
+rm -f "$m/success"
+expect "$(pick "$w" | head -1)" 'omarchy default-omarchy' 'normal qualified reboot has no pending and re-selects Omarchy'
+printf 'boot_id=00000000-0000-0000-0000-000000000000\nimage_id=%s\n' "$uuid_hex" >"$m/success"
+printf 'boot_id=%s\nimage_id=%s\n' "$id" "$uuid_hex" >"$m/pending"; chmod 600 "$m/success" "$m/pending"
+expect "$(pick "$w" | head -1)" 'pmos stale-pending-latched' 'success for another boot does not commit this pending'
+w=$(world d); m=$w/var/lib/omarchy-mobile/main
+printf 'garbage\n' >"$m/pending"; chmod 600 "$m/pending"
+expect "$(pick "$w" | head -1)" 'pmos stale-pending-latched' 'malformed pending'
+w=$(world e); m=$w/var/lib/omarchy-mobile/main
+ln -s /nonexistent "$m/pending"
+expect "$(pick "$w" | head -1)" 'pmos stale-pending-latched' 'linked pending'
+w=$(world f); m=$w/var/lib/omarchy-mobile/main
+: >"$m/latch"
+expect "$(pick "$w" | head -1)" 'pmos recovery-latch' 'empty latch still latches'
+rm -f "$m/latch"; mkdir "$m/latch"
+expect "$(pick "$w" | head -1)" 'pmos recovery-latch' 'latch directory latches'
+pass 'commit vs stale token, cleanup of committed pending, malformed/linked/odd latch objects are sticky'
+
+# explicit recovery and re-entry go through the control (below); unsafe state here
+w=$(world g); m=$w/var/lib/omarchy-mobile/main
+rm "$m/rootfs.img"; ln -s /etc/hostname "$m/rootfs.img"
+expect "$(pick "$w" | head -1)" 'pmos image-untrusted' 'linked image'
+rm -f "$m/rootfs.img"; truncate -s 1048576 "$m/rootfs.img"; chmod 600 "$m/rootfs.img"
+expect "$(pick "$w" | head -1)" 'pmos image-identity-mismatch' 'wrong filesystem identity'
+stamp_uuid "$m/rootfs.img"
+chmod 644 "$m/rootfs.img"; expect "$(pick "$w" | head -1)" 'pmos image-untrusted' 'image readable by others'
+chmod 600 "$m/rootfs.img"; ln "$m/rootfs.img" "$m/extra-link"
+expect "$(pick "$w" | head -1)" 'pmos image-untrusted' 'hard-linked image'
+rm "$m/extra-link"; truncate -s 2097152 "$m/rootfs.img"
+expect "$(pick "$w" | head -1)" 'pmos image-size-mismatch' 'size drift'
+truncate -s 1048576 "$m/rootfs.img"
+chmod 755 "$m"; expect "$(pick "$w" | head -1)" 'pmos state-untrusted' 'state directory not root-only'
+chmod 700 "$m"; chmod 775 "$w/var/lib"; expect "$(pick "$w" | head -1)" 'pmos state-untrusted' 'group-writable ancestor'
+chmod 755 "$w/var/lib"; mv "$w/var/lib/omarchy-mobile" "$w/real"; ln -s ../../real "$w/var/lib/omarchy-mobile"
+expect "$(pick "$w" | head -1)" 'pmos state-untrusted' 'symlinked ancestor'
+rm "$w/var/lib/omarchy-mobile"; mv "$w/real" "$w/var/lib/omarchy-mobile"
+expect "$(pick "$w" | head -1)" 'omarchy default-omarchy' 'restored state selects Omarchy again'
+sed "s/^main_root_uid=.*/main_root_uid=$((uid + 1))/" "$work/sel/select.sh" >"$work/sel/select-foreign.sh"
+expect "$(sh "$work/sel/drv.sh" "$w" "$work/sel/select-foreign.sh" | head -1)" 'pmos state-untrusted' 'foreign owner is refused'
+w=$(world h); state=$w/var/lib/omarchy-mobile
+printf 'mode=main\nboot_id=x\n' >"$state/hardware-test.armed"
+pick "$w" >/dev/null; [[ ! -e $state/hardware-test.armed ]] || fail 'stale main compat marker survived'
+printf 'mode=temporary\n' >"$state/hardware-test.armed"
+pick "$w" >/dev/null; [[ -e $state/hardware-test.armed ]] || fail 'selector removed a temporary arm marker'
+w=$(world i); chmod 775 "$w/var/lib"; printf 'mode=main\n' >"$w/var/lib/omarchy-mobile/hardware-test.armed"
+pick "$w" >/dev/null; [[ -e $w/var/lib/omarchy-mobile/hardware-test.armed ]] || fail 'cleanup ran before the trust chain was proven'
+pass 'corrupt, linked, mis-owned and unsafe image/state refuse ownership without latch; cleanup only after trust'
+
+# ---- control / guard -------------------------------------------------------
+fix=$work/fix; bin=$fix/bin
+mkdir -p "$bin"
+control_copy=$work/myron-main-os
+patch_control() {
+  sh_patch "$control" "$control_copy" "runtime_dir=$fix/run" "os_release=$fix/os-release" "apk_database=$fix/apk" \
+    "omarchy_state=$fix/state" "pmos_state=$fix/state" "proc_boot_id=$fix/bootid" "proc_uptime=$fix/uptime" \
+    "lock_file=$fix/lock" "battery=$fix/battery" "root_uid=$uid" "root_gid=$gid" \
+    "guard_deadline_seconds=${1:-30}" 'guard_poll_seconds=5' 'reboot_grace_seconds=10'
+}
+mock() { printf '#!/bin/sh\nfix=%s\n%s\n' "$fix" "$2" >"$bin/$1"; chmod +x "$bin/$1"; }
+mock id 'echo ${MOCK_UID:-'"$uid"'}'
+mock systemctl 'echo "systemctl $*" >>"$fix/calls"
+case $1 in is-active) [ ! -e "$fix/inactive-${3:-}" ] ;; *) : ;; esac'
+mock ss 'echo "ss $*" >>"$fix/calls"; [ -e "$fix/no-listener" ] || echo "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"'
+mock ip '[ -e "$fix/no-usb-addr" ] || echo "2: usb0    inet 172.16.42.1/24 scope global usb0"'
+mock reboot 'echo "reboot $*" >>"$fix/calls"'
+mock sync 'n=$(cat "$fix/sync-n" 2>/dev/null || echo 0); echo $((n+1)) >"$fix/sync-n"
+m=$fix/state/main
+echo "latch=$([ -e $m/latch ] && echo y || echo n) pending=$([ -e $m/pending ] && echo y || echo n) success=$([ -e $m/success ] && echo y || echo n)" >>"$fix/sync-log"'
+mock sleep 'read -r up _ <"$fix/uptime"; up=${up%%.*}; echo "$((up + $1)).00 0.00" >"$fix/uptime"
+echo "sleep $1" >>"$fix/calls"
+n=$(cat "$fix/sleep-n" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$fix/sleep-n"
+[ ! -f "$fix/hook-sleep-$n" ] || sh "$fix/hook-sleep-$n"'
+mock flock '[ ! -f "$fix/hook-flock" ] || { sh "$fix/hook-flock"; rm -f "$fix/hook-flock"; }; exec '"$(command -v flock)"' "$@"'
+bootid=11111111-2222-3333-4444-555555555555
+other=99999999-2222-3333-4444-555555555555
+reset() { # [omarchy|pmos]
+  rm -rf "$fix/state" "$fix/run" "$fix/battery" "$fix"/calls "$fix"/sleep-n "$fix"/sync-* "$fix"/hook-* "$fix"/inactive-* "$fix"/no-* "$fix/lock" "$fix/uptime"
+  mkdir -p "$fix/state/main" "$fix/battery"
+  chmod 755 "$fix/state"; chmod 700 "$fix/state/main"
+  echo "$bootid" >"$fix/bootid"; echo '100.00 0.00' >"$fix/uptime"
+  echo 87 >"$fix/battery/capacity"; echo Good >"$fix/battery/health"
+  printf 'ID_LIKE="alpine"\nSUPPORT_URL="https://gitlab.postmarketos.org/postmarketOS"\n' >"$fix/os-release"
+  echo 'P:postmarketos-base' >"$fix/apk"
+  if [[ ${1:-omarchy} == omarchy ]]; then mkdir -p "$fix/run"; echo "$bootid" >"$fix/run/boot-id"; echo "$uuid_hex" >"$fix/run/image-id"; fi
+  touch "$fix/calls" "$fix/sync-log"
+  patch_control "${2:-30}"
+}
+ctl() { PATH=$bin:$PATH sh "$control_copy" "$@"; }
+m=$fix/state/main
+pend() { printf 'boot_id=%s\nimage_id=%s\n' "${1:-$bootid}" "$uuid_hex" >"$m/pending"; chmod 600 "$m/pending"; }
+ctl_has() { local want=$1; shift; ctl "$@" >"$work/co" 2>&1 || true; grep -Fq -- "$want" "$work/co"; }
+calls() { cat "$fix/calls"; }
+
+# commit
+reset; pend
+ctl commit >"$work/o" 2>&1 || { cat "$work/o"; fail 'commit with a current token and healthy checks'; }
+[[ -f $m/success && ! -e $m/pending ]] || fail 'commit did not write success and remove pending'
+grep -Fxq "boot_id=$bootid" "$m/success" || fail 'success token'
+grep -Fq 'sport = :22' "$fix/calls" || fail 'commit did not check the listener'
+ctl_has 'success=current' status || fail 'status after commit'
+reset; pend "$other"; ctl commit >"$work/o" 2>&1 && fail 'commit accepted a stale token'; grep -Fq 'stale' "$work/o" || fail 'stale token reason'
+[[ -f $m/pending && ! -e $m/success ]] || fail 'stale commit changed state'
+reset; pend; : >"$m/latch"; ctl commit >"$work/o" 2>&1 && fail 'commit under latch'
+reset pmos; pend; ctl commit >"$work/o" 2>&1 && fail 'commit outside Omarchy'
+reset; pend; echo bad >"$fix/run/image-id"; ctl commit >"$work/o" 2>&1 && fail 'commit with different image id'
+for case in 'inactive-sshd.service:sshd service' 'no-listener:listener' 'no-usb-addr:USB address' 'inactive-NetworkManager.service:NetworkManager' \
+  'inactive-myron-reference-wifi-import.service:wifi import' 'inactive-myron-batterysecret.service:battery secret'; do
+  reset; pend; : >"$fix/${case%%:*}"
+  if ctl commit >"$work/o" 2>&1; then fail "commit accepted a missing ${case#*:}"; fi
+  [[ -f $m/pending && ! -e $m/success ]] || fail "commit under failing ${case#*:} changed state"
+done
+reset; pend; echo Overheat >"$fix/battery/health"; ctl commit >/dev/null 2>&1 && fail 'bad battery health'
+reset; pend; echo 150 >"$fix/battery/capacity"; ctl commit >/dev/null 2>&1 && fail 'bad battery percent'
+reset; pend; MOCK_UID=4242 ctl commit >/dev/null 2>&1 && fail 'commit as non-root'
+reset; pend; chmod 755 "$m"; ctl commit >/dev/null 2>&1 && fail 'commit with unsafe state dir'
+pass 'commit verifies token, image id, sshd+listener, USB address, NM, Wi-Fi import, battery auth; refuses otherwise without changes'
+
+# recover / resume
+reset; pend
+ctl recover --reason qualify-failed >"$work/o" 2>&1 || fail 'recover'
+grep -Fxq 'reason=qualify-failed' "$m/latch" || fail 'latch reason'
+grep -Fq 'systemctl --no-block reboot' "$fix/calls" || fail 'recover does not request a normal reboot'
+grep -n 'reboot' "$fix/calls" | grep -Eq 'bootloader|reboot -f.*bootloader' && fail 'recover rebooted to the bootloader'
+ctl recover --reason 'Bad Reason' >/dev/null 2>&1 && fail 'recover accepted a malformed reason'
+reset; pend; ctl commit >/dev/null; : >"$fix/calls"
+ctl_has ignored-committed recover --reason unit-failed --unless-committed || fail 'recover after commit must be ignored'
+[[ ! -e $m/latch ]] || fail 'failure after commit latched'
+reset pmos; ctl recover >/dev/null || fail 'recover from pmOS'
+[[ -f $m/latch ]] || fail 'explicit recover sets the latch'
+: >"$fix/calls"; ctl_has already-latched recover || fail 'repeat recover must not loop'
+grep -Fq reboot "$fix/calls" && fail 'repeat recover rebooted'
+ctl_has 'latch=present' status || fail 'status latch'
+ctl_has 'next_boot=pmos' status || fail 'status next boot'
+# resume: latch removed last; pmOS identity required; Omarchy refused
+reset pmos; pend; : >"$m/latch"; echo 'x=y' >"$m/success"; : >"$fix/sync-log"
+ctl resume >"$work/o" 2>&1 || { cat "$work/o"; fail 'resume'; }
+[[ ! -e $m/latch && ! -e $m/pending && ! -e $m/success ]] || fail 'resume left state'
+grep -Fq 'latch=y pending=n success=n' "$fix/sync-log" || fail 'pending/success must be flushed away while the latch still exists'
+[[ $(tail -n1 "$fix/sync-log") != *'latch=y'* ]] || fail 'the latch must be removed before the final sync'
+grep -Fq 'systemctl --no-block reboot' "$fix/calls" || fail 'resume does not reboot normally'
+reset; : >"$m/latch"; ctl resume >/dev/null 2>&1 && fail 'resume inside the Omarchy boot'
+reset pmos; : >"$m/latch"; echo 'ID_LIKE="arch"' >"$fix/os-release"; ctl resume >/dev/null 2>&1 && fail 'resume without pmOS identity'
+[[ -e $m/latch ]] || fail 'refused resume removed the latch'
+reset pmos; ctl_has already-main resume || fail 'resume without latch'
+pass 'recover/resume: latch ordering, reboot, repeat safety, identity, no reboot after commit-ignore'
+
+# full cycle through the selector
+reset omarchy
+real_boot=$(cat /proc/sys/kernel/random/boot_id)
+echo "$real_boot" >"$fix/bootid"; echo "$real_boot" >"$fix/run/boot-id"
+w=$(world cycle)
+cc=$work/cycle-ctl
+sh_patch "$control_copy" "$cc" "omarchy_state=$w/var/lib/omarchy-mobile" "pmos_state=$w/var/lib/omarchy-mobile"
+cyc() { PATH=$bin:$PATH sh "$cc" "$@"; }
+expect "$(pick "$w" begin | tr '\n' ' ')" "omarchy default-omarchy begin $real_boot " 'boot 1 starts'
+cyc commit >/dev/null || fail 'cycle commit'
+expect "$(pick "$w" | head -1)" 'omarchy default-omarchy' 'qualified reboot goes to Omarchy again'
+# a new boot has a new boot id, so the earlier boot's success no longer matches
+sed -i "s/^boot_id=.*/boot_id=$other/" "$w/var/lib/omarchy-mobile/main/success"
+pick "$w" begin >/dev/null
+expect "$(pick "$w" | head -1)" 'pmos stale-pending-latched' 'unqualified boot then selects pmOS'
+rm -rf "$fix/run"
+expect "$(pick "$w" | head -1)" 'pmos recovery-latch' 'pmOS stays selected until resume'
+cyc resume >/dev/null || fail 'cycle resume'
+expect "$(pick "$w" | head -1)" 'omarchy default-omarchy' 'resume re-enters Omarchy'
+cyc recover >/dev/null || fail 'cycle explicit recover'
+expect "$(pick "$w" | head -1)" 'pmos recovery-latch' 'explicit recover latches pmOS'
+pass 'selector + control cycle: qualified -> Omarchy, unqualified -> pmOS latch, sticky until resume, explicit recover/resume re-enter'
+
+# guard
+reset omarchy 30; pend
+ctl guard-preflight || fail 'preflight with a current pending token'
+reset omarchy 30; pend "$other"; ctl guard-preflight >"$work/o" 2>&1 && fail 'preflight accepted a stale token'; grep -Fq 'pending-token-not-current' "$work/o" || fail 'preflight reason'
+reset omarchy 30; pend; : >"$m/latch"; ctl guard-preflight >/dev/null 2>&1 && fail 'preflight under latch'
+reset pmos 30; pend; ctl guard-preflight >/dev/null 2>&1 && fail 'preflight outside Omarchy'
+# timeout: latch, normal reboot, then forced plain reboot, never a bootloader, no partition tool
+reset omarchy 30; pend
+ctl guard >"$work/o" 2>&1 || { cat "$work/o"; fail 'guard timeout run'; }
+grep -Fxq 'reason=guard-timeout' "$m/latch" || fail 'timeout did not latch'
+grep -Fq 'systemctl --no-block reboot' "$fix/calls" || fail 'timeout did not request a normal reboot'
+grep -Fxq 'reboot -f' "$fix/calls" || fail 'no forced plain reboot after the grace period'
+grep -Eq 'bootloader|dd |fastboot' "$fix/calls" && fail 'guard touched the bootloader or a partition tool'
+# commit lands mid-wait: no latch, no reboot, even after the deadline passes
+reset omarchy 30; pend
+printf 'printf "boot_id=%s\\nimage_id=%s\\n" >%s/success; rm -f %s/pending\n' "$bootid" "$uuid_hex" "$m" "$m" >"$fix/hook-sleep-2"
+ctl guard >"$work/o" 2>&1 || fail 'guard after commit exits 0'
+[[ ! -e $m/latch ]] || fail 'guard latched a committed boot'
+grep -Fq reboot "$fix/calls" && fail 'guard rebooted after the commit'
+# default timer expiry after commit: success present from the start, clock far beyond the deadline
+reset omarchy 30; pend; ctl commit >/dev/null; echo '9999.00 0' >"$fix/uptime"
+ctl guard >/dev/null 2>&1 || fail 'guard with committed boot'
+[[ ! -e $m/latch ]] && ! grep -Fq reboot "$fix/calls" || fail 'timer expiry rebooted after commit'
+# the timeout re-checks success under the lock: the commit lands just as the lock is taken
+reset omarchy 30; pend
+printf 'printf "boot_id=%s\\nimage_id=%s\\n" >%s/success\nrm -f %s/pending\n' "$bootid" "$uuid_hex" "$m" "$m" >"$fix/hook-flock"
+ctl guard >/dev/null 2>&1 || fail 'guard race run'
+[[ ! -e $m/latch ]] || fail 'a commit that landed during the timeout was latched'
+grep -Fq 'systemctl --no-block reboot' "$fix/calls" && fail 'rebooted despite a commit under the lock'
+# latched elsewhere: guard stops, no second reboot
+reset omarchy 30; pend; : >"$m/latch"; ctl guard >/dev/null 2>&1 || fail 'guard under latch'
+grep -Fq reboot "$fix/calls" && fail 'guard rebooted under an existing latch'
+pass 'guard: deadline latch + normal reboot, commit wins, no reboot after commit, no loop once latched, no partition or bootloader call'
+
+# a held lock blocks another mutation, which then changes nothing
+reset; pend
+( exec 8>"$fix/lock"; flock -n 8; ctl commit >"$work/o" 2>&1 ) && fail 'commit ran while the lock was held'
+grep -Fq 'holds the lock' "$work/o" || fail 'lock refusal reason'
+[[ -f $m/pending && ! -e $m/success ]] || fail 'locked-out commit changed state'
+pass 'mutations are serialized by the lock'
+
+# ---- composer and builder refusals ------------------------------------------
+out=$(tools/myron-dev-image-compose --boot-policy bogus 2>&1) && fail 'composer accepted a bogus policy'
+grep -Fq 'unsupported boot policy' <<<"$out" || fail 'composer bogus policy message'
+out=$(tools/myron-dev-image-compose --boot-policy main 2>&1) && fail 'composer accepted main with the coexistence profile'
+grep -Fq 'supports only --profile cellular' <<<"$out" || fail 'composer main profile message'
+grep -Fq 'boot_policy=temporary' tools/myron-dev-image-compose || fail 'composer default policy must stay temporary'
+pass 'composer: default temporary, main only with cellular, unknown policy refused'
+
+B=tools/myron-build-main-init-boot
+out=$($B 2>&1) && fail 'builder with no arguments'; grep -Fq -- '--base-init-boot is required' <<<"$out" || fail 'builder base message'
+out=$($B --base-init-boot "$work/missing" --out "$work/o.img" 2>&1) && fail 'builder missing base'; grep -Fq 'missing or linked' <<<"$out" || fail 'missing base message'
+head -c 8388608 /dev/zero >"$work/zero.img"; ln -s "$work/zero.img" "$work/link.img"
+out=$($B --base-init-boot "$work/link.img" --out "$work/o.img" 2>&1) && fail 'builder linked base'; grep -Fq 'linked' <<<"$out" || fail 'linked base message'
+out=$($B --base-init-boot "$work/zero.img" --out "$work/o.img" 2>&1) && fail 'builder wrong base'; grep -Fq 'not exact systemd release-v3' <<<"$out" || fail 'wrong base message'
+touch "$work/exists.img"
+out=$($B --base-init-boot "$work/zero.img" --out "$work/exists.img" 2>&1) && fail 'builder replaced an output'; grep -Fq 'refusing to replace' <<<"$out" || fail 'replace message'
+touch "$work/e2.img.ramdisk.lz4"
+out=$($B --base-init-boot "$work/zero.img" --out "$work/e2.img" 2>&1) && fail 'builder replaced a ramdisk'; grep -Fq 'refusing to replace' <<<"$out" || fail 'ramdisk replace message'
+[[ ! -e $work/o.img ]] || fail 'a refused build wrote output'
+pass 'builder refuses no/missing/linked/wrong-hash base and existing outputs'
+
+# ---- real build, AArch64 BusyBox -------------------------------------------
+base=../myron-postmarketos/artifacts/candidates/init_boot_a-pmos-systemd-release-v3.img
+if [[ -f $base ]] && command -v unpack_bootimg lz4 cpio avbtool mkbootimg >/dev/null 2>&1 && [[ -x ../myron-postmarketos/scripts/build-init-boot-candidate.py ]]; then
+  $B --base-init-boot "$base" --out "$work/main.img" >"$work/build.log" 2>&1 || { cat "$work/build.log"; fail 'real build'; }
+  [[ $(stat -c %s "$work/main.img") == 8388608 ]] || fail 'built image size'
+  [[ $(cat "$work/main.img.expected-sha256") == "$(sha256sum "$work/main.img" | cut -d' ' -f1)" ]] || fail 'expected hash file'
+  mkdir -p "$work/rd"
+  (cd "$work/rd" && lz4 -d -l "$work/main.img.ramdisk.lz4" -c | cpio -idm --quiet)
+  for f in init main-select.sh myron-main-os bin/busybox lib/ld-musl-aarch64.so.1; do [[ -e $work/rd/$f ]] || fail "ramdisk lacks $f"; done
+  sh -n "$work/rd/init" || fail 'built init parses'
+  grep -Fq 'fail_boot_dead()' "$work/rd/init" && grep -Fq 'main_select' "$work/rd/init" || fail 'built init lacks the main stage'
+  ! grep -Fq 'wait_partition pmos_root || fail_boot pmos-root-missing$' "$work/rd/init" || true
+  cmp -s "$control" "$work/rd/myron-main-os" || fail 'ramdisk control differs from the repository'
+  cmp -s "$init_dir/select.sh" "$work/rd/main-select.sh" || fail 'ramdisk selector differs from the repository'
+  pass 'real build: 8 MiB image, hash file, ramdisk carries init, selector, control, BusyBox and musl'
+  if command -v qemu-aarch64-static >/dev/null 2>&1; then
+    rootdir=$work/rd
+    qemu=$(command -v qemu-aarch64-static)
+    run_bb() { "$qemu" -L "$rootdir" "$rootdir/bin/busybox" "$@"; }
+    for f in init main-select.sh myron-main-os; do
+      run_bb ash -n "$rootdir/$f" || fail "AArch64 BusyBox ash rejects $f"
+    done
+    # run the selector under the original BusyBox ash with its applets
+    mkdir -p "$work/bbbin"
+    for applet in stat grep sed cat od dd tr sync mv rm mkdir date; do
+      printf '#!/bin/sh\nexec %q -L %q %q %s "$@"\n' "$qemu" "$rootdir" "$rootdir/bin/busybox" "$applet" >"$work/bbbin/$applet"
+      chmod +x "$work/bbbin/$applet"
+    done
+    w=$(world bb)
+    out=$(PATH=$work/bbbin "$qemu" -L "$rootdir" "$rootdir/bin/busybox" ash "$work/sel/drv.sh" "$w" "$work/sel/select.sh" 2>&1) || { echo "$out"; fail 'selector under BusyBox'; }
+    expect "$(head -1 <<<"$out")" 'omarchy default-omarchy' 'BusyBox selector default'
+    ln -sf /etc/hostname "$w/var/lib/omarchy-mobile/main/rootfs.img"
+    out=$(PATH=$work/bbbin "$qemu" -L "$rootdir" "$rootdir/bin/busybox" ash "$work/sel/drv.sh" "$w" "$work/sel/select.sh" 2>&1) || fail 'selector under BusyBox (linked)'
+    expect "$(head -1 <<<"$out")" 'pmos image-untrusted' 'BusyBox selector linked image'
+    pass 'built templates parse and the selector runs under the original AArch64 BusyBox ash'
+  else
+    echo 'ok - # skip: qemu-aarch64-static not available for the AArch64 BusyBox checks'
+  fi
+else
+  echo 'ok - # skip: pinned base image or tools unavailable for the real build'
+fi

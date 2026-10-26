@@ -1,0 +1,111 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Build the 8 MiB persistent-main init_boot offline from the pinned systemd
+# release-v3 base. No device is contacted and no partition is written. The
+# result selects Omarchy by default and postmarketOS on a recovery latch; the
+# temporary rollback init stays a separate builder (tools/myron-build-test-init-boot).
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+base= out=
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'EOF2'
+Usage: tools/myron-build-main-init-boot --base-init-boot FILE --out FILE
+
+Base must be the exact, reviewed systemd release-v3 init_boot (8 MiB, pinned
+SHA-256). Writes OUT, OUT.ramdisk.lz4 and OUT.expected-sha256, all mode 0600,
+and refuses to replace any of them. Deployment is a separate, attended step
+(docs/myron/MAIN-OS.md).
+EOF2
+}
+while (($#)); do
+  case $1 in
+    --base-init-boot) base=${2:?}; shift 2 ;;
+    --out) out=${2:?}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+[[ -n $base ]] || die '--base-init-boot is required'
+[[ -n $out ]] || die '--out is required'
+[[ ! -L $base ]] || die "missing or linked input: $base"
+base=$(realpath "$base")
+out=$(realpath -m "$out")
+[[ -f $base && ! -L $base ]] || die "missing or linked input: $base"
+[[ ! -e $out && ! -L $out ]] || die "refusing to replace $out"
+ramdisk=$out.ramdisk.lz4
+[[ ! -e $ramdisk && ! -L $ramdisk ]] || die "refusing to replace $ramdisk"
+[[ ! -e $out.expected-sha256 && ! -L $out.expected-sha256 ]] ||
+  die "refusing to replace $out.expected-sha256"
+
+readonly systemd_release_sha=535d8e2fe0db2b35dc003e329fafc2b76dd82705df70cef63dc74accf653ec24
+base_sha=$(sha256sum "$base" | awk '{print $1}')
+[[ $base_sha == "$systemd_release_sha" ]] || die "base is not exact systemd release-v3: $base_sha"
+[[ $(stat -c %s "$base") == 8388608 ]] || die 'base must be 8 MiB'
+
+src=device/myron/main-initramfs
+control=device/myron/main-overlay/usr/local/sbin/myron-main-os
+for f in "$src/fail-boot.sh" "$src/select.sh" "$src/stage.sh" "$control"; do
+  [[ -f $f && ! -L $f ]] || die "missing template: $f"
+done
+for tool in unpack_bootimg lz4 cpio avbtool mkbootimg; do
+  command -v "$tool" >/dev/null || die "missing tool: $tool"
+done
+candidate_builder=../myron-postmarketos/scripts/build-init-boot-candidate.py
+[[ -x $candidate_builder ]] || die "missing candidate builder: $candidate_builder"
+
+tmp=$(mktemp -d /tmp/myron-main-initboot.XXXXXX)
+trap 'rm -rf -- "$tmp"' EXIT
+mkdir -p "$tmp/unpack" "$tmp/root"
+unpack_bootimg --boot_img "$base" --out "$tmp/unpack" >/dev/null
+[[ $(od -An -tx1 -N4 "$tmp/unpack/ramdisk" | tr -d ' \n') == 02214c18 ]] ||
+  die 'base ramdisk is not legacy LZ4'
+(
+  cd "$tmp/root"
+  lz4 -d -l "$tmp/unpack/ramdisk" -c | cpio -idm --quiet
+)
+init=$tmp/root/init
+grep -Fq 'wait_partition pmos_root || fail_boot pmos-root-missing' "$init" ||
+  die 'systemd release-v3 handoff marker missing'
+[[ -f $tmp/root/bin/busybox && -f $tmp/root/lib/ld-musl-aarch64.so.1 ]] ||
+  die 'base lacks BusyBox or its musl loader'
+
+# Original prefix (modules, logfs, helpers) with fail_boot replaced, then the
+# main stage in place of the pmOS-only mount and handoff.
+awk '
+  FNR == NR { replacement = replacement $0 ORS; next }
+  /^fail_boot\(\) \{/ { printf "%s", replacement; replacing = 1; next }
+  replacing && /^}/ { replacing = 0; next }
+  replacing { next }
+  /^wait_partition pmos_root \|\| fail_boot pmos-root-missing$/ { exit }
+  { print }
+' "$src/fail-boot.sh" "$init" >"$tmp/init.new"
+cat "$src/stage.sh" >>"$tmp/init.new"
+mv "$tmp/init.new" "$init"
+cp "$src/select.sh" "$tmp/root/main-select.sh"
+cp "$control" "$tmp/root/myron-main-os"
+chmod 0755 "$init" "$tmp/root/main-select.sh" "$tmp/root/myron-main-os"
+sh -n "$init"
+sh -n "$tmp/root/main-select.sh"
+sh -n "$tmp/root/myron-main-os"
+# The main init never carries the temporary partition writer.
+! grep -Eq 'dd .*of=|of=/dev|blockdev|setrw|rollback|myron-watchdog/(busybox|watchdog)' \
+  "$init" "$tmp/root/main-select.sh" "$tmp/root/myron-main-os" ||
+  die 'main init contains a temporary or partition-writing construct'
+grep -Fq 'fail_boot_dead()' "$init" || die 'main fail handling was not installed'
+
+find "$tmp/root" -exec touch -h -d '@0' {} +
+mkdir -p "$(dirname -- "$out")"
+(
+  cd "$tmp/root"
+  find . -print0 | LC_ALL=C sort -z |
+    cpio --null -o --format=newc --owner=0:0 --reproducible --quiet |
+    lz4 -l -12 - "$ramdisk"
+)
+"$candidate_builder" "$base" "$ramdisk" "$out"
+sha=$(sha256sum "$out" | awk '{print $1}')
+printf '%s\n' "$sha" >"$out.expected-sha256"
+chmod 0600 "$out" "$ramdisk" "$out.expected-sha256"
+printf 'status=built\nboot_policy=main\ncandidate=%s\nsha256=%s\nbase_sha256=%s\n' \
+  "$out" "$sha" "$base_sha"

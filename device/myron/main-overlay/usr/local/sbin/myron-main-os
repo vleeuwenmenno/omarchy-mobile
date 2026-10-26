@@ -1,0 +1,333 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Control and guard for the persistent Omarchy main boot on Myron.
+#
+#   myron-main-os status           read-only report, any user that can read state
+#   myron-main-os recover [--reason WORD] [--unless-committed]
+#                                  root: set the recovery latch, normal reboot
+#   myron-main-os resume           root, from postmarketOS: clear latch, reboot
+#   myron-main-os commit           root, in Omarchy: mark this boot qualified
+#   myron-main-os guard-preflight  (unit) refuse to start unless this boot is pending
+#   myron-main-os guard            (unit) deadline guard, never writes a partition
+#
+# State lives in <omarchy-mobile state>/main, root-only. The same file runs
+# from postmarketOS (installed once by the deploy step), from the Omarchy
+# payload and, for the guard, from /run/myron-main with the initramfs BusyBox.
+# Mutations take one lock so commit, timeout and recover cannot interleave.
+# Nothing here ever writes a block device or reboots to the bootloader.
+set -eu
+umask 077
+
+runtime_dir=/run/myron-main
+os_release=/usr/lib/os-release
+apk_database=/lib/apk/db/installed
+omarchy_state=/run/myron-host/var/lib/omarchy-mobile
+pmos_state=/var/lib/omarchy-mobile
+proc_boot_id=/proc/sys/kernel/random/boot_id
+proc_uptime=/proc/uptime
+battery=/sys/class/power_supply/battery
+root_uid=0
+root_gid=0
+guard_deadline_seconds=1200
+guard_poll_seconds=5
+reboot_grace_seconds=120
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+in_omarchy() { [ -f "$runtime_dir/boot-id" ]; }
+if in_omarchy; then state_root=$omarchy_state; else state_root=$pmos_state; fi
+main=$state_root/main
+guard_log=$main/guard.log
+
+current_boot_id() { cat "$proc_boot_id" 2>/dev/null || true; }
+uptime_s() { read -r up _ <"$proc_uptime" || up=0; printf '%s\n' "${up%%.*}"; }
+
+require_root() { [ "$(id -u)" = "$root_uid" ] || die 'must run as root'; }
+
+# Directory (or file) is owned by root, is not a link, has no group/other bits
+# beyond $2. The state directory must be exactly root-only.
+safe_dir() {
+	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	info=$(stat -c '%u:%g:%a' "$1" 2>/dev/null) || return 1
+	[ "${info%:*}" = "$root_uid:$root_gid" ] || return 1
+	[ $((0${info##*:} & $2)) -eq 0 ]
+}
+safe_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	info=$(stat -c '%u:%g:%a:%h' "$1" 2>/dev/null) || return 1
+	case $info in "$root_uid:$root_gid":*:1) ;; *) return 1 ;; esac
+	mode=${info#*:*:}
+	[ $((0${mode%%:*} & 077)) -eq 0 ]
+}
+trust_state() {
+	safe_dir "$state_root" 022 && safe_dir "$main" 077 ||
+		die 'main state directory is missing or not root-only'
+}
+
+# Value of "key=" in file, only when the key occurs exactly once.
+kv() {
+	[ "$(grep -c "^$2=" "$1" 2>/dev/null || true)" = 1 ] || return 0
+	sed -n "s/^$2=//p" "$1"
+}
+
+is_uuid() {
+	case $1 in ????????-????-????-????-????????????) ;; *) return 1 ;; esac
+	case $1 in *[!0-9a-f-]*) return 1 ;; esac
+}
+
+has_latch() { [ -e "$main/latch" ] || [ -L "$main/latch" ]; }
+
+# success file written for the CURRENT boot and the running image. Outside the
+# Omarchy boot there is no running image id, so only the boot id is compared.
+committed_current() {
+	cur=$(current_boot_id)
+	is_uuid "$cur" && safe_file "$main/success" && [ "$(kv "$main/success" boot_id)" = "$cur" ] || return 1
+	in_omarchy || return 0
+	[ "$(kv "$main/success" image_id)" = "$(cat "$runtime_dir/image-id" 2>/dev/null || true)" ]
+}
+
+log_line() {
+	[ -d "$main" ] || return 0
+	size=$(stat -c %s "$guard_log" 2>/dev/null || echo 0)
+	[ "$size" -lt 65536 ] || return 0
+	printf 'uptime=%s boot=%s %s\n' "$(uptime_s)" "$(current_boot_id)" "$*" >>"$guard_log" || true
+}
+
+# One mutation at a time, with flock on a file in /run (cleared by reboot). The
+# kernel drops the lock when the holder dies, so there is no stale-lock cleanup
+# that could remove another holder's lock.
+lock_file=/run/myron-main.lock
+unlock() { flock -u 9 2>/dev/null || true; }
+lock() {
+	exec 9>"$lock_file" || die 'cannot open the main-os lock file'
+	tries=0
+	while ! flock -n 9; do
+		tries=$((tries + 1))
+		[ "$tries" -lt 30 ] || die 'another main-os operation holds the lock'
+		sleep 1
+	done
+}
+
+# Durable write: tmp, sync, rename, sync.
+put_file() {
+	rm -f "$1.new"
+	printf '%s' "$2" >"$1.new"
+	sync
+	mv -f "$1.new" "$1"
+	sync
+}
+
+set_latch() {
+	if has_latch; then return 0; fi
+	put_file "$main/latch" "reason=$1
+"
+}
+
+# Plain reboot, never the bootloader. In the Omarchy boot, if systemd does not
+# act within the grace period, a forced plain reboot after a sync.
+request_reboot() {
+	sync
+	systemctl --no-block reboot 2>/dev/null || true
+	in_omarchy || return 0
+	waited=0
+	while [ "$waited" -lt "$reboot_grace_seconds" ]; do
+		sleep "$guard_poll_seconds"
+		waited=$((waited + guard_poll_seconds))
+	done
+	log_line 'systemd reboot did not act; forced plain reboot'
+	sync
+	reboot -f
+}
+
+cmd_status() {
+	[ -d "$main" ] || { say 'main=not-deployed'; exit 0; }
+	os=pmos; in_omarchy && os=omarchy
+	cur=$(current_boot_id)
+	latch=absent; has_latch && latch=present
+	pending=absent
+	pending_id=
+	if [ -e "$main/pending" ] || [ -L "$main/pending" ]; then
+		pending=malformed
+		if safe_file "$main/pending"; then
+			pending_id=$(kv "$main/pending" boot_id)
+			if is_uuid "$pending_id"; then
+				if [ "$pending_id" = "$cur" ]; then pending=current; else pending=stale; fi
+			fi
+		fi
+	fi
+	success=absent
+	if safe_file "$main/success"; then
+		success=other
+		committed_current && success=current
+	fi
+	image=absent; safe_file "$main/rootfs.img" && image=present
+	if [ "$latch" = present ] || [ "$pending" = stale ] || [ "$pending" = malformed ] || [ "$image" = absent ]; then
+		next=pmos
+	else
+		next=omarchy
+	fi
+	say "os=$os boot_id=$cur latch=$latch pending=$pending success=$success image=$image next_boot=$next"
+	if [ "$latch" = present ]; then say "latch_reason=$(kv "$main/latch" reason)"; fi
+	if in_omarchy; then
+		guard=inactive
+		systemctl is-active --quiet myron-hardware-watchdog.service 2>/dev/null && guard=active
+		say "guard=$guard"
+	fi
+}
+
+cmd_recover() {
+	reason=explicit
+	unless_committed=no
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--reason) reason=${2:-}; shift 2 || die '--reason needs a word' ;;
+			--unless-committed) unless_committed=yes; shift ;;
+			*) die "unknown recover option: $1" ;;
+		esac
+	done
+	case $reason in ''|*[!a-z0-9-]*) die 'reason must be lowercase letters, digits and dashes' ;; esac
+	[ "${#reason}" -le 40 ] || die 'reason is too long'
+	require_root
+	trust_state
+	lock
+	# A failure after a qualified commit must not undo that commit.
+	if [ "$unless_committed" = yes ] && committed_current; then
+		say 'result=ignored-committed reboot=no'
+		return 0
+	fi
+	if has_latch && ! in_omarchy; then
+		say 'result=already-latched reboot=no'
+		return 0
+	fi
+	set_latch "$reason"
+	log_line "recover reason=$reason"
+	say "result=latched reason=$reason reboot=normal"
+	unlock
+	request_reboot
+}
+
+cmd_resume() {
+	require_root
+	! in_omarchy || die 'resume runs from postmarketOS, not from the Omarchy boot'
+	# Positive identity of the running root, not merely the absence of the marker.
+	grep -Fqx 'ID_LIKE="alpine"' "$os_release" 2>/dev/null &&
+		grep -Fqx 'SUPPORT_URL="https://gitlab.postmarketos.org/postmarketOS"' "$os_release" &&
+		grep -Fqx 'P:postmarketos-base' "$apk_database" 2>/dev/null ||
+		die 'the running root is not the preserved postmarketOS'
+	trust_state
+	lock
+	if ! has_latch && [ ! -e "$main/pending" ] && [ ! -L "$main/pending" ]; then
+		say 'result=already-main reboot=no'
+		return 0
+	fi
+	# pending/success first while the latch still holds, the latch last: a
+	# crash in between leaves the phone in recovery, never half re-armed.
+	rm -f "$main/pending" "$main/pending.new" "$main/success" "$main/success.new"
+	sync
+	rm -f "$main/latch" "$main/latch.new"
+	sync
+	log_line 'resume cleared latch'
+	say 'result=resumed reboot=normal'
+	unlock
+	request_reboot
+}
+
+# Everything the commit checks, one reason per failure.
+commit_checks() {
+	has_latch && die 'recovery latch is set'
+	in_omarchy || die 'commit is only valid in the Omarchy main boot'
+	cur=$(current_boot_id)
+	is_uuid "$cur" || die 'boot id is unreadable'
+	[ "$(cat "$runtime_dir/boot-id" 2>/dev/null || true)" = "$cur" ] ||
+		die 'runtime boot id differs from the kernel boot id'
+	safe_file "$main/pending" || die 'pending attempt is missing or unsafe'
+	[ "$(kv "$main/pending" boot_id)" = "$cur" ] || die 'pending token is not this boot (stale)'
+	[ "$(kv "$main/pending" image_id)" = "$(cat "$runtime_dir/image-id" 2>/dev/null || true)" ] ||
+		die 'pending image identity differs from the running image'
+	systemctl is-active --quiet sshd.service || die 'sshd service is not active'
+	ss -H -ltn 'sport = :22' 2>/dev/null | grep -q . || die 'nothing is listening on port 22'
+	ip -4 -o addr show dev usb0 2>/dev/null | grep -Fq ' 172.16.42.1/24' ||
+		die 'usb0 rescue address is not configured'
+	systemctl is-active --quiet NetworkManager.service || die 'NetworkManager is not active'
+	systemctl is-active --quiet myron-reference-wifi-import.service ||
+		die 'Wi-Fi profile import service is not active'
+	systemctl is-active --quiet myron-batterysecret.service || die 'battery authentication is not active'
+	capacity=$(cat "$battery/capacity" 2>/dev/null || true)
+	case $capacity in ''|*[!0-9]*) die 'battery capacity is unreadable' ;; esac
+	[ "$capacity" -le 100 ] || die 'battery capacity is invalid'
+	[ "$(cat "$battery/health" 2>/dev/null || true)" = Good ] || die 'battery health is not Good'
+}
+
+cmd_commit() {
+	require_root
+	trust_state
+	lock
+	commit_checks
+	put_file "$main/success" "boot_id=$(current_boot_id)
+image_id=$(kv "$main/pending" image_id)
+"
+	rm -f "$main/pending"
+	sync
+	log_line 'commit qualified'
+	say 'result=committed'
+}
+
+cmd_guard_preflight() {
+	in_omarchy || { say 'result=preflight-failed reason=not-main-runtime'; exit 78; }
+	if ! safe_dir "$state_root" 022 || ! safe_dir "$main" 077; then
+		say 'result=preflight-failed reason=state-untrusted'
+		exit 78
+	fi
+	if has_latch; then say 'result=preflight-failed reason=latched'; exit 78; fi
+	cur=$(current_boot_id)
+	if ! is_uuid "$cur" || ! safe_file "$main/pending" || [ "$(kv "$main/pending" boot_id)" != "$cur" ]; then
+		say 'result=preflight-failed reason=pending-token-not-current'
+		exit 78
+	fi
+	log_line 'guard-preflight ok'
+}
+
+guard_timeout() {
+	lock
+	# Success wins over the clock: a commit that landed while we waited stands.
+	if committed_current; then
+		log_line 'timeout-check boot already committed'
+		return 0
+	fi
+	set_latch guard-timeout
+	log_line "guard-timeout deadline=${guard_deadline_seconds}s latched"
+	unlock
+	request_reboot
+}
+
+cmd_guard() {
+	log_line "guard-start deadline=${guard_deadline_seconds}s"
+	start=$(uptime_s)
+	while :; do
+		if committed_current; then
+			log_line 'guard-done committed; staying active'
+			exit 0
+		fi
+		if has_latch; then
+			log_line 'guard-done latch set elsewhere'
+			exit 0
+		fi
+		now=$(uptime_s)
+		[ $((now - start)) -lt "$guard_deadline_seconds" ] || break
+		sleep "$guard_poll_seconds"
+	done
+	guard_timeout
+}
+
+cmd=${1:-}
+[ $# -eq 0 ] || shift
+case $cmd in
+	status) cmd_status ;;
+	recover) cmd_recover "$@" ;;
+	resume) cmd_resume ;;
+	commit) cmd_commit ;;
+	guard-preflight) cmd_guard_preflight ;;
+	guard) cmd_guard ;;
+	*) die 'usage: myron-main-os status|recover [--reason WORD] [--unless-committed]|resume|commit' ;;
+esac

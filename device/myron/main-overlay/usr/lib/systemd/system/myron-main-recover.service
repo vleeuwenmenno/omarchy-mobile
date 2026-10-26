@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# Started by OnFailure= of the main boot's units. Latches recovery (unless the
+# boot was already committed) and requests a normal reboot. Once the latch
+# exists a repeat run changes nothing, so there is no reboot loop.
+[Unit]
+Description=Latch Myron recovery to postmarketOS and reboot
+DefaultDependencies=no
+ConditionPathExists=/run/myron-main/myron-main-os
+
+[Service]
+Type=oneshot
+Environment=PATH=/run/myron-main/bin:/usr/bin
+ExecStart=/run/myron-main/bin/busybox sh /run/myron-main/myron-main-os recover --reason unit-failed --unless-committed

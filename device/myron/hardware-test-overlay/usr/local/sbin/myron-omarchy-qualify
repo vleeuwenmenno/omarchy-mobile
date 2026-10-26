@@ -54,15 +54,18 @@ qualify_profile() {
       ! pgrep -x btattach >/dev/null 2>&1 ||
         die 'cellular profile unexpectedly started Bluetooth transport'
       modem_ready=no
-      elapsed=0
-      while [ "$elapsed" -lt 180 ]; do
+      # Monotonic absolute deadline: each mmcli probe can itself take up to 5 s,
+      # and the wall clock can jump while the phone bootstraps its time.
+      modem_start=$(cut -d. -f1 /proc/uptime)
+      modem_deadline=$((modem_start + 180))
+      while [ "$(cut -d. -f1 /proc/uptime)" -lt "$modem_deadline" ]; do
         if timeout 5 mmcli -L 2>/dev/null | grep -Fq '/Modem/'; then
           modem_ready=yes
           break
         fi
         sleep 3
-        elapsed=$((elapsed + 3))
       done
+      elapsed=$(( $(cut -d. -f1 /proc/uptime) - modem_start ))
       [ "$modem_ready" = yes ] || die 'ModemManager did not publish a modem within 180 seconds'
       location=$(timeout 10 mmcli -m any --location-status --output-keyvalue 2>/dev/null || true)
       printf '%s\n' "$location" | grep -Fq ': gps-raw' ||
@@ -135,12 +138,12 @@ done
 wayland=$(sed -n '2p' "$runtime/hypr/$signature/hyprland.lock" 2>/dev/null || true)
 case "$wayland" in wayland-[0-9]*) ;; *) die 'Hyprland Wayland socket metadata missing' ;; esac
 [ -S "$runtime/$wayland" ] || die 'Hyprland Wayland socket missing'
-monitor_json=$(XDG_RUNTIME_DIR="$runtime" HYPRLAND_INSTANCE_SIGNATURE="$signature" hyprctl -j monitors 2>>"$log") ||
+monitor_json=$(XDG_RUNTIME_DIR="$runtime" HYPRLAND_INSTANCE_SIGNATURE="$signature" timeout 10 hyprctl -j monitors 2>>"$log") ||
   die 'hyprctl monitors failed'
 printf '%s\n' "$monitor_json" >>"$log"
 printf '%s\n' "$monitor_json" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"DSI-1"' ||
   die 'Hyprland did not publish DSI-1'
-devices_json=$(XDG_RUNTIME_DIR="$runtime" HYPRLAND_INSTANCE_SIGNATURE="$signature" hyprctl -j devices 2>>"$log") ||
+devices_json=$(XDG_RUNTIME_DIR="$runtime" HYPRLAND_INSTANCE_SIGNATURE="$signature" timeout 10 hyprctl -j devices 2>>"$log") ||
   die 'hyprctl devices failed'
 printf '%s\n' "$devices_json" >>"$log"
 printf '%s\n' "$devices_json" | grep -Eq 'focaltech|touch' ||
@@ -186,6 +189,16 @@ fi
   say "client_egl_exit=$client_status state=unrelated-platform-failure-accepted"
 
 qualify_profile
+
+# Persistent main boot: every check above has passed, so commit this boot
+# through the main control, which also verifies sshd, its listener, the USB
+# rescue address, NetworkManager, the Wi-Fi import, the battery authentication
+# and this boot's pending token. No legacy disarm marker is written.
+if [ -f /run/myron-main/boot-id ]; then
+  /usr/local/sbin/myron-main-os commit >>"$log" 2>&1 || die 'main boot commit refused'
+  say "result=qualified dsi=DSI-1 renderer=isolated-zink-turnip client_egl=adreno840 dma_heap=ready stable_seconds=$stable_seconds main=committed"
+  exit 0
+fi
 
 # The cellular profile never disarms rollback. The guarded cellular stage
 # removes any disarm and relies on the watchdog restoring postmarketOS, so a
