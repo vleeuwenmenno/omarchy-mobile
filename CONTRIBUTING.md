@@ -41,7 +41,7 @@ Omarchy Mobile runs native Omarchy on mobile devices: Arch Linux ARM, Hyprland a
 
 - `docker`: kernel builds run in the [`docker/Dockerfile`](docker/Dockerfile) environment (Ubuntu 24.04).
 - `adb`, `fastboot` (`android-tools`), `lz4`, `zstd`, `cpio`, `python3`, `ssh`, plus `unzip`, `debugfs` (e2fsprogs), `simg2img`/`lpunpack` and `erofs-utils` for firmware extraction.
-- **Android's prebuilt clang and the AOSP boot-image tools.** `bin/omamobile` takes clang from `CLANG_DIR`, and `mkbootimg` and `mkdtboimg.py` from `SRC_DIR` (`system/tools/mkbootimg`, `system/libufdt`). Today these come from a LineageOS checkout (`bin/lineage-ref sync`, about 400 GB). A smaller setup also works: the AOSP `platform/prebuilts/clang/host/linux-x86`, `platform/system/tools/mkbootimg` and `platform/system/libufdt` projects under `~/android`, with `CLANG_DIR` and `SRC_DIR` set in `omamobile.local.conf`. The initramfs build links against that clang's Android compiler-rt builtins. A lighter toolchain setup would make a good PR.
+- **Android's prebuilt clang and the AOSP boot-image tools.** `bin/omamobile` takes clang from `CLANG_DIR`, and `mkbootimg` and `mkdtboimg.py` from `SRC_DIR` (`system/tools/mkbootimg`, `system/libufdt`). Today these come from a LineageOS checkout (`bin/lineage-ref sync`, about 400 GB). A smaller setup also works: the AOSP `platform/prebuilts/clang/host/linux-x86`, `platform/system/tools/mkbootimg` and `platform/system/libufdt` projects under `~/android` (plus `platform/external/avb` for a device with `AVB_FOOTERS`), with `CLANG_DIR` and `SRC_DIR` set in `omamobile.local.conf`. The initramfs build links against that clang's Android compiler-rt builtins. A lighter toolchain setup would make a good PR.
 - **The kernel tree.** Clone [derekross/linux-omarchy-mobile](https://github.com/derekross/linux-omarchy-mobile) to `~/android/mainline/linux`, or set `KERNEL_DIR`. Branch `omamobile-int` is what the phone runs today (every subsystem merged, work in progress included, as one snapshot commit); branch `omamobile` holds the curated, upstream-ready commits and lags behind it. Build `omamobile-int` to match this repository's packages and overlays; base your own kernel work on `omamobile`.
 - **Google's GPL kernel for your device**, as a reference for registers, clocks and power sequences (manifests at `android.googlesource.com/kernel/manifest`, branches named `android-gs-<family>-…`). The postmarketOS Tensor kernel is a useful second reference.
 - **The host side of USB networking:** give the laptop `172.16.42.2/24` on the phone's USB network interface. A NetworkManager profile with a manual address works (see "Host setup" in [NOTES.md](device/cheetah/NOTES.md)).
@@ -95,7 +95,7 @@ Bring-up steps hang phones. Plan for it before you start:
 - **When the phone hangs:**
   1. Wait about 2 minutes. A dead-man undo, a watchdog reset or `panic=10` may bring it back on its own.
   2. Unplug and replug the cable once.
-  3. Force a restart: hold Power for about 30 s until the phone is off, then press Power.
+  3. Force a restart: hold Power for about 30 s until the phone is off, then press Power. On the Pixel 8 Pro, hold Power + Volume Up for 15-30 s; Power alone does nothing under our kernel ([BRINGUP-M1](device/husky/BRINGUP-M1.md) test 23).
   4. Reach fastboot by hand: with the phone off, hold Volume Down, add Power, and keep both held about 20 s until "Fastboot Mode" appears. Letting go early lands on the unlocked-bootloader warning, which carries on booting slot B.
   5. From fastboot, flash known-good images to slot B, or `fastboot --set-active=a` to boot stock Android.
 - **Slot fallback:** a slot B that hasn't been marked successful falls back to stock slot A after the bootloader's retries run out. Once `omamobile-boot-success` has marked slot B, don't rely on that fallback: use fastboot. Keep a known-good image set (we keep one in `~/android/mainline/known-good`).
@@ -141,6 +141,7 @@ tools/phone-ssh <command>      # root@172.16.42.1 over USB
 tools/phone-mirror             # the phone's screen in a window here, mouse and keyboard included (omamobile-mirror)
 ```
 
+- **An SSH key that needs a touch per connection** (a security key): set `OMAMOBILE_SSH_SHARE=1`, and `tools/phone-ssh` (so `push` too) shares one connection and asks once. Check that SSH still works after a USB or firewall step with `tools/phone-ssh --fresh`, which never shares.
 - **The device** comes from `DEVICE` (default `cheetah`, in [`omamobile.conf`](omamobile.conf)) and its descriptor `device/<codename>/device.conf`: `DEVICE=<codename> bin/omamobile images`. How builds and releases work for several devices: [docs/RELEASES.md](docs/RELEASES.md).
 - **One worktree per subsystem branch.** Each branch gets its own output directory (`KERNEL_DIR=~/android/mainline/wt-gnss KERNEL_OUT=~/android/mainline/out-gnss bin/omamobile kernel`), so builds don't step on each other.
 - **The kernel command line goes in the DTB** (`/chosen/bootargs`), not in `vendor_boot`: the Pixel bootloader (ABL) ignores the vendor_boot cmdline.
@@ -198,7 +199,7 @@ The same SoC does **not** mean the same board. The panel, touch controller, PMIC
 
 - The board DTS lives in the **kernel repository** ([linux-omarchy-mobile](https://github.com/derekross/linux-omarchy-mobile)), not here. Start from the SoC `.dtsi` (`arch/arm64/boot/dts/exynos/google/gs201.dtsi` or `gs101.dtsi`) and from the live stock DT. Add `<soc>-<codename>.dts` with `compatible = "google,<soc>-<codename>", "google,<soc>"`, plus its entry in `Documentation/devicetree/bindings/arm/google.yaml`.
 - Read [BRINGUP-M1.md](device/cheetah/BRINGUP-M1.md) §1 (the boot chain) and §4 (the minimal DTS) first. The Pixel bootloader has rules of its own:
-  - It picks the base DTB by `/soc_id`. Ship one copy per silicon revision.
+  - It picks the base DTB by `/soc_id` (gs101, gs201; ship one copy per silicon revision) or, on zuma, by the children of `/soc_compatible` (one DTB carries them all; descriptor key `SOC_COMPATIBLE`).
   - It requires `/chosen/bootargs` and an empty `/ect` node.
   - It applies a board `dtbo` keyed by `board_id`/`board_rev`. Ship a trivial one with your device's IDs (from `getprop ro.boot.dtbo_idx` and the stock `dtbo.img`).
   - It applies a debug-policy overlay from the `dpm` partition, so build with `-@` and add the label stubs it targets.
@@ -275,7 +276,7 @@ Findings that matter beyond one subsystem go into `device/<codename>/NOTES.md`, 
   - `make dt_binding_check DT_SCHEMA_FILES=<your schemas>`;
   - `make CHECK_DTBS=y W=1 exynos/google/<soc>-<codename>.dtb` (or `dt-validate`), with no new warnings, also with your bring-up overlays applied.
 
-  The plans record these results (for example [HAPTICS-TORCH-PLAN.md](device/cheetah/HAPTICS-TORCH-PLAN.md)). `tools/kernel-pr-check --build OUT BASE` in this repository runs the sign-off, prefix, checkpatch and identifier checks and the `W=1`, `dtbs_check` and `dt_binding_check` builds on your branch's commits, comparing device-tree warnings against the base, and the review runs it too.
+  The plans record these results (for example [HAPTICS-TORCH-PLAN.md](device/cheetah/HAPTICS-TORCH-PLAN.md)). `tools/kernel-pr-check --build OUT --merge BASE` in this repository runs the sign-off, prefix, checkpatch and identifier checks on your branch's commits and the `W=1`, `dtbs_check` and `dt_binding_check` builds on your branch merged onto the current base, comparing device-tree warnings against that base; CI and the review run it the same way. If it says "rebase needed", rebase onto `omamobile`.
 - **New hardware is `disabled` by default.** A separate, later commit turns it on once it has passed on the phone. One exception: a board node whose pins, flags and driver are already proven on another phone with the same SoC (the Pixel Fold's volume keys, wired as the Pixel 7 Pro's) may be added enabled in one commit, once it has passed on your phone; say which phone's node it matches.
 - **Code imported from Google's GPL tree** keeps its copyright and is marked as such. Port it to upstream APIs and style before proposing it for `omamobile`.
 - **Sending upstream:** the published `omamobile` branch sits on one squashed commit that holds the tree of the upstream tag (see [`tools/publish-kernel`](tools/publish-kernel)). Rebase your commits onto the real tag (`git rebase --onto v7.3-rc6 <squashed base>`), run `scripts/get_maintainer.pl`, and follow `Documentation/process/submitting-patches.rst`.
