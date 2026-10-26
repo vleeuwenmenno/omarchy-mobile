@@ -21,13 +21,54 @@ equal "$(nvm_public_address "$tmp/nvm")" '01:02:03:04:05:06' \
 
 mgmt_fixture=$tmp/mgmt
 bluetooth_fixture=$tmp/bluetoothctl
+scan_commands=$tmp/scan-commands
+scan_fixture=$tmp/scan-fixture
+tree_fixture=$tmp/tree
+scan_status=0
+writer_status=0
+show_status=0
+tree_status=0
+scan_read_mode=all
+test_sleep_delay=0
 timeout() {
+  if [[ $1 == -k ]]; then shift 2; fi
   shift
+  if [[ $1 == sh && $2 == -c && $3 == *'exec bluetoothctl'* ]]; then
+      pid_file=${@: -2:1}
+      command_fifo=${!#}
+      printf '%s\n' "$BASHPID" >"$pid_file"
+      exec 3<"$command_fifo"
+      if [[ $scan_read_mode == one ]]; then
+        IFS= read -r first_command <&3 || true
+        printf '%s\n' "$first_command" >"$scan_commands"
+      else
+        cat <&3 >"$scan_commands"
+      fi
+      cat "$scan_fixture"
+      return "$scan_status"
+  fi
+  if [[ $1 == sh && $2 == -c && $3 == *'printf "%s\n" "scan on"'* ]]; then
+      pid_file=${@: -2:1}
+      command_fifo=${!#}
+      printf '%s\n' "$BASHPID" >"$pid_file"
+      exec 3>"$command_fifo"
+      printf '%s\n' 'scan on' >&3 || return $?
+      sleep 8
+      printf '%s\n' 'scan off' >&3 || return $?
+      sleep 1
+      printf '%s\n' quit >&3 || return $?
+      exec 3>&-
+      return "$writer_status"
+  fi
   case "$*" in
     'btmgmt config'|'btmgmt --index 0 info') cat "$mgmt_fixture" ;;
-    'bluetoothctl show') cat "$bluetooth_fixture" ;;
+    'bluetoothctl show') cat "$bluetooth_fixture"; return "$show_status" ;;
+    'busctl --system --list tree org.bluez') cat "$tree_fixture"; return "$tree_status" ;;
     *) return 124 ;;
   esac
+}
+sleep() {
+  if [[ $test_sleep_delay == 1 ]]; then command sleep 0.05; fi
 }
 
 printf 'hci0:\tUnconfigured controller\n' >"$mgmt_fixture"
@@ -39,27 +80,104 @@ if mgmt_has_unconfigured_hci0; then
 fi
 equal "$(mgmt_configured_address)" 'a1:b2:c3:d4:e5:f6' \
   'configured MGMT address parser'
-equal "$(printf '\001\033[1;30mDevice AA:BB:CC:DD:EE:FF JBL Flip 6\033[0m\002\n' |
-  strip_terminal_controls)" 'Device AA:BB:CC:DD:EE:FF JBL Flip 6' \
-  'BlueZ terminal control stripping'
-printf '\033[0;93mDiscovering:\033[0m no\n' >"$bluetooth_fixture"
+# Background shell functions can exit before Bash exposes their /proc entry.
+# Runtime ownership is covered statically; logic checks use stable synthetic starts.
+process_start_time() { printf '%s\n' "$1"; }
+same_process() { kill -0 "$1" 2>/dev/null; }
+printf 'Discovering: no\n' >"$bluetooth_fixture"
 equal "$(bluetooth_discovering)" no 'bounded discovery-state parser'
+printf 'Discovering: yes\n' >"$bluetooth_fixture"
+equal "$(bluetooth_discovering)" yes 'continued discovery is not reported as stopped'
+show_status=124
+if bluetooth_discovering >/dev/null; then
+  fail 'discovery query masked its timeout status'
+fi
+show_status=0
 
 scan=$tmp/scan
-printf '\033[1;30mDevice AA:BB:CC:DD:EE:FF JBL Flip 6\033[0m\n' >"$scan"
-equal "$(fresh_event_count JBL '' "$scan")" 0 'cached proxy is not fresh discovery'
-printf '\001[\033[0;92mNEW\033[0m] Device AA:BB:CC:DD:EE:FF JBL Flip 6\002\n' >"$scan"
-equal "$(fresh_event_count JBL '' "$scan")" 1 'new named peer is fresh discovery'
-printf '[\033[0;92mNEW\033[0m] Device AA:BB:CC:DD:EE:FF Other Speaker\n' >"$scan"
-equal "$(fresh_event_count JBL '' "$scan")" 0 'unrelated new peer is rejected'
-printf '[\033[0;93mCHG\033[0m] Device AA:BB:CC:DD:EE:FF RSSI: -42\n' >"$scan"
-equal "$(fresh_event_count JBL aa:bb:cc:dd:ee:ff "$scan")" 1 \
-  'cached named peer requires fresh advertisement data'
-printf '[\033[0;93mCHG\033[0m] Device AA:BB:CC:DD:EE:FF ManufacturerData.Key: 0x0001\n' >"$scan"
-equal "$(fresh_event_count JBL aa:bb:cc:dd:ee:ff "$scan")" 1 \
-  'manufacturer data is fresh advertisement data'
-printf '[\033[0;93mCHG\033[0m] Device AA:BB:CC:DD:EE:FF Connected: yes\n' >"$scan"
-equal "$(fresh_event_count JBL aa:bb:cc:dd:ee:ff "$scan")" 0 \
-  'non-discovery property change is rejected'
+: >"$scan_fixture"
+run_bounded_scan "$scan" || fail 'same-client scan transaction failed'
+equal "$(cat "$scan_commands")" "$(printf 'scan on\nscan off\nquit')" \
+  'scan on/off command sequence'
+scan_status=124
+if run_bounded_scan "$scan"; then
+  fail 'bounded same-client scan accepted a timeout'
+fi
+scan_status=0
+scan_read_mode=one
+test_sleep_delay=1
+if run_bounded_scan "$scan"; then
+  fail 'same-client scan masked an early successful client exit'
+fi
+scan_read_mode=all
+test_sleep_delay=0
+scan_command_fifo=$tmp/teardown.fifo
+scan_client_pid_file=$tmp/teardown.pid
+scan_writer_pid_file=$tmp/teardown-writer.pid
+mkfifo -m 0600 "$scan_command_fifo"
+command sleep 30 &
+scan_supervisor_pid=$!
+scan_supervisor_start=$(process_start_time "$scan_supervisor_pid")
+command sleep 30 &
+scan_client_pid=$!
+scan_client_start=$(process_start_time "$scan_client_pid")
+command sleep 30 &
+scan_writer_pid=$!
+scan_writer_start=$(process_start_time "$scan_writer_pid")
+command sleep 30 &
+scan_writer_child_pid=$!
+scan_writer_child_start=$(process_start_time "$scan_writer_child_pid")
+teardown_supervisor=$scan_supervisor_pid
+teardown_client=$scan_client_pid
+teardown_writer=$scan_writer_pid
+teardown_writer_child=$scan_writer_child_pid
+stop_scan_children
+wait "$teardown_client" 2>/dev/null || true
+wait "$teardown_writer_child" 2>/dev/null || true
+[[ ! -e $tmp/teardown.fifo ]] || fail 'scan teardown left its command FIFO'
+if kill -0 "$teardown_supervisor" 2>/dev/null || kill -0 "$teardown_client" 2>/dev/null ||
+   kill -0 "$teardown_writer" 2>/dev/null || kill -0 "$teardown_writer_child" 2>/dev/null; then
+  fail 'scan teardown left a tracked child alive'
+fi
+scan_writer_pid_file=$tmp/unremovable-writer.pid
+: >"$scan_writer_pid_file"
+rm() {
+  if [[ $* == *unremovable-writer.pid* ]]; then return 13; fi
+  command rm "$@"
+}
+if stop_scan_children; then
+  fail 'scan teardown accepted writer PID-file removal failure'
+fi
+[[ $scan_writer_pid_file == "$tmp/unremovable-writer.pid" ]] ||
+  fail 'scan teardown lost failed writer PID-file tracking'
+unset -f rm
+command rm -f "$tmp/unremovable-writer.pid"
 
-printf '%s\n' 'ok - Bluetooth MGMT and fresh-discovery failure paths'
+path_a=/org/bluez/hci0/dev_11_22_33_44_55_66
+path_b=/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF
+printf '%s\n%s\n' "$path_a" '/org/bluez/hci0/dev_invalid' >"$tree_fixture"
+before=$tmp/before
+bluez_device_paths "$tmp/filter" >"$before" || fail 'structured pre-scan snapshot failed'
+equal "$(cat "$before")" "$path_a" 'only canonical Device1 paths enter snapshot'
+printf '%s\n%s\n' "$path_a" "$path_b" >"$tree_fixture"
+timeout() {
+  if [[ $1 == -k ]]; then shift 2; fi
+  shift
+  if [[ "$*" == 'busctl --system --list tree org.bluez' ]]; then cat "$tree_fixture"; return 0; fi
+  if [[ $1 == busctl && $2 == --system && $3 == --json=short && $4 == get-property ]]; then
+    if [[ $6 == "$path_b" ]]; then
+      printf '%s\n' '{"type":"s","data":"JBL Charge 4"}'
+    else
+      printf '%s\n' '{"type":"s","data":"Other Speaker"}'
+    fi
+    return 0
+  fi
+  return 124
+}
+equal "$(fresh_bluez_peer_count JBL "$before" "$tmp/after" "$tmp/new" "$tmp/filter")" 1 \
+  'fresh structured JBL object is accepted'
+printf '%s\n' "$path_a" >"$tree_fixture"
+equal "$(fresh_bluez_peer_count JBL "$before" "$tmp/after2" "$tmp/new2" "$tmp/filter")" 0 \
+  'cached object is not fresh discovery'
+
+printf '%s\n' 'ok - Bluetooth MGMT, structured discovery and teardown paths'

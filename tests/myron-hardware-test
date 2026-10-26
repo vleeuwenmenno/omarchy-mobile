@@ -434,17 +434,18 @@ for required in \
   'source=exact-nvm-tag-2 identity=not-logged' \
   'myron-bluetooth-state "$bluez_state_dir"' \
   'state=bluez-volatile identities=not-persisted' \
-  'scan produced no fresh event from the expected peer' \
+  'scan produced no fresh structured D-Bus peer object' \
   'Bluetooth discovery did not stop after scanner exit'; do
   grep -Fq "$required" "$bluetooth_experiment/0003-bluetooth-qca-skip-open-reset.patch" \
     "$bluetooth_stage" || fail "Bluetooth address/discovery gate lacks: $required"
 done
 ! grep -Fq '/sys/class/bluetooth/hci0/address' "$bluetooth_stage" ||
   fail 'Bluetooth address gate reads a nonexistent sysfs attribute'
-for required in 'expected_peer=${1:-}' '/^\[NEW\] Device /' '/^\[CHG\] Device /' \
+for required in 'expected_peer=${1:-}' 'busctl --system --list tree org.bluez' \
+  'busctl --system --json=short get-property' 'org.bluez.Device1 Name' \
+  'jq -e --arg peer "$expected_peer"' 'LC_ALL=C comm -13' \
   'configured MGMT index did not publish the NVM public address' \
-  'gsub(/\033\[[0-9;]*m/, "")' 'install -d -m0700 "$runtime_dir"' \
-  'ManufacturerData.Key:' 'ServiceData.Key:'; do
+  'install -d -m0700 "$runtime_dir"'; do
   grep -Fq "$required" "$bluetooth_stage" ||
     fail "Bluetooth fresh-event/MGMT verification lacks: $required"
 done
@@ -452,16 +453,32 @@ if grep -Fq 'bluetooth_b' "$bluetooth_stage"; then
   fail 'Bluetooth runtime still reads Android slot B'
 fi
 for cleanup in \
-  'timeout 3 bluetoothctl scan off' \
-  'timeout 3 bluetoothctl power off' \
-  'systemctl mask --runtime bluetooth.service' \
-  'timeout 10 systemctl stop bluetooth.service' \
-  'timeout 5 "$probe" --set-power off' \
-  'timeout 5 umount "$bluez_state_dir"'; do
+  'timeout -k 1 3 bluetoothctl scan off' \
+  'timeout -k 1 3 bluetoothctl power off' \
+  'timeout -k 1 3 systemctl mask --runtime bluetooth.service' \
+  'timeout -k 2 10 systemctl stop bluetooth.service' \
+  'timeout -k 1 5 "$probe" --set-power off' \
+  'timeout -k 1 5 umount "$bluez_state_dir"'; do
   grep -Fq "$cleanup" "$bluetooth_stage" ||
     fail "Bluetooth cleanup is not bounded: $cleanup"
 done
-grep -Fq 'if systemctl --quiet is-active bluetooth.service; then cleanup_ok=0; fi' "$bluetooth_stage" ||
+grep -Fq 'timeout -k 2 15 sh -c' "$bluetooth_stage" ||
+  fail 'Bluetooth scan on/off does not use one bounded client'
+grep -Fq 'wait "$scan_supervisor_pid" || client_wait_status=$?' "$bluetooth_stage" ||
+  fail 'Bluetooth scan does not preserve client status'
+grep -Fq 'wait "$scan_writer_pid" || writer_wait_status=$?' "$bluetooth_stage" ||
+  fail 'Bluetooth scan does not preserve command-writer status'
+grep -Fq 'same_process "$parent" "$start" || continue' "$bluetooth_stage" ||
+  fail 'Bluetooth teardown adopts children before validating parent ownership'
+grep -Fq 'cleanup_count=$((cleanup_count + 1))' "$bluetooth_stage" ||
+  fail 'Bluetooth transport cleanup can overwrite discovery count'
+grep -Fq 'if rm -f "$pidfile" && [ ! -e "$pidfile" ]; then :; else cleanup_ok=0; fi' "$bluetooth_stage" ||
+  fail 'Bluetooth transport PID cleanup can be ignored before disarm'
+grep -Fq 'stop_scan_children' "$bluetooth_stage" ||
+  fail 'Bluetooth failure cleanup does not tear down scan children'
+grep -Fq 'run_bounded_scan "$scan_raw" || status=$?' "$bluetooth_stage" ||
+  fail 'Bluetooth scan path does not invoke the bounded same-client transaction'
+grep -Fq 'service_state=$(timeout -k 1 3 systemctl is-active bluetooth.service 2>/dev/null)' "$bluetooth_stage" ||
   fail 'Bluetooth cleanup does not verify that BlueZ stayed stopped'
 if grep -Fq 'rc-service' "$bluetooth_stage"; then
   fail 'Bluetooth runner contains an Alpine/OpenRC service command'

@@ -38,6 +38,21 @@ bluetooth_sha=
 btbcm_sha=
 btqca_sha=
 hci_uart_sha=
+scan_command_fifo=
+scan_client_pid_file=
+scan_supervisor_pid=
+scan_supervisor_start=
+scan_client_pid=
+scan_client_start=
+scan_writer_pid_file=
+scan_writer_pid=
+scan_writer_start=
+scan_writer_child_pid=
+scan_writer_child_start=
+scan_before_file=
+scan_after_file=
+scan_new_file=
+scan_filter_file=
 
 persist() {
 	mkdir -p "$(dirname "$log")"
@@ -284,90 +299,308 @@ nvm_public_address() {
 }
 
 mgmt_has_unconfigured_hci0() {
-	LC_ALL=C timeout 3 btmgmt config 2>/dev/null |
+	LC_ALL=C timeout -k 1 3 btmgmt config 2>/dev/null |
 		grep -Eq '^hci0:[[:space:]]+Unconfigured controller$'
 }
 
 mgmt_configured_address() {
-	LC_ALL=C timeout 3 btmgmt --index 0 info 2>/dev/null |
+	LC_ALL=C timeout -k 1 3 btmgmt --index 0 info 2>/dev/null |
 		awk '$1 == "addr" && $2 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/ {
 			print tolower($2)
 			exit
 		}'
 }
 
-strip_terminal_controls() {
-	LC_ALL=C awk '{
-		gsub(/\033\[[0-9;]*m/, "")
-		gsub(/[\001\002]/, "")
-		print
-	}'
+bluez_device_paths() {
+	filter_file=$1
+	tree_output=$(timeout -k 1 3 busctl --system --list tree org.bluez 2>/dev/null) || return $?
+	printf '%s\n' "$tree_output" |
+		LC_ALL=C awk '/^\/org\/bluez\/hci0\/dev_[0-9A-Fa-f][0-9A-Fa-f]_[0-9A-Fa-f][0-9A-Fa-f]_[0-9A-Fa-f][0-9A-Fa-f]_[0-9A-Fa-f][0-9A-Fa-f]_[0-9A-Fa-f][0-9A-Fa-f]_[0-9A-Fa-f][0-9A-Fa-f]$/ { print }' \
+		>"$filter_file" || return 1
+	LC_ALL=C sort -u "$filter_file" || return 1
+	rm -f "$filter_file" || return 1
+	[ ! -e "$filter_file" ] || return 1
 }
 
-fresh_event_count() {
+fresh_bluez_peer_count() {
 	expected_peer=$1
-	known_address=$2
-	scan_file=$3
-	strip_terminal_controls <"$scan_file" |
-	awk -v peer="$expected_peer" -v known="$known_address" '
-		BEGIN { peer = tolower(peer); known = tolower(known); count = 0 }
-		/^\[NEW\] Device / {
-			line = tolower($0)
-			if (index(line, peer)) count++
-		}
-		/^\[CHG\] Device / && known != "" {
-			address = tolower($3)
-			if (address == known && ($4 == "RSSI:" || $4 == "ManufacturerData.Key:" ||
-			    $4 == "ManufacturerData.Value:" || $4 == "ServiceData.Key:" ||
-			    $4 == "ServiceData.Value:")) count++
-		}
-		END { print count }
-	'
+	before_file=$2
+	after_file=$3
+	new_file=$4
+	filter_file=$5
+	bluez_device_paths "$filter_file" >"$after_file" || return 1
+	LC_ALL=C comm -13 "$before_file" "$after_file" >"$new_file" || return 1
+	count=0
+	while IFS= read -r object_path; do
+		[ -n "$object_path" ] || continue
+		property=$(timeout -k 1 3 busctl --system --json=short get-property \
+			org.bluez "$object_path" org.bluez.Device1 Name 2>/dev/null) || continue
+		if printf '%s\n' "$property" |
+			jq -e --arg peer "$expected_peer" \
+			'($peer | ascii_downcase) as $needle |
+			 (.type == "s" and (.data | type) == "string" and
+			  (.data | ascii_downcase | contains($needle)))' >/dev/null 2>&1; then
+			count=$((count + 1))
+		fi
+	done <"$new_file"
+	printf '%s\n' "$count"
 }
 
 bluetooth_discovering() {
-	timeout 2 bluetoothctl show 2>/dev/null |
-		strip_terminal_controls |
-		awk '$1 == "Discovering:" { print $2; exit }'
+	show_output=$(timeout -k 1 2 bluetoothctl show 2>/dev/null) || return $?
+	printf '%s\n' "$show_output" |
+		LC_ALL=C awk '$1 == "Discovering:" { print $2; exit }'
+}
+
+process_start_time() {
+	pid=$1
+	case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+	[ -r "/proc/$pid/stat" ] || return 1
+	awk '{ print $22 }' "/proc/$pid/stat"
+}
+
+same_process() {
+	pid=$1
+	expected_start=$2
+	[ -n "$expected_start" ] || return 1
+	actual_start=$(process_start_time "$pid" 2>/dev/null) || return 1
+	[ "$actual_start" = "$expected_start" ]
+}
+
+run_bounded_scan() {
+	scan_file=$1
+	scan_command_fifo=$scan_file.commands.$$
+	scan_client_pid_file=$scan_file.client.$$
+	scan_writer_pid_file=$scan_file.writer.$$
+	[ ! -e "$scan_command_fifo" ] || return 1
+	[ ! -e "$scan_client_pid_file" ] || return 1
+	[ ! -e "$scan_writer_pid_file" ] || return 1
+	mkfifo -m 0600 "$scan_command_fifo" || return 1
+	client_status=0
+	writer_status=0
+	timeout -k 2 15 sh -c '
+		umask 077
+		printf "%s\n" "$$" >"$1"
+		exec bluetoothctl <"$2"
+	' sh "$scan_client_pid_file" "$scan_command_fifo" >"$scan_file" 2>&1 &
+	scan_supervisor_pid=$!
+	if ! scan_supervisor_start=$(process_start_time "$scan_supervisor_pid"); then
+		kill "$scan_supervisor_pid" 2>/dev/null || true
+		wait "$scan_supervisor_pid" 2>/dev/null || true
+		rm -f "$scan_command_fifo" "$scan_client_pid_file" "$scan_writer_pid_file"
+		scan_command_fifo=
+		scan_client_pid_file=
+		scan_supervisor_pid=
+		return 1
+	fi
+	timeout -k 1 12 sh -c '
+		umask 077
+		printf "%s\n" "$$" >"$1"
+		exec 3>"$2"
+		printf "%s\n" "scan on" >&3
+		sleep 8
+		printf "%s\n" "scan off" >&3
+		sleep 1
+		printf "%s\n" quit >&3
+		exec 3>&-
+	' sh "$scan_writer_pid_file" "$scan_command_fifo" &
+	scan_writer_pid=$!
+	if ! scan_writer_start=$(process_start_time "$scan_writer_pid"); then
+		kill "$scan_supervisor_pid" "$scan_writer_pid" 2>/dev/null || true
+		wait "$scan_supervisor_pid" 2>/dev/null || true
+		wait "$scan_writer_pid" 2>/dev/null || true
+		rm -f "$scan_command_fifo" "$scan_client_pid_file" "$scan_writer_pid_file"
+		scan_command_fifo=
+		scan_client_pid_file=
+		scan_writer_pid_file=
+		scan_supervisor_pid=
+		scan_supervisor_start=
+		scan_writer_pid=
+		return 1
+	fi
+	tries=0
+	while [ "$tries" -lt 20 ] && [ ! -s "$scan_client_pid_file" ]; do
+		same_process "$scan_supervisor_pid" "$scan_supervisor_start" || break
+		sleep 0.1
+		tries=$((tries + 1))
+	done
+	if [ -s "$scan_client_pid_file" ]; then
+		scan_client_pid=$(cat "$scan_client_pid_file")
+		if ! scan_client_start=$(process_start_time "$scan_client_pid" 2>/dev/null); then client_status=126; fi
+	else
+		client_status=126
+	fi
+	tries=0
+	while [ "$tries" -lt 20 ] && [ ! -s "$scan_writer_pid_file" ]; do
+		same_process "$scan_writer_pid" "$scan_writer_start" || break
+		sleep 0.1
+		tries=$((tries + 1))
+	done
+	if [ -s "$scan_writer_pid_file" ]; then
+		scan_writer_child_pid=$(cat "$scan_writer_pid_file")
+		if ! scan_writer_child_start=$(process_start_time "$scan_writer_child_pid" 2>/dev/null); then writer_status=126; fi
+	else
+		writer_status=126
+	fi
+	client_wait_status=0
+	wait "$scan_supervisor_pid" || client_wait_status=$?
+	[ "$client_status" -ne 0 ] || client_status=$client_wait_status
+	writer_wait_status=0
+	wait "$scan_writer_pid" || writer_wait_status=$?
+	[ "$writer_status" -ne 0 ] || writer_status=$writer_wait_status
+	if same_process "$scan_client_pid" "$scan_client_start"; then client_status=125; fi
+	if same_process "$scan_writer_child_pid" "$scan_writer_child_start"; then writer_status=125; fi
+	scan_cleanup_status=0
+	stop_scan_children || scan_cleanup_status=$?
+	[ "$client_status" -eq 0 ] && [ "$writer_status" -eq 0 ] && [ "$scan_cleanup_status" -eq 0 ]
+}
+
+stop_scan_children() {
+	scan_teardown_ok=1
+	tracked=
+	for pair in \
+		"$scan_supervisor_pid:$scan_supervisor_start" \
+		"$scan_client_pid:$scan_client_start" \
+		"$scan_writer_pid:$scan_writer_start" \
+		"$scan_writer_child_pid:$scan_writer_child_start"; do
+		parent=${pair%%:*}
+		start=${pair#*:}
+		case "$parent:$start" in :*|*[!0-9:]*|*:) continue ;; esac
+		same_process "$parent" "$start" || continue
+		tracked="$tracked $parent:$start"
+		children=/proc/$parent/task/$parent/children
+		if [ -r "$children" ]; then
+			for child in $(cat "$children"); do
+				child_start=$(process_start_time "$child" 2>/dev/null || true)
+				[ -n "$child_start" ] && tracked="$tracked $child:$child_start"
+			done
+		fi
+	done
+	for pair in $tracked; do
+		pid=${pair%%:*}; start=${pair#*:}
+		same_process "$pid" "$start" && kill "$pid" 2>/dev/null || true
+	done
+	count=0
+	while [ "$count" -lt 20 ]; do
+		alive=0
+		for pair in $tracked; do
+			pid=${pair%%:*}; start=${pair#*:}
+			same_process "$pid" "$start" && alive=1
+		done
+		[ "$alive" -eq 1 ] || break
+		sleep 0.1
+		count=$((count + 1))
+	done
+	for pair in $tracked; do
+		pid=${pair%%:*}; start=${pair#*:}
+		same_process "$pid" "$start" && kill -9 "$pid" 2>/dev/null || true
+	done
+	case "$scan_supervisor_pid" in ''|*[!0-9]*) ;; *) wait "$scan_supervisor_pid" 2>/dev/null || true ;; esac
+	case "$scan_writer_pid" in ''|*[!0-9]*) ;; *) wait "$scan_writer_pid" 2>/dev/null || true ;; esac
+	for pair in $tracked; do
+		pid=${pair%%:*}; start=${pair#*:}
+		same_process "$pid" "$start" && scan_teardown_ok=0
+	done
+	if [ -n "$scan_command_fifo" ]; then
+		if rm -f "$scan_command_fifo" && [ ! -e "$scan_command_fifo" ]; then scan_command_fifo=; else scan_teardown_ok=0; fi
+	fi
+	if [ -n "$scan_client_pid_file" ]; then
+		if rm -f "$scan_client_pid_file" && [ ! -e "$scan_client_pid_file" ]; then scan_client_pid_file=; else scan_teardown_ok=0; fi
+	fi
+	if [ -n "$scan_writer_pid_file" ]; then
+		if rm -f "$scan_writer_pid_file" && [ ! -e "$scan_writer_pid_file" ]; then scan_writer_pid_file=; else scan_teardown_ok=0; fi
+	fi
+	scan_supervisor_pid=
+	scan_supervisor_start=
+	scan_client_pid=
+	scan_client_start=
+	scan_writer_pid=
+	scan_writer_start=
+	scan_writer_child_pid=
+	scan_writer_child_start=
+	[ "$scan_teardown_ok" -eq 1 ]
 }
 
 stop_internal() {
 	cleanup_ok=1
-	rm -f /run/myron-bluetooth-ready "$scan_raw"
-	timeout 3 bluetoothctl scan off >/dev/null 2>&1 || true
-	timeout 3 bluetoothctl power off >/dev/null 2>&1 || true
+	rm -f /run/myron-bluetooth-ready || cleanup_ok=0
+	if rm -f "$scan_raw" && [ ! -e "$scan_raw" ]; then :; else cleanup_ok=0; fi
+	if [ -n "$scan_before_file" ]; then
+		if rm -f "$scan_before_file" && [ ! -e "$scan_before_file" ]; then scan_before_file=; else cleanup_ok=0; fi
+	fi
+	if [ -n "$scan_after_file" ]; then
+		if rm -f "$scan_after_file" && [ ! -e "$scan_after_file" ]; then scan_after_file=; else cleanup_ok=0; fi
+	fi
+	if [ -n "$scan_new_file" ]; then
+		if rm -f "$scan_new_file" && [ ! -e "$scan_new_file" ]; then scan_new_file=; else cleanup_ok=0; fi
+	fi
+	if [ -n "$scan_filter_file" ]; then
+		if rm -f "$scan_filter_file" && [ ! -e "$scan_filter_file" ]; then scan_filter_file=; else cleanup_ok=0; fi
+	fi
+	timeout -k 1 3 bluetoothctl scan off >/dev/null 2>&1 || true
+	timeout -k 1 3 bluetoothctl power off >/dev/null 2>&1 || true
 	# The desktop can D-Bus-activate BlueZ as soon as it stops. This one-shot
 	# test never starts a second controller in the same boot, so a runtime-only
 	# mask keeps cleanup stable and disappears automatically on reboot.
-	systemctl mask --runtime bluetooth.service >/dev/null 2>&1 || cleanup_ok=0
-	timeout 10 systemctl stop bluetooth.service >/dev/null 2>&1 || true
-	if systemctl --quiet is-active bluetooth.service; then cleanup_ok=0; fi
+	timeout -k 1 3 systemctl mask --runtime bluetooth.service >/dev/null 2>&1 || cleanup_ok=0
+	timeout -k 2 10 systemctl stop bluetooth.service >/dev/null 2>&1 || true
+	service_status=0
+	service_state=$(timeout -k 1 3 systemctl is-active bluetooth.service 2>/dev/null) || service_status=$?
+	case "$service_status:$service_state" in
+		3:inactive|3:failed) ;;
+		*) cleanup_ok=0 ;;
+	esac
+	transport_stopped=0
 	if [ -s "$pidfile" ]; then
-		pid=$(cat "$pidfile")
-		case "$pid" in ''|*[!0-9]*) pid= ;; esac
-		if [ -n "$pid" ] && [ -r "/proc/$pid/comm" ] && [ "$(cat "/proc/$pid/comm")" = btattach ]; then
-			kill "$pid" 2>/dev/null || true
-			count=0
-			while [ "$count" -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
-				sleep 0.1
-				count=$((count + 1))
-			done
-			kill -9 "$pid" 2>/dev/null || true
-		fi
+		pid=
+		pid_start=
+		read -r pid pid_start <"$pidfile" || true
+		case "$pid:$pid_start" in :*|*[!0-9:]*|*:) cleanup_ok=0 ;;
+		*)
+			if same_process "$pid" "$pid_start"; then
+				if [ -r "/proc/$pid/comm" ] && [ "$(cat "/proc/$pid/comm")" = btattach ]; then
+					kill "$pid" 2>/dev/null || true
+					cleanup_count=0
+					while [ "$cleanup_count" -lt 30 ] && same_process "$pid" "$pid_start"; do
+						sleep 0.1
+						cleanup_count=$((cleanup_count + 1))
+					done
+					same_process "$pid" "$pid_start" && kill -9 "$pid" 2>/dev/null || true
+					cleanup_count=0
+					while [ "$cleanup_count" -lt 10 ] && same_process "$pid" "$pid_start"; do
+						sleep 0.1
+						cleanup_count=$((cleanup_count + 1))
+					done
+					same_process "$pid" "$pid_start" && cleanup_ok=0 || transport_stopped=1
+				else
+					cleanup_ok=0
+				fi
+			else
+				transport_stopped=1
+			fi
+			;;
+		esac
+	else
+		transport_stopped=1
 	fi
-	rm -f "$pidfile"
+	if [ "$transport_stopped" -eq 1 ]; then
+		if rm -f "$pidfile" && [ ! -e "$pidfile" ]; then :; else cleanup_ok=0; fi
+	fi
 	if [ -e /sys/module/hci_uart/parameters/qca_preinitialized ]; then
 		printf 0 >/sys/module/hci_uart/parameters/qca_preinitialized || true
 	fi
 	if [ -c /dev/btpower ]; then
+		probe_ok=1
 		[ -f "$probe" ] && [ ! -L "$probe" ] &&
-			[ "$(sha256sum "$probe" | awk '{print $1}')" = "$probe_sha" ] || cleanup_ok=0
-		if [ "$cleanup_ok" -eq 1 ]; then
-			timeout 5 "$probe" --set-power off >/dev/null 2>&1 || cleanup_ok=0
+			[ "$(sha256sum "$probe" | awk '{print $1}')" = "$probe_sha" ] || probe_ok=0
+		if [ "$probe_ok" -eq 1 ]; then
+			timeout -k 1 5 "$probe" --set-power off >/dev/null 2>&1 || cleanup_ok=0
+		else
+			cleanup_ok=0
 		fi
 	fi
 	if mountpoint -q "$bluez_state_dir"; then
-		timeout 5 umount "$bluez_state_dir" >/dev/null 2>&1 || cleanup_ok=0
+		timeout -k 1 5 umount "$bluez_state_dir" >/dev/null 2>&1 || cleanup_ok=0
 	fi
 	[ "$cleanup_ok" -eq 1 ]
 }
@@ -376,9 +609,11 @@ cleanup_failed_start() {
 	status=$?
 	trap - 0 HUP INT TERM
 	[ "$status" -ne 0 ] || return 0
-	stop_internal || true
+	scan_cleanup_status=0
+	stop_scan_children || scan_cleanup_status=$?
+	if stop_internal && [ "$scan_cleanup_status" -eq 0 ]; then cleanup=controller-powered-off; else cleanup=failed; fi
 	write_state "failed:start:$boot_id"
-	persist 'stage=start result=failed cleanup=controller-powered-off'
+	persist "stage=start result=failed cleanup=$cleanup"
 	exit "$status"
 }
 
@@ -386,9 +621,11 @@ cleanup_failed_scan() {
 	status=$?
 	trap - 0 HUP INT TERM
 	[ "$status" -ne 0 ] || return 0
-	stop_internal || true
+	scan_cleanup_status=0
+	stop_scan_children || scan_cleanup_status=$?
+	if stop_internal && [ "$scan_cleanup_status" -eq 0 ]; then cleanup=controller-powered-off; else cleanup=failed; fi
 	write_state "failed:scan:$boot_id"
-	persist 'stage=scan result=failed cleanup=controller-powered-off'
+	persist "stage=scan result=failed cleanup=$cleanup"
 	exit "$status"
 }
 
@@ -434,11 +671,16 @@ start_test() {
 		exec </dev/null >>"$transport_log" 2>&1
 		exec btattach -B /dev/ttyHS0 -P qca -S 115200
 	) &
-	printf '%s\n' "$!" >"$pidfile"
+	btattach_pid=$!
+	btattach_start=$(process_start_time "$btattach_pid" 2>/dev/null || true)
+	[ -n "$btattach_start" ] || {
+		kill "$btattach_pid" 2>/dev/null || true
+		fail 'could not capture btattach process identity'
+	}
+	printf '%s %s\n' "$btattach_pid" "$btattach_start" >"$pidfile"
 	count=0
 	while [ "$count" -lt 100 ] && [ ! -e /sys/class/bluetooth/hci0 ]; do
-		pid=$(cat "$pidfile")
-		kill -0 "$pid" 2>/dev/null || fail 'btattach exited before creating hci0'
+		same_process "$btattach_pid" "$btattach_start" || fail 'btattach exited before creating hci0'
 		sleep 0.1
 		count=$((count + 1))
 	done
@@ -451,7 +693,7 @@ start_test() {
 	mgmt_has_unconfigured_hci0 || fail 'hci0 did not reach unconfigured MGMT index state'
 	public_address=$(nvm_public_address "$nvm") || fail 'could not parse public address from exact NVM tag 2'
 	persist 'stage=start action=configure-public-address source=exact-nvm-tag-2 identity=not-logged'
-	timeout 5 btmgmt --index 0 public-addr "$public_address" >/dev/null 2>&1 ||
+	timeout -k 1 5 btmgmt --index 0 public-addr "$public_address" >/dev/null 2>&1 ||
 		fail 'Bluetooth management API rejected NVM public address'
 	deadline=$(( $(awk '{print int($1)}' /proc/uptime) + 15 ))
 	while [ "$(awk '{print int($1)}' /proc/uptime)" -lt "$deadline" ]; do
@@ -479,18 +721,18 @@ start_test() {
 	# monotonic uptime for up to 20 seconds, while bounding every D-Bus query.
 	deadline=$(( $(awk '{print int($1)}' /proc/uptime) + 20 ))
 	while [ "$(awk '{print int($1)}' /proc/uptime)" -lt "$deadline" ]; do
-		timeout 3 bluetoothctl list 2>/dev/null | grep -Fq 'Controller ' && break
+		timeout -k 1 3 bluetoothctl list 2>/dev/null | grep -Fq 'Controller ' && break
 		sleep 0.2
 	done
-	timeout 3 bluetoothctl list 2>/dev/null | grep -Fq 'Controller ' || fail 'BlueZ did not publish hci0'
+	timeout -k 1 3 bluetoothctl list 2>/dev/null | grep -Fq 'Controller ' || fail 'BlueZ did not publish hci0'
 	power_attempt=0
 	while [ "$power_attempt" -lt 15 ]; do
-		if timeout 5 bluetoothctl power on >/dev/null 2>&1; then break; fi
+		if timeout -k 1 5 bluetoothctl power on >/dev/null 2>&1; then break; fi
 		power_attempt=$((power_attempt + 1))
 		sleep 1
 	done
 	[ "$power_attempt" -lt 15 ] || fail 'BlueZ could not power the controller within 15 seconds'
-	timeout 3 bluetoothctl show | grep -Fq 'Powered: yes' || fail 'BlueZ did not reach powered state'
+	timeout -k 1 3 bluetoothctl show | grep -Fq 'Powered: yes' || fail 'BlueZ did not reach powered state'
 	require_temperature
 	printf '%s\n' ready >/run/myron-bluetooth-ready
 	write_state "started:$boot_id"
@@ -509,23 +751,15 @@ scan_test() {
 	trap 'exit 130' HUP INT TERM
 	[ -e /sys/class/bluetooth/hci0 ] && [ -s /run/myron-bluetooth-ready ] || fail 'Bluetooth ready marker or hci0 is missing'
 	require_temperature
-	known_address=$(timeout 3 bluetoothctl devices 2>/dev/null |
-		strip_terminal_controls |
-		awk -v peer="$expected_peer" '
-			BEGIN { peer = tolower(peer) }
-			$1 == "Device" {
-				line = tolower($0)
-				if (index(line, peer)) { print $2; exit }
-			}' || true)
-	case "$known_address" in
-		'') ;;
-		[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]) ;;
-		*) fail 'cached expected-peer address is malformed' ;;
-	esac
+	scan_before_file=$runtime_dir/scan.before.$$
+	scan_filter_file=$runtime_dir/scan.filter.$$
+	bluez_device_paths "$scan_filter_file" >"$scan_before_file" ||
+		fail 'could not snapshot BlueZ device objects before scan'
+	chmod 0600 "$scan_before_file"
 	: >"$scan_raw"
 	chmod 0600 "$scan_raw"
 	status=0
-	timeout 15 bluetoothctl --timeout 8 scan on >"$scan_raw" 2>&1 || status=$?
+	run_bounded_scan "$scan_raw" || status=$?
 	[ "$status" -eq 0 ] || fail "bounded Bluetooth scan failed with status $status"
 	deadline=$(( $(awk '{print int($1)}' /proc/uptime) + 5 ))
 	discovering=
@@ -535,22 +769,25 @@ scan_test() {
 		sleep 0.2
 	done
 	[ "$discovering" = no ] || fail 'Bluetooth discovery did not stop after scanner exit'
-	count=$(fresh_event_count "$expected_peer" "$known_address" "$scan_raw")
-	[ "$count" -gt 0 ] || fail 'scan produced no fresh event from the expected peer'
-	known_address=
+	scan_after_file=$runtime_dir/scan.after.$$
+	scan_new_file=$runtime_dir/scan.new.$$
+	count=$(fresh_bluez_peer_count "$expected_peer" "$scan_before_file" \
+		"$scan_after_file" "$scan_new_file" "$scan_filter_file") ||
+		fail 'could not inspect fresh BlueZ device objects'
+	[ "$count" -gt 0 ] || fail 'scan produced no fresh structured D-Bus peer object'
 	expected_peer=
 	rm -f "$scan_raw"
 	require_temperature
 	stop_internal || fail 'Bluetooth cleanup failed after scan'
 	write_state "qualified:$boot_id"
-	persist "stage=scan result=complete discovery_events=$count identities=not-persisted cleanup=powered-off"
+	persist "stage=scan result=complete discovery_objects=$count identities=not-persisted cleanup=powered-off"
 	tmp=$disarm.new.$$
-	printf 'bluetooth_qualified_boot=%s\ndiscovery_events=%s\n' "$boot_id" "$count" >"$tmp"
+	printf 'bluetooth_qualified_boot=%s\ndiscovery_objects=%s\n' "$boot_id" "$count" >"$tmp"
 	chmod 0600 "$tmp"
 	mv -f "$tmp" "$disarm"
 	sync
 	trap - 0 HUP INT TERM
-	printf 'stage=scan result=complete discovery_events=%s identities=not-persisted cleanup=powered-off rollback=disarmed\n' "$count"
+	printf 'stage=scan result=complete discovery_objects=%s identities=not-persisted cleanup=powered-off rollback=disarmed\n' "$count"
 }
 
 stop_test() {
