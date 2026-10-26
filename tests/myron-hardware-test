@@ -31,6 +31,7 @@ tests/myron-cellular-stage || fail 'cellular stage checks failed'
 tests/myron-cellular-start || fail 'cellular start checks failed'
 tests/myron-ipa-guard || fail 'IPA guard checks failed'
 tests/myron-wifi-import || fail 'Wi-Fi profile import checks failed'
+tests/myron-watchdog || fail 'rollback watchdog checks failed'
 tests/myron-modemmanager-admission || fail 'ModemManager admission checks failed'
 for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
   sh -n "$fragment" || fail "$fragment parses"
@@ -945,8 +946,13 @@ grep -Fq '"$root/usr/local/sbin/myron-speaker-dsp-stage"' "$compose" ||
   fail 'composer does not explicitly install speaker DSP staging as executable'
 pass 'overlay has no partition writer; composer is output-exclusive and modem-safe'
 
-grep -Fq 'target=/dev/block/by-name/init_boot_a' "$initramfs/watchdog.sh" ||
+grep -Fq 'target=$node_dir/init_boot_a.blk' "$initramfs/watchdog.sh" ||
   fail 'watchdog target is not slot-A init_boot'
+grep -Fq 'boot_target=$node_dir/boot_a.blk' "$initramfs/watchdog.sh" ||
+  fail 'watchdog boot target is not slot-A boot'
+if grep -Fq '/dev/block/by-name' <(grep -v '^[[:space:]]*#' "$initramfs/watchdog.sh"); then
+  fail 'watchdog trusts a by-name alias node'
+fi
 grep -Fq 'find_partition init_boot_a && target=$found_device' "$initramfs/fail-boot.sh" ||
   fail 'early rollback does not resolve init_boot_a from sysfs'
 grep -Fq 'readonly systemd_release_sha=535d8e2fe0db2b35dc003e329fafc2b76dd82705df70cef63dc74accf653ec24' \
@@ -971,8 +977,10 @@ for required in hardware-test-init-boot.sha256 myron-init_boot_a-rollback-202610
   'rm -f "$state/hardware-test.armed"'; do
   grep -RFq "$required" "$initramfs" || fail "rollback contract lacks $required"
 done
-grep -Fq 'make_unique_partition_node init_boot_a "$target" init-boot' "$initramfs/watchdog.sh" ||
-  fail 'watchdog init_boot_a fallback is not uniqueness-checked'
-grep -Fq 'make_unique_partition_node boot_a "$boot_target" boot' "$initramfs/watchdog.sh" ||
-  fail 'watchdog boot_a fallback is not uniqueness-checked'
+grep -Fq 'check_target init_boot_a "$target" init-boot' "$initramfs/watchdog.sh" ||
+  fail 'watchdog init_boot_a node is not uniqueness-checked'
+grep -Fq 'check_target boot_a "$boot_target" boot' "$initramfs/watchdog.sh" ||
+  fail 'watchdog boot_a node is not uniqueness-checked'
+grep -Fq 'node-count-$partition_matches' "$initramfs/watchdog.sh" ||
+  fail 'watchdog does not require exactly one sysfs match'
 pass 'watchdog hash-guards slot-A boot/init_boot, never touches slot B and never formats storage'

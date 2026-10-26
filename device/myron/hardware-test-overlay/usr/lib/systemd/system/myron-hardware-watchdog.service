@@ -5,11 +5,18 @@ DefaultDependencies=no
 Before=sysinit.target
 ConditionPathExists=/run/myron-watchdog/watchdog
 ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+# Bounds retries of a failing preflight (each failure logs one fixed reason).
+StartLimitIntervalSec=120
+StartLimitBurst=3
 
 [Service]
 Type=simple
+# Refuse to arm unless every rollback precondition holds.  Preflight exits 78
+# with a fixed reason in the log.  The start limit above bounds any retry.
+ExecStartPre=/run/myron-watchdog/busybox sh /run/myron-watchdog/watchdog --preflight
 ExecStart=/run/myron-watchdog/busybox sh /run/myron-watchdog/watchdog
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=5s
 StandardOutput=append:/run/myron-host/var/log/myron-omarchy-watchdog.log
 StandardError=inherit

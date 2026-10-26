@@ -1,0 +1,484 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# shellcheck disable=SC2016,SC2012
+# Run the real rollback watchdog as a /bin/sh process against a fake sysfs, fake
+# state directory, fake partition files and a mocked BusyBox. The mock records
+# every call and implements only what the watchdog uses. Nothing here touches a
+# block device, a phone, a network, or the real bootloader.
+#
+# Seams: the production script keeps its paths and sizes as top-level
+# assignments. This test copies it, rewrites those assignments and the build
+# placeholders (tools/myron-build-test-init-boot does the same substitution),
+# and runs the copy. The shipped script has no environment or flag bypass.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+src=device/myron/hardware-test-initramfs/watchdog.sh
+unit=device/myron/hardware-test-overlay/usr/lib/systemd/system/myron-hardware-watchdog.service
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+# shellcheck source=/dev/null
+source tests/lib/myron-sh-harness.sh
+
+[[ -f $src ]] || fail 'watchdog exists'
+sh -n "$src" || fail 'watchdog parses as POSIX sh'
+bash -n "$src" || fail 'watchdog parses as bash'
+shellcheck_bin=$(command -v shellcheck || true)
+if [[ -z $shellcheck_bin ]] || ! "$shellcheck_bin" --version >/dev/null 2>&1; then
+  shellcheck_bin=$(ls /home/menno/.local/share/mise/installs/shellcheck/*/shellcheck-*/shellcheck 2>/dev/null | tail -n1 || true)
+fi
+if [[ -n $shellcheck_bin ]]; then
+  "$shellcheck_bin" -s sh "$src" || fail 'shellcheck watchdog'
+  "$shellcheck_bin" -s bash -e SC2154 "$0" || fail 'shellcheck watchdog test'
+fi
+if grep -nE '\[\[[^:]|<<<|(^|[[:space:]])local[[:space:]]|\bfunction\b|\bdeclare\b|&>|<\(' "$src"; then
+  fail 'watchdog uses shell syntax outside POSIX sh'
+fi
+code=$(grep -vE '^[[:space:]]*#' "$src")
+if grep -nE 'blockdev[^#]*setrw|--setrw|\bmkfs|\bwipefs|\bsgdisk|\bparted|/dev/block/by-name|\$\{?(WATCHDOG|MYRON)' <<<"$code"; then
+  fail 'watchdog has a forbidden storage action, alias node or environment seam'
+fi
+if grep -nE '(^|[^a-z_])(init_)?boot_b([^a-z]|$)|vendor_boot|recovery_b' <<<"$code"; then
+  fail 'watchdog names a slot-B or other partition'
+fi
+grep -Fq -- '--preflight' "$src" || fail 'watchdog has no preflight mode'
+grep -Fq 'ExecStartPre=/run/myron-watchdog/busybox sh /run/myron-watchdog/watchdog --preflight' "$unit" ||
+  fail 'unit does not run preflight before arming'
+grep -Fq 'ExecStart=/run/myron-watchdog/busybox sh /run/myron-watchdog/watchdog' "$unit" ||
+  fail 'unit does not start the watchdog'
+pass 'watchdog syntax, no setrw/alias/slot-B, unit runs preflight first'
+
+work=$(mktemp -d /tmp/myron-watchdog.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+fix=$work/fix
+bin=$work/bin
+script=$work/watchdog
+mkdir -p "$bin"
+init_size=4096
+boot_size=8192
+sentinel=99 # the mocked "sleep 60" the script parks in after a reboot request
+
+# Mocked BusyBox: records every call, answers only the applets and options the
+# watchdog uses, and fails loudly on anything else. Partition nodes are
+# symlinks to image files named MAJOR:MINOR, so mknod/stat/test stay mocked.
+cat >"$bin/busybox" <<'MOCK'
+#!/bin/sh
+fix=@FIX@
+cmd=$1
+shift
+printf '%s %s\n' "$cmd" "$*" >>"$fix/calls"
+rdev() { t=$(readlink "$1") || return 1; b=${t##*/}; printf '%s %s\n' "${b%%:*}" "${b##*:}"; }
+case $cmd in
+test)
+	[ "$1" = -b ] && [ -L "$2" ] ;;
+mknod)
+	[ ! -e "$fix/fail-mknod" ] || exit 1
+	[ "$2" = b ] || exit 2
+	ln -s "$fix/parts/$3:$4" "$1" ;;
+rm)
+	exec rm "$@" ;;
+stat)
+	if [ "$1 $2" = '-c %t:%T' ]; then
+		set -- $(rdev "$3") || exit 1
+		printf '%x:%x\n' "$1" "$2"
+	else
+		exec stat "$@"
+	fi ;;
+blockdev)
+	node=$2
+	key=$(rdev "$node" | tr ' ' :) || exit 1
+	case $1 in
+	--getsize64)
+		if [ -f "$fix/size/$key" ]; then cat "$fix/size/$key"; else wc -c <"$node" | tr -d ' '; fi ;;
+	--getro)
+		[ ! -e "$fix/fail-getro" ] || exit 1
+		if [ -f "$fix/ro/$key" ]; then cat "$fix/ro/$key"; else echo 0; fi ;;
+	*) exit 97 ;;
+	esac ;;
+dd)
+	of=
+	for a in "$@"; do case $a in of=*) of=${a#of=} ;; esac; done
+	key=$(rdev "$of" | tr ' ' :) || exit 1
+	[ ! -e "$fix/fail-dd/$key" ] || exit 1
+	dd "$@" 2>/dev/null || exit 1
+	[ ! -e "$fix/corrupt-dd/$key" ] || printf Z | dd of="$of" bs=1 count=1 conv=notrunc 2>/dev/null ;;
+sync)
+	n=$(cat "$fix/sync-count" 2>/dev/null || echo 0)
+	n=$((n + 1))
+	echo "$n" >"$fix/sync-count"
+	cp "$fix/out" "$fix/out-at-sync"
+	[ ! -f "$fix/hook-sync-$n" ] || sh "$fix/hook-sync-$n" "$fix" ;;
+sleep)
+	if [ -f "$fix/hook-sleep" ]; then sh "$fix/hook-sleep" "$fix"; mv "$fix/hook-sleep" "$fix/hook-sleep.done"; fi
+	[ "$1" != 60 ] || exit 99 ;;
+reboot)
+	: ;;
+grep | sed | cat | awk | sha256sum | printf | chmod | mv | date)
+	exec "$cmd" "$@" ;;
+*)
+	printf 'mock busybox: unexpected applet %s\n' "$cmd" >&2
+	exit 98 ;;
+esac
+MOCK
+cat >"$bin/reboot-to-bootloader" <<'MOCK'
+#!/bin/sh
+fix=@FIX@
+printf 'reboot-to-bootloader\n' >>"$fix/calls"
+MOCK
+sed -i "s|@FIX@|$fix|" "$bin/busybox" "$bin/reboot-to-bootloader"
+chmod +x "$bin/busybox" "$bin/reboot-to-bootloader"
+
+fill() { head -c "$2" /dev/zero | tr '\0' "$1" >"$3"; }
+sha() { sha256sum "$1" | awk '{print $1}'; }
+part() { # sysname partname major minor
+  mkdir -p "$fix/sys/$1"
+  printf 'MAJOR=%s\nMINOR=%s\nPARTNAME=%s\nDEVNAME=%s\n' "$3" "$4" "$2" "$1" >"$fix/sys/$1/uevent"
+}
+
+# setup [boot]: fresh fixture. boot=1 enables the optional boot_a rollback and
+# leaves boot_a holding the candidate image.
+setup() {
+  boot_enabled=${1:-0}
+  rm -rf "$fix"
+  mkdir -p "$fix"/{parts,ro,size,fail-dd,corrupt-dd,sys,state,host,nodes}
+  part sda5 init_boot_a 259 5
+  part sda6 init_boot_b 259 6
+  part sda7 boot_a 259 7
+  part sda8 boot_b 259 8
+  part sda9 init_boot_a_extra 259 9
+  fill C "$init_size" "$fix/parts/259:5"
+  fill B "$init_size" "$fix/parts/259:6"
+  fill D "$boot_size" "$fix/parts/259:7"
+  fill E "$boot_size" "$fix/parts/259:8"
+  fill X "$init_size" "$fix/parts/259:9"
+  fill R "$init_size" "$fix/host/init-rollback"
+  fill P "$boot_size" "$fix/host/boot-rollback"
+  sha "$fix/parts/259:5" >"$fix/state/hardware-test-init-boot.sha256"
+  : >"$fix/state/hardware-test.armed"
+  echo '123.45 100.00' >"$fix/uptime"
+  : >"$fix/out" "$fix/calls"
+  slot_b_sha=$(sha "$fix/parts/259:6")
+  slot_b_boot_sha=$(sha "$fix/parts/259:8")
+  init_cand=$(sha "$fix/parts/259:5")
+  init_roll=$(sha "$fix/host/init-rollback")
+  boot_cand=$(sha "$fix/parts/259:7")
+  boot_roll=$(sha "$fix/host/boot-rollback")
+  sh_patch "$src" "$script" \
+    bb="$bin/busybox" reboot_bootloader="$bin/reboot-to-bootloader" node_dir="$fix/nodes" \
+    sysfs_block="$fix/sys" proc_uptime="$fix/uptime" host_log="$fix/out" state="$fix/state" \
+    rollback="$fix/host/init-rollback" boot_rollback="$fix/host/boot-rollback" \
+    init_size="$init_size" boot_size="$boot_size"
+  if [[ $boot_enabled == 1 ]]; then
+    sed -i -e "s/@CANDIDATE_BOOT_SHA256@/$boot_cand/" -e "s/@ROLLBACK_BOOT_SHA256@/$boot_roll/" "$script"
+  else
+    sed -i -e 's/@CANDIDATE_BOOT_SHA256@//' -e 's/@ROLLBACK_BOOT_SHA256@//' "$script"
+  fi
+  sed -i -e "s/@BOOT_ROLLBACK_ENABLED@/$boot_enabled/" -e "s/@ROLLBACK_SHA256@/$init_roll/" \
+    -e 's/@WATCHDOG_SECONDS@/7/' "$script"
+  chmod +x "$script"
+}
+
+snapshot() { (cd "$fix" && sha256sum parts/* host/* state/*) 2>/dev/null; }
+run() {
+  : >"$fix/calls"
+  before=$(snapshot)
+  rc=0
+  sh "$script" "$@" >>"$fix/out" 2>&1 || rc=$?
+  if grep -Eq 'setrw|^unexpected' "$fix/calls"; then fail "watchdog tried to make storage writable: $(cat "$fix/calls")"; fi
+  if grep -q 'unexpected applet' "$fix/out"; then fail "watchdog called an unmocked applet: $(cat "$fix/out")"; fi
+  after=$(snapshot)
+}
+out() { cat "$fix/out"; }
+calls() { cat "$fix/calls"; }
+out_has() { grep -Fq -- "$1" "$fix/out" || fail "$2: log lacks '$1': $(out)"; }
+out_lacks() { if grep -Fq -- "$1" "$fix/out"; then fail "$2: log has '$1': $(out)"; fi; }
+call_has() { grep -Eq -- "$1" "$fix/calls" || fail "$2: no call matching '$1': $(calls)"; }
+call_lacks() { if grep -Eq -- "$1" "$fix/calls"; then fail "$2: unexpected call '$1': $(calls)"; fi; }
+expect_rc() { [[ $rc == "$1" ]] || fail "$2: exit $rc, wanted $1: $(out)"; }
+unchanged() { [[ $before == "$after" ]] || fail "$1: partition or state files changed"; }
+slot_b_untouched() {
+  [[ $(sha "$fix/parts/259:6") == "$slot_b_sha" ]] || fail "$1: slot-B init_boot changed"
+  [[ $(sha "$fix/parts/259:8") == "$slot_b_boot_sha" ]] || fail "$1: slot-B boot changed"
+  call_lacks 'mknod .* b 259 (6|8)$' "$1"
+  call_lacks 'nodes/(init_boot_b|boot_b)' "$1"
+  call_lacks 'nodes/.*_extra' "$1"
+}
+last_sync_has() { grep -Fq -- "$1" "$fix/out-at-sync" || fail "$2: last sync did not already hold '$1'"; }
+line_of() { grep -nE -m1 -- "$1" "$fix/calls" | cut -d: -f1; }
+last_line_of() { grep -nE -- "$1" "$fix/calls" | tail -n1 | cut -d: -f1; }
+no_writes() {
+  call_lacks '^(dd|mv|chmod|reboot|reboot-to-bootloader)( |$)' "$1"
+}
+bootloader_with() { # reason label
+  expect_rc "$sentinel" "$2"
+  out_has "result=bootloader reason=$1" "$2"
+  last_sync_has "result=bootloader reason=$1" "$2"
+  call_has '^reboot-to-bootloader$' "$2"
+  [[ $(last_line_of '^sync ') -lt $(line_of '^reboot-to-bootloader$') ]] ||
+    fail "$2: sync did not precede reboot-to-bootloader"
+  call_lacks '^reboot -f' "$2"
+  slot_b_untouched "$2"
+}
+preflight_fails() { # reason label
+  run --preflight
+  expect_rc 78 "$2"
+  out_has "result=preflight-failed reason=$1" "$2"
+  out_lacks 'state=armed' "$2"
+  no_writes "$2"
+  call_has '^sync ' "$2"
+  last_sync_has "reason=$1" "$2"
+  unchanged "$2"
+}
+
+# --- preflight --------------------------------------------------------------
+setup
+run --preflight
+expect_rc 0 'preflight ok'
+out_has 'result=preflight-ok' 'preflight ok'
+out_has 'event=start mode=preflight ts=' 'preflight ok'
+out_has 'event=preflight-ok mode=preflight ts=' 'preflight ok'
+out_has 'uptime=123.45' 'preflight ok'
+out_lacks 'state=armed' 'preflight ok'
+no_writes 'preflight ok'
+call_has '^blockdev --getro .*init_boot_a.blk$' 'preflight ok'
+call_has '^blockdev --getsize64 .*init_boot_a.blk$' 'preflight ok'
+call_lacks '/boot_a.blk' 'preflight ok (boot disabled)'
+call_lacks '^sleep' 'preflight ok'
+[[ $(readlink "$fix/nodes/init_boot_a.blk") == "$fix/parts/259:5" ]] || fail 'preflight node is not the unique sysfs partition'
+unchanged 'preflight ok'
+slot_b_untouched 'preflight ok'
+pass 'preflight success: nodes from unique sysfs PARTNAME, RO/size/hash checked, no write, no reboot'
+
+setup 1
+run --preflight
+expect_rc 0 'preflight ok with boot rollback'
+call_has '^blockdev --getro .*/boot_a.blk$' 'preflight ok with boot rollback'
+no_writes 'preflight ok with boot rollback'
+unchanged 'preflight ok with boot rollback'
+slot_b_untouched 'preflight ok with boot rollback'
+cp "$fix/host/boot-rollback" "$fix/parts/259:7" # already rolled back
+run --preflight
+expect_rc 0 'preflight ok with boot already restored'
+pass 'preflight accepts the optional boot_a rollback in the candidate or restored state'
+
+setup
+ln -s "$fix/parts/259:6" "$fix/nodes/init_boot_a.blk" # a stale node aimed at slot B
+run --preflight
+expect_rc 0 'stale node replaced'
+[[ $(readlink "$fix/nodes/init_boot_a.blk") == "$fix/parts/259:5" ]] || fail 'stale rdev node was trusted'
+call_has '^rm -f .*init_boot_a.blk$' 'stale node replaced'
+call_has '^mknod .*init_boot_a.blk b 259 5$' 'stale node replaced'
+run --preflight # second run keeps the correct node without rebuilding it
+expect_rc 0 'node reused'
+call_lacks '^(rm|mknod) ' 'node reused'
+pass 'existing node is trusted only when its rdev matches sysfs'
+
+setup
+rm -r "$fix/sys/sda5"
+preflight_fails init-boot-node-count-0 'missing init_boot_a'
+setup
+part sdb1 init_boot_a 259 11
+preflight_fails init-boot-node-count-2 'duplicate init_boot_a'
+setup
+printf 'MAJOR=abc\nMINOR=5\nPARTNAME=init_boot_a\n' >"$fix/sys/sda5/uevent"
+preflight_fails init-boot-node-numbers-invalid 'bad sysfs numbers'
+setup
+touch "$fix/fail-mknod"
+preflight_fails init-boot-node-create-failed 'mknod fails'
+setup
+printf 'xyz\n' >"$fix/state/hardware-test-init-boot.sha256"
+preflight_fails expected-hash-invalid 'bad expected hash'
+setup
+printf 'abcdef\n' >"$fix/state/hardware-test-init-boot.sha256"
+preflight_fails expected-hash-length 'short expected hash'
+setup
+echo 4097 >"$fix/size/259:5"
+preflight_fails init-boot-size-mismatch 'bad size'
+setup
+echo 1 >"$fix/ro/259:5"
+preflight_fails init-boot-read-only 'read-only init_boot_a'
+setup
+touch "$fix/fail-getro"
+preflight_fails init-boot-getro-failed 'getro fails'
+setup
+printf 'Z' | dd of="$fix/parts/259:5" bs=1 count=1 conv=notrunc 2>/dev/null
+preflight_fails init-boot-current-hash-mismatch 'unexpected current init_boot_a'
+setup
+rm "$fix/host/init-rollback"
+preflight_fails rollback-size-mismatch 'missing rollback'
+setup
+fill Q "$init_size" "$fix/host/init-rollback"
+preflight_fails rollback-hash-mismatch 'wrong rollback'
+setup
+rm "$fix/state/hardware-test.armed"
+preflight_fails armed-marker-missing 'not armed'
+setup 1
+rm -r "$fix/sys/sda7"
+preflight_fails boot-node-count-0 'missing boot_a'
+setup 1
+echo 1 >"$fix/ro/259:7"
+preflight_fails boot-read-only 'read-only boot_a'
+setup 1
+echo 8193 >"$fix/size/259:7"
+preflight_fails boot-size-mismatch 'bad boot size'
+setup 1
+fill U "$boot_size" "$fix/parts/259:7"
+preflight_fails boot-current-hash-mismatch 'unknown boot_a'
+setup 1
+fill Q "$boot_size" "$fix/host/boot-rollback"
+preflight_fails boot-rollback-hash-mismatch 'wrong boot rollback'
+setup 1
+rm "$fix/host/boot-rollback"
+preflight_fails boot-rollback-size-mismatch 'missing boot rollback'
+setup
+run --bogus
+expect_rc 64 'unknown argument'
+out_has 'result=usage' 'unknown argument'
+no_writes 'unknown argument'
+pass 'preflight refuses missing/duplicate/invalid targets, bad metadata, bad hashes, bad sizes and read-only storage with fixed reasons and no writes'
+
+setup
+head -c 300000 /dev/zero | tr '\0' x >"$fix/out"
+echo >>"$fix/out"
+run --preflight
+expect_rc 0 'log cap'
+out_lacks 'event=' 'log cap'
+out_has 'result=preflight-ok' 'log cap'
+pass 'stage events stop at the log cap; result lines still land'
+
+# --- armed run: timeout restore ---------------------------------------------
+setup
+run
+expect_rc "$sentinel" 'timeout restore'
+out_has 'state=armed timeout=7' 'timeout restore'
+out_has 'state=restoring reason=qualification-timeout' 'timeout restore'
+out_has 'result=restored reboot=normal' 'timeout restore'
+for ev in start armed deadline restoring init-boot-restored; do out_has "event=$ev mode=run ts=" 'timeout restore'; done
+[[ $(sha "$fix/parts/259:5") == "$init_roll" ]] || fail 'init_boot_a was not restored'
+[[ -f $fix/state/hardware-test.rollback-complete ]] || fail 'rollback-complete marker missing'
+grep -Fxq 'result=restored' "$fix/state/hardware-test.rollback-complete" || fail 'rollback-complete marker content'
+[[ ! -e $fix/state/hardware-test.armed ]] || fail 'armed marker survived the restore'
+call_has '^dd if=.*init-rollback of=.*init_boot_a.blk bs=1048576 conv=fsync$' 'timeout restore'
+call_lacks '^reboot-to-bootloader' 'timeout restore'
+call_has '^reboot -f$' 'timeout restore'
+call_lacks '/boot_a.blk' 'timeout restore (boot disabled)'
+[[ $(grep -c '^dd ' "$fix/calls") == 1 ]] || fail 'restore wrote more than init_boot_a'
+[[ $(sha "$fix/parts/259:7") == "$boot_cand" ]] || fail 'boot_a changed while boot rollback is disabled'
+slot_b_untouched 'timeout restore'
+pass 'timeout restore writes init_boot_a only, verifies readback, records stages and reboots normally'
+
+setup 1
+run
+expect_rc "$sentinel" 'timeout restore with boot'
+[[ $(sha "$fix/parts/259:7") == "$boot_roll" ]] || fail 'boot_a was not restored'
+[[ $(sha "$fix/parts/259:5") == "$init_roll" ]] || fail 'init_boot_a was not restored with boot'
+[[ $(line_of '^dd .*boot-rollback') -lt $(line_of '^dd .*init-rollback') ]] || fail 'boot_a not restored before init_boot_a'
+out_has 'event=boot-restored' 'timeout restore with boot'
+slot_b_untouched 'timeout restore with boot'
+setup 1
+cp "$fix/host/boot-rollback" "$fix/parts/259:7"
+run
+expect_rc "$sentinel" 'boot already restored'
+call_lacks '^dd .*boot-rollback' 'boot already restored'
+call_has '^dd .*init-rollback' 'boot already restored'
+pass 'optional boot_a rollback is written only when enabled and the candidate is present'
+
+# --- disarm ------------------------------------------------------------------
+setup 1
+echo ': >"$1/state/hardware-test.disarm"' >"$fix/hook-sleep"
+run
+expect_rc 0 'disarm'
+out_has 'result=disarmed' 'disarm'
+no_writes 'disarm'
+call_lacks '^(dd|reboot)' 'disarm'
+[[ $(sha "$fix/parts/259:5") == "$init_cand" ]] || fail 'disarm changed init_boot_a'
+[[ $(sha "$fix/parts/259:7") == "$boot_cand" ]] || fail 'disarm changed boot_a'
+[[ ! -e $fix/state/hardware-test.rollback-complete ]] || fail 'disarm wrote a rollback marker'
+pass 'disarm exits without a partition write or reboot'
+
+# --- armed run: failures fall back durably -----------------------------------
+setup
+rm -r "$fix/sys/sda5"
+run
+bootloader_with init-boot-node-count-0 'run without node'
+out_lacks 'state=armed' 'run without node'
+call_lacks '^dd ' 'run without node'
+setup
+echo 1 >"$fix/ro/259:5"
+run
+bootloader_with init-boot-read-only 'run with read-only target'
+call_lacks '^dd ' 'run with read-only target'
+setup
+touch "$fix/fail-dd/259:5"
+run
+bootloader_with rollback-write-failed 'init write failure'
+out_lacks 'result=restored' 'init write failure'
+[[ ! -e $fix/state/hardware-test.rollback-complete ]] || fail 'failed write left a rollback marker'
+setup
+touch "$fix/corrupt-dd/259:5"
+run
+bootloader_with rollback-readback-mismatch 'init readback failure'
+setup 1
+touch "$fix/fail-dd/259:7"
+run
+bootloader_with boot-rollback-write-failed 'boot write failure'
+call_lacks '^dd .*init-rollback' 'boot write failure'
+[[ $(sha "$fix/parts/259:5") == "$init_cand" ]] || fail 'init_boot_a written after boot failure'
+setup 1
+touch "$fix/corrupt-dd/259:7"
+run
+bootloader_with boot-rollback-readback-mismatch 'boot readback failure'
+call_lacks '^dd .*init-rollback' 'boot readback failure'
+pass 'failed write or readback exits to the bootloader with a durable reason, synced first'
+
+# Conditions that change while the watchdog sleeps are caught by the deadline re-check.
+setup
+echo 'printf Z | dd of="$1/parts/259:5" bs=1 count=1 conv=notrunc 2>/dev/null' >"$fix/hook-sleep"
+run
+bootloader_with init-boot-current-hash-mismatch 'target changed while armed'
+call_lacks '^dd ' 'target changed while armed'
+setup
+echo 'echo 1 >"$1/ro/259:5"' >"$fix/hook-sleep"
+run
+bootloader_with init-boot-read-only 'target went read-only while armed'
+call_lacks '^dd ' 'target went read-only while armed'
+setup
+echo 'rm "$1/state/hardware-test.armed"' >"$fix/hook-sleep"
+run
+bootloader_with armed-marker-missing 'marker removed'
+setup
+echo 'printf Z | dd of="$1/host/init-rollback" bs=1 count=1 conv=notrunc 2>/dev/null' >"$fix/hook-sleep"
+run
+bootloader_with rollback-hash-mismatch 'rollback changed while armed'
+call_lacks '^dd ' 'rollback changed while armed'
+setup
+echo 'rm -r "$1/sys/sda5"' >"$fix/hook-sleep"
+run
+bootloader_with init-boot-node-count-0 'partition vanished'
+setup
+echo 'rm -f "$1/nodes/init_boot_a.blk"; ln -s "$1/parts/259:6" "$1/nodes/init_boot_a.blk"' >"$fix/hook-sleep"
+run
+expect_rc "$sentinel" 'node swapped to slot B'
+[[ $(sha "$fix/parts/259:5") == "$init_roll" ]] || fail 'restore missed init_boot_a after a node swap'
+slot_b_untouched 'node swapped to slot B'
+pass 'deadline re-check catches changed hash, RO, marker, rollback image and node; a swapped node is rebuilt from sysfs'
+
+# The re-check right before each write: run once the restoring stage has synced.
+setup
+echo 'echo 1 >"$1/ro/259:5"' >"$fix/hook-sync-2"
+run
+bootloader_with init-boot-read-only 'read-only just before the init_boot write'
+call_lacks '^dd ' 'read-only just before the init_boot write'
+setup
+echo 'printf Z | dd of="$1/parts/259:5" bs=1 count=1 conv=notrunc 2>/dev/null' >"$fix/hook-sync-2"
+run
+bootloader_with init-boot-pre-write-hash-mismatch 'hash changed just before the init_boot write'
+call_lacks '^dd ' 'hash changed just before the init_boot write'
+setup 1
+echo 'echo 1 >"$1/ro/259:7"' >"$fix/hook-sync-2"
+run
+bootloader_with boot-read-only 'read-only just before the boot write'
+call_lacks '^dd ' 'read-only just before the boot write'
+pass 'each write is re-checked (node, RO, size, hash) immediately before dd'
+
+echo 'all myron-watchdog checks passed'
