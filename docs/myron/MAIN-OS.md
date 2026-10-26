@@ -198,7 +198,11 @@ It prints the old and planned SHA-256 of the 256 KiB (first and last 32 blocks)
 so the plan can be reviewed before anything is written.
 
 `--apply` needs all of `--baseline-capture`, `--expected-sha256` and
-`--backup-dir` (a new directory under a root-only tree), and refuses unless:
+`--backup-dir` (a new directory inside the main state directory,
+`/run/myron-host/var/lib/omarchy-mobile/main`, which must be on the read-write
+ext4 mount of the physical `pmos_root` partition: tmpfs, RAM, loop devices and
+other partitions are refused because a reset would lose the backup), and
+refuses unless:
 
 * kernel, notes and device compatible match, the boot is slot A, and
   `/run/myron-main/boot-id` equals the kernel boot id;
@@ -226,8 +230,14 @@ tools/myron-slot-a-success --inspect-capture $cap --repair-stale-backup
 sudo tools/myron-slot-a-success                                    # read-only live check
 sudo tools/myron-slot-a-success --apply --repair-stale-backup \
   --baseline-capture $cap --expected-sha256 <sha256 of $cap> \
-  --backup-dir /root/slot-a-success-backup-1
+  --backup-dir /run/myron-host/var/lib/omarchy-mobile/main/slot-a-success-backup-1
 ```
+
+All device reads and writes use `O_DIRECT` with page-aligned buffers in whole
+4 KiB multiples, so every readback is the media's bytes, never the page cache
+(a kernel or device that refuses `O_DIRECT` makes the tool refuse). Before the
+primary table is touched the backup header must be byte for byte the planned
+4 KiB backup header, not merely any valid header.
 
 Run it once, by hand. It is not an automatic service.
 

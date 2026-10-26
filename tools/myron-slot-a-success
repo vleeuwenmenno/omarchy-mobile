@@ -13,6 +13,7 @@ slot state is separate from the userland proof of a qualified main boot."""
 import argparse
 import fcntl
 import hashlib
+import mmap
 import os
 import stat
 import struct
@@ -44,9 +45,10 @@ EXPECTED_COMPATIBLE = "qcom,canoe-mtp"
 ROOT_UID = 0
 TRUST_TOP = "/"
 LOCK_FILE = "/run/myron-main.lock"
+HOST_MOUNT = "/run/myron-host"
 PATHS = {
     "uname": "/proc/sys/kernel/osrelease", "notes": "/sys/kernel/notes",
-    "compatible": "/proc/device-tree/compatible", "cmdline": "/proc/cmdline",
+    "compatible": "/proc/device-tree/compatible", "cmdline": "/proc/cmdline", "bootconfig": "/proc/bootconfig",
     "boot_id": "/proc/sys/kernel/random/boot_id", "runtime": "/run/myron-main",
     "state": "/run/myron-host/var/lib/omarchy-mobile/main", "mountinfo": "/proc/self/mountinfo",
     "sysfs": "/sys/class/block", "sysdev": "/sys/dev/block", "dev": "/dev",
@@ -202,6 +204,23 @@ def read_text(path):
         return handle.read()
 
 
+def slot_suffixes():
+    """Every androidboot.slot_suffix the kernel reports. This phone passes it through the bootconfig
+    (androidboot.slot_suffix = "_a"), not the command line; fixtures may use either. The caller accepts only
+    when every reported value is exactly _a."""
+    found = [token.split("=", 1)[1] for token in read_text(PATHS["cmdline"]).split()
+             if token.startswith("androidboot.slot_suffix=")]
+    try:
+        bootconfig = read_text(PATHS["bootconfig"])
+    except FileNotFoundError:
+        bootconfig = ""
+    for line in bootconfig.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "androidboot.slot_suffix":
+            found.append(value.strip().rstrip(",").strip('"'))
+    return found
+
+
 def prove_main():
     """Userland proof that this is the qualified main boot (not pmOS, the test boot or a pre-qualified one)."""
     if os.geteuid() != ROOT_UID:
@@ -214,7 +233,7 @@ def prove_main():
     with open(PATHS["compatible"], "rb") as handle:
         if handle.read().split(b"\0")[0].decode() != EXPECTED_COMPATIBLE:
             raise Refuse("device compatible differs")
-    if "androidboot.slot_suffix=_a" not in read_text(PATHS["cmdline"]).split():
+    if set(slot_suffixes()) != {"_a"}:
         raise Refuse("not booted from slot A")
     boot_id = read_text(PATHS["boot_id"]).strip()
     runtime, state = PATHS["runtime"], PATHS["state"]
@@ -263,11 +282,19 @@ def find_disk():
 
 
 class Device:
-    """The opened whole LUN. Reads the edges, writes whole blocks, fsyncs. No ioctl writes."""
+    """The opened whole LUN. O_DIRECT only: every read and write goes to the media through page-aligned
+    anonymous buffers and whole 4 KiB multiples, never through the page cache, so a readback is the device's
+    bytes and not a cached copy of what was just written. A kernel or device that refuses O_DIRECT makes the
+    open fail closed. No ioctl writes."""
 
     def __init__(self, name, majmin, writable):
-        flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
+        direct = getattr(os, "O_DIRECT", 0)
+        if not direct:
+            raise Refuse("O_DIRECT is not available: cannot bypass the page cache")
+        flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW | direct
         self.fd = os.open(f"{PATHS['dev']}/{name}", flags)
+        if not fcntl.fcntl(self.fd, fcntl.F_GETFL) & direct:
+            raise Refuse("the device is not open with O_DIRECT")
         st = os.fstat(self.fd)
         if not stat.S_ISBLK(st.st_mode) or f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}" != majmin:
             raise Refuse("opened device differs from the sysfs disk")
@@ -277,21 +304,40 @@ class Device:
         if sector != BLOCK or size != LUN_BLOCKS * BLOCK or (writable and readonly):
             raise Refuse("device sector size, size or read-only flag differs")
 
+    @staticmethod
+    def _aligned(offset, length):
+        if offset % BLOCK or length <= 0 or length % BLOCK or offset < 0 or offset + length > LUN_BLOCKS * BLOCK:
+            raise Refuse("unaligned or out-of-range device access")
+
     def _read(self, offset, length):
-        data = b""
-        while len(data) < length:
-            chunk = os.pread(self.fd, length - len(data), offset + len(data))
-            if not chunk:
-                raise Refuse("short read")
-            data += chunk
+        self._aligned(offset, length)
+        buffer = mmap.mmap(-1, length)  # anonymous: page aligned, as O_DIRECT needs
+        view = memoryview(buffer)
+        done = 0
+        while done < length:
+            got = os.preadv(self.fd, [view[done:]], offset + done)
+            if got <= 0 or got % BLOCK:
+                raise Refuse("short or unaligned read")
+            done += got
+        data = bytes(view)
+        view.release()
+        buffer.close()
         return data
 
     def read_edges(self):
         return self._read(0, EDGE_BYTES) + self._read((LUN_BLOCKS - EDGE) * BLOCK, EDGE_BYTES)
 
     def write_block(self, lba, data):
-        if os.pwrite(self.fd, data, lba * BLOCK) != len(data):
-            raise Refuse("short write")
+        self._aligned(lba * BLOCK, len(data))
+        buffer = mmap.mmap(-1, len(data))
+        buffer[:] = data
+        view = memoryview(buffer)
+        try:
+            if os.pwritev(self.fd, [view], lba * BLOCK) != len(data):
+                raise Refuse("short write")
+        finally:
+            view.release()
+            buffer.close()
 
     def sync(self):
         os.fsync(self.fd)
@@ -309,18 +355,52 @@ def put(directory, name, data, mode=0o600, append=False):
     fd = os.open(os.path.join(directory, name),
                  os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_EXCL) | os.O_NOFOLLOW, mode)
     try:
-        os.write(fd, data)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise Refuse(f"short write of {name}")
+            view = view[written:]
         os.fsync(fd)
     finally:
         os.close(fd)
     sync_dir(directory)
 
 
+def persistent_backup_dir(directory):
+    """The backup must survive a reset: it has to live in the main state directory, on the real pmOS root
+    partition mounted at /run/myron-host (not a loop device, tmpfs or RAM disk)."""
+    parent = os.path.dirname(os.path.abspath(directory))
+    state = os.path.realpath(PATHS["state"])
+    if os.path.realpath(parent) != parent or os.path.commonpath([parent, state]) != state:
+        raise Refuse("backup directory must be inside the persistent main state directory")
+    dev = os.stat(parent).st_dev
+    majmin = f"{os.major(dev)}:{os.minor(dev)}"
+    mount = None
+    for line in read_text(PATHS["mountinfo"]).splitlines():
+        head, _, tail = line.partition(" - ")
+        fields, tail = head.split(), tail.split()
+        if len(fields) >= 6 and fields[4] == HOST_MOUNT and len(tail) >= 2:
+            mount = (fields, tail)
+    if mount is None:
+        raise Refuse(f"{HOST_MOUNT} is not mounted")
+    fields, tail = mount
+    if fields[3] != "/" or fields[2] != majmin or "rw" not in fields[5].split(",") or tail[0] != "ext4":
+        raise Refuse("the state directory is not on the read-write ext4 pmOS root")
+    sys_dev = f"{PATHS['sysdev']}/{majmin}"
+    uevent = read_text(f"{sys_dev}/uevent").splitlines()
+    if os.path.exists(f"{sys_dev}/loop") or "DEVTYPE=partition" not in uevent or "PARTNAME=pmos_root" not in uevent:
+        raise Refuse("the state directory is not on the physical pmos_root partition")
+
+
 def make_backup(directory, original, plan):
+    persistent_backup_dir(directory)
     trusted_chain(directory)
     if os.path.lexists(directory):
         raise Refuse("backup directory already exists")
     os.mkdir(directory, 0o700)
+    # The new directory entry itself must be durable before anything depends on it.
+    sync_dir(os.path.dirname(os.path.abspath(directory)))
     put(directory, "original-edges.bin", original)
     meta = (f"original_sha256={sha256(original)}\nplanned_sha256={plan['new_sha256']}\n"
             f"sectors={','.join(str(lba) for lba, _ in plan['changes'])}\nstale_backup={plan['stale_backup']}\n")
@@ -346,7 +426,11 @@ def transaction(device, baseline, plan, directory):
             if lba == BACKUP_HEADER:
                 edges = device.read_edges()
                 header = parse_header(read_lba(edges, BACKUP_HEADER))
-                if not header["ok"] or read_lba(edges, BACKUP_ARRAY, ARRAY_BLOCKS) != new_array or \
+                # The complete 4 KiB header must be exactly the planned backup header: a valid primary header
+                # (or any other valid-CRC sector) at the backup location is not a backup.
+                if read_lba(edges, BACKUP_HEADER) != data or not header["ok"] or \
+                        (header["mine"], header["alt"], header["entries_lba"]) != (BACKUP_HEADER, PRIMARY_HEADER, BACKUP_ARRAY) or \
+                        read_lba(edges, BACKUP_ARRAY, ARRAY_BLOCKS) != new_array or \
                         zlib.crc32(new_array) != header["array_crc"]:
                     raise Refuse("backup readback is not the valid new table: primary NOT written")
             put(directory, "phases.log", f"written {number}/4 lba={lba}\n".encode(), append=True)

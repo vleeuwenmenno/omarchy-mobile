@@ -19,7 +19,7 @@ fi
 [[ $(grep -oE 'ioctl\(self\.fd, 0x[0-9A-Fa-f]+' <<<"$code" | sed 's/.*, //' | sort | tr '\n' ' ') == '0x125E 0x1268 0x80081272 ' ]] ||
   fail 'only the three read-only ioctls may be used'
 grep -Fq 'subprocess.run(["systemctl", "is-active"' "$tool" || fail 'only a systemctl status probe may run'
-[[ $(wc -l <"$tool") -le 420 ]] || fail 'tool grew past its narrow scope'
+[[ $(wc -l <"$tool") -le 500 ]] || fail 'tool grew past its narrow scope'
 pass 'tool parses, read-only ioctls only, no repair framework, tests/all runs this test'
 
 work=$(mktemp -d /tmp/myron-slot-a.XXXXXX)
@@ -199,6 +199,8 @@ class Fake:
 t.LOCK_FILE = f"{work}/lock"
 prove_main_real = t.prove_main
 t.prove_main = lambda: None
+persistent_real = t.persistent_backup_dir
+t.persistent_backup_dir = lambda directory: None
 t.ROOT_UID = os.geteuid()
 t.TRUST_TOP = work
 backups = [0]
@@ -234,6 +236,25 @@ for label, kwargs, expect_writes, text in [
     if "primary" in text or "backup" in label:
         assert 2 not in dev.writes and 1 not in dev.writes, label
     assert t.read_lba(bytes(dev.buf), t.BOOT_B, 0) if False else True
+class WrongHeader(Fake):
+    """The backup-header write lands a perfectly valid PRIMARY header (valid CRC, valid array) instead."""
+    def write_block(self, lba, data):
+        if lba == t.BACKUP_HEADER:
+            data = t.read_lba(t.analyse(stale, True)["new"], t.PRIMARY_HEADER)
+        super().write_block(lba, data)
+dev = WrongHeader(stale)
+refuses(lambda: run(dev), "primary NOT written", "valid primary header at the backup location")
+assert dev.writes == [494587, 494591], dev.writes
+assert t.parse_header(t.read_lba(bytes(dev.buf), t.BACKUP_HEADER))["ok"], "the injected header must be CRC-valid"
+class WrongTail(Fake):
+    """A backup header that is valid but differs from the planned one in the unused tail of the sector."""
+    def write_block(self, lba, data):
+        if lba == t.BACKUP_HEADER:
+            data = data[:-1] + bytes([data[-1] ^ 1])
+        super().write_block(lba, data)
+dev = WrongTail(stale)
+refuses(lambda: run(dev), "primary NOT written", "backup header differs in the unchecked tail")
+assert dev.writes == [494587, 494591], dev.writes
 dev = Fake(stale, fail_sync=2)
 try:
     run(dev)
@@ -287,17 +308,174 @@ refuses(lambda: t.load_baseline(f"{work}/short.bin", good), "256 KiB", "short ba
 os.makedirs(f"{work}/loose"); os.chmod(f"{work}/loose", 0o770)
 refuses(lambda: t.trusted_chain(f"{work}/loose/file"), "unsafe ancestor", "group-writable ancestor")
 refuses(lambda: t.make_backup(f"{work}/backup1", stale, t.analyse(stale, True)), "already exists", "existing backup directory")
+# the backup directory entry is made durable (parent fsync) before any file in it
+events = []
+real_sync_dir, real_mkdir = t.sync_dir, os.mkdir
+t.sync_dir = lambda path: (events.append(("sync", os.path.abspath(path))), real_sync_dir(path))[1]
+os.mkdir = lambda path, *a: (events.append(("mkdir", os.path.abspath(path))), real_mkdir(path, *a))[1]
+try:
+    t.make_backup(f"{work}/backup-durable", stale, t.analyse(stale, True))
+finally:
+    t.sync_dir, os.mkdir = real_sync_dir, real_mkdir
+bd = os.path.abspath(f"{work}/backup-durable")
+assert events[0] == ("mkdir", bd) and events[1] == ("sync", os.path.abspath(work)), events[:3]
+assert ("sync", bd) in events[2:], events
+# put writes everything even when the kernel accepts only part of each write
+real_write = os.write
+os.write = lambda fd, data: real_write(fd, bytes(data)[:7])
+try:
+    t.put(work, "partial-write.bin", b"0123456789" * 100)
+finally:
+    os.write = real_write
+assert open(f"{work}/partial-write.bin", "rb").read() == b"0123456789" * 100
+# a write that makes no progress is a refusal, not a silently truncated backup
+os.write = lambda fd, data: 0
+try:
+    refuses(lambda: t.put(work, "stuck-write.bin", b"abc"), "short write", "zero-length write")
+finally:
+    os.write = real_write
 t.TRUST_TOP = "/"
 refuses(lambda: t.trusted_chain(f"{work}/baseline.bin"), "unsafe ancestor", "real /tmp is not a protected root")
 t.TRUST_TOP = work
 ok("baseline must be protected, single-link, exact size and hash; ancestors must be root-only; backup directory must be new")
+
+# ---- the real Device: O_DIRECT, aligned, never the page cache ----------------
+import ctypes
+import types
+from unittest import mock
+media = bytearray(t.LUN_BLOCKS * t.BLOCK)
+cache = bytearray(len(media))
+log = []
+def fake_open(path, flags, *a):
+    log.append(("open", flags)); return 77
+def fake_fstat(fd):
+    return types.SimpleNamespace(st_mode=stat.S_IFBLK | 0o600, st_rdev=os.makedev(8, 0))
+def fake_ioctl(fd, req, buf):
+    return {0x1268: struct.pack("i", 4096), 0x80081272: struct.pack("Q", len(media)), 0x125E: struct.pack("i", 0)}[req]
+def fake_getfl(fd, cmd, *a):
+    return flags_seen[0] if cmd == fcntl.F_GETFL else 0
+def addr(view):
+    return ctypes.addressof(ctypes.c_char.from_buffer(view.obj))
+def fake_preadv(fd, bufs, offset):
+    assert offset % 4096 == 0 and len(bufs[0]) % 4096 == 0 and addr(bufs[0]) % 4096 == 0, ("unaligned read", offset, len(bufs[0]))
+    log.append(("preadv", offset, len(bufs[0])))
+    n = min(len(bufs[0]), 8192)  # a short read forces the loop
+    bufs[0][:n] = media[offset:offset + n]
+    return n
+def fake_pwritev(fd, bufs, offset):
+    assert offset % 4096 == 0 and len(bufs[0]) % 4096 == 0 and addr(bufs[0]) % 4096 == 0, ("unaligned write", offset, len(bufs[0]))
+    log.append(("pwritev", offset, len(bufs[0])))
+    media[offset:offset + len(bufs[0])] = bytes(bufs[0])
+    cache[offset:offset + len(bufs[0])] = bytes(bufs[0])
+    return len(bufs[0])
+def forbidden(*a, **k):
+    raise AssertionError("buffered page-cache IO used on the device")
+flags_seen = [0]
+def open_device(writable=True, getfl=None):
+    def fo(path, flags, *a):
+        flags_seen[0] = flags; return fake_open(path, flags)
+    patches = [mock.patch.object(os, "open", fo), mock.patch.object(os, "fstat", fake_fstat), mock.patch.object(fcntl, "ioctl", fake_ioctl),
+               mock.patch.object(fcntl, "fcntl", getfl or fake_getfl), mock.patch.object(os, "preadv", fake_preadv),
+               mock.patch.object(os, "pwritev", fake_pwritev), mock.patch.object(os, "pread", forbidden),
+               mock.patch.object(os, "pwrite", forbidden), mock.patch.object(os, "fsync", lambda fd: None)]
+    return patches
+import contextlib as _cl
+with _cl.ExitStack() as stack:
+    for patch in open_device():
+        stack.enter_context(patch)
+    device = t.Device("sda", "8:0", True)
+    assert flags_seen[0] & os.O_DIRECT and flags_seen[0] & os.O_RDWR and flags_seen[0] & os.O_NOFOLLOW, "O_DIRECT, O_RDWR and O_NOFOLLOW required"
+    media[:] = os.urandom(len(media))
+    cache[:] = b"\xCC" * len(cache)  # a stale page cache that a buffered read would return
+    edges = device.read_edges()
+    assert edges == bytes(media[:t.EDGE_BYTES]) + bytes(media[-t.EDGE_BYTES:]), "read_edges must return the media, not the cache"
+    assert all(entry[0] == "open" or (entry[1] % 4096 == 0 and entry[2] % 4096 == 0) for entry in log)
+    block = os.urandom(4096)
+    device.write_block(t.BACKUP_HEADER, block)
+    assert bytes(media[t.BACKUP_HEADER * 4096:(t.BACKUP_HEADER + 1) * 4096]) == block
+    # a media that diverges from what was written (a cache would hide this) is seen by the readback
+    media[t.BACKUP_HEADER * 4096] ^= 1
+    assert device.read_edges()[-4096:] != block, "readback must reflect the media, not the written data"
+    for bad_offset, bad_length in [(1, 4096), (0, 100), (0, 0), (t.LUN_BLOCKS * 4096, 4096)]:
+        refuses(lambda o=bad_offset, n=bad_length: device._read(o, n), "unaligned", "unaligned or out-of-range read")
+    refuses(lambda: device.write_block(5, b"x" * 100), "unaligned", "partial block write")
+ok("Device: O_DIRECT open, aligned anonymous buffers, whole 4 KiB multiples, media readback (not the cache), no buffered IO")
+with _cl.ExitStack() as stack:
+    for patch in open_device(getfl=lambda fd, cmd, *a: 0):
+        stack.enter_context(patch)
+    refuses(lambda: t.Device("sda", "8:0", True), "not open with O_DIRECT", "device opened without O_DIRECT")
+with _cl.ExitStack() as stack:
+    for patch in open_device():
+        stack.enter_context(patch)
+    def einval(path, flags, *a):
+        raise OSError(22, "Invalid argument")
+    stack.enter_context(mock.patch.object(os, "open", einval))
+    try:
+        t.Device("sda", "8:0", True)
+        bad("a device that refuses O_DIRECT was accepted")
+    except OSError:
+        pass
+    assert t.main(["--apply"]) == 2
+with mock.patch.object(os, "O_DIRECT", 0, create=True):
+    refuses(lambda: t.Device("sda", "8:0", False), "O_DIRECT", "no O_DIRECT support")
+ok("Device: a kernel or device without O_DIRECT fails closed")
+
+# ---- persistent backup destination -------------------------------------------
+def persistence(**over):
+    base = tempfile.mkdtemp(dir=work); os.chmod(base, 0o700)
+    state = f"{base}/state"; os.makedirs(state, mode=0o700); os.makedirs(f"{base}/sysdev/8:5")
+    dev = os.stat(state).st_dev
+    majmin = f"{os.major(dev)}:{os.minor(dev)}"
+    os.makedirs(f"{base}/sysdev/{majmin}")
+    open(f"{base}/sysdev/{majmin}/uevent", "w").write("DEVTYPE=partition\nPARTNAME=pmos_root\n")
+    open(f"{base}/mountinfo", "w").write(f"1 0 {majmin} / {t.HOST_MOUNT} rw,noatime - ext4 /dev/sda5 rw\n")
+    t.PATHS.update(state=state, sysdev=f"{base}/sysdev", mountinfo=f"{base}/mountinfo")
+    t.TRUST_TOP = base
+    for key, mutate_fn in over.items():
+        mutate_fn(base, majmin)
+    return base, state
+def uevent_of(base, majmin, text):
+    open(f"{base}/sysdev/{majmin}/uevent", "w").write(text)
+base, state = persistence()
+t.persistent_backup_dir = persistent_real
+persistent_real(f"{state}/backup")
+persistent_real(f"{state}/sub/backup") if os.makedirs(f"{state}/sub") is None else None
+cases = {
+    "outside the state directory": (lambda b, m: None, lambda b, s_: f"{b}/elsewhere/backup"),
+    "tmpfs source": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 {m} / {t.HOST_MOUNT} rw - tmpfs tmpfs rw\n"), None),
+    "ramdisk partition name": (lambda b, m: uevent_of(b, m, "DEVTYPE=disk\nDEVNAME=ram0\n"), None),
+    "loop backed": (lambda b, m: os.makedirs(f"{b}/sysdev/{m}/loop"), None),
+    "another partition": (lambda b, m: uevent_of(b, m, "DEVTYPE=partition\nPARTNAME=userdata\n"), None),
+    "read-only mount": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 {m} / {t.HOST_MOUNT} ro - ext4 /dev/sda5 ro\n"), None),
+    "different device than the mount": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 9:9 / {t.HOST_MOUNT} rw - ext4 /dev/sda5 rw\n"), None),
+    "host root not mounted": (lambda b, m: open(f"{b}/mountinfo", "w").write("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"), None),
+    "mount root is a subdirectory": (lambda b, m: open(f"{b}/mountinfo", "w").write(f"1 0 {m} /x {t.HOST_MOUNT} rw - ext4 /dev/sda5 rw\n"), None),
+}
+reasons = {"outside the state directory": "inside the persistent", "tmpfs source": "ext4 pmOS root", "ramdisk partition name": "physical pmos_root",
+           "loop backed": "physical pmos_root", "another partition": "physical pmos_root", "read-only mount": "ext4 pmOS root",
+           "different device than the mount": "ext4 pmOS root", "host root not mounted": "not mounted", "mount root is a subdirectory": "ext4 pmOS root"}
+for label, (mutate_fn, where) in cases.items():
+    base, state = persistence(x=mutate_fn)
+    target = where(base, state) if where else f"{state}/backup"
+    refuses(lambda target=target: persistent_real(target), reasons[label], label)
+    # make_backup itself refuses before creating anything
+    refuses(lambda target=target: t.make_backup(target, stale, t.analyse(stale, True)), reasons[label], label + " (make_backup)")
+    assert not os.path.lexists(target), label
+base, state = persistence()
+os.symlink(state, f"{base}/link")
+refuses(lambda: persistent_real(f"{base}/link/backup"), "inside the persistent", "symlinked parent")
+refuses(lambda: persistent_real(f"{state}/../state/backup") if False else persistent_real(f"{base}/state/../x/backup"), "inside the persistent", "dot-dot escape")
+t.make_backup(f"{state}/backup", stale, t.analyse(stale, True))
+assert os.path.isdir(f"{state}/backup") and stat.S_IMODE(os.stat(f"{state}/backup").st_mode) == 0o700
+ok("backup destination: only inside the main state directory on the rw ext4 physical pmos_root mount; tmpfs, RAM, loop, other partitions, read-only, wrong device and escapes refused before anything is created")
+t.persistent_backup_dir = lambda directory: None
 
 # ---- main boot proof --------------------------------------------------------
 def setup_main(**over):
     base = tempfile.mkdtemp(dir=work)
     os.chmod(base, 0o700)
     t.TRUST_TOP = base
-    P = {k: f"{base}/{k}" for k in ("uname", "notes", "compatible", "cmdline", "boot_id", "mountinfo")}
+    P = {k: f"{base}/{k}" for k in ("uname", "notes", "compatible", "cmdline", "bootconfig", "boot_id", "mountinfo")}
     P.update(runtime=f"{base}/run", state=f"{base}/state", sysdev=f"{base}/sysdev", sysfs=f"{base}/sysfs", dev=f"{base}/dev")
     os.makedirs(P["runtime"]); os.makedirs(P["state"], mode=0o700); os.makedirs(f"{P['sysdev']}/7:3/loop")
     boot = "11111111-2222-3333-4444-555555555555"
@@ -324,6 +502,12 @@ import types
 types_ns = types.SimpleNamespace
 t.subprocess = types.SimpleNamespace(run=None)
 setup_main(); prove_main_real()
+# the live phone: no suffix on the command line, exactly _a in the bootconfig
+setup_main(x=lambda: (open(t.PATHS["cmdline"], "w").write("x y\n"),
+                      open(t.PATHS["bootconfig"], "w").write('androidboot.hardware = "x"\nandroidboot.slot_suffix = "_a"\n')))
+prove_main_real()
+setup_main(x=lambda: open(t.PATHS["bootconfig"], "w").write('androidboot.slot_suffix = "_a"\n'))
+prove_main_real()
 sources = {
     "pmOS: no main runtime": lambda: os.unlink(f"{t.PATHS['runtime']}/boot-id"),
     "runtime boot id differs": lambda: open(f"{t.PATHS['runtime']}/boot-id", "w").write("other\n"),
@@ -334,6 +518,13 @@ sources = {
     "guard inactive": lambda: setattr(t.subprocess, "run", lambda *a, **k: types_ns(returncode=3)),
     "wrong kernel": lambda: open(t.PATHS["uname"], "w").write("6.1.0\n"),
     "slot B": lambda: open(t.PATHS["cmdline"], "w").write("androidboot.slot_suffix=_b\n"),
+    "slot B in the bootconfig": lambda: (open(t.PATHS["cmdline"], "w").write("x y\n"),
+                                        open(t.PATHS["bootconfig"], "w").write('androidboot.slot_suffix = "_b"\n')),
+    "cmdline A conflicts with bootconfig B": lambda: open(t.PATHS["bootconfig"], "w").write('androidboot.slot_suffix = "_b"\n'),
+    "unknown slot value": lambda: (open(t.PATHS["cmdline"], "w").write("x y\n"),
+                                  open(t.PATHS["bootconfig"], "w").write('androidboot.slot_suffix = "_a2"\n')),
+    "no slot anywhere": lambda: (open(t.PATHS["cmdline"], "w").write("x y\n"),
+                                open(t.PATHS["bootconfig"], "w").write('androidboot.hardware = "x"\n')),
     "root not loop backed": lambda: open(t.PATHS["mountinfo"], "w").write("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"),
     "root backed by another file": lambda: open(f"{t.PATHS['sysdev']}/7:3/loop/backing_file", "w").write(f"{work}/baseline.bin\n"),
 }
