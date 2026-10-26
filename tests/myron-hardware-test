@@ -25,6 +25,7 @@ sh -n "$bluetooth_selector" "$bluetooth_only_start" || fail 'Bluetooth experimen
 python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
   "$bluetooth_boot_builder" || fail 'Bluetooth boot builder parses'
 tests/myron-bluetooth-logic || fail 'Bluetooth executable logic checks failed'
+tests/myron-cellular-stage || fail 'cellular stage checks failed'
 for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
   sh -n "$fragment" || fail "$fragment parses"
 done
@@ -37,6 +38,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
   "$overlay/usr/local/sbin/myron-cellular-start" \
+  "$overlay/usr/local/sbin/myron-cellular-stage" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
   "$overlay/usr/local/sbin/myron-coexistence-start" \
   "$overlay/usr/local/sbin/myron-audio-stage" \

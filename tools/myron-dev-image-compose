@@ -224,6 +224,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
       "$root/usr/local/sbin/myron-reference-radio-start" \
       "$root/usr/local/sbin/myron-cellular-start" \
+      "$root/usr/local/sbin/myron-cellular-stage" \
       "$root/usr/local/sbin/myron-reference-audio-start" \
       "$root/usr/local/sbin/myron-coexistence-start" \
       "$root/usr/local/sbin/myron-audio-stage" \

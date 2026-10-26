@@ -342,6 +342,26 @@ ModemManager and writes a readiness marker. Neither the radio foundation nor
 ModemManager is independently enabled in a cellular image, removing the boot
 race while keeping the rollback watchdog authoritative.
 
+## Cellular data and airplane stage
+
+`myron-cellular-stage` runs after `myron-cellular.service` and needs the same
+arm, watchdog and cellular profile. Stock `ipam.ko` can panic if
+`rmnet_ipa0` is opened a second time, so a boot gets at most one data
+activation and the stage never stops, disconnects or reconnects anything.
+Reboot to retry. Output and logs carry aggregates only, never identities.
+
+- `status`: read-only counts and states.
+- `qualify`: exactly one modem, SIM ready, packet service attached, no
+  Bluetooth, no AudioReach.
+- `data`: writes an atomic per-boot marker, then creates the autoconnect-off
+  profile (APN `internet`, or `apn=NAME` from root-owned
+  `/etc/omamobile/myron-cellular-apn`), activates once, and probes HTTPS
+  bound to the data interface. Always reboot afterwards.
+- `airplane-off`: only before any data attempt; disables the modem radio once.
+- `airplane-on`: always refused; reboot to restore the radio.
+
+`tests/myron-cellular-stage` covers the gates with mocked tools.
+
 ## Battery and charging stage
 
 The next private payload adds the exact 20-file `charging` runtime from the
