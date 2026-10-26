@@ -55,6 +55,10 @@ fi
 sh -n plugins/omamobile.quicksettings/tile-state.sh || fail "tile-state.sh parses"
 sh -n plugins/omamobile.quicksettings/tile-action.sh || fail "tile-action.sh parses"
 bash test/tile-scripts.sh || fail "quick-settings tile scripts"
+grep -Fq 'readonly property string status: myron ?' plugins/omamobile.quicksettings/QuickSettings.qml \
+  || fail "Myron unavailable status is overridden by the generic no-modem label"
+grep -Fq ': !available ? "No modem"' plugins/omamobile.quicksettings/QuickSettings.qml \
+  || fail "non-Myron mobile data lost its no-modem label"
 grep -Fq 'for d in amber:flash-2 white:torch white:flash-1' plugins/omamobile.quicksettings/QuickSettings.qml \
   || fail "torch does not prefer Myron's physically verified LED"
 grep -Fq 'visible: torch.available && torch.enabled' plugins/omamobile.quicksettings/QuickSettings.qml \

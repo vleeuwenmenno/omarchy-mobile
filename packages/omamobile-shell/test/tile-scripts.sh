@@ -96,6 +96,7 @@ pass "tile-action.sh drives battery saver, stay awake, mobile data and hotspot"
 # for the supported start, while airplane mode is unavailable because a
 # partial Wi-Fi/Bluetooth-only action would leave cellular transmitting.
 stub myron-mobile-data '
+[ ! -e '"$tmp"'/state/myron-helper-fail ] || exit 1
 case $1 in
   state) printf "data=off\ndata_status=Off ·5G\ndata_enable=1\ndata_busy=0\n" ;;
   on) echo "myron-data on" >>'"$log"' ;;
@@ -107,6 +108,12 @@ grep -cx 'airplane=none' <<<"$out" >/dev/null || fail "Myron airplane mode is no
 for line in data=off 'data_status=Off ·5G' data_enable=1 data_busy=0; do
   grep -cxF "$line" <<<"$out" >/dev/null || fail "Myron tile state lacks: $line"
 done
+touch "$tmp/state/myron-helper-fail"
+out=$(run "$dir/tile-state.sh")
+for line in data=none 'data_status=Status unavailable' data_enable=0 data_busy=1; do
+  grep -cxF "$line" <<<"$out" >/dev/null || fail "failed Myron helper is not honestly unavailable: $line"
+done
+rm -f "$tmp/state/myron-helper-fail"
 : >"$log"
 run "$dir/tile-action.sh" mobile-data on
 grep -cxF 'myron-data on' "$log" >/dev/null || fail "Myron mobile-data start did not use its helper"
@@ -117,7 +124,7 @@ if run "$dir/tile-action.sh" airplane on 2>/dev/null; then fail "Myron airplane 
 if run "$dir/tile-action.sh" mobile-data off 2>/dev/null; then fail "Myron mobile data off was accepted"; fi
 grep -cxF 'myron-data off-refused' "$log" >/dev/null || fail "Myron mobile-data off did not reach the refusing helper"
 ! grep -q '^sit ' "$log" || fail "Myron refusal fell through to Pixel SIT"
-pass "Myron tile uses only its honest one-shot helper and refuses airplane/off"
+pass "Myron tile uses only its one-shot helper, reports helper failure unavailable, and refuses airplane/off"
 
 stub omamobile-microphone 'echo "microphone $*" >>'"$log"'; if [ "$1" = status ]; then echo off; fi; exit 0'
 grep -cx 'mic_bridge=off' <<<"$(run "$dir/tile-state.sh")" >/dev/null ||

@@ -95,7 +95,7 @@ if have myron-mobile-data; then
   if [ -n "$out" ]; then
     printf '%s\n' "$out"
   else
-    printf 'data=off\ndata_status=Status unavailable\ndata_enable=0\ndata_busy=1\n'
+    printf 'data=none\ndata_status=Status unavailable\ndata_enable=0\ndata_busy=1\n'
   fi
 elif have omamobile-sit && [ -r "$state" ] && have python3; then
   if systemctl is-active --quiet omamobile-sit-data.service 2>/dev/null; then echo "data=on"; else echo "data=off"; fi

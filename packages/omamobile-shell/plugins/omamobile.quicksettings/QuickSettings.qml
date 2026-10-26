@@ -697,8 +697,8 @@ Item {
     readonly property bool available: root.probedHas("data")
     readonly property bool enabled: available && (myron ? root.probed.data === "on" : root.probedOn("mobile-data", "data"))
     readonly property string icon: "󰞃"
-    readonly property string status: !available ? "No modem"
-      : myron ? (myronStarting ? "Starting" : (root.probed.data_status || (enabled ? "On" : "Off")))
+    readonly property string status: myron ? (myronStarting ? "Starting" : (root.probed.data_status || (enabled ? "On" : "Off")))
+      : !available ? "No modem"
       : !enabled ? "Off" : (root.probed.data_status || "On")
     function toggle() {
       if (!available) return

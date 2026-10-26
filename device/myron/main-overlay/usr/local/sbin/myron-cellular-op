@@ -28,11 +28,12 @@
 #                kernel. Only root writes it; nothing the tile sends can.
 #   abort WORD   the timer or a failed operation unit. Sealed: nothing. Before
 #                the first mutation: cancel without a reboot. After it, or in an
-#                unknown state: stop the operation unit, then a normal reboot
-#                through `myron-main-os reboot-normal` (never a latch, never a
-#                partition write).
+#                unknown state: stop the operation unit, then invoke the
+#                bounded normal-reboot helper (never a latch or partition
+#                write).
 #   watch        after the seal: observe the connection and the IPA guard and
 #                publish up or lost. It never reconnects or changes a radio.
+#   watch-stopped systemd's observer exit hook: publish lost unless already so.
 #   publish      write the world-readable status, also at boot.
 #   evidence-check
 #                exit 0 only for valid evidence of the current stage, image and
@@ -48,6 +49,7 @@ set -eu
 umask 077
 
 main_os=/usr/local/sbin/myron-main-os
+reboot_failsafe=/usr/local/sbin/myron-cellular-reboot-failsafe
 stage=/usr/local/sbin/myron-cellular-stage
 self=/usr/local/sbin/myron-cellular-op
 helper=/usr/local/bin/myron-mobile-data
@@ -83,6 +85,7 @@ window_seconds=1200
 min_remaining_begin=1140
 lock_seconds=30
 stop_seconds=15
+observer_start_seconds=10
 watch_poll_seconds=5
 watch_failures=3
 root_uid=0
@@ -217,9 +220,9 @@ transition_allowed() {
 sha_of() { sha256sum "$1" 2>/dev/null | awk '{ print $1 }'; }
 
 # One hash over everything the evidence is bound to: stage, supervisor,
-# unprivileged UI helper and actual cellular startup helper; effective profile;
-# NetworkManager GSM inhibit; polkit and unit policy; APN input; kernel notes;
-# running image, proof boot and kernel release.
+# unprivileged UI helper, actual cellular startup helper and normal-reboot
+# failsafe; effective profile; NetworkManager GSM inhibit; polkit and unit
+# policy; APN input; kernel notes; running image, proof boot and kernel release.
 fingerprint_parts() {
 	fp_proof_boot=${1:-$boot_id}
 	fp_notes=$(sha_of "$notes_file")
@@ -228,8 +231,9 @@ fingerprint_parts() {
 	{ [ -n "$fp_notes" ] && [ -n "$fp_image" ] && [ -n "$fp_kernel" ]; } || return 1
 	fp_stage=$(sha_of "$stage") fp_self=$(sha_of "$self") fp_helper=$(sha_of "$helper")
 	fp_startup=$(sha_of "$startup_helper")
+	fp_reboot=$(sha_of "$reboot_failsafe")
 	fp_nm=$(sha_of "$nm_conf") fp_polkit=$(sha_of "$polkit_rule")
-	{ [ -n "$fp_stage" ] && [ -n "$fp_self" ] && [ -n "$fp_helper" ] && [ -n "$fp_startup" ] && [ -n "$fp_nm" ] && [ -n "$fp_polkit" ]; } || return 1
+	{ [ -n "$fp_stage" ] && [ -n "$fp_self" ] && [ -n "$fp_helper" ] && [ -n "$fp_startup" ] && [ -n "$fp_reboot" ] && [ -n "$fp_nm" ] && [ -n "$fp_polkit" ]; } || return 1
 	# Exactly "cellular" plus its terminating newline: no alternate profile,
 	# extra record, symlink or writable policy input is evidence-compatible.
 	safe_root_input "$profile_file" || return 1
@@ -250,8 +254,8 @@ fingerprint_parts() {
 		fp_apn=$(sha_of "$apn_config")
 		[ -n "$fp_apn" ] || return 1
 	fi
-	fp_all=$(printf 'proof_boot=%s\nstage=%s\nop=%s\nhelper=%s\nstartup=%s\nprofile=%s\nnm=%s\npolkit=%s\nunits=%s\napn=%s\nnotes=%s\nimage=%s\nkernel=%s\n' \
-		"$fp_proof_boot" "$fp_stage" "$fp_self" "$fp_helper" "$fp_startup" "$fp_profile" "$fp_nm" "$fp_polkit" "$fp_units" "$fp_apn" "$fp_notes" "$fp_image" "$fp_kernel" |
+	fp_all=$(printf 'proof_boot=%s\nstage=%s\nop=%s\nhelper=%s\nstartup=%s\nreboot=%s\nprofile=%s\nnm=%s\npolkit=%s\nunits=%s\napn=%s\nnotes=%s\nimage=%s\nkernel=%s\n' \
+		"$fp_proof_boot" "$fp_stage" "$fp_self" "$fp_helper" "$fp_startup" "$fp_reboot" "$fp_profile" "$fp_nm" "$fp_polkit" "$fp_units" "$fp_apn" "$fp_notes" "$fp_image" "$fp_kernel" |
 		sha256sum | awk '{ print $1 }')
 	[ -n "$fp_all" ]
 }
@@ -278,6 +282,7 @@ require_committed_main() {
 	[ -f "$runtime_boot_id" ] && [ "$(cat "$runtime_boot_id" 2>/dev/null || true)" = "$boot_id" ] ||
 		fail 'this is not the persistent main boot'
 	[ -f "$main_os" ] && [ -x "$main_os" ] && [ ! -L "$main_os" ] || fail 'the main control is unavailable'
+	[ -f "$reboot_failsafe" ] && [ -x "$reboot_failsafe" ] && [ ! -L "$reboot_failsafe" ] || fail 'the normal reboot failsafe is unavailable'
 	status_line=$(timeout -k 1 10 "$main_os" status 2>/dev/null) || fail 'main status is unavailable'
 	for want in os=omarchy latch=absent pending=absent success=current image=present; do
 		case " $status_line " in *" $want "*) ;; *) fail "main boot is not qualified: $want required" ;; esac
@@ -286,6 +291,8 @@ require_committed_main() {
 
 # --- the timer ----------------------------------------------------------------
 timer_active() { timeout -k 1 5 systemctl --quiet is-active "$timer_unit" 2>/dev/null; }
+watch_active() { timeout -k 1 2 systemctl --quiet is-active "$watch_unit" 2>/dev/null; }
+observer_ready() { watch_active && [ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ]; }
 
 timer_remaining() {
 	timer_active || return 1
@@ -380,13 +387,34 @@ cmd_seal() {
 		proofs_valid || fail 'the fresh SSH proofs are missing'
 	fi
 	write_state sealed "$kind"
-	printf '%s\n' up >"$lifecycle_file"
+	put_runtime_file "$lifecycle_file" starting
 	unlock
 	# From here the operation is final: expiry reads "sealed" and does nothing.
 	stop_timer
 	publish
-	persist "stage=seal kind=$kind result=sealed"
-	timeout -k 1 "$stop_seconds" systemctl start --no-block "$watch_unit" >/dev/null 2>&1 || persist 'stage=seal watcher=not-started'
+	observer_deadline=$(( $(monotonic_seconds) + observer_start_seconds ))
+	timeout -k 1 "$observer_start_seconds" systemctl start --no-block "$watch_unit" >/dev/null 2>&1 ||
+		persist 'stage=seal observer=start-failed'
+	while ! observer_ready && [ "$(monotonic_seconds)" -lt "$observer_deadline" ]; do
+		sleep 1
+	done
+	# Serialize the final admission/loss decision with the observer's own
+	# starting -> up transition. A late observer can never revive lost.
+	lock
+	read_state
+	if [ "$state" = sealed ] && observer_ready; then
+		observer=active
+	else
+		put_runtime_file "$lifecycle_file" lost
+		observer=lost
+	fi
+	unlock
+	publish
+	if [ "$observer" != active ]; then
+		persist "stage=seal kind=$kind result=observer-lost"
+		fail 'the cellular observer did not become active'
+	fi
+	persist "stage=seal kind=$kind result=sealed observer=active"
 	printf 'result=sealed kind=%s\n' "$kind"
 }
 
@@ -516,12 +544,13 @@ cmd_proof_ready() {
 	require_root
 	read_boot_id
 	read_state
-	[ "$state" = sealed ] && [ "$kind" = attended ] && [ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ]
+	[ "$state" = sealed ] && [ "$kind" = attended ] && observer_ready
 }
 
 # Called by the stage after its standalone proof. Root, sealed attended
-# operation, lifecycle up: nothing a tile or an unprivileged user sends reaches
-# this, and the operation itself never writes evidence.
+# operation, lifecycle up and observer active: nothing a tile or an
+# unprivileged user sends reaches this, and the operation itself never writes
+# evidence.
 cmd_record_evidence() {
 	require_root
 	read_boot_id
@@ -531,6 +560,7 @@ cmd_record_evidence() {
 	read_state
 	[ "$state" = sealed ] && [ "$kind" = attended ] || fail 'no sealed attended operation exists'
 	[ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ] || fail 'the cellular connection is not up'
+	watch_active || fail 'the cellular observer is not active'
 	[ ! -L "$evidence" ] || fail 'the evidence file is a link'
 	put_file "$evidence" "$(evidence_text "$boot_id")"
 	unlock
@@ -548,13 +578,13 @@ cmd_abort() {
 	# Terminal state must win under the same brief lock as seal, before the
 	# worker is stopped. If even the bounded lock cannot be obtained, do not
 	# race an unlocked state write or stop the worker: request the same reviewed
-	# normal reboot directly. The worker may finish, but no retry can occur
+	# normal reboot helper directly. The worker may finish, but no retry can occur
 	# before that reboot because the per-boot mutation marker remains.
 	if ! lock_nofail; then
 		persist "stage=abort result=reboot reason=$reason lock=unavailable"
 		printf 'result=aborted reason=%s reboot=normal lock=unavailable\n' "$reason"
-		[ -x "$main_os" ] || fail 'the main control is unavailable'
-		exec "$main_os" reboot-normal --reason "cellular-op-$reason"
+		[ -f "$reboot_failsafe" ] && [ -x "$reboot_failsafe" ] && [ ! -L "$reboot_failsafe" ] || fail 'the normal reboot failsafe is unavailable'
+		exec "$reboot_failsafe" --reason "cellular-op-$reason"
 	fi
 	read_state
 	case "$state" in
@@ -601,15 +631,18 @@ kind=${kind:-attended}" ;;
 	if [ "$already" = 1 ]; then
 		persist 'stage=abort result=already-requested'
 		printf 'result=already-requested reboot=normal\n'
-		return 0
+	else
+		for unit in $run_units; do
+			timeout -k 1 "$stop_seconds" systemctl stop "$unit" >/dev/null 2>&1 || true
+		done
+		persist "stage=abort result=reboot reason=$reason"
+		printf 'result=aborted reason=%s reboot=normal\n' "$reason"
 	fi
-	for unit in $run_units; do
-		timeout -k 1 "$stop_seconds" systemctl stop "$unit" >/dev/null 2>&1 || true
-	done
-	persist "stage=abort result=reboot reason=$reason"
-	printf 'result=aborted reason=%s reboot=normal\n' "$reason"
-	[ -x "$main_os" ] || fail 'the main control is unavailable'
-	exec "$main_os" reboot-normal --reason "cellular-op-$reason"
+	# reboot-requested suppresses duplicate worker stops only. Every abort still
+	# invokes the independently bounded reboot helper, so a prior controller
+	# refusal cannot turn a later abort into a no-op.
+	[ -f "$reboot_failsafe" ] && [ -x "$reboot_failsafe" ] && [ ! -L "$reboot_failsafe" ] || fail 'the normal reboot failsafe is unavailable'
+	exec "$reboot_failsafe" --reason "cellular-op-$reason"
 }
 
 # Takes the lock without failing the shell: returns 1 if it could not.
@@ -623,12 +656,25 @@ lock_nofail() {
 cmd_watch() {
 	require_root
 	read_boot_id
+	lock
 	read_state
 	[ "$state" = sealed ] || fail 'the operation is not sealed'
-	[ "$(cat "$lifecycle_file" 2>/dev/null || true)" = up ] || fail 'the operation lifecycle is not up'
+	case $(cat "$lifecycle_file" 2>/dev/null || true) in
+	starting) put_runtime_file "$lifecycle_file" up ;;
+	up) ;;
+	*) fail 'the operation lifecycle cannot be admitted' ;;
+	esac
+	unlock
+	publish
+	persist 'stage=watch result=admitted'
 	bad=0
 	while :; do
 		sleep "$watch_poll_seconds"
+		case $(cat "$lifecycle_file" 2>/dev/null || true) in
+		up) ;;
+		lost) return 0 ;;
+		*) fail 'the operation lifecycle is not observable' ;;
+		esac
 		if timeout -k 1 5 "$guard" check >/dev/null 2>&1 &&
 			[ "$(timeout -k 1 5 nmcli -t -g GENERAL.STATE connection show uuid "$target_uuid" 2>/dev/null | sed -n '1p')" = activated ]; then
 			bad=0
@@ -636,12 +682,32 @@ cmd_watch() {
 		fi
 		bad=$((bad + 1))
 		[ "$bad" -ge "$watch_failures" ] || continue
-		printf '%s\n' lost >"$lifecycle_file"
+		put_runtime_file "$lifecycle_file" lost
 		publish || true
 		persist 'stage=watch result=lost'
 		printf 'result=lost\n'
 		return 0
 	done
+}
+
+# ExecStopPost= closes the gap between systemd observing a dead watcher and
+# public status. It never changes the connection and sealed remains terminal,
+# so neither this command nor the watch unit can enter the abort/reboot path.
+cmd_watch_stopped() {
+	require_root
+	read_boot_id
+	lock
+	read_state
+	changed=0
+	if [ "$state" = sealed ]; then
+		case $(cat "$lifecycle_file" 2>/dev/null || true) in
+		starting|up) put_runtime_file "$lifecycle_file" lost; changed=1 ;;
+		esac
+	fi
+	unlock
+	[ "$changed" = 1 ] || return 0
+	publish || true
+	persist 'stage=watch result=stopped'
 }
 
 cmd_status() {
@@ -651,7 +717,7 @@ cmd_status() {
 }
 
 usage() {
-	printf 'usage: %s launch TOKEN | begin attended|qualified | remaining | mark STATE | seal | abort WORD | watch | publish | evidence-check | status | nonce-new | ssh-nonce | ssh-proof NONCE | record-evidence\n' "${0##*/}" >&2
+	printf 'usage: %s launch TOKEN | begin attended|qualified | remaining | mark STATE | seal | abort WORD | watch | watch-stopped | publish | evidence-check | status | nonce-new | ssh-nonce | ssh-proof NONCE | record-evidence\n' "${0##*/}" >&2
 	exit 2
 }
 
@@ -675,6 +741,7 @@ mark) [ "$#" = 1 ] || usage; cmd_mark "$1" ;;
 seal) [ "$#" = 0 ] || usage; cmd_seal ;;
 abort) [ "$#" -le 1 ] || usage; cmd_abort "${1:-failed}" ;;
 watch) [ "$#" = 0 ] || usage; cmd_watch ;;
+watch-stopped) [ "$#" = 0 ] || usage; cmd_watch_stopped ;;
 publish) [ "$#" = 0 ] || usage; publish ;;
 evidence-check)
 	[ "$#" = 0 ] || usage

@@ -20,6 +20,7 @@ op_src=$overlay/usr/local/sbin/myron-cellular-op
 units_dir=$overlay/usr/lib/systemd/system
 polkit_src=$overlay/etc/polkit-1/rules.d/50-myron-cellular-enable.rules
 helper_src=$overlay/usr/local/bin/myron-mobile-data
+reboot_src=$overlay/usr/local/sbin/myron-cellular-reboot-failsafe
 stage_src=device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage
 root=$(pwd)
 
@@ -29,13 +30,13 @@ if [[ -z $shellcheck_bin ]] || ! "$shellcheck_bin" --version >/dev/null 2>&1; th
 fi
 
 # ---- static ----------------------------------------------------------------
-for f in "$op_src" "$helper_src"; do
+for f in "$op_src" "$helper_src" "$reboot_src"; do
   [[ -x $f ]] || fail "$f is executable"
   sh -n "$f" || fail "$f parses as POSIX sh"
   bash -n "$f" || fail "$f parses as bash"
   if [[ -n $shellcheck_bin ]]; then "$shellcheck_bin" -s sh -e SC2086,SC2034,SC2046,SC2015,SC2155,SC2294,SC2329 "$f" || fail "shellcheck $f"; fi
 done
-if grep -nE '\[\[[^:]|<<<|(^|[[:space:]])local[[:space:]]|\bfunction\b|\bdeclare\b|\bmapfile\b|&>|<\(' "$op_src" "$helper_src"; then
+if grep -nE '\[\[[^:]|<<<|(^|[[:space:]])local[[:space:]]|\bfunction\b|\bdeclare\b|\bmapfile\b|&>|<\(' "$op_src" "$helper_src" "$reboot_src"; then
   fail 'supervisor or helper uses shell syntax outside POSIX sh'
 fi
 # The supervisor only ever starts the timer, the watcher and the attended unit,
@@ -53,8 +54,24 @@ fi
 if grep -nE 'recover|set_latch|[/]latch|latch[.]new' "$op_src" | grep -vE '^[0-9]+:[[:space:]]*#'; then
   fail 'supervisor refers to the recovery latch'
 fi
-grep -Fq 'reboot-normal --reason' "$op_src" || fail 'abort does not use reboot-normal'
-if grep -niE 'imei|imsi|iccid|msisdn|own-numbers|equipment-identifier|hw-addr|mac-address|ether ' "$op_src" "$helper_src"; then
+grep -Fq 'exec "$reboot_failsafe" --reason "cellular-op-$reason"' "$op_src" || fail 'abort does not delegate to the reboot failsafe'
+grep -Fq '"$main_os" reboot-normal --reason "$reason"' "$reboot_src" || fail 'reboot failsafe does not try main-os first'
+grep -Fq 'systemctl --no-block reboot' "$reboot_src" || fail 'reboot failsafe lacks a normal systemd request'
+grep -Fq 'reboot -f' "$reboot_src" || fail 'reboot failsafe lacks a forced plain reboot'
+if grep -nE 'recover|set_latch|[/]latch|latch[.]new|fastboot|reboot-to-bootloader|\bdd\b|blockdev|sgdisk|--set-|/dev/(disk|block|sd|mmc)' "$reboot_src" |
+  grep -vE '^[0-9]+:[[:space:]]*#'; then
+  fail 'reboot failsafe can select recovery, a slot or storage'
+fi
+lock_bound=$(sed -n 's/^lock_seconds=//p' "$op_src")
+stop_bound=$(sed -n 's/^stop_seconds=//p' "$op_src")
+controller_bound=$(sed -n 's/^controller_seconds=//p' "$reboot_src")
+controller_kill_bound=$(sed -n 's/^controller_kill_seconds=//p' "$reboot_src")
+grace_bound=$(sed -n 's/^grace_seconds=//p' "$reboot_src")
+command_bound=$(sed -n 's/^command_seconds=//p' "$reboot_src")
+(( lock_bound + 3 * (stop_bound + 1) + controller_bound + controller_kill_bound + grace_bound + 4 * (command_bound + 1) < 300 )) || fail 'worst-case abort path is not below 300 seconds'
+grep -Fq 'myron-cellular-reboot-failsafe' tools/myron-dev-image-compose || fail 'composer omits the reboot failsafe'
+grep -Fq "cellular reboot failsafe differs from the repository" tools/myron-dev-image-compose || fail 'composer does not byte-verify the reboot failsafe'
+if grep -niE 'imei|imsi|iccid|msisdn|own-numbers|equipment-identifier|hw-addr|mac-address|ether ' "$op_src" "$helper_src" "$reboot_src"; then
   fail 'supervisor or helper reads or prints identity fields'
 fi
 # Helper: only ModemManager listing and keys, and the one start.
@@ -62,7 +79,7 @@ grep -E 'mmcli' "$helper_src" | grep -vE 'mmcli -L|mmcli -m "\$\(printf|^[[:spac
 grep -c 'systemctl' "$helper_src" | grep -qx 1 || fail 'helper uses systemctl more than once'
 grep -Fq 'exec systemctl start --no-block "$enable_unit"' "$helper_src" || fail 'helper does not start exactly the enable unit'
 if grep -nE 'nmcli|rfkill|connection (up|down)|device (disconnect|set)' "$helper_src"; then fail 'helper touches NetworkManager or rfkill'; fi
-pass 'supervisor and helper: syntax, forbidden actions, no latch, no identity'
+pass 'supervisor and helpers: POSIX syntax, bounded plain reboot, forbidden actions, no latch, no identity'
 
 # Constants shared with the stage and the units.
 window=$(sed -n 's/^window_seconds=\([0-9]*\)$/\1/p' "$op_src")
@@ -104,7 +121,10 @@ grep -Fxq 'ExecStart=/usr/local/sbin/myron-cellular-op abort failed' "$units_dir
 grep -Fxq 'Unit=myron-cellular-op-abort.service' "$units_dir/myron-cellular-op.timer" || fail 'timer target'
 grep -Fxq 'RemainAfterElapse=no' "$units_dir/myron-cellular-op.timer" || fail 'timer elapse'
 grep -Fxq 'Restart=no' "$units_dir/myron-cellular-watch.service" || fail 'watcher restarts'
+grep -Fxq 'ExecStopPost=/usr/local/sbin/myron-cellular-op watch-stopped' "$units_dir/myron-cellular-watch.service" || fail 'watcher exit does not publish loss'
 if grep -nE 'reboot|OnFailure' "$units_dir/myron-cellular-watch.service" | grep -v '^[0-9]*:#'; then fail 'watcher can reboot'; fi
+grep -Fxq 'TimeoutStartSec=300' "$units_dir/myron-cellular-op-abort.service" || fail 'deadline abort bound'
+grep -Fxq 'TimeoutStartSec=300' "$units_dir/myron-cellular-op-failed.service" || fail 'failure abort bound'
 # Polkit: exactly the enable unit, start only, active local intended user.
 grep -Fq 'action.lookup("unit") == "myron-cellular-enable.service"' "$polkit_src" &&
   grep -Fq 'action.lookup("verb") == "start"' "$polkit_src" &&
@@ -127,13 +147,13 @@ nonce_re='^[0-9a-f]{32}$'
 
 patch_op() {
   sh_patch "$op_src" "$opc" "main_os=$fix/main-os" "stage=$work/stage" "self=$opc" "helper=$work/helper" \
-    "startup_helper=$work/startup" "guard=$fix/guard" "nm_conf=$work/nm.conf" "apn_config=$work/apn" \
+    "reboot_failsafe=$work/reboot-helper" "startup_helper=$work/startup" "guard=$fix/guard" "nm_conf=$work/nm.conf" "apn_config=$work/apn" \
     "profile_file=$work/profile" "unit_dir=$work/units" "polkit_rule=$work/polkit.rules" \
     "rescue_before=$fix/rescue.before" "net_root=$fix/net" "op_dir=$fix/op" "public_dir=$fix/public" \
     "lock_file=$fix/lock" "mutation_marker=$fix/stage-mutation" "runtime_boot_id=$fix/run/boot-id" \
     "runtime_image_id=$fix/run/image-id" "main_state=$fix/main" "log=$fix/log" "boot_id_file=$fix/bootid" \
     "uptime_file=$fix/uptime" "notes_file=$work/notes" "root_uid=$uid" "root_gid=$gid" \
-    "lock_seconds=2" "stop_seconds=3" "watch_poll_seconds=1" "watch_failures=3"
+    "lock_seconds=2" "stop_seconds=3" "observer_start_seconds=2" "watch_poll_seconds=1" "watch_failures=3"
 }
 mock() { printf '#!/bin/sh\nfix=%s\n%s\n' "$fix" "$2" >"$bin/$1"; chmod +x "$bin/$1"; }
 mock id 'echo ${MOCK_UID:-'"$uid"'}'
@@ -150,7 +170,8 @@ is-active) [ -e "$fix/active-$unit" ] ;;
 start)
   [ ! -f "$fix/hook-start-$unit" ] || sh "$fix/hook-start-$unit"
   [ ! -e "$fix/fail-start-$unit" ] || exit 1
-  touch "$fix/active-$unit"
+  [ -e "$fix/no-activate-$unit" ] || touch "$fix/active-$unit"
+  if [ "$unit" = myron-cellular-watch.service ] && [ ! -e "$fix/no-admit-$unit" ]; then echo up >"$fix/op/lifecycle"; fi
   case $unit in *.timer)
     read -r up _ <"$fix/uptime"; up=${up%%.*}
     echo "$(( (up - ${TIMER_SKEW:-0}) * 1000000 ))" >"$fix/entered" ;; esac ;;
@@ -160,35 +181,45 @@ stop)
 show)
   [ ! -f "$fix/hook-show" ] || sh "$fix/hook-show"
   cat "$fix/entered" 2>/dev/null ;;
+reboot) [ ! -e "$fix/fail-systemd-reboot" ] ;;
 esac'
 mock main-os 'echo "main-os $*" >>"$fix/calls"
 case $1 in
 status) cat "$fix/main-status" ;;
-reboot-normal) exit ${MAIN_OS_RC:-0} ;;
+reboot-normal) [ "${MAIN_OS_HANG:-0}" != 1 ] || /bin/sleep 3; exit ${MAIN_OS_RC:-0} ;;
 esac'
 mock guard 'echo "guard $*" >>"$fix/calls"; [ ! -e "$fix/guard-bad" ]'
 mv "$bin/guard" "$fix/guard"
 mv "$bin/main-os" "$fix/main-os"
+cp "$fix/main-os" "$work/main-os.mock"
 mock nmcli 'echo "nmcli $*" >>"$fix/calls"; [ ! -e "$fix/nm-down" ] && echo activated || echo deactivated'
 mock ss 'echo "ss $*" >>"$fix/calls"; cat "$fix/ss-established" 2>/dev/null; true'
 mock ip 'echo "ip $*" >>"$fix/calls"; cat "$fix/ip-addr" 2>/dev/null; true'
+mock reboot 'echo "reboot $*" >>"$fix/calls"'
+
+reboot_mock=$work/reboot-helper.mock
+printf '#!/bin/sh\necho "reboot-helper $*" >>%q\nexit "${FAILSAFE_RC:-0}"\n' "$fix/calls" >"$reboot_mock"
+chmod +x "$reboot_mock"
 
 reset() {
   rm -rf "$fix/op" "$fix/public" "$fix/main" "$fix/run" "$fix/net" "$work/units" "$fix"/active-* "$fix"/hook-* "$fix"/fail-* \
+    "$fix"/no-activate-* "$fix"/no-admit-* \
     "$fix"/calls "$fix/entered" "$fix/lock" "$fix/log" "$fix/sleep-n" "$fix/guard-bad" "$fix/nm-down" "$fix/stage-mutation" \
     "$fix/rescue.before" "$fix/ss-established" "$fix/ip-addr" "$work/apn"
   mkdir -p "$fix/run" "$fix/main" "$fix/net/usb0" "$fix/net/wlan0/wireless" "$fix/net/rmnet_data0" "$work/units"
   chmod 700 "$fix/main"
+  cp "$work/main-os.mock" "$fix/main-os"; chmod +x "$fix/main-os"
   echo "$bootid" >"$fix/bootid"; echo "$bootid" >"$fix/run/boot-id"; echo "$image" >"$fix/run/image-id"
   echo '1000.00 0.00' >"$fix/uptime"
   printf 'os=omarchy boot_id=%s latch=absent pending=absent success=current image=present next_boot=omarchy\n' "$bootid" >"$fix/main-status"
   printf 'stage-v1\n' >"$work/stage"; printf 'helper-v1\n' >"$work/helper"; printf 'startup-v1\n' >"$work/startup"
+  cp "$reboot_mock" "$work/reboot-helper"; chmod +x "$work/reboot-helper"
   printf 'cellular\n' >"$work/profile"; chmod 644 "$work/profile"
   printf 'nm-v1\n' >"$work/nm.conf"; printf 'notes-v1' >"$work/notes"
   cp "$units_dir"/myron-cellular-*.service "$units_dir"/myron-cellular-op.timer "$work/units/"
   cp "$polkit_src" "$work/polkit.rules"
   touch "$fix/calls" "$fix/log"
-  unset MOCK_UID MAIN_OS_RC TIMER_SKEW SSH_CONNECTION || true
+  unset MOCK_UID MAIN_OS_RC MAIN_OS_HANG FAILSAFE_RC TIMER_SKEW SSH_CONNECTION || true
   patch_op
 }
 op() { PATH=$bin:$PATH sh "$opc" "$@"; }
@@ -196,7 +227,7 @@ opq() { op "$@" >"$work/out" 2>&1; }       # output kept in $work/out
 st() { sed -n 's/^state=//p' "$fix/op/state" 2>/dev/null; }
 pubv() { sed -n "s/^$1=//p" "$fix/public/state"; }
 calls() { cat "$fix/calls"; }
-reboots() { grep -c '^main-os reboot-normal' "$fix/calls" || true; }
+reboots() { grep -c '^reboot-helper --reason' "$fix/calls" || true; }
 mark_all() { for s in "$@"; do opq mark "$s" || { cat "$work/out"; fail "mark $s"; }; done; }
 to_ready() { # kind
   opq begin "$1" || { cat "$work/out"; fail 'begin'; }
@@ -207,6 +238,41 @@ to_ready_with_proofs() {
   echo 'ESTAB 0 0 172.16.42.1:22 172.16.42.2:51000' >"$fix/ss-established"
 }
 no_identity() { :; }
+
+# ---- normal reboot failsafe -------------------------------------------------
+# Every controller outcome reaches the same systemd request and forced plain
+# fallback in this mock environment. On a phone a successful reboot never
+# returns far enough to execute the fallback.
+rebootc=$work/myron-cellular-reboot-failsafe
+patch_reboot() {
+  sh_patch "$reboot_src" "$rebootc" "main_os=$fix/main-os" "runtime_boot_id=$fix/run/boot-id" \
+    "boot_id_file=$fix/bootid" "controller_seconds=1" "controller_kill_seconds=1" "grace_seconds=2" "poll_seconds=1" \
+    "command_seconds=2" "root_uid=$uid"
+}
+run_reboot() { PATH=$bin:$PATH sh "$rebootc" --reason cellular-op-failed >"$work/reboot-out" 2>&1; }
+for outcome in returned failed hung unavailable systemd-refused; do
+  reset; patch_reboot; : >"$fix/calls"
+  case $outcome in
+  returned) run_reboot && fail 'failsafe returned success after a returned controller' ;;
+  failed) MAIN_OS_RC=1 run_reboot && fail 'failsafe returned success after a failed controller' ;;
+  hung) MAIN_OS_HANG=1 run_reboot && fail 'failsafe returned success after a hung controller' ;;
+  unavailable) rm -f "$fix/main-os"; run_reboot && fail 'failsafe returned success without main-os' ;;
+  systemd-refused) touch "$fix/fail-systemd-reboot"; run_reboot && fail 'failsafe returned success after systemd refused reboot' ;;
+  esac
+  if [[ $outcome == unavailable ]]; then
+    ! grep -q '^main-os ' "$fix/calls" || fail 'failsafe called unavailable main-os'
+  else
+    grep -Fxq 'main-os reboot-normal --reason cellular-op-failed' "$fix/calls" || fail "failsafe did not call main-os for $outcome"
+  fi
+  grep -Fxq 'systemctl --no-block reboot' "$fix/calls" || fail "failsafe omitted systemd reboot for $outcome"
+  grep -Fxq 'reboot -f' "$fix/calls" || fail "failsafe omitted forced plain reboot for $outcome"
+  grep -Eq 'recover|latch|bootloader' "$fix/calls" && fail "failsafe selected recovery for $outcome"
+done
+reset; patch_reboot; : >"$fix/calls"; MOCK_UID=4242 run_reboot && fail 'reboot failsafe accepted a non-root caller'
+[[ ! -s $fix/calls ]] || fail 'non-root reboot failsafe acted'
+reset; patch_reboot; echo "$other" >"$fix/run/boot-id"; : >"$fix/calls"
+run_reboot && fail 'reboot failsafe accepted another boot'; [[ ! -s $fix/calls ]] || fail 'foreign-boot reboot failsafe acted'
+pass 'normal reboot failsafe: root/current-main only; controller/systemd failure, return, absence and hang reach forced plain fallback'
 
 # ---- begin: committed boot only, timer armed after the state, before any mutation
 reset
@@ -269,6 +335,7 @@ reset; to_ready qualified
 opq seal || { cat "$work/out"; fail 'qualified seal'; }
 [[ $(st) == sealed && ! -e $fix/active-myron-cellular-op.timer ]] || fail 'seal did not final-state and cancel the timer'
 grep -Fq 'systemctl start --no-block myron-cellular-watch.service' "$fix/calls" || fail 'seal did not start the watcher'
+[[ -e $fix/active-myron-cellular-watch.service ]] || fail 'seal did not prove the watcher active'
 [[ $(cat "$fix/op/lifecycle") == up && $(pubv state) == on ]] || fail 'seal lifecycle/public state'
 [[ ! -e $fix/main/cellular-evidence ]] || fail 'seal wrote evidence'
 op live && fail 'sealed is not live'
@@ -284,7 +351,18 @@ opq seal || fail 'seal with a failing timer stop'
 [[ $(st) == sealed ]] || fail 'sealed state lost'
 : >"$fix/calls"; opq abort deadline || fail 'abort after seal'
 grep -Fq 'result=ignored-sealed' "$work/out" && [[ $(reboots) == 0 && $(st) == sealed ]] || fail 'expiry after seal acted'
-pass 'seal: ready and live only, proofs required for attended, no evidence, a failed timer stop cannot be undone by expiry'
+# A queued-but-dead observer cannot leave sealed data looking up. The sealed
+# state makes the worker's resulting OnFailure abort harmless.
+reset; to_ready qualified; touch "$fix/no-activate-myron-cellular-watch.service"
+opq seal && fail 'seal accepted a queued-but-dead observer'
+[[ $(st) == sealed && $(cat "$fix/op/lifecycle") == lost && $(pubv state) == restart ]] || fail 'dead observer was not published lost'
+[[ ! -e $fix/active-myron-cellular-op.timer ]] || fail 'dead-observer seal left the deadline armed'
+: >"$fix/calls"; opq abort failed || fail 'OnFailure-style abort after observer loss'
+grep -Fq 'result=ignored-sealed' "$work/out" && [[ $(reboots) == 0 ]] || fail 'observer loss rebooted a sealed operation'
+reset; to_ready qualified; touch "$fix/fail-start-myron-cellular-watch.service" "$fix/no-admit-myron-cellular-watch.service"
+opq seal && fail 'seal accepted an observer start failure'
+[[ $(st) == sealed && $(cat "$fix/op/lifecycle") == lost && $(pubv state) == restart && $(reboots) == 0 ]] || fail 'observer start failure was not sealed/lost without reboot'
+pass 'seal: ready and live only, proofs required, observer must admit itself active, loss stays sealed and cannot reboot'
 
 # ---- abort policy ------------------------------------------------------------
 reset; : >"$fix/calls"; opq abort failed || fail 'abort with nothing armed'
@@ -310,7 +388,7 @@ for s in attempting activating active ready; do
     want=failed; [[ $why == deadline ]] && want=expired
     [[ $(st) == "$want" ]] || fail "abort $why in $s: state $(st)"
     [[ $(reboots) == 1 ]] || fail "abort $why in $s: reboots $(reboots)"
-    grep -Fxq "main-os reboot-normal --reason cellular-op-$why" "$fix/calls" || fail "abort $why reason"
+    grep -Fxq "reboot-helper --reason cellular-op-$why" "$fix/calls" || fail "abort $why reason"
     grep -Fq 'systemctl stop myron-cellular-attended.service' "$fix/calls" && grep -Fq 'systemctl stop myron-cellular-enable.service' "$fix/calls" || fail 'abort did not stop the operation units'
     [[ ! -e $fix/active-myron-cellular-op.timer ]] || fail 'abort left the timer'
     [[ $(pubv state) == restart ]] || fail 'abort public state'
@@ -327,9 +405,11 @@ opq abort deadline || fail 'abort with late worker steps'
 grep -Fq 'not live' "$fix/late-mark" || fail 'late mark was not refused for liveness'
 [[ $(st) == expired && $(reboots) == 1 ]] || fail 'late steps changed the aborted operation'
 rm -f "$fix/late-mark" "$fix/late-seal"
-# idempotent: the timer and OnFailure may both fire; one reboot request
+# The timer and OnFailure may both fire. The marker avoids duplicate worker
+# stops but never suppresses another independently bounded reboot request.
 reset; to_ready qualified; opq abort failed; : >"$fix/calls"; opq abort deadline || fail 'second abort'
-grep -Fq 'already-requested' "$work/out" && [[ $(reboots) == 0 ]] || fail 'a second abort asked for another reboot'
+grep -Fq 'already-requested' "$work/out" && [[ $(reboots) == 1 ]] || fail 'a second abort failed to reinforce the reboot'
+! grep -Eq '^systemctl stop myron-cellular-(attended|enable)[.]service' "$fix/calls" || fail 'a repeat abort stopped workers again'
 # an untrusted state fails closed
 reset; opq begin attended; printf 'garbage\n' >"$fix/op/state"; : >"$fix/calls"
 opq abort failed || fail 'abort with garbage state'; [[ $(reboots) == 1 ]] || fail 'garbage state did not reboot'
@@ -339,8 +419,10 @@ reset; opq begin attended; sed -i 's/^state=.*/state=bogus/' "$fix/op/state"; : 
 opq abort failed || fail 'abort with a bogus word'; [[ $(reboots) == 1 ]] || fail 'bogus state did not reboot'
 reset; opq begin attended; rm -f "$fix/op/state"; ln -s /dev/null "$fix/op/state"; : >"$fix/calls"
 opq abort failed || fail 'abort with a linked state'; [[ $(reboots) == 1 ]] || fail 'linked state did not reboot'
-# a refused reboot-normal is reported, never turned into a latch
-reset; to_ready qualified; : >"$fix/calls"; MAIN_OS_RC=1 opq abort failed && fail 'abort hid a refused reboot-normal'
+# The supervisor delegates even if the helper later reports failure; no
+# alternate recovery or latch path exists here.
+reset; to_ready qualified; : >"$fix/calls"; FAILSAFE_RC=1 opq abort failed && fail 'abort hid a reboot-helper failure'
+[[ $(reboots) == 1 ]] || fail 'abort did not invoke the failing reboot helper'
 grep -Eq 'recover|latch' "$fix/calls" && fail 'abort fell back to recover'
 # A lock held past the bounded wait requests the normal reboot directly. It
 # never writes terminal state without the lock and never stops the worker.
@@ -351,7 +433,7 @@ PATH=$bin:$PATH sh "$opc" abort deadline >"$work/out" 2>&1 || fail 'abort withou
 wait "$holder" || true
 [[ $(st) == ready && $(reboots) == 1 ]] || fail 'lock-timeout abort wrote unlocked state or missed the reboot'
 ! grep -q '^systemctl stop myron-cellular-' "$fix/calls" || fail 'lock-timeout abort stopped the worker without sealing state'
-pass 'abort: cancel before mutation, normal reboot after, terminal state under lock before worker stop, late steps refused, idempotent, untrusted state fails closed, never a latch'
+pass 'abort: cancel before mutation, bounded helper after, terminal state before worker stop, repeat abort reinforces reboot, never a latch'
 
 # ---- the seal/abort race under one lock -----------------------------------------
 # Expiry arrives while seal holds the lock: the seal commits, the expiry reads sealed.
@@ -466,6 +548,7 @@ invalid() { local what=$1; opq evidence-check && fail "evidence stayed valid aft
 printf 'stage-v2\n' >"$work/stage"; invalid 'a stage change'; printf 'stage-v1\n' >"$work/stage"; op evidence-check >/dev/null || fail 'restored stage'
 printf 'helper-v2\n' >"$work/helper"; invalid 'a helper change'; printf 'helper-v1\n' >"$work/helper"
 printf 'startup-v2\n' >"$work/startup"; invalid 'a startup helper change'; printf 'startup-v1\n' >"$work/startup"
+printf '# changed\n' >>"$work/reboot-helper"; invalid 'a reboot failsafe change'; cp "$reboot_mock" "$work/reboot-helper"; chmod +x "$work/reboot-helper"
 printf 'bluetooth\n' >"$work/profile"; invalid 'a profile value change'; printf 'cellular\n' >"$work/profile"
 printf 'cellular' >"$work/profile"; invalid 'an unterminated profile value'; printf 'cellular\n' >"$work/profile"
 chmod 666 "$work/profile"; invalid 'a writable profile input'; chmod 644 "$work/profile"
@@ -492,14 +575,22 @@ MOCK_UID=4242 opq evidence-check && fail 'evidence-check as non-root'
 reset; to_ready qualified; opq seal; opq record-evidence && fail 'a qualified operation recorded evidence'
 reset; to_ready qualified; opq record-evidence && fail 'a ready operation recorded evidence'
 sealed_attended; echo lost >"$fix/op/lifecycle"; opq record-evidence && fail 'evidence recorded after the connection was lost'
+sealed_attended; rm -f "$fix/active-myron-cellular-watch.service"; opq watch-stopped || fail 'observer exit hook'
+[[ $(cat "$fix/op/lifecycle") == lost && $(pubv state) == restart && $(reboots) == 0 ]] || fail 'observer exit did not publish lost without reboot'
+opq proof-ready && fail 'proof-ready accepted a dead observer'
+opq record-evidence && fail 'evidence recorded without a live observer'
+[[ ! -e $fix/main/cellular-evidence ]] || fail 'dead-observer refusal wrote evidence'
 sealed_attended; opq proof-ready || fail 'proof-ready'; MOCK_UID=4242 opq record-evidence && fail 'record-evidence as non-root'
 reset; opq record-evidence && fail 'record-evidence with no operation'
 [[ ! -e $fix/main/cellular-evidence ]] || fail 'a refused record wrote evidence'
-pass 'evidence: root-only, sealed attended proof only, bound to boot, stage, UI/startup helpers, cellular profile, units, polkit, NM inhibit, APN, kernel notes and image; stale or loosened evidence is invalid'
+pass 'evidence: sealed attended/live-observer only, bound to boot, startup/reboot policy, profile, units, NM, APN, kernel and image'
 
 # ---- the watcher -----------------------------------------------------------------
 sealed_attended
 : >"$fix/calls"
+# A newly started observer owns starting -> up before its first poll.
+echo starting >"$fix/op/lifecycle"
+printf 'grep -Fxq up %s/op/lifecycle\n' "$fix" >"$fix/hook-sleep-1"
 # two transient failures recover; three in a row are lost
 printf 'touch %s/guard-bad\n' "$fix" >"$fix/hook-sleep-2"; printf 'rm -f %s/guard-bad\n' "$fix" >"$fix/hook-sleep-4"
 printf 'touch %s/nm-down\n' "$fix" >"$fix/hook-sleep-6"
@@ -518,7 +609,7 @@ op publish; [[ $(pubv state) == restart ]] || fail 'a publish revived lost data'
 reset; to_ready qualified; opq watch && fail 'watch before the seal'
 reset; opq watch && fail 'watch with no operation'
 sealed_attended; rm -f "$fix/op/lifecycle"; opq watch && fail 'watch without a lifecycle'
-pass 'watcher: observes only, debounced, lost is final, never reconnects, reboots or changes a radio'
+pass 'watcher: self-admits starting to up, observes only, debounces, lost is final, never mutates or reboots'
 
 # ---- the public status -------------------------------------------------------------
 pubstate() { op publish; printf '%s/%s' "$(pubv state)" "$(pubv evidence)"; }

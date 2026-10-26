@@ -9,4 +9,5 @@ ConditionPathExists=/run/myron-main/boot-id
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/myron-cellular-op watch
+ExecStopPost=/usr/local/sbin/myron-cellular-op watch-stopped
 Restart=no

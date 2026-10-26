@@ -176,6 +176,7 @@ docker run --rm --privileged --platform linux/arm64 \
         if [[ -d $path && ! -L $path ]]; then chmod 0755 "$root$relative"; fi
       done < <(find /main-overlay -mindepth 1 -print0)
       chmod 0755 "$root/usr/local/sbin/myron-main-os" "$root/usr/local/sbin/myron-cellular-op" \
+        "$root/usr/local/sbin/myron-cellular-reboot-failsafe" \
         "$root/usr/local/bin/myron-mobile-data"
       chmod 0644 "$root/usr/lib/systemd/system/myron-hardware-watchdog.service" \
         "$root/usr/lib/systemd/system/myron-main-recover.service" \
@@ -336,7 +337,7 @@ docker run --rm --privileged --platform linux/arm64 \
 e2fsck -fn "$out" >/dev/null
 if [[ $boot_policy == main ]]; then
   for path in /usr/local/sbin/myron-main-os /usr/lib/systemd/system/myron-hardware-watchdog.service \
-    /usr/local/sbin/myron-cellular-op /usr/local/bin/myron-mobile-data \
+    /usr/local/sbin/myron-cellular-op /usr/local/sbin/myron-cellular-reboot-failsafe /usr/local/bin/myron-mobile-data \
     /usr/lib/systemd/system/myron-cellular-op.timer /usr/lib/systemd/system/myron-cellular-op-abort.service \
     /usr/lib/systemd/system/myron-cellular-op-failed.service /usr/lib/systemd/system/myron-cellular-attended.service \
     /usr/lib/systemd/system/myron-cellular-enable.service /usr/lib/systemd/system/myron-cellular-watch.service \
@@ -350,6 +351,9 @@ if [[ $boot_policy == main ]]; then
     grep -Fq 'myron-main-os guard' || die 'main guard unit is not installed'
   debugfs -R 'cat /usr/lib/systemd/system/myron-hardware-watchdog.service' "$out" 2>/dev/null |
     grep -Fq '/run/myron-watchdog' && die 'temporary watchdog unit survived in the main payload'
+  [[ $(debugfs -R 'cat /usr/local/sbin/myron-cellular-reboot-failsafe' "$out" 2>/dev/null | sha256sum) == \
+    "$(sha256sum <device/myron/main-overlay/usr/local/sbin/myron-cellular-reboot-failsafe)" ]] ||
+    die 'cellular reboot failsafe differs from the repository'
   # debugfs exits 0 for a missing path, so existence is read from its output.
   in_image() { ! debugfs -R "stat $1" "$out" 2>&1 | grep -Fq 'File not found'; }
   # The operation units: byte for byte the repository's, never enabled except

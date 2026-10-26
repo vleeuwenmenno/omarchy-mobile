@@ -1,0 +1,51 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Last-resort normal reboot for a half-mutated Myron cellular operation.
+#
+# The reviewed main controller gets one bounded chance first. If it refuses,
+# fails, returns or hangs, this helper asks systemd for a normal reboot and,
+# only after a bounded grace, forces a plain reboot. It never selects recovery,
+# changes a slot or writes a partition.
+set -eu
+
+main_os=/usr/local/sbin/myron-main-os
+runtime_boot_id=/run/myron-main/boot-id
+boot_id_file=/proc/sys/kernel/random/boot_id
+controller_seconds=130
+controller_kill_seconds=5
+grace_seconds=30
+poll_seconds=5
+command_seconds=5
+root_uid=0
+
+fail() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
+
+[ "$(id -u)" = "$root_uid" ] || fail 'must run as root'
+[ "$#" = 2 ] && [ "$1" = --reason ] || fail 'usage: myron-cellular-reboot-failsafe --reason WORD'
+reason=$2
+case $reason in ''|*[!a-z0-9-]*) fail 'reason must be lowercase letters, digits and dashes' ;; esac
+[ "${#reason}" -le 40 ] || fail 'reason is too long'
+
+# Positive identity of the persistent main boot. Reason stays in the
+# supervisor's root-only log; this helper does not add another state file.
+[ -f "$runtime_boot_id" ] && [ ! -L "$runtime_boot_id" ] || fail 'this is not the persistent main boot'
+current=$(cat "$boot_id_file" 2>/dev/null) || fail 'boot id is unreadable'
+[ -n "$current" ] && [ "$(cat "$runtime_boot_id" 2>/dev/null || true)" = "$current" ] ||
+	fail 'this is not the persistent main boot'
+
+# A successful reboot does not return. Every possible return reaches the
+# independent fallback, including exit 0 from a broken controller.
+if [ -f "$main_os" ] && [ -x "$main_os" ] && [ ! -L "$main_os" ]; then
+	timeout -k "$controller_kill_seconds" "$controller_seconds" "$main_os" reboot-normal --reason "$reason" || true
+fi
+
+timeout -k 1 "$command_seconds" sync >/dev/null 2>&1 || true
+timeout -k 1 "$command_seconds" systemctl --no-block reboot >/dev/null 2>&1 || true
+waited=0
+while [ "$waited" -lt "$grace_seconds" ]; do
+	sleep "$poll_seconds"
+	waited=$((waited + poll_seconds))
+done
+timeout -k 1 "$command_seconds" sync >/dev/null 2>&1 || true
+timeout -k 1 "$command_seconds" reboot -f || true
+fail 'forced plain reboot returned'

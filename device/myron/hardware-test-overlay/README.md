@@ -88,3 +88,11 @@ autoconnect before releasing management. The composer rejects cellular profiles
 from all supported NetworkManager keyfile stores. The
 guarded `myron-cellular-stage` allows exactly one data activation per boot
 and never disarms rollback; see `docs/myron/HARDWARE-TEST.md`.
+
+The first attended persistent-main activation uses strict rescue admission:
+USB and Wi-Fi must both be live before activation, and fresh authenticated SSH
+connections over both paths must be proved afterward. Later qualified runs are
+allowed only with valid evidence bound to that attended run; they relax the
+pre-activation liveness requirement, not preservation. Both modes take the
+same private snapshot and require every USB, Wi-Fi, route, listener and SSH
+session fact present before activation to remain unchanged afterward.
