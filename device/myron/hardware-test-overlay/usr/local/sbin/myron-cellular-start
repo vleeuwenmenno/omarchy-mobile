@@ -1,47 +1,157 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 # Guarded cellular-profile transaction: radio foundation, then ModemManager.
+# Stock ipam.ko can panic after rmnet_ipa0 goes down and is opened again, so
+# the in-tree rmnet stack is verified before the radio starts, the read-only
+# IPA guard runs before ModemManager, and nothing here ever reconnects,
+# re-enables or restarts a radio-path component in a boot.
 set -eu
 umask 077
 
+expected_kernel=6.12.23-android16-5-g5a0e85dd9db0-dirty-4k
+expected_notes=8ba2b05e346c638d699e16d4b782378e394bba374a12b16abacc1b905cb8d608
+rmnet_sha=351ee168950591a3a9c35ea2c35b23678dd6ed8a2b0d0c218eb3c4a13a60dff3
+max_temperature_mc=95000
+
 runtime=/run/omamobile-myron
 ready=/run/myron-cellular-ready
+wireless_ready=/run/myron-wireless-ready
 profile_file=/etc/omamobile/myron-test-profile
+host_arm=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+rmnet_marker=/etc/myron/use-in-tree-rmnet
+notes_file=/sys/kernel/notes
+selector=/usr/local/sbin/myron-attempt79-module-dir
+module_set_root=/usr/local/lib/myron-gki-module-sets
+guard=/usr/local/sbin/myron-ipa-guard
+sys_module=/sys/module
+net_root=/sys/class/net
+thermal_root=/sys/class/thermal
+bluetooth_hci=/sys/class/bluetooth/hci0
+ipa_port=rmnet_ipa0
+guard_wait_steps=10
+module_dir=
 
 fail() {
 	printf 'ERROR: Myron cellular bring-up: %s\n' "$*" >&2
 	exit 1
 }
 
-[ "$(id -u)" = 0 ] || fail 'must run as root'
-[ -f /run/myron-host/var/lib/omarchy-mobile/hardware-test.armed ] ||
-	fail 'temporary hardware-test arm is absent'
-systemctl --quiet is-active myron-hardware-watchdog.service ||
-	fail 'independent rollback watchdog is not active'
-[ "$(cat "$profile_file" 2>/dev/null || true)" = cellular ] ||
-	fail 'cellular hardware-test profile is not selected'
-! systemctl --quiet is-active myron-coexistence.service ||
-	fail 'coexistence profile must remain inactive'
-! systemctl --quiet is-active myron-reference-audio-foundation.service ||
-	fail 'AudioReach must remain inactive in the cellular profile'
-! systemctl --quiet is-active myron-speaker-bridge.service ||
-	fail 'speaker bridge must remain inactive in the cellular profile'
-[ ! -e /sys/class/bluetooth/hci0 ] ||
-	fail 'Bluetooth controller must remain absent in the cellular profile'
-! pgrep -x btattach >/dev/null 2>&1 ||
-	fail 'Bluetooth transport must remain inactive in the cellular profile'
-[ ! -e "$ready" ] || exit 0
+hottest_temperature() {
+	hottest=0
+	valid_sensors=0
+	for file in "$thermal_root"/thermal_zone*/temp; do
+		[ -r "$file" ] || continue
+		type=$(timeout -k 1 2 cat "${file%/temp}/type" 2>/dev/null) || continue
+		[ -n "$type" ] || continue
+		case "$type" in *-trip-*) continue ;; esac
+		value=$(timeout -k 1 2 cat "$file" 2>/dev/null) || continue
+		case "$value" in ''|*[!0-9]*) continue ;; esac
+		[ "$value" -gt 0 ] && [ "$value" -lt 200000 ] || continue
+		valid_sensors=$((valid_sensors + 1))
+		[ "$value" -le "$hottest" ] || hottest=$value
+	done
+	[ "$valid_sensors" -gt 0 ] || return 1
+	printf '%s\n' "$hottest"
+}
 
-install -d -m0700 "$runtime"
-printf '%s\n' verified-read-only-backup >"$runtime/radio-backup-verified"
-systemctl start myron-reference-radio.service
-[ -s /run/myron-wireless-ready ] || fail 'radio foundation did not become ready'
+require_temperature() {
+	reading=$(hottest_temperature) || fail 'temperature sensors are unavailable'
+	[ "$reading" -lt "$max_temperature_mc" ] ||
+		fail "temperature safety limit reached: $reading mC"
+}
 
-udevadm settle --timeout=30 || fail 'radio devices did not settle'
-systemctl start ModemManager.service
-systemctl --quiet is-active ModemManager.service ||
-	fail 'ModemManager did not remain active'
+check_profile_gates() {
+	[ "$(id -u)" = 0 ] || fail 'must run as root'
+	[ -f "$host_arm" ] ||
+		fail 'temporary hardware-test arm is absent'
+	systemctl --quiet is-active myron-hardware-watchdog.service ||
+		fail 'independent rollback watchdog is not active'
+	[ "$(cat "$profile_file" 2>/dev/null || true)" = cellular ] ||
+		fail 'cellular hardware-test profile is not selected'
+	! systemctl --quiet is-active myron-coexistence.service ||
+		fail 'coexistence profile must remain inactive'
+	! systemctl --quiet is-active myron-reference-audio-foundation.service ||
+		fail 'AudioReach must remain inactive in the cellular profile'
+	! systemctl --quiet is-active myron-speaker-bridge.service ||
+		fail 'speaker bridge must remain inactive in the cellular profile'
+	[ ! -e "$bluetooth_hci" ] ||
+		fail 'Bluetooth controller must remain absent in the cellular profile'
+	! pgrep -x btattach >/dev/null 2>&1 ||
+		fail 'Bluetooth transport must remain inactive in the cellular profile'
+}
 
-printf 'radio=ready\nmodem-manager=active\nbluetooth=absent\naudio=inactive\n' >"$ready"
-chmod 0600 "$ready"
-printf '%s\n' 'result=ready radio=wifi modem-manager=active bluetooth=absent audio=inactive'
+# Everything that can be proven before the radio foundation touches hardware.
+check_rmnet_assets() {
+	[ -f "$rmnet_marker" ] && [ ! -L "$rmnet_marker" ] ||
+		fail 'in-tree rmnet selection marker is not a regular file'
+	[ "$(uname -r)" = "$expected_kernel" ] ||
+		fail "unexpected kernel release: $(uname -r)"
+	notes=$(sha256sum "$notes_file" | awk '{print $1}')
+	[ "$notes" = "$expected_notes" ] || fail 'kernel notes differ from the reviewed candidate'
+	[ -x "$selector" ] || fail 'GKI module selector is unavailable'
+	module_dir=$("$selector") || fail 'GKI module selection failed'
+	[ -d "$module_dir" ] && [ ! -L "$module_dir" ] ||
+		fail 'selected GKI module directory is invalid'
+	[ "$module_dir" = "$module_set_root/$notes" ] ||
+		fail 'GKI module selector returned a directory for different kernel notes'
+	[ -f "$module_dir/rmnet.ko" ] && [ ! -L "$module_dir/rmnet.ko" ] ||
+		fail 'in-tree rmnet module is missing'
+	[ "$(sha256sum "$module_dir/rmnet.ko" | awk '{print $1}')" = "$rmnet_sha" ] ||
+		fail 'in-tree rmnet module checksum mismatch'
+	[ ! -e "$module_dir/rmnet_core.ko" ] || fail 'rmnet_core must not be present'
+	[ ! -d "$sys_module/rmnet_core" ] || fail 'rmnet_core must not be loaded'
+}
+
+# After the radio foundation and udev settle, before ModemManager may run.
+check_radio_result() {
+	[ -s "$wireless_ready" ] || fail 'radio foundation did not become ready'
+	[ -d "$sys_module/rmnet" ] || fail 'in-tree rmnet is not loaded'
+	[ ! -d "$sys_module/rmnet_core" ] || fail 'rmnet_core must remain absent'
+	for module in rmnet_mem gsim ipam ipanetm rmnet_ctl; do
+		[ -d "$sys_module/$module" ] || fail "required radio module is not loaded: $module"
+	done
+	[ -e "$net_root/$ipa_port" ] || fail 'rmnet_ipa0 does not exist'
+	udevadm info -q property -p "$net_root/$ipa_port" 2>/dev/null |
+		grep -Fqx ID_MM_QCOM_SOC=1 || fail 'rmnet_ipa0 lacks the qcom-soc udev classification'
+	require_temperature
+}
+
+start_guard() {
+	systemctl start myron-ipa-guard.service ||
+		fail 'IPA guard did not start'
+	systemctl --quiet is-active myron-ipa-guard.service ||
+		fail 'IPA guard is not active'
+	step=0
+	until "$guard" check pristine >/dev/null 2>&1; do
+		step=$((step + 1))
+		[ "$step" -lt "$guard_wait_steps" ] || fail 'IPA guard did not report a clean pristine state'
+		sleep 1
+	done
+}
+
+main() {
+	check_profile_gates
+	check_rmnet_assets
+	[ ! -e "$ready" ] || exit 0
+
+	install -d -m0700 "$runtime"
+	printf '%s\n' verified-read-only-backup >"$runtime/radio-backup-verified"
+	systemctl start myron-reference-radio.service
+	udevadm settle --timeout=30 || fail 'radio devices did not settle'
+	check_radio_result
+	start_guard
+	# ModemManager may be D-Bus activated early; its drop-in refuses to run
+	# until this marker exists.
+	printf '%s\n' checked >"$runtime/modem-manager-allowed"
+	chmod 0600 "$runtime/modem-manager-allowed"
+	systemctl start ModemManager.service
+	systemctl --quiet is-active ModemManager.service ||
+		fail 'ModemManager did not remain active'
+
+	printf 'radio=ready\nmodem-manager=active\nrmnet=in-tree\nipa-guard=active\nbluetooth=absent\naudio=inactive\n' >"$ready"
+	chmod 0600 "$ready"
+	printf '%s\n' 'result=ready radio=wifi modem-manager=active rmnet=in-tree ipa-guard=active bluetooth=absent audio=inactive'
+}
+
+# --- main ---
+main

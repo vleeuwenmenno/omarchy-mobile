@@ -8,7 +8,9 @@ SUBSYSTEM=="input", KERNEL=="event*", GROUP="input", MODE="0660"
 # physical power key or resin-backed Volume Down key.
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pmic_pwrkey", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pmic_resin", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1"
-# Qualcomm's downstream IPA stack exposes rmnet_ipa0 as a virtual net device,
-# without the "ipa" driver parent matched by ModemManager's qcom-soc rule.
-# Group this one exact port with the QRTR control node for attended discovery.
-SUBSYSTEM=="net", KERNEL=="rmnet_ipa0", ENV{ID_MM_QCOM_SOC}="1", ENV{ID_MM_PHYSDEV_UID}="qcom-soc", ENV{ID_MM_CANDIDATE}="1"
+# Qualcomm's downstream IPA stack exposes rmnet_ipa0 (and, with the in-tree
+# rmnet, qmapmux* mux ports) as virtual net devices, without the "ipa" driver
+# parent matched by ModemManager's qcom-soc rule. Group these exact port names
+# with the QRTR control node for attended discovery.
+SUBSYSTEM=="net", KERNEL=="rmnet_ipa*", ENV{ID_MM_QCOM_SOC}="1", ENV{ID_MM_PHYSDEV_UID}="qcom-soc", ENV{ID_MM_CANDIDATE}="1"
+SUBSYSTEM=="net", KERNEL=="qmapmux*", ENV{ID_MM_QCOM_SOC}="1", ENV{ID_MM_PHYSDEV_UID}="qcom-soc", ENV{ID_MM_CANDIDATE}="1"

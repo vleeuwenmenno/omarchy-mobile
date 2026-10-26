@@ -76,3 +76,10 @@ bridge remain stopped. In either profile the rollback watchdog stays armed
 until native DSI/GPU qualification and the selected profile checks succeed.
 For `cellular`, qualification requires a published modem with raw and NMEA GPS
 capabilities, but it does not enable GNSS, mobile data, SMS or voice calls.
+
+The `cellular` profile additionally selects the in-tree `rmnet` stack through
+the empty marker `etc/myron/use-in-tree-rmnet`, verifies it before the radio
+starts, runs the read-only `myron-ipa-guard` before ModemManager, and gates
+ModemManager behind `/run/omamobile-myron/modem-manager-allowed`. The
+guarded `myron-cellular-stage` allows exactly one data activation per boot
+and never disarms rollback; see `docs/myron/HARDWARE-TEST.md`.

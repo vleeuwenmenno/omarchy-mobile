@@ -1,39 +1,66 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# Execute the one-shot Myron cellular data and airplane-stage gates against
-# mocked mmcli/nmcli/ip/curl. Nothing touches a phone or a network.
+# Execute the one-shot Myron cellular data stage's gates against mocked
+# mmcli/nmcli/ip/curl/resolvectl and fake host state. Nothing touches a phone
+# or a network.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 stage=device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage
-fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+tfail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
-[[ -x $stage ]] || fail 'stage is executable'
-sh -n "$stage" || fail 'stage parses as POSIX sh'
-bash -n "$stage" || fail 'stage parses as bash'
+[[ -x $stage ]] || tfail 'stage is executable'
+sh -n "$stage" || tfail 'stage parses as POSIX sh'
+bash -n "$stage" || tfail 'stage parses as bash'
 if shellcheck --version >/dev/null 2>&1; then
-  shellcheck -s sh -e SC2086,SC2034,SC2046,SC2015,SC2155 "$stage" || fail 'shellcheck'
+  shellcheck -s sh -e SC2086,SC2034,SC2046,SC2015,SC2155,SC2294 "$stage" || tfail 'shellcheck'
 fi
 # POSIX sh only: no bash-isms in the guarded root script.
-if grep -nE '\[\[|<<<|\blocal\b|\bfunction\b|\$\{[^}]*(//|,,|\^\^)|\bdeclare\b|\bmapfile\b|&>|<\(' "$stage"; then
-  fail 'stage uses shell syntax outside POSIX sh'
+if grep -nE '\[\[[^:]|<<<|(^|[[:space:]])local[[:space:]]|\bfunction\b|\$\{[^}]*(//|,,|\^\^)|\bdeclare\b|\bmapfile\b|&>|<\(' "$stage"; then
+  tfail 'stage uses shell syntax outside POSIX sh'
 fi
-# The sbin script never stops, restarts, disconnects, reconnects or re-enables.
-if grep -nE 'connection (down|delete|reapply)|device (disconnect|reapply)|\bdisconnect\b|systemctl +(stop|restart|reload|kill|mask|disable)|\bkill(all)?\b|modprobe|rmmod|insmod|fastboot|\bdd\b|--enable|--set-power-state-(high|on)|set-power-state-on|\bsudo\b|/dev/(disk|block|sd|mmc)|remoteproc[^ ]*/state|nmcli +(radio|networking)|\brfkill\b|\bnv\b' "$stage"; then
-  fail 'stage contains a forbidden stop, disconnect, re-enable or storage action'
+# The sbin script never stops, restarts, disconnects, reconnects or re-enables,
+# never changes modem power, and never touches storage.
+if grep -nE 'connection (down|delete|reapply)|device (disconnect|reapply)|\bdisconnect\b|systemctl +(stop|restart|reload|kill|mask|disable|start)|\bkill(all)?\b|modprobe|rmmod|insmod|fastboot|\bdd\b|--enable|--disable|set-power-state|--set-|\bsudo\b|/dev/(disk|block|sd|mmc)|remoteproc[^ ]*/state|nmcli +(radio|networking)|\brfkill\b|\bnv\b' "$stage"; then
+  tfail 'stage contains a forbidden stop, disconnect, re-enable, power or storage action'
 fi
 # No identity readers.
 if grep -niE 'imei|imsi|iccid|msisdn|own-numbers|equipment-identifier|operator-code|operator-name|hw-addr|mac-address|ether ' "$stage"; then
-  fail 'stage reads or prints identity fields'
+  tfail 'stage reads or prints identity fields'
 fi
-# Every radio-path tool call is bounded by timeout.
-if grep -nE '(^|[^-_/a-z])(mmcli|nmcli|curl) ' "$stage" |
-  grep -vE 'timeout -k [0-9]+ [0-9]+ (mmcli|nmcli|curl)|command -v|tool|ERROR|usage|printf|^[0-9]+:#'; then
-  fail 'stage runs mmcli/nmcli/curl without a timeout'
+# The modem is only ever listed or read as keys.
+if grep -nE 'mmcli' "$stage" | grep -vE 'mmcli -L|mmcli -m "\$modem" -K|command -v|for tool|^[0-9]+:#|mmcli nmcli|mm_key|mmcli.*\)$'; then
+  tfail 'stage runs an mmcli command other than list and read-only keys'
 fi
-grep -Fq 'connection.autoconnect no' "$stage" || fail 'stage does not set autoconnect off'
-pass 'cellular stage syntax, forbidden-action and identity greps'
+# Every radio-path tool call is bounded by timeout and sheds raw stderr.
+joined=$(sed ':a;/\\$/{N;s/\\\n//;ba}' "$stage")
+if printf '%s\n' "$joined" | grep -E '(^|[^-_/a-zA-Z])(mmcli|nmcli|curl|resolvectl|ss|ip) -' |
+  grep -vE 'timeout -k [0-9]+ [0-9]+ (mmcli|nmcli|curl|resolvectl|ss|ip)|command -v|for tool|ERROR|usage|printf|^[[:space:]]*#|mm_key|persist|case '; then
+  tfail 'stage runs mmcli/nmcli/curl/resolvectl/ss/ip without a timeout'
+fi
+# Every profile mutation, activation and lookup uses the fixed UUID, never a name.
+if grep -nE 'connection (modify|up) ' "$stage" | grep -vE 'uuid "\$target_uuid"'; then
+  tfail 'stage mutates or activates a profile by name'
+fi
+grep -Fq 'connection.uuid "$target_uuid"' "$stage" || tfail 'profile is not created with the fixed UUID'
+grep -Fq 'gsm.home-only yes' "$stage" || tfail 'profile is not home-only'
+# Failure logs never carry variables: persist only the fixed message.
+grep -Fq 'persist "result=failed message=$1"' "$stage" || tfail 'failure logging can persist variable detail'
+if printf '%s\n' "$joined" | grep -E 'timeout -k [0-9]+ [0-9]+ (mmcli|nmcli|curl|resolvectl|ip)' | grep -vE '2>/dev/null|>/dev/null 2>&1'; then
+  tfail 'stage lets a tool write raw stderr'
+fi
+grep -Fq 'connection.autoconnect no' "$stage" || tfail 'stage does not set autoconnect off'
+grep -Fq 'curl -q --interface' "$stage" || tfail 'curl does not ignore its config file first'
+for flag in '--retry 0' "--noproxy '*'" '--proto =https' '--tlsv1.2' '--max-time' '--max-filesize' '--max-redirs 0'; do
+  grep -Fq -- "$flag" "$stage" || tfail "probe lacks $flag"
+done
+# No finish or disarm command, and the host disarm marker is only ever removed.
+if grep -nE '^(finish|disarm)\)|cmd_(finish|disarm)' "$stage"; then tfail 'stage exposes finish or disarm'; fi
+if grep -n 'host_disarm' "$stage" | grep -vE 'host_disarm=|rm -f "\$host_disarm"|-e "\$host_disarm"'; then
+  tfail 'stage writes the host disarm marker'
+fi
+pass 'cellular stage syntax, forbidden-action, privacy and bounded-call greps'
 
 work=$(mktemp -d /tmp/myron-cellular-stage.XXXXXX)
 trap 'rm -rf -- "$work"' EXIT
@@ -42,18 +69,33 @@ source <(sed '/^# --- main ---$/,$d' "$stage")
 
 calls=$work/calls
 runtime_dir=$work/run
-attempt_marker=$runtime_dir/data-attempted
-airplane_marker=$runtime_dir/airplane-off
+mutation_marker=$runtime_dir/mutation
+arm_marker=$runtime_dir/stage-armed
 data_state=$runtime_dir/data.state
-airplane_state=$runtime_dir/airplane.state
 log=$work/host-log
-arm=$work/armed
+host_state=$work/host
+host_armed=$host_state/hardware-test.armed
+host_disarm=$host_state/hardware-test.disarm
+init_boot_sha_file=$host_state/hardware-test-init-boot.sha256
+rollback_complete=$host_state/hardware-test.rollback-complete
+init_boot_rollback=$work/init_boot.img
+boot_rollback=$work/boot.img
 profile_file=$work/profile
 cellular_ready=$work/cellular-ready
 wireless_ready=$work/wireless-ready
 apn_config=$work/apn
+os_release=$work/os-release
+dt_root=$work/dt
+notes_file=$work/notes
+uptime_file=$work/uptime
+boot_id_file=$work/boot-id
 net_root=$work/net
+sys_module=$work/sys-module
+thermal_root=$work/thermal
 bluetooth_hci=$work/hci0
+expected_kernel=6.12.23-test
+init_boot_size=16
+boot_size=32
 qualify_steps=2
 late_steps=2
 
@@ -61,42 +103,95 @@ secret_imei=358240051111110
 secret_iccid=8931080019000000000
 secret_number=+31612345678
 secret_ip=100.77.88.99
+secret_wifi_ip=192.168.50.7
 secret_dns=198.51.100.53
+secret_apn=carrier-secret-apn.example
+secret_uuid=4f2a9c1e-1b2d-4c3e-8f40-0123456789ab
+other_uuid=11111111-2222-4333-8444-555555555555
+real_uid=0
+[[ $target_uuid =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || tfail 'stage target UUID is not a fixed lowercase UUID'
+stage_target_uuid=$target_uuid
+target_uuid=$secret_uuid
+
+printf 'notes' >"$notes_file"
+expected_notes=$(sha256sum "$notes_file" | awk '{print $1}')
+printf '%s' 0123456789abcdef >"$work/init_boot.good"
+printf '%s' 0123456789abcdef0123456789abcdef >"$work/boot.good"
+rollback_init_boot_sha=$(sha256sum "$work/init_boot.good" | awk '{print $1}')
+rollback_boot_sha=$(sha256sum "$work/boot.good" | awk '{print $1}')
+candidate_sha=$(printf candidate | sha256sum | awk '{print $1}')
+payload_sha=$(printf payload | sha256sum | awk '{print $1}')
 
 reset() {
-  rm -rf "$runtime_dir" "$calls" "$log" "$apn_config" "$net_root" "$bluetooth_hci"
+  rm -rf "$runtime_dir" "$calls" "$log" "$apn_config" "$net_root" "$bluetooth_hci" "$host_state" \
+    "$sys_module" "$thermal_root" "$work/activated" "$work"/arrive.* "$work/dtmodel" \
+    "$init_boot_rollback" "$boot_rollback" "$work"/real* "$arm_marker"
   : >"$calls"
-  mkdir -p "$net_root/rmnet_data0" "$net_root/wlan0"
-  : >"$arm"; echo cellular >"$profile_file"; : >"$cellular_ready"; echo ready >"$wireless_ready"
-  active_units=' myron-hardware-watchdog.service ModemManager.service '
+  mkdir -p "$net_root/rmnet_data0" "$net_root/rmnet_ipa0" "$net_root/wlan0" "$host_state" "$dt_root" \
+    "$thermal_root/thermal_zone0"
+  for m in rmnet rmnet_mem gsim ipam ipanetm rmnet_ctl; do mkdir -p "$sys_module/$m"; done
+  echo battery >"$thermal_root/thermal_zone0/type"; echo 60000 >"$thermal_root/thermal_zone0/temp"
+  : >"$cellular_ready"; echo ready >"$wireless_ready"; echo cellular >"$profile_file"
+  printf 'payload_sha256=%s\nwatchdog_seconds=900\n' "$payload_sha" >"$host_armed"
+  printf '%s\n' "$candidate_sha" >"$init_boot_sha_file"
+  cp "$work/init_boot.good" "$init_boot_rollback"; cp "$work/boot.good" "$boot_rollback"
+  printf 'Myron Test Device\0' >"$dt_root/model"
+  printf 'qcom,canoe-mtp\0qcom,canoe\0' >"$dt_root/compatible"
+  printf 'ID=omarchy\nNAME=Omarchy\n' >"$os_release"
+  printf 'notes' >"$notes_file"
+  echo boot-X >"$boot_id_file"
+  echo '500.00 0.00' >"$uptime_file"
+  wd_enter=100000000
+  expected_notes=$(sha256sum "$notes_file" | awk '{print $1}')
+  active_units=' myron-hardware-watchdog.service ModemManager.service myron-ipa-guard.service '
+  guard_rc=0 guard_log=$work/guard-log; : >"$guard_log"
   hci=0 modems=1 unlock=-- reg=home packet=attached power=on state=registered
-  nm_ok=0 profile_exists=0 autoconnect_reply=no up_rc=0 up_activates=1 activated=0
-  curl_code=204 dns_lines=1 addr_lines=1 route_lines=1 power_rc=0
-  stat_reply='0 600' uid=0 conflict=1
+  access_len=2 access1=lte access2=5gnr bearers=0
+  nm_ok=0 m_profile_exists=0 autoconnect_reply=no up_rc=0 up_activates=1 activated=0
+  gsm_state=disconnected gsm_devices=1 m_active_gsm=0 m_active_after=0 m_busy_state=activating
+  m_rows='' m_auto='' m_own_auto=no m_homeonly=yes m_id_reply=myron-cellular m_uuid_by_name=$secret_uuid
+  m_bound=ttyMODEM0 m_wifi=connected m_wifi_after=connected m_eth=connected m_eth_after=connected m_listeners_after='LISTEN 0 128 0.0.0.0:22\n'
+  m_listeners='LISTEN 0 128 0.0.0.0:22\n' m_sessions='ESTAB 0 0 x:22 y:1\n' m_sessions_after='ESTAB 0 0 x:22 y:1\n'
+  curl_code=204 curl_local=$secret_ip dns_lines=1 addr_lines=1 m_default_lines=1 m_route_table=1430
+  rule_line="100:	from all oif rmnet_data0 lookup 1430 proto kernel"
+  m_main_default='default via 192.168.1.1 dev wlan0 metric 600'
+  m_link_dns_data=$secret_dns m_link_dns_control='' m_counter_move=both
+  route_get_dev=rmnet_data0
+  mkdir -p "$net_root/rmnet_data0/statistics"
+  echo 100 >"$net_root/rmnet_data0/statistics/tx_packets"; echo 100 >"$net_root/rmnet_data0/statistics/rx_packets"
+  stat_reply='0 600' uid=$real_uid conflict=1 kernel=$expected_kernel
+  noisy=1
 }
 
 id() { printf '%s\n' "$uid"; }
+uname() { printf '%s\n' "$kernel"; }
 sleep() { :; }
 pgrep() { return "$conflict"; }
 systemctl() {
-  [[ $1 == --quiet && $2 == is-active ]] || { echo "systemctl $*" >>"$calls"; return 0; }
-  [[ $active_units == *" $3 "* ]]
+  if [[ $1 == --quiet && $2 == is-active ]]; then [[ $active_units == *" $3 "* ]]; return; fi
+  if [[ $1 == show ]]; then printf '%s\n' "$wd_enter"; return 0; fi
+  echo "systemctl $*" >>"$calls"
+  return 0
 }
-timeout() {
-  while [[ $1 == -k ]]; do shift 2; done
-  shift
-  "$@"
-}
+guard_check() { echo "guard ${*:-plain}" >>"$guard_log"; return "$guard_rc"; }
+timeout() { while [[ $1 == -k ]]; do shift 2; done; shift; "$@"; }
 stat() { printf '%s\n' "$stat_reply"; }
+leak() { [[ $noisy == 1 ]] && printf 'raw %s %s %s %s\n' "$secret_imei" "$secret_iccid" "$secret_ip" "$secret_apn" >&2 || true; }
 mmcli() {
   if [[ $1 == -L ]]; then
+    leak
     for ((i = 0; i < modems; i++)); do echo "/org/freedesktop/ModemManager1/Modem/$i [Qualcomm] myron"; done
   elif [[ $1 == -m && $3 == -K ]]; then
+    leak
     cat <<EOF
 modem.generic.state                         : $state
 modem.generic.power-state                   : $power
 modem.generic.unlock-required               : $unlock
 modem.generic.sim                           : /org/freedesktop/ModemManager1/SIM/0
+modem.generic.bearers.length                : $bearers
+modem.generic.access-technologies.length    : $access_len
+modem.generic.access-technologies.value[1]  : $access1
+modem.generic.access-technologies.value[2]  : $access2
 modem.generic.equipment-identifier          : $secret_imei
 modem.generic.own-numbers.length            : 1
 modem.generic.own-numbers.value[1]          : $secret_number
@@ -107,29 +202,44 @@ sim.properties.iccid                        : $secret_iccid
 EOF
   else
     echo "mmcli $*" >>"$calls"
-    return "$power_rc"
   fi
 }
 nmcli() {
   case "$*" in
   'general status') return "$nm_ok" ;;
-  '-g connection.id connection show myron-cellular') [[ $profile_exists == 1 ]]; return ;;
-  '-g connection.autoconnect connection show myron-cellular') echo "$autoconnect_reply"; return ;;
-  '-t -f NAME,TYPE,STATE connection show --active')
-    [[ $activated == 1 ]] && echo 'myron-cellular:gsm:activated'
+  '-t -f DEVICE,TYPE,STATE device status')
+    if [[ -e $work/activated ]]; then echo "wlan0:wifi:$m_wifi_after"; else echo "wlan0:wifi:$m_wifi"; fi
+    if [[ -e $work/activated ]]; then echo "usb9:ethernet:$m_eth_after"; else echo "usb9:ethernet:$m_eth"; fi
+    for ((i = 0; i < gsm_devices; i++)); do echo "ttyMODEM$i:gsm:$gsm_state"; done
     return 0 ;;
-  '-g GENERAL.DEVICES connection show myron-cellular') echo ttyMODEM0; return ;;
+  '-t -f UUID,NAME,TYPE,STATE connection show')
+    echo 'aaaaaaaa-0000-4000-8000-000000000001:home-wifi:802-11-wireless:activated'
+    if [[ -e $work/activated ]]; then echo "$secret_uuid:myron-cellular:gsm:activated"
+    elif [[ $m_profile_exists == 1 ]]; then echo "$secret_uuid:myron-cellular:gsm:"; fi
+    for ((i = 0; i < m_active_gsm; i++)); do echo "bbbbbbbb-0000-4000-8000-00000000000$i:other$i:gsm:$m_busy_state"; done
+    [[ ! -e $work/activated ]] || for ((i = 0; i < m_active_after; i++)); do echo "cccccccc-0000-4000-8000-00000000000$i:late$i:gsm:activated"; done
+    [[ -z $m_rows ]] || printf '%b\n' "$m_rows"
+    return 0 ;;
+  '-t -f UUID,TYPE,AUTOCONNECT connection show')
+    echo 'aaaaaaaa-0000-4000-8000-000000000001:802-11-wireless:yes'
+    [[ $m_profile_exists == 0 ]] || echo "$secret_uuid:gsm:$m_own_auto"
+    [[ -z $m_auto ]] || printf '%b\n' "$m_auto"
+    return 0 ;;
+  "-g connection.autoconnect connection show uuid $secret_uuid") echo "$autoconnect_reply"; return ;;
+  "-g gsm.home-only connection show uuid $secret_uuid") echo "$m_homeonly"; return ;;
+  "-g connection.id connection show uuid $secret_uuid") echo "$m_id_reply"; return ;;
+  '-g connection.uuid connection show id myron-cellular') echo "$m_uuid_by_name"; return ;;
+  "-g GENERAL.DEVICES connection show uuid $secret_uuid") echo "$m_bound"; return ;;
   '-g GENERAL.IP-IFACE device show ttyMODEM0') echo rmnet_data0; return ;;
-  '-t -f IP4.DNS device show rmnet_data0')
+  '-t -f IP4.DNS device show ttyMODEM0')
     for ((i = 0; i < dns_lines; i++)); do echo "IP4.DNS[$((i + 1))]:$secret_dns"; done
     return 0 ;;
   esac
   local marker=no
-  [[ -d $attempt_marker ]] && marker=yes
+  [[ -d $mutation_marker ]] && marker=yes
   echo "nmcli marker=$marker $*" >>"$calls"
-  if [[ $* == 'connection up myron-cellular' ]]; then
-    [[ $up_activates == 0 ]] || activated=1
-    # the real client runs in a subshell: persist activation through a file
+  leak
+  if [[ $* == "connection up uuid $secret_uuid ifname ttyMODEM0" ]]; then
     [[ $up_activates == 0 ]] || : >"$work/activated"
     return "$up_rc"
   fi
@@ -137,175 +247,498 @@ nmcli() {
 }
 ip() {
   case "$*" in
-  *'addr show dev rmnet_data0'*) for ((i = 0; i < addr_lines; i++)); do echo "3: rmnet_data0 inet $secret_ip/30 scope global"; done ;;
-  *'route show default dev rmnet_data0'*) for ((i = 0; i < route_lines; i++)); do echo "default dev rmnet_data0 metric 700"; done ;;
-  *'route show dev rmnet_data0'*) for ((i = 0; i < route_lines; i++)); do echo "10.0.0.0/8 dev rmnet_data0"; done ;;
+  '-4 -o addr show dev rmnet_data0 scope global')
+    for ((i = 0; i < addr_lines; i++)); do echo "3: rmnet_data0    inet $secret_ip/30 scope global rmnet_data0"; done ;;
+  '-4 route show table all default dev rmnet_data0')
+    for ((i = 0; i < m_default_lines; i++)); do
+      if [[ $m_route_table == main ]]; then echo "default via 10.0.0.1 dev rmnet_data0 metric 700"
+      else echo "default via 10.0.0.1 dev rmnet_data0 table $m_route_table metric 700"; fi
+    done ;;
+  '-4 route show table main default') [[ -z $m_main_default ]] || printf '%b\n' "$m_main_default" ;;
+  '-4 rule show') printf '0:\tfrom all lookup local\n%s\n32766:\tfrom all lookup main\n' "$rule_line" ;;
+  "-4 route get $secret_dns oif rmnet_data0") echo "$secret_dns dev $route_get_dev table 1430 src $secret_ip" ;;
+  *) echo "ip $*" >>"$calls" ;;
   esac
 }
-curl() { echo "curl $*" >>"$calls"; printf '%s' "$curl_code"; }
-# nmcli --active state lives in a file so subshell command substitutions see it.
-connection_active() { [[ -e $work/activated ]]; }
+resolvectl() {
+  case "$*" in
+  'dns rmnet_data0') [[ -z $m_link_dns_data ]] || echo "Link 7 (rmnet_data0): $m_link_dns_data" ;;
+  'dns ttyMODEM0') [[ -z $m_link_dns_control ]] || echo "Link 8 (ttyMODEM0): $m_link_dns_control" ;;
+  *) return 1 ;;
+  esac
+}
+ss() {
+  case "$*" in
+  '-H -ltn sport = :22')
+    if [[ -e $work/activated ]]; then printf '%b' "$m_listeners_after"; else printf '%b' "$m_listeners"; fi ;;
+  '-H -tn state established sport = :22')
+    if [[ -e $work/activated ]]; then printf '%b' "$m_sessions_after"; else printf '%b' "$m_sessions"; fi ;;
+  *) return 1 ;;
+  esac
+}
+curl() {
+  echo "curl $*" >>"$calls"
+  leak
+  # A curl that loads a hostile config because -q was not first prints garbage.
+  if [[ $1 != -q ]]; then printf '999 %s' "$secret_ip"; return 0; fi
+  local dir=$net_root/rmnet_data0/statistics
+  case "$m_counter_move" in
+  both|tx) echo $(( $(cat "$dir/tx_packets") + 5 )) >"$dir/tx_packets" ;;
+  esac
+  case "$m_counter_move" in
+  both|rx) echo $(( $(cat "$dir/rx_packets") + 5 )) >"$dir/rx_packets" ;;
+  esac
+  printf '%s %s' "$curl_code" "$curl_local"
+}
 
 run() { ( "$@" ) 2>&1; }
 expect_fail() { # description expected-substring command...
   local what=$1 want=$2 out rc=0; shift 2
   out=$(run "$@") || rc=$?
-  [[ $rc -ne 0 ]] || fail "$what: command succeeded"
-  [[ $out == *"$want"* ]] || fail "$what: expected '$want', got: $out"
+  [[ $rc -ne 0 ]] || tfail "$what: command succeeded"
+  [[ $out == *"$want"* ]] || tfail "$what: expected '$want', got: $out"
+  no_identity "$out"
 }
 expect_ok() {
   local what=$1 out rc=0; shift
   out=$(run "$@") || rc=$?
-  [[ $rc -eq 0 ]] || fail "$what: failed: $out"
+  [[ $rc -eq 0 ]] || tfail "$what: failed: $out"
+  no_identity "$out"
   printf '%s\n' "$out"
 }
 no_identity() { # text
   local secret
-  for secret in "$secret_imei" "$secret_iccid" "$secret_number" "$secret_ip" "$secret_dns" ttyMODEM0 rmnet_data0 "$apn"; do
-    [[ -z $secret || $1 != *"$secret"* ]] || fail "output leaked identity or address data: $secret"
+  for secret in "$secret_imei" "$secret_iccid" "$secret_number" "$secret_ip" "$secret_wifi_ip" "$secret_dns" \
+    "$secret_apn" "$secret_uuid" ttyMODEM0 rmnet_data0 "$candidate_sha" "$payload_sha"; do
+    [[ -z $secret || $1 != *"$secret"* ]] || tfail "output leaked identity, address or hash data: $secret"
   done
 }
-reset_all() { reset; rm -f "$work/activated"; }
+no_secrets_anywhere() { no_identity "$(cat "$log" "$runtime_dir"/data.state "$calls.out" 2>/dev/null || true)"; }
+nm_untouched() { ! grep -q nmcli "$calls" || tfail "$1: NetworkManager was mutated"; }
+armed() { mkdir -p "$runtime_dir"; printf 'boot_id=boot-X\n' >"$arm_marker"; }
+TOKEN=ONE-SHOT-CELLULAR-DATA-REBOOT-REQUIRED
 
-# -- qualify gates ------------------------------------------------------------
-reset_all
-out=$(expect_ok 'qualify' cmd_qualify)
-[[ $out == *'result=ready'*'bluetooth=absent'*'audio=inactive'*'modem_count=1'* ]] || fail "qualify output: $out"
-no_identity "$out$(cat "$log")"
-[[ ! -d $attempt_marker && ! -d $airplane_marker ]] || fail 'qualify created a marker'
-grep -q nmcli "$calls" && fail 'qualify mutated NetworkManager'
-reset_all; out=$(expect_ok 'status' cmd_status)
-[[ $out == *'data_attempted=no'*'airplane=unchanged'*'reboot_required=no'* ]] || fail "status output: $out"
-no_identity "$out"
-[[ ! -d $runtime_dir ]] || fail 'status created state'
+# -- identity -----------------------------------------------------------------------
+reset
+out=$(expect_ok identity cmd_identity)
+[[ $out == *'result=ok'*'device=myron'*'compatible=exact'*'kernel=exact'*'notes=exact'*'rollback_boot=exact'* ]] ||
+  tfail "identity output: $out"
+id_gate() { local what=$1 want=$2 setup=$3
+  reset; eval "$setup"; expect_fail "identity: $what" "$want" cmd_identity
+  [[ ! -e $arm_marker ]] || tfail "identity $what armed"; }
+id_gate 'not root' 'must run as root' uid=1000
+id_gate 'kernel' 'unexpected kernel release' 'kernel=6.12.23-other'
+id_gate 'notes' 'notes differ' 'echo wrong >"$notes_file"'
+id_gate 'model' 'model is not Myron' "printf 'Other Phone\\0' >\"\$dt_root/model\""
+id_gate 'compatible' 'compatible differs' "printf 'qcom,other\\0qcom,canoe-mtp\\0' >\"\$dt_root/compatible\""
+id_gate 'os' 'not Omarchy' 'echo ID=arch >"$os_release"'
+id_gate 'profile' 'profile is not selected' 'echo coexistence >"$profile_file"'
+id_gate 'no host arm' 'arm is absent' 'rm -f "$host_armed"'
+id_gate 'host arm symlink' 'arm is absent' 'mv "$host_armed" "$work/real-arm"; ln -s "$work/real-arm" "$host_armed"'
+id_gate 'arm extra line' 'arm metadata is invalid' 'echo extra >>"$host_armed"'
+id_gate 'arm bad payload' 'arm metadata is invalid' 'printf "payload_sha256=zz\nwatchdog_seconds=900\n" >"$host_armed"'
+id_gate 'watchdog short' 'duration metadata' 'printf "payload_sha256=%s\nwatchdog_seconds=60\n" "$payload_sha" >"$host_armed"'
+id_gate 'watchdog long' 'duration metadata' 'printf "payload_sha256=%s\nwatchdog_seconds=9000\n" "$payload_sha" >"$host_armed"'
+id_gate 'rollback complete' 'rollback already completed' ': >"$rollback_complete"'
+id_gate 'candidate missing' 'candidate init_boot metadata' 'rm -f "$init_boot_sha_file"'
+id_gate 'candidate short' 'candidate init_boot metadata' 'echo abc >"$init_boot_sha_file"'
+id_gate 'candidate upper' 'candidate init_boot metadata' 'echo "${candidate_sha^^}" >"$init_boot_sha_file"'
+id_gate 'candidate two lines' 'candidate init_boot metadata' 'echo "$candidate_sha" >>"$init_boot_sha_file"'
+id_gate 'candidate is rollback' 'candidate init_boot metadata' 'echo "$rollback_init_boot_sha" >"$init_boot_sha_file"'
+id_gate 'init_boot rollback size' 'init_boot rollback image' 'echo x >>"$init_boot_rollback"'
+id_gate 'init_boot rollback hash' 'init_boot rollback image' 'printf %s XXXXXXXXXXXXXXXX >"$init_boot_rollback"'
+id_gate 'init_boot rollback missing' 'init_boot rollback image' 'rm -f "$init_boot_rollback"'
+id_gate 'init_boot rollback link' 'init_boot rollback image' 'mv "$init_boot_rollback" "$work/real.img"; ln -s "$work/real.img" "$init_boot_rollback"'
+id_gate 'boot rollback size' 'kernel-boot rollback image' 'echo x >>"$boot_rollback"'
+id_gate 'boot rollback hash' 'kernel-boot rollback image' 'printf %s XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX >"$boot_rollback"'
+id_gate 'boot rollback missing' 'kernel-boot rollback image' 'rm -f "$boot_rollback"'
+pass 'identity validates device, kernel, notes, OS, profile and exact candidate and rollback metadata, aggregate output only'
 
-gate() { # description expected command-setup...
-  local what=$1 want=$2 setup=$3
-  reset_all
-  eval "$setup"
-  expect_fail "gate: $what" "$want" cmd_qualify
-  [[ ! -s $calls ]] || fail "gate $what ran a mutating command"
+# -- arm -----------------------------------------------------------------------------
+reset; : >"$host_disarm"
+out=$(expect_ok arm cmd_arm)
+[[ $out == *'result=armed'*'rollback=armed'*'remaining_seconds=500'* ]] || tfail "arm output: $out"
+[[ ! -e $host_disarm ]] || tfail 'arm left the host disarm marker'
+grep -Fxq 'boot_id=boot-X' "$arm_marker" || tfail 'arm marker is not boot-scoped'
+nm_untouched arm
+[[ ! -d $mutation_marker ]] || tfail 'arm took the mutation lock'
+reset; expect_ok 'arm twice' cmd_arm >/dev/null; expect_ok 'arm twice' cmd_arm >/dev/null
+reset; : >"$host_disarm"; kernel=other
+expect_fail 'arm without identity' 'unexpected kernel release' cmd_arm
+[[ -e $host_disarm && ! -e $arm_marker ]] || tfail 'arm changed state before identity passed'
+reset; active_units=' '
+expect_fail 'arm without watchdog' 'watchdog is not active' cmd_arm
+[[ ! -e $arm_marker ]] || tfail 'arm marker written without watchdog'
+reset; echo '700.00 0' >"$uptime_file"        # 900 - (700 - 100) = 300: exactly enough
+expect_ok 'arm at the minimum deadline' cmd_arm >/dev/null
+reset; echo '701.00 0' >"$uptime_file"        # 299: too close
+expect_fail 'arm near deadline' 'deadline is too close' cmd_arm
+[[ ! -e $arm_marker ]] || tfail 'arm marker written with an insufficient deadline'
+reset; wd_enter=; expect_fail 'arm unknown deadline' 'deadline is unavailable' cmd_arm
+pass 'arm needs identity, removes the host disarm, proves watchdog and deadline, writes a boot-scoped marker only'
+
+# -- status --------------------------------------------------------------------------
+reset
+before=$(find "$work" -type f ! -name guard-log | sort | md5sum)
+out=$(expect_ok status cmd_status)
+[[ $out == *'watchdog_disarm=absent'*'stage_armed=no'*'ipa_guard=clean'*'data_attempted=no'*'reboot_required=no'* ]] || tfail "status output: $out"
+[[ $out == *'access=lte-or-5g'*'radio_off=unavailable'*'radio_on=unavailable'* ]] || tfail "status output: $out"
+[[ $(find "$work" -type f ! -name guard-log | sort | md5sum) == "$before" && ! -d $runtime_dir ]] || tfail 'status changed state'
+nm_untouched status
+reset; : >"$host_disarm"; armed; active_units=' myron-hardware-watchdog.service '
+out=$(expect_ok status cmd_status)
+[[ $out == *'watchdog_disarm=present'*'stage_armed=yes'*'ipa_guard=inactive'* ]] || tfail "status output: $out"
+pass 'status is read-only and private'
+
+# -- qualify gates (read-only) -------------------------------------------------------
+reset
+out=$(expect_ok qualify cmd_qualify)
+[[ $out == *'result=ready'*'bluetooth=absent'*'audio=inactive'*'ipa_guard=clean'*'isolation=clean'*'modem_count=1'* ]] || tfail "qualify output: $out"
+[[ ! -d $mutation_marker ]] || tfail 'qualify took the lock'
+nm_untouched qualify
+gate() { # description expected setup [command]
+  local what=$1 want=$2 setup=$3 cmd=${4:-cmd_qualify}
+  reset; armed; eval "$setup"
+  expect_fail "gate: $what" "$want" "$cmd" ${5:-}
+  [[ ! -s $calls ]] || tfail "gate $what ran a mutating command"
+  [[ ! -d $mutation_marker ]] || tfail "gate $what took the lock"
 }
-gate 'not root' 'must run as root' uid=1000
-gate 'no arm' 'arm is absent' 'rm -f "$arm"'
-gate 'watchdog' 'watchdog is not active' "active_units=' ModemManager.service '"
-gate 'wrong profile' 'profile is not selected' 'echo coexistence >"$profile_file"'
-gate 'foundation' 'cellular foundation is not ready' 'rm -f "$cellular_ready"'
-gate 'radio' 'radio foundation is not ready' ': >"$wireless_ready"'
-gate 'ModemManager' 'ModemManager is not active' "active_units=' myron-hardware-watchdog.service '"
-gate 'NetworkManager' 'NetworkManager is not running' nm_ok=1
-gate 'coexistence' 'coexistence profile must remain inactive' "active_units+=' myron-coexistence.service '"
-gate 'audio' 'AudioReach must remain inactive' "active_units+=' myron-reference-audio-foundation.service '"
-gate 'speaker' 'speaker bridge must remain inactive' "active_units+=' myron-speaker-bridge.service '"
-gate 'bluetooth' 'Bluetooth controller must remain absent' 'touch "$bluetooth_hci"'
-gate 'bluetooth transport' 'Bluetooth transport must remain inactive' conflict=0
-gate 'no modem' 'expected exactly one modem, found 0' modems=0
-gate 'two modems' 'expected exactly one modem, found 2' modems=2
-gate 'SIM PIN' 'SIM is not ready' unlock=sim-pin
-gate 'power low' 'SIM is not ready' power=low
-gate 'no packet' 'packet service is not registered' packet=detached
-gate 'unregistered' 'packet service is not registered' reg=searching
-pass 'qualify gates are bounded, privacy-safe and non-mutating'
+gates() {
+  local c=${1:-cmd_qualify} t=${2:-}
+  gate 'not root' 'must run as root' uid=1000 "$c" "$t"
+  gate 'no arm' 'arm is absent' 'rm -f "$host_armed"' "$c" "$t"
+  gate 'watchdog' 'watchdog is not active' "active_units=' ModemManager.service myron-ipa-guard.service '" "$c" "$t"
+  gate 'wrong profile' 'profile is not selected' 'echo coexistence >"$profile_file"' "$c" "$t"
+  gate 'foundation' 'cellular foundation is not ready' 'rm -f "$cellular_ready"' "$c" "$t"
+  gate 'radio' 'radio foundation is not ready' ': >"$wireless_ready"' "$c" "$t"
+  gate 'ModemManager' 'ModemManager is not active' "active_units=' myron-hardware-watchdog.service myron-ipa-guard.service '" "$c" "$t"
+  gate 'NetworkManager' 'NetworkManager is not running' nm_ok=1 "$c" "$t"
+  gate 'coexistence' 'coexistence profile must remain inactive' "active_units+=' myron-coexistence.service '" "$c" "$t"
+  gate 'audio' 'AudioReach must remain inactive' "active_units+=' myron-reference-audio-foundation.service '" "$c" "$t"
+  gate 'speaker' 'speaker bridge must remain inactive' "active_units+=' myron-speaker-bridge.service '" "$c" "$t"
+  gate 'bluetooth' 'Bluetooth controller must remain absent' 'touch "$bluetooth_hci"' "$c" "$t"
+  gate 'bluetooth transport' 'Bluetooth transport must remain inactive' conflict=0 "$c" "$t"
+  gate 'rmnet not loaded' 'in-tree rmnet is not loaded' 'rmdir "$sys_module/rmnet"' "$c" "$t"
+  gate 'rmnet_core loaded' 'rmnet_core must remain absent' 'mkdir "$sys_module/rmnet_core"' "$c" "$t"
+  for m in rmnet_mem gsim ipam ipanetm rmnet_ctl; do
+    gate "module $m" "required radio module is not loaded: $m" "rmdir \"\$sys_module/$m\"" "$c" "$t"
+  done
+  gate 'no rmnet_ipa0' 'rmnet_ipa0 does not exist' 'rmdir "$net_root/rmnet_ipa0"' "$c" "$t"
+  gate 'guard inactive' 'IPA guard is not active' "active_units=' myron-hardware-watchdog.service ModemManager.service '" "$c" "$t"
+  gate 'guard dirty' 'IPA guard is not clean' 'guard_rc=1' "$c" "$t"
+  gate 'thermal at limit' 'temperature safety limit' 'echo 95000 >"$thermal_root/thermal_zone0/temp"' "$c" "$t"
+  gate 'thermal unreadable' 'sensors are unavailable' 'rm -rf "$thermal_root/thermal_zone0"' "$c" "$t"
+  gate 'no modem' 'expected exactly one modem, found 0' modems=0 "$c" "$t"
+  gate 'two modems' 'expected exactly one modem, found 2' modems=2 "$c" "$t"
+  gate 'SIM PIN' 'SIM is not ready' unlock=sim-pin "$c" "$t"
+  gate 'power low' 'SIM is not ready' power=low "$c" "$t"
+  gate 'no packet' 'not attached to the home network' packet=detached "$c" "$t"
+  gate 'unregistered' 'not attached to the home network' reg=searching "$c" "$t"
+  gate 'roaming' 'not attached to the home network' reg=roaming "$c" "$t"
+  gate 'UMTS only' 'access technology is not LTE or 5G' 'access_len=1 access1=umts' "$c" "$t"
+  gate 'GSM and EDGE' 'access technology is not LTE or 5G' 'access1=gsm access2=edge' "$c" "$t"
+  gate 'HSPA only' 'access technology is not LTE or 5G' 'access1=hspa-plus access2=hsupa' "$c" "$t"
+  gate 'access missing' 'access technology is not LTE or 5G' 'access_len=0' "$c" "$t"
+  gate 'access length junk' 'access technology is not LTE or 5G' 'access_len=--' "$c" "$t"
+  gate 'two gsm devices' 'exactly one NetworkManager modem device' gsm_devices=2 "$c" "$t"
+  gate 'no gsm device' 'exactly one NetworkManager modem device' gsm_devices=0 "$c" "$t"
+  gate 'gsm device busy' 'modem control device is not idle' gsm_state=connecting "$c" "$t"
+  gate 'gsm already activating' 'active, activating or deactivating' m_active_gsm=1 "$c" "$t"
+  gate 'gsm deactivating' 'active, activating or deactivating' 'm_active_gsm=1 m_busy_state=deactivating' "$c" "$t"
+  gate 'gsm activated elsewhere' 'active, activating or deactivating' 'm_active_gsm=1 m_busy_state=activated' "$c" "$t"
+  gate 'gsm active myron' 'active, activating or deactivating' ': >"$work/activated"' "$c" "$t"
+  gate 'inactive gsm profile not busy but competing' 'autoconnect enabled exists' 'm_rows="dddddddd-0000-4000-8000-000000000001:idle:gsm:"; m_auto="dddddddd-0000-4000-8000-000000000001:gsm:yes"' "$c" "$t"
+  gate 'competing autoconnect' 'autoconnect enabled exists' 'm_auto="dddddddd-0000-4000-8000-000000000001:gsm:yes"' "$c" "$t"
+  gate 'own profile autoconnect' 'autoconnect enabled exists' 'm_profile_exists=1 m_own_auto=yes' "$c" "$t"
+  gate 'unset autoconnect' 'autoconnect enabled exists' 'm_auto="dddddddd-0000-4000-8000-000000000001:gsm:"' "$c" "$t"
+  gate 'duplicate target profile' 'target profile is duplicated' 'm_profile_exists=1; m_rows="$secret_uuid:myron-cellular:gsm:"' "$c" "$t"
+  gate 'same name, Wi-Fi profile' 'belongs to another profile' 'm_rows="dddddddd-0000-4000-8000-000000000002:myron-cellular:802-11-wireless:"' "$c" "$t"
+  gate 'same name, ethernet profile' 'belongs to another profile' 'm_rows="dddddddd-0000-4000-8000-000000000003:myron-cellular:802-3-ethernet:"' "$c" "$t"
+  gate 'same name, vpn profile' 'belongs to another profile' 'm_rows="dddddddd-0000-4000-8000-000000000004:myron-cellular:vpn:"' "$c" "$t"
+  gate 'same name, other gsm profile' 'belongs to another profile' 'm_rows="dddddddd-0000-4000-8000-000000000005:myron-cellular:gsm:"' "$c" "$t"
+  gate 'same name next to the exact profile' 'belongs to another profile' 'm_profile_exists=1; m_rows="dddddddd-0000-4000-8000-000000000006:myron-cellular:bridge:"' "$c" "$t"
+  gate 'target UUID under another name' 'belongs to another profile' 'm_rows="$secret_uuid:renamed:gsm:"' "$c" "$t"
+  gate 'target UUID under another type' 'belongs to another profile' 'm_rows="$secret_uuid:myron-cellular:802-11-wireless:"' "$c" "$t"
+  gate 'bearer length missing' 'modem bearer already exists' 'bearers=' "$c" "$t"
+  gate 'bearer exists' 'modem bearer already exists' bearers=1 "$c" "$t"
+}
+gates cmd_qualify
+# LTE-only, 5G-only and mixed pass.
+for tech in 'access_len=1 access1=lte' 'access_len=1 access1=5gnr' 'access1=lte access2=umts' 'access1=umts access2=5gnr'; do
+  reset; eval "$tech"; expect_ok "access $tech" cmd_qualify >/dev/null
+done
+reset; m_rows='dddddddd-0000-4000-8000-000000000007:other-sim:gsm:'; m_auto='dddddddd-0000-4000-8000-000000000007:gsm:no'; expect_ok 'unrelated autoconnect-off profile' cmd_qualify >/dev/null
+reset; m_rows='dddddddd-0000-4000-8000-000000000008:my:colon:profile:gsm:'; m_auto='dddddddd-0000-4000-8000-000000000008:gsm:no'; expect_ok 'colon in name' cmd_qualify >/dev/null
+reset; echo 94999 >"$thermal_root/thermal_zone0/temp"; expect_ok 'just below thermal limit' cmd_qualify >/dev/null
+pass 'qualify gates are bounded, privacy-safe, non-mutating; LTE/5G and home-only; profile isolation fails closed'
 
 # Bluetooth presence/transport use real paths; check them via the static gate text.
 grep -Fq '/sys/class/bluetooth/hci0' "$stage" && grep -Fq 'pgrep -x btattach' "$stage" ||
-  fail 'stage does not gate Bluetooth absence'
+  tfail 'stage does not gate Bluetooth absence'
 
-# -- data: ordering, autoconnect, once --------------------------------------------
-reset_all
-out=$(expect_ok 'data' cmd_data)
-[[ $out == *'result=ready'*'https=204'* && $out == *'Reboot required'* ]] || fail "data output: $out"
-no_identity "$out$(cat "$log")"
-[[ -d $attempt_marker ]] || fail 'data left no attempt marker'
-[[ $(cat "$data_state") == ready ]] || fail 'data state not ready'
+# -- data: token, arm, order, once ---------------------------------------------------
+reset; armed
+expect_fail 'no token' 'confirmation token' cmd_data
+expect_fail 'empty token' 'confirmation token' cmd_data ''
+expect_fail 'wrong token' 'confirmation token' cmd_data wrong
+expect_fail 'token case' 'confirmation token' cmd_data one-shot-cellular-data-reboot-required
+expect_fail 'token suffix' 'confirmation token' cmd_data "${TOKEN}x"
+[[ ! -s $calls && ! -d $mutation_marker && ! -s $guard_log ]] || tfail 'bad token ran commands or took the lock'
+gates cmd_data "$TOKEN"
+dgate() { # description expected setup   (armed unless the setup removes it)
+  local what=$1 want=$2 setup=$3
+  reset; armed; eval "$setup"
+  expect_fail "data gate: $what" "$want" cmd_data "$TOKEN"
+  nm_untouched "data gate $what"
+  [[ ! -d $mutation_marker && ! -e $data_state ]] || tfail "data gate $what took the lock"
+}
+reset
+expect_fail 'data unarmed' 'not armed for this boot' cmd_data "$TOKEN"
+nm_untouched 'data unarmed'
+dgate 'arm marker from another boot' 'not armed for this boot' 'echo boot_id=boot-Y >"$arm_marker"'
+dgate 'arm marker symlink' 'not armed for this boot' 'mv "$arm_marker" "$work/real-armed"; ln -s "$work/real-armed" "$arm_marker"'
+dgate 'host disarm present' 'rollback was disarmed' ': >"$host_disarm"'
+dgate 'deadline too close' 'deadline is too close' "echo '761.00 0' >\"\$uptime_file\""
+dgate 'unknown deadline' 'deadline is unavailable' 'wd_enter='
+dgate 'guard not pristine' 'IPA guard is not clean' 'guard_rc=1'
+pass 'data needs the exact token, the stage arm, no host disarm and a deadline, before any mutation'
+
+# a concurrent qualifier that would write the disarm after arm is refused at data
+reset; armed; : >"$host_disarm"
+expect_fail 'disarm after arm' 'rollback was disarmed' cmd_data "$TOKEN"
+nm_untouched 'disarm after arm'
+
+reset; armed
+out=$(expect_ok 'data' cmd_data "$TOKEN")
+[[ $out == *'result=ready'*'policy=oif-rule'*'https=204'*'ipa_guard=clean'* && $out == *'Reboot required'* ]] || tfail "data output: $out"
+no_identity "$(cat "$log")"
+[[ -d $mutation_marker && $(cat "$mutation_marker/kind") == data ]] || tfail 'data left no shared mutation lock'
+[[ $(cat "$data_state") == ready ]] || tfail 'data state not ready'
 grep -Fq 'connection add' "$calls" && grep -Fq 'connection modify' "$calls" ||
-  fail 'data did not create and modify the profile'
-grep -E 'nmcli marker=' "$calls" | grep -vq 'marker=yes' && fail 'NetworkManager mutated before the marker'
-[[ $(grep -c 'connection up' "$calls") == 1 ]] || fail 'data did not activate exactly once'
-grep -E 'connection (add|modify)' "$calls" | grep -vqF 'connection.autoconnect no' && fail 'profile write lacks autoconnect=no'
-grep -Fq 'gsm.apn internet' "$calls" || fail 'default APN is not internet'
-grep -Eq 'connection (down|delete|reapply)|disconnect|--enable|systemctl' "$calls" && fail 'data disconnected or stopped something'
+  tfail 'data did not create and modify the profile'
+grep -E 'nmcli marker=' "$calls" | grep -vq 'marker=yes' && tfail 'NetworkManager mutated before the lock'
+[[ $(grep -c 'connection up' "$calls") == 1 ]] || tfail 'data did not activate exactly once'
+grep -Fq "connection up uuid $secret_uuid ifname ttyMODEM0" "$calls" || tfail 'activation is not m_bound to the exact UUID and device'
+grep -E 'connection (add|modify)' "$calls" | grep -vqF 'connection.autoconnect no' && tfail 'profile write lacks autoconnect=no'
+grep -E 'connection (add|modify)' "$calls" | grep -vqF 'gsm.home-only yes' && tfail 'profile write lacks gsm.home-only yes'
+grep -E 'connection add' "$calls" | grep -qF "connection.uuid $secret_uuid" || tfail 'profile is not created with the fixed UUID'
+grep -E 'connection add' "$calls" | grep -qF 'ifname ttyMODEM0' || tfail 'profile is not created for the exact device'
+grep -Fq 'gsm.apn internet' "$calls" || tfail 'default APN is not internet'
+grep -Fq 'ipv4.routing-rules priority 32768 from all table 1430' "$calls" || tfail 'profile lacks the reference routing rule'
+grep -Eq 'connection (down|delete|reapply)|disconnect|--enable|systemctl|mmcli|radio' "$calls" && tfail 'data disconnected, stopped or touched radio'
 curl_line=$(grep '^curl ' "$calls")
-[[ $curl_line == *'--interface rmnet_data0'* && $curl_line == *'--proto =https'* && $curl_line == *'--max-time'* && $curl_line == *'--max-filesize'* ]] ||
-  fail 'HTTPS probe is not bound, bounded and HTTPS-only'
-[[ $(grep -c '^curl ' "$calls") == 1 ]] || fail 'more than one probe'
+[[ $curl_line == 'curl -q --interface rmnet_data0 '* && $curl_line == *'--retry 0'* && $curl_line == *'--proto =https'* &&
+   $curl_line == *'--max-time'* && $curl_line == *'--max-filesize'* && $curl_line == *'--noproxy *'* &&
+   $curl_line == *'--tlsv1.2'* && $curl_line == *'connectivitycheck.gstatic.com/generate_204' ]] ||
+  tfail "HTTPS probe is not curl -q first, m_bound, bounded and HTTPS-only: $curl_line"
+[[ $(grep -c '^curl ' "$calls") == 1 ]] || tfail 'more than one probe'
+guards=$(sed 's/^guard //' "$guard_log" | tr '\n' ',')
+[[ $guards == 'plain,pristine,plain,plain,' ]] || tfail "guard checks before/after: $guards"
 before=$(wc -l <"$calls")
-expect_fail 'second attempt' 'already attempted this boot' cmd_data
-expect_fail 'second attempt after airplane check' 'reboot' cmd_data
-[[ $(wc -l <"$calls") == "$before" ]] || fail 'second attempt ran commands'
-pass 'data takes the marker before NM mutation, sets autoconnect=no, activates once, never disconnects, refuses a second attempt'
+expect_fail 'second attempt' 'already taken this boot' cmd_data "$TOKEN"
+[[ $(wc -l <"$calls") == "$before" ]] || tfail 'second attempt ran commands'
+expect_fail 'radio-off after data' 'radio-off is unavailable' cmd_radio_refused radio-off
+pass 'data takes the shared lock before NM mutation, binds UUID and device, sets autoconnect=no, activates once, guards before and after'
 
-# failure after the marker still burns the attempt and never disconnects.
-reset_all; up_activates=0 up_rc=1
-expect_fail 'activation failure' 'activation failed' cmd_data
-[[ -d $attempt_marker ]] || fail 'failed activation released the marker'
-expect_fail 'retry after failure' 'already attempted this boot' cmd_data
-[[ $(grep -c 'connection up' "$calls") == 1 ]] || fail 'failure path retried activation'
-grep -Eq 'connection (down|delete|reapply)|disconnect' "$calls" && fail 'failure path disconnected'
-reset_all; autoconnect_reply=yes
-expect_fail 'autoconnect not off' 'autoconnect is not disabled' cmd_data
-grep -Fq 'connection up' "$calls" && fail 'activated while autoconnect was on'
-reset_all; curl_code=000
-expect_fail 'probe failure' 'HTTPS probe' cmd_data
-reset_all; dns_lines=0
-expect_fail 'no DNS' 'no DNS server' cmd_data
-reset_all; addr_lines=0
-expect_fail 'no address' 'no IPv4 address' cmd_data
-reset_all; route_lines=0
-expect_fail 'no route' 'no default route' cmd_data
-# gate failure before the marker does not burn the attempt.
-reset_all; packet=detached
-expect_fail 'data gate' 'packet service is not registered' cmd_data
-[[ ! -d $attempt_marker ]] || fail 'gate failure created the attempt marker'
-pass 'data failures keep the marker and never reconnect; gate failures keep the attempt'
+# Concurrency: two simultaneous data commands, exactly one reaches NetworkManager.
+reset; armed
+pre_marker_hook() {
+  : >"$work/arrive.$BASHPID"
+  local tries=0
+  while (( $(ls "$work"/arrive.* 2>/dev/null | wc -l) < 2 && tries < 300 )); do command sleep 0.02; tries=$((tries + 1)); done
+}
+{ rc=0; ( cmd_data "$TOKEN" ) >"$work/out1" 2>&1 || rc=$?; echo "$rc" >"$work/rc1"; } &
+{ rc=0; ( cmd_data "$TOKEN" ) >"$work/out2" 2>&1 || rc=$?; echo "$rc" >"$work/rc2"; } &
+wait
+pre_marker_hook() { :; }
+rcs=$(cat "$work/rc1" "$work/rc2" | sort | tr '\n' ',')
+[[ $rcs == '0,1,' ]] || tfail "concurrent data results: $rcs"
+[[ $(grep -c 'connection up' "$calls") == 1 && $(grep -c 'connection add' "$calls") == 1 ]] ||
+  tfail 'concurrent data reached NetworkManager more than once'
+grep -Fq 'already taken this boot' "$work/out1" "$work/out2" || tfail 'the loser did not report the lock'
+rm -f "$work"/rc? "$work"/out?
+pass 'concurrent data: exactly one reaches NetworkManager'
 
-# -- APN config -------------------------------------------------------------------
-reset_all; echo 'apn=my-apn.example' >"$apn_config"
-expect_ok 'custom APN' cmd_data >/dev/null
-grep -Fq 'gsm.apn my-apn.example' "$calls" || fail 'custom APN not used'
-for bad in 'apn=a b' 'apn=a;b' 'apn=' 'internet' 'apn=$(x)'; do
-  reset_all; printf '%s\n' "$bad" >"$apn_config"
-  expect_fail "APN config '$bad'" 'APN config' cmd_data
-  [[ ! -d $attempt_marker ]] || fail 'bad APN burned the attempt'
+# Failure after the lock still burns it and never disconnects.
+reset; armed; up_activates=0 up_rc=1
+expect_fail 'activation failure' 'activation failed' cmd_data "$TOKEN"
+[[ -d $mutation_marker ]] || tfail 'failed activation released the lock'
+expect_fail 'retry after failure' 'already taken this boot' cmd_data "$TOKEN"
+[[ $(grep -c 'connection up' "$calls") == 1 ]] || tfail 'failure path retried activation'
+grep -Eq 'connection (down|delete|reapply)|disconnect' "$calls" && tfail 'failure path disconnected'
+reset; armed; autoconnect_reply=yes
+expect_fail 'autoconnect not off' 'autoconnect is not disabled' cmd_data "$TOKEN"
+grep -Fq 'connection up' "$calls" && tfail 'activated while autoconnect was on'
+for case in 'm_id_reply=other-name|name and identifier disagree' \
+  'm_uuid_by_name=dddddddd-0000-4000-8000-000000000009|name and identifier disagree' \
+  'm_homeonly=no|not home-only'; do
+  reset; armed; eval "${case%%|*}"
+  expect_fail "profile check ${case%%|*}" "${case##*|}" cmd_data "$TOKEN"
+  grep -Fq 'connection up' "$calls" && tfail 'activated although the profile name and UUID disagree'
 done
-reset_all; printf 'apn=ok\nextra=1\n' >"$apn_config"
-expect_fail 'APN extra line' 'exactly one line' cmd_data
-reset_all; echo 'apn=ok' >"$apn_config"; stat_reply='1000 644'
-expect_fail 'APN not root-owned' 'not root-owned' cmd_data
-reset_all; echo 'apn=ok' >"$apn_config"; stat_reply='0 666'
-expect_fail 'APN writable' 'writable' cmd_data
-reset_all; echo 'apn=ok' >"$apn_config"; ln -s "$apn_config" "$apn_config.link"; apn_config=$apn_config.link
-expect_fail 'APN symlink' 'not a regular file' cmd_data
-apn_config=$work/apn
-pass 'APN config is strict, root-owned and defaults to internet'
+# An existing exact profile is modified by UUID, never re-added.
+reset; armed; m_profile_exists=1
+expect_ok 'existing exact profile' cmd_data "$TOKEN" >/dev/null
+grep -Fq 'connection add' "$calls" && tfail 'existing exact profile was added again'
+grep -Fq "connection modify uuid $secret_uuid" "$calls" || tfail 'existing profile was not modified by UUID'
+pass 'failures keep the lock and never reconnect'
 
-# -- airplane ---------------------------------------------------------------------
-reset_all
-out=$(expect_ok 'airplane-off' cmd_airplane_off)
-[[ $out == *'result=radio-off'* ]] || fail "airplane-off output: $out"
-[[ $(grep -c 'set-power-state-low' "$calls") == 1 ]] || fail 'airplane-off did not disable exactly once'
+post_fail() { local what=$1 want=$2 setup=$3
+  reset; armed; eval "$setup"
+  expect_fail "post-activation: $what" "$want" cmd_data "$TOKEN"
+  [[ -d $mutation_marker && $(grep -c 'connection up' "$calls") == 1 ]] || tfail "post $what lost the lock or reactivated"
+  grep -Eq 'connection (down|delete|reapply)|disconnect' "$calls" && tfail "post $what disconnected"
+  [[ $(cat "$data_state") != ready ]] || tfail "post $what reported ready"
+}
+post_fail 'wrong device' 'not on the selected modem device' 'm_bound=ttyMODEM9'
+post_fail 'two gsm active' 'more than one cellular connection' 'm_active_after=1'
+post_fail 'no address' 'no IPv4 address' addr_lines=0
+post_fail 'no default route in any table' 'no default route' m_default_lines=0
+post_fail 'table route without policy rule' 'no policy rule safely selects' 'rule_line="100:	from all oif wlan0 lookup 1430"'
+post_fail 'rule for another table' 'no policy rule safely selects' 'rule_line="100:	from all oif rmnet_data0 lookup 1431"'
+post_fail 'from-all rule, no other main default' 'no policy rule safely selects' 'rule_line="32768:	from all lookup 1430" m_main_default=""'
+post_fail 'from-all rule, main default is cellular' 'no policy rule safely selects' 'rule_line="32768:	from all lookup 1430" m_main_default="default via 10.0.0.1 dev rmnet_data0"'
+post_fail 'from-all rule for another table' 'no policy rule safely selects' 'rule_line="32768:	from all lookup 1431"'
+post_fail 'no DNS on the modem device' 'no DNS server' dns_lines=0
+post_fail 'link DNS missing' 'link-scoped DNS' 'm_link_dns_data='
+post_fail 'link DNS other server' 'link-scoped DNS' 'm_link_dns_data=203.0.113.9'
+post_fail 'link DNS other server on both' 'link-scoped DNS' 'm_link_dns_data=203.0.113.9 m_link_dns_control=203.0.113.10'
+post_fail 'packets do not move' 'did not move packets' m_counter_move=none
+post_fail 'only transmit moves' 'did not move packets' m_counter_move=tx
+post_fail 'only receive moves' 'did not move packets' m_counter_move=rx
+post_fail 'Wi-Fi link lost' 'rescue link or SSH session was lost' 'm_wifi_after=disconnected'
+post_fail 'Ethernet link lost' 'rescue link or SSH session was lost' 'm_eth_after=disconnected'
+post_fail 'SSH listener lost' 'rescue link or SSH session was lost' 'm_listeners_after='
+post_fail 'SSH session lost' 'rescue link or SSH session was lost' 'm_sessions_after='
+post_fail 'DNS routed elsewhere' 'not routed through the cellular interface' 'route_get_dev=wlan0'
+post_fail 'probe 000' 'HTTPS probe' curl_code=000
+post_fail 'probe 200 (captive portal)' 'HTTPS probe' curl_code=200
+post_fail 'probe 302' 'HTTPS probe' curl_code=302
+post_fail 'probe through Wi-Fi source' 'did not use the cellular interface address' "curl_local=$secret_wifi_ip"
+post_fail 'probe no local address' 'did not use the cellular interface address' 'curl_local='
+reset; armed
+guard_check() { echo "guard ${*:-plain}" >>"$guard_log"; [[ -e $work/activated ]] && return 1; return 0; }
+expect_fail 'guard dirty after activation' 'IPA guard is not clean' cmd_data "$TOKEN"
+[[ -d $mutation_marker && $(grep -c 'connection up' "$calls") == 1 ]] || tfail 'guard-dirty path lost the lock'
+guard_check() { echo "guard ${*:-plain}" >>"$guard_log"; return "$guard_rc"; }
+reset; armed; echo 99000 >"$thermal_root/thermal_zone0/temp"
+expect_fail 'hot' 'temperature safety limit' cmd_data "$TOKEN"
+nm_untouched hot
+pass 'post-activation verification fails closed on route, policy rule, DNS, link DNS, probe code, source address and guard'
+
+# Three accepted route shapes; the Wi-Fi rescue link is never touched.
+reset; armed; m_route_table=main rule_line=
+out=$(expect_ok 'main-table default' cmd_data "$TOKEN")
+[[ $out == *'policy=main'* ]] || tfail "main-table output: $out"
+grep -Eq 'wlan0|wifi|rfkill' "$calls" && tfail 'data touched Wi-Fi'
+reset; armed
+out=$(expect_ok 'oif rule' cmd_data "$TOKEN")
+[[ $out == *'policy=oif-rule'* ]] || tfail "oif-rule output: $out"
+reset; armed; rule_line="32768:	from all lookup 1430"
+out=$(expect_ok 'from-all rule with another main default' cmd_data "$TOKEN")
+[[ $out == *'policy=from-all-rule'* ]] || tfail "from-all output: $out"
+# DNS may be scoped on the data or the control link.
+reset; armed; m_link_dns_data= m_link_dns_control=$secret_dns
+expect_ok 'control-link DNS' cmd_data "$TOKEN" >/dev/null
+reset; armed; m_link_dns_data="203.0.113.9 $secret_dns"
+expect_ok 'data-link DNS among several' cmd_data "$TOKEN" >/dev/null
+# Counters and rescue state are aggregate and unchanged-or-better passes.
+reset; armed; m_sessions_after='ESTAB 0 0 x:22 y:1\nESTAB 0 0 x:22 y:2\n'
+out=$(expect_ok 'more sessions are fine' cmd_data "$TOKEN")
+[[ $out == *'tx_delta=5 rx_delta=5'*'rescue_links=2 ssh_listeners=1 ssh_sessions=2'* ]] || tfail "aggregate output: $out"
+pass 'route shapes, data/control DNS, packet counters and rescue-state aggregates'
+
+# -- privacy and hostile tools -------------------------------------------------------
+reset; armed; noisy=1
+out=$(expect_ok 'data noisy' cmd_data "$TOKEN")
 no_identity "$out$(cat "$log")"
-expect_fail 'airplane-off twice' 'already disabled' cmd_airplane_off
-expect_fail 'data after airplane-off' 'radio was disabled this boot' cmd_data
-expect_fail 'airplane-on' 'airplane-on is refused' cmd_airplane_on
-[[ $(grep -c 'mmcli' "$calls") == 1 ]] || fail 'airplane-on or retry touched the modem'
-grep -Eq 'power-state-(high|on)|--enable|nmcli' "$calls" && fail 'radio was re-enabled'
-reset_all; expect_ok 'data' cmd_data >/dev/null
-expect_fail 'airplane-off after data' 'forbidden after a data attempt' cmd_airplane_off
-grep -Fq mmcli "$calls" && fail 'airplane-off ran after a data attempt'
-reset_all
-expect_fail 'airplane-on fresh' 'airplane-on is refused' cmd_airplane_on
-[[ ! -s $calls && ! -d $runtime_dir ]] || fail 'airplane-on mutated state'
-reset_all; modems=2
-expect_fail 'airplane-off modem count' 'exactly one modem' cmd_airplane_off
-[[ ! -d $airplane_marker ]] || fail 'failed gate burned airplane marker'
-pass 'airplane-off is once and never after data; airplane-on always fails closed'
+reset; armed; noisy=1 up_activates=0 up_rc=1 curl_code=000
+out=$(run cmd_data "$TOKEN") || true
+no_identity "$out$(cat "$log")"
+grep -q '^curl ' "$calls" && tfail 'probe ran after a failed activation'
+reset; armed; noisy=1 curl_code=000
+out=$(run cmd_data "$TOKEN") || true
+no_identity "$out$(cat "$log")"
+reset; noisy=1 modems=0
+out=$(run cmd_qualify) || true
+no_identity "$out"
+# A curl that ignored -q would return a hostile reply; the -q-first check above covers argv, this checks the reply parse.
+reset; armed; curl_code=$'204\n999' curl_local="$secret_ip"
+expect_fail 'hostile curl reply' 'HTTPS probe' cmd_data "$TOKEN"
+pass 'tool stderr, curl output and failures never leak identities, addresses or APN'
 
-# -- usage ------------------------------------------------------------------------
-for arg in '' bogus 'status extra'; do
-  rc=0; out=$(sh "$stage" $arg 2>&1) || rc=$?
-  [[ $rc -eq 2 && $out == *usage* ]] || fail "usage for '$arg': rc=$rc"
+# -- failure logs carry only fixed reasons -------------------------------------------
+reset; armed; echo 99000 >"$thermal_root/thermal_zone0/temp"; run cmd_data "$TOKEN" >/dev/null || true
+reset; armed; rmdir "$sys_module/gsim"; run cmd_data "$TOKEN" >/dev/null || true
+reset; armed; modems=2; run cmd_data "$TOKEN" >/dev/null || true
+reset; armed; curl_code=302; run cmd_data "$TOKEN" >/dev/null || true
+for detail in 99000 gsim 302 ' 2' 'mC'; do
+  reset; armed
+  case $detail in
+  99000) echo 99000 >"$thermal_root/thermal_zone0/temp" ;;
+  gsim) rmdir "$sys_module/gsim" ;;
+  302) curl_code=302 ;;
+  ' 2') modems=2 ;;
+  mC) echo 99000 >"$thermal_root/thermal_zone0/temp" ;;
+  esac
+  run cmd_data "$TOKEN" >/dev/null || true
+  failed_lines=$(grep 'result=failed' "$log")
+  [[ -n $failed_lines ]] || tfail "no failure was logged for $detail"
+  [[ $failed_lines != *"$detail"* ]] || tfail "failure log persisted variable detail: $detail"
 done
-rc=0; out=$(sh "$stage" airplane-on 2>&1) || rc=$?
-[[ $rc -eq 1 && $out == *'airplane-on is refused'* ]] || fail "real airplane-on: rc=$rc $out"
-pass 'dispatcher rejects bad usage and airplane-on exits nonzero'
+pass 'failure logs persist fixed reasons only'
+
+# -- APN config ----------------------------------------------------------------------
+reset; armed; printf 'apn=%s\n' "$secret_apn" >"$apn_config"
+expect_ok 'custom APN' cmd_data "$TOKEN" >/dev/null
+grep -Fq "gsm.apn $secret_apn" "$calls" || tfail 'custom APN not used'
+no_identity "$(cat "$log")"
+apn_case() { # description printf-format [expect]
+  reset; armed; printf "$2" >"$apn_config"
+  expect_fail "APN config: $1" "${3:-APN config}" cmd_data "$TOKEN"
+  [[ ! -d $mutation_marker ]] || tfail "bad APN ($1) burned the lock"
+  nm_untouched "APN $1"
+}
+apn_case 'space' 'apn=a b\n'
+apn_case 'semicolon' 'apn=a;b\n'
+apn_case 'empty value' 'apn=\n'
+apn_case 'no key' 'internet\n'
+apn_case 'substitution' 'apn=$(x)\n'
+apn_case 'unterminated' 'apn=ok'
+apn_case 'second line' 'apn=ok\nextra=1\n' 'exactly one'
+apn_case 'trailing unterminated content' 'apn=ok\nextra' 'exactly one'
+apn_case 'second record same key' 'apn=ok\napn=other\n' 'exactly one'
+apn_case 'trailing NUL junk' 'apn=ok\0junk\n' 'exactly one'
+apn_case 'carriage return' 'apn=ok\r\n'
+apn_case 'too long' "apn=%064d\\n"
+apn_case 'blank line' '\n'
+apn_case 'empty file' ''
+reset; armed; echo 'apn=ok' >"$apn_config"; stat_reply='1000 644'
+expect_fail 'APN not root-owned' 'not root-owned' cmd_data "$TOKEN"
+reset; armed; echo 'apn=ok' >"$apn_config"; stat_reply='0 666'
+expect_fail 'APN writable' 'writable' cmd_data "$TOKEN"
+reset; armed; echo 'apn=ok' >"$work/apn.real"; ln -s "$work/apn.real" "$apn_config"
+expect_fail 'APN symlink' 'not a regular file' cmd_data "$TOKEN"
+rm -f "$work/apn.real"
+pass 'APN config is exactly one terminated root-owned record and defaults to internet'
+
+# -- radio-off and radio-on are unavailable -------------------------------------------
+for cmd in radio-off radio-on; do
+  reset; armed
+  expect_fail "$cmd" "$cmd is unavailable" cmd_radio_refused "$cmd"
+  [[ ! -s $calls && ! -d $mutation_marker && ! -e $data_state ]] || tfail "$cmd touched the modem, NM or state"
+  rc=0; out=$(sh "$stage" "$cmd" 2>&1) || rc=$?
+  [[ $rc -eq 1 && $out == *"$cmd is unavailable"* ]] || tfail "real $cmd: rc=$rc $out"
+done
+reset; armed; expect_ok data cmd_data "$TOKEN" >/dev/null
+for cmd in radio-off radio-on; do expect_fail "$cmd after data" 'is unavailable' cmd_radio_refused "$cmd"; done
+grep -Eq 'mmcli|power' "$calls" && tfail 'radio refusal touched the modem'
+pass 'radio-off and radio-on are always refused without touching the modem'
+
+# -- usage ---------------------------------------------------------------------------
+for arg in '' bogus 'status extra' 'identity x' 'arm x' 'qualify x' 'radio-off x' 'data' 'data a b' 'finish' 'disarm'; do
+  rc=0; out=$(sh "$stage" $arg 2>&1) || rc=$?
+  [[ $rc -eq 2 && $out == *usage* ]] || tfail "usage for '$arg': rc=$rc"
+done
+[[ $stage_target_uuid != "$secret_uuid" ]] || tfail 'test must not reuse the real target UUID'
+pass 'dispatcher rejects bad usage; finish and disarm do not exist'

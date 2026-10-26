@@ -39,6 +39,12 @@ qualify_profile() {
         die 'cellular radio readiness marker is missing'
       systemctl --quiet is-active ModemManager.service ||
         die 'cellular ModemManager service is not active'
+      [ -d /sys/module/rmnet ] || die 'in-tree rmnet is not loaded'
+      [ ! -d /sys/module/rmnet_core ] || die 'rmnet_core must remain absent'
+      systemctl --quiet is-active myron-ipa-guard.service ||
+        die 'IPA guard is not active'
+      /usr/local/sbin/myron-ipa-guard check >/dev/null 2>&1 ||
+        die 'IPA guard is not clean'
       ! systemctl --quiet is-active myron-reference-audio-foundation.service ||
         die 'cellular profile unexpectedly started AudioReach'
       ! systemctl --quiet is-active myron-speaker-bridge.service ||
@@ -180,6 +186,15 @@ fi
   say "client_egl_exit=$client_status state=unrelated-platform-failure-accepted"
 
 qualify_profile
+
+# The cellular profile never disarms rollback. The guarded cellular stage
+# removes any disarm and relies on the watchdog restoring postmarketOS, so a
+# concurrent qualifier must not be able to undo the stage's explicit arm.
+if [ "$(cat "$profile_file" 2>/dev/null || true)" = cellular ]; then
+  rm -f "$host_state/hardware-test.disarm"
+  say "result=qualified dsi=DSI-1 renderer=isolated-zink-turnip client_egl=adreno840 dma_heap=ready stable_seconds=$stable_seconds rollback=armed-until-timeout"
+  exit 0
+fi
 
 mkdir -p "$host_state"
 printf 'qualified_pid=%s\nstable_seconds=%s\n' "$pid" "$stable_seconds" \

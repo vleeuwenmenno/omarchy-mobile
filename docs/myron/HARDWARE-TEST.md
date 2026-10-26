@@ -335,32 +335,86 @@ without the radio foundation. A guarded live recovery created the marker,
 started radio, settled udev and started ModemManager; modem publication and
 raw/NMEA location capabilities then qualified without a bearer, SMS or call.
 
-`myron-cellular.service` now owns that exact transaction. It requires the
-hardware arm and independent watchdog, rejects Bluetooth and AudioReach,
-creates the radio marker, starts the radio foundation, settles udev, starts
-ModemManager and writes a readiness marker. Neither the radio foundation nor
-ModemManager is independently enabled in a cellular image, removing the boot
-race while keeping the rollback watchdog authoritative.
+`myron-cellular.service` now owns that exact transaction. Before it touches
+the radio it requires the hardware arm and independent watchdog, rejects
+Bluetooth and AudioReach, and checks the in-tree rmnet selection: the empty
+regular marker `/etc/myron/use-in-tree-rmnet` (it makes the pinned
+postmarketOS `myron-wireless-start` load the in-tree `rmnet.ko`), kernel
+release `6.12.23-android16-5-g5a0e85dd9db0-dirty-4k`, the exact kernel-notes
+SHA-256, the module directory resolved through
+`myron-attempt79-module-dir`, the exact `rmnet.ko` SHA-256, and no
+`rmnet_core`. It then creates the radio marker, starts the radio foundation
+and settles udev. Before ModemManager it requires `rmnet` loaded,
+`rmnet_core` absent, `rmnet_mem`, `gsim`, `ipam`, `ipanetm` and `rmnet_ctl`
+loaded, `rmnet_ipa0` present with `ID_MM_QCOM_SOC=1` (udev classifies
+`rmnet_ipa*` and `qmapmux*`), and the hottest thermal zone below 95000 mC.
+Only then does it start the read-only IPA guard, write
+`/run/omamobile-myron/modem-manager-allowed` and start ModemManager. The
+ModemManager drop-in requires the radio service, `/run/myron-wireless-ready`
+and that marker, and sets `Restart=no`, so an early D-Bus activation cannot
+start it. Neither the radio foundation, the guard nor ModemManager is
+independently enabled.
 
-## Cellular data and airplane stage
+`myron-ipa-guard` (`myron-ipa-guard.service`, no `[Install]`) only observes:
+it reads `rmnet_ipa0` flags from sysfs and counts kernel-journal lines. It
+never configures, opens or closes a net device. Its boot-scoped state holds
+aggregate up, down, fatal and info counters and markers, and its bounded log
+carries no journal text. It is clean while there is no fatal line, no down
+and at most one up. `myron-ipa-guard check pristine` additionally requires
+that `rmnet_ipa0` has never been up. The graphical qualifier's cellular
+branch requires `rmnet` loaded, `rmnet_core` absent and the guard active and
+clean, and it never disarms rollback in the cellular profile.
 
-`myron-cellular-stage` runs after `myron-cellular.service` and needs the same
-arm, watchdog and cellular profile. Stock `ipam.ko` can panic if
-`rmnet_ipa0` is opened a second time, so a boot gets at most one data
-activation and the stage never stops, disconnects or reconnects anything.
-Reboot to retry. Output and logs carry aggregates only, never identities.
+## Cellular data stage
 
-- `status`: read-only counts and states.
-- `qualify`: exactly one modem, SIM ready, packet service attached, no
-  Bluetooth, no AudioReach.
-- `data`: writes an atomic per-boot marker, then creates the autoconnect-off
-  profile (APN `internet`, or `apn=NAME` from root-owned
-  `/etc/omamobile/myron-cellular-apn`), activates once, and probes HTTPS
-  bound to the data interface. Always reboot afterwards.
-- `airplane-off`: only before any data attempt; disables the modem radio once.
-- `airplane-on`: always refused; reboot to restore the radio.
+`myron-cellular-stage` runs after `myron-cellular.service`. Stock `ipam.ko`
+can panic if `rmnet_ipa0` goes down and is opened again, so a boot gets at
+most one data activation through one shared per-boot mutation lock, and
+nothing in the stage stops, disconnects, reconnects or re-enables anything.
+Output and logs carry aggregates only, never identities, addresses, APNs or
+interface names, and failure logs persist fixed reasons. There is no finish
+or disarm command: the watchdog restores postmarketOS at its deadline, and
+the cellular qualifier does not disarm it. Reboot to retry.
 
-`tests/myron-cellular-stage` covers the gates with mocked tools.
+Exact safe sequence (each step is a separate SSH command; stop on any error):
+
+1. Boot the attended candidate. Do not touch NetworkManager or ModemManager.
+2. `myron-cellular-stage identity`: exact device, model, compatible, OS,
+   kernel, notes, profile, and the candidate `init_boot` and rollback
+   metadata. Aggregate output.
+3. `myron-cellular-stage arm`: runs identity, removes any host
+   `hardware-test.disarm`, proves the watchdog is active with at least 300 s
+   left, and writes a boot-scoped arm marker. No partition is written. The
+   watchdog (default 900 s, 300-1800 s) keeps running toward rollback.
+4. `myron-cellular-stage status`, then `qualify`: read-only. Exactly one
+   modem and NetworkManager modem device, SIM ready, home registration,
+   LTE and/or 5G access technology, no bearer, no active, activating or
+   deactivating GSM profile, no autoconnect-enabled GSM profile, guard
+   clean, correct modules, temperature below 95000 mC.
+5. `myron-cellular-stage data ONE-SHOT-CELLULAR-DATA-REBOOT-REQUIRED`
+   (needs at least 240 s of watchdog time left): the exact non-secret token,
+   the arm marker, no host disarm, a pristine guard (`rmnet_ipa0` never up),
+   and a snapshot of connected Wi-Fi/Ethernet links and SSH listener and
+   session counts. Then it takes the mutation lock, creates or updates the
+   profile identified by a fixed UUID (autoconnect off, home-only, APN
+   `internet` or the single `apn=NAME` record of a root-owned
+   `/etc/omamobile/myron-cellular-apn`, the proven pmOS route rule with
+   metric 700), brings up exactly that UUID on the one modem device, and
+   verifies IPv4, a default route in any table with a policy rule or main
+   default that selects the data interface, NetworkManager DNS matching
+   link-scoped DNS on the data or control link, and one interface-bound
+   HTTPS probe returning exactly 204 from the data interface address with
+   moving transmit and receive counters. Guard checks run before and after,
+   and the link snapshot must not drop. Wi-Fi is never changed.
+6. Reboot. The watchdog restores postmarketOS if the test is left running.
+
+`radio-off` and `radio-on` exist but always refuse: ModemManager's
+`SetPowerState` needs a disabled modem, so no safe transition on a registered
+modem is proven. Full airplane-mode UX and any RF-off step are deferred.
+
+`tests/myron-cellular-stage`, `tests/myron-cellular-start` and
+`tests/myron-ipa-guard` cover the gates, order, concurrency, privacy and
+forbidden actions with mocked tools and fake paths.
 
 ## Battery and charging stage
 

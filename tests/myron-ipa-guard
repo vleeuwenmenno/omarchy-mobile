@@ -1,0 +1,160 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Execute the read-only rmnet_ipa0 guard against fake sysfs, journal and
+# clock hooks. Nothing touches a phone, a net device or a network.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+guard=device/myron/hardware-test-overlay/usr/local/sbin/myron-ipa-guard
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+[[ -x $guard ]] || fail 'guard is executable'
+sh -n "$guard" || fail 'guard parses as POSIX sh'
+bash -n "$guard" || fail 'guard parses as bash'
+if shellcheck --version >/dev/null 2>&1; then
+  shellcheck -s sh -e SC2086,SC2034,SC2046,SC2015,SC2155,SC2294,SC2162 "$guard" || fail 'shellcheck'
+fi
+if grep -nE '\[\[[^:]|<<<|(^|[[:space:]])local[[:space:]]|\bfunction\b|\bdeclare\b|\bmapfile\b|&>|<\(' "$guard"; then
+  fail 'guard uses shell syntax outside POSIX sh'
+fi
+# Read-only: no net-device configuration, no network or radio tools, no
+# process control (never kill 0), no module or storage action.
+if grep -nE '\bip (link|addr|route|rule)|\bifconfig\b|\bnmcli\b|\bmmcli\b|\bresolvectl\b|\bcurl\b|\bkill\b|\bpkill\b|\bkillall\b|systemctl|modprobe|rmmod|insmod|\bdd\b|\bsudo\b|/dev/(disk|block|sd|mmc)|>[[:space:]]*"?\$net_root|>[[:space:]]*/sys' "$guard"; then
+  fail 'guard contains a forbidden configure, process or storage action'
+fi
+if grep -niE 'imei|imsi|iccid|msisdn|hw-addr|mac-address|inet |ether ' "$guard"; then
+  fail 'guard reads identity or address data'
+fi
+pass 'guard syntax and read-only greps'
+
+work=$(mktemp -d /tmp/myron-ipa-guard.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+# shellcheck disable=SC1090
+source <(sed '/^# --- main ---$/,$d' "$guard")
+
+state_dir=$work/state
+state_file=$state_dir/state
+cursor_file=$state_dir/cursor
+log=$work/host-log
+net_root=$work/net
+boot_id_file=$work/boot-id
+uptime_file=$work/uptime
+poll_seconds=0
+stale_seconds=15
+mkdir -p "$net_root/rmnet_ipa0"
+
+secret_line='kernel: rmnet_ipa0 owner=IMEI358240051111110 addr=100.77.88.99'
+journal_text=
+flags=0x1002
+flags_present=1
+now=100
+
+sleep() { :; }
+timeout() { while [[ $1 == -k ]]; do shift 2; done; shift; "$@"; }
+read_flags() { [[ $flags_present == 1 ]] || return 1; printf '%s\n' "$flags"; }
+journal_batch() { printf '%s' "$journal_text"; journal_text=; }
+now_seconds() { echo "$now"; }
+
+fresh() {
+  rm -rf "$state_dir" "$log"
+  echo boot-A >"$boot_id_file"
+  boot_id=; samples=0 up=0 down=0 fatal=0 info=0 last=absent
+  flags=0x1002 flags_present=1 journal_text= now=100
+}
+run_once() { max_iterations=1 cmd_run; }
+state_get() { field "$(cat "$state_file")" "$1"; }
+check() { ( cmd_check "$@" ) 2>&1; }
+
+# -- flag transitions -----------------------------------------------------------
+fresh
+run_once
+[[ $(state_get up) == 0 && $(state_get last) == down ]] || fail 'initial down is not neutral'
+out=$(check pristine) || fail "pristine down is not clean: $out"
+flags=0x1003; run_once
+[[ $(state_get up) == 1 && $(state_get last) == up && -e $state_dir/up ]] || fail 'up not counted or marked'
+out=$(check) || fail "single up is not clean: $out"
+check pristine >/dev/null && fail 'pristine accepted an interface that is already up'
+run_once; [[ $(state_get up) == 1 ]] || fail 'steady up recounted'
+flags=0x1002; run_once
+[[ $(state_get down) == 1 && -e $state_dir/down ]] || fail 'down after up not counted'
+check >/dev/null && fail 'down after up is clean'
+flags=0x1003; run_once
+[[ $(state_get up) == 2 ]] || fail 'reopen not counted'
+check >/dev/null && fail 'reopen is clean'
+pass 'up/down/reopen are counted at flag transitions; reopen and down are dirty'
+
+fresh; flags=0x1003; run_once; flags_present=0; run_once
+[[ $(state_get down) == 1 && $(state_get last) == absent ]] || fail 'removal after up is not a down'
+fresh; flags_present=0; run_once
+[[ $(state_get last) == absent && $(state_get down) == 0 ]] || fail 'absent port counted as down'
+fresh; flags=garbage; run_once
+[[ $(state_get last) == absent ]] || fail 'malformed flags accepted'
+pass 'removal counts as down; absent and malformed flags are neutral'
+
+# -- journal --------------------------------------------------------------------
+fresh
+journal_text=$'harmless line\nkernel: rmnet_ipa open\nipa_start ok'
+run_once
+[[ $(state_get fatal) == 0 && $(state_get info) == 2 && -e $state_dir/info && ! -e $state_dir/fatal ]] ||
+  fail 'info lines not counted'
+check >/dev/null || fail 'info lines made the guard dirty'
+journal_text=$'Kernel panic - not syncing: ipa'
+run_once
+[[ $(state_get fatal) == 1 && -e $state_dir/fatal ]] || fail 'fatal not counted'
+check >/dev/null && fail 'fatal journal line is clean'
+fresh; journal_text=$'Unable to handle kernel paging request\nInternal error: Oops\nBUG: scheduling'
+run_once; [[ $(state_get fatal) == 3 ]] || fail 'fatal patterns not all counted'
+pass 'journal fatal/info lines are counted; fatal is dirty'
+
+# -- privacy ----------------------------------------------------------------------
+fresh
+journal_text=$secret_line$'\nKernel panic'
+flags=0x1003; run_once
+dump=$(cat "$state_file" "$log"; ls "$state_dir"; check || true)
+for secret in IMEI358240051111110 100.77.88.99 owner= rmnet_ipa0 'kernel:'; do
+  [[ $dump != *"$secret"* ]] || fail "guard persisted or printed journal or identity data: $secret"
+done
+pass 'guard state, log and output carry aggregates only'
+
+# -- boot scoping, staleness, resume ------------------------------------------------
+fresh; run_once
+echo boot-B >"$boot_id_file"
+out=$(check) && fail 'state from another boot accepted'
+[[ $out == *stale-boot* ]] || fail "other-boot output: $out"
+echo boot-A >"$boot_id_file"
+check >/dev/null || fail 'same-boot state rejected'
+now=200
+out=$(check) && fail 'stale heartbeat accepted'
+[[ $out == *'guard=stale'* ]] || fail "stale output: $out"
+rm -f "$state_file"
+out=$(check) && fail 'absent state accepted'
+[[ $out == *guard=absent* ]] || fail "absent output: $out"
+fresh; flags=0x1003; run_once; flags=0x1002; run_once
+boot_id= samples=0 up=0 down=0 fatal=0 info=0 last=absent now=101
+run_once
+[[ $(state_get down) == 1 ]] || fail 'restart forgot a down transition'
+echo boot-C >"$boot_id_file"
+boot_id= samples=0 up=0 down=0 fatal=0 info=0 last=absent
+run_once
+[[ $(state_get down) == 0 ]] || fail 'counters leaked across boots'
+pass 'state is boot-scoped, heartbeat-fresh and survives a guard restart'
+
+# -- bounded loop and bounded log ---------------------------------------------------
+fresh
+max_iterations=5 cmd_run
+[[ $(state_get samples) == 5 ]] || fail 'bounded loop ran the wrong number of samples'
+fresh
+for i in $(seq 1 3000); do printf '%s boot_id=x event=filler padding-padding-padding-padding-padding\n' "$i"; done >"$log"
+journal_text=$'Kernel panic'; run_once
+[[ $(wc -c <"$log") -lt 70000 ]] || fail 'log is not bounded'
+pass 'loop and log are bounded'
+
+# -- real dispatcher -----------------------------------------------------------------
+for arg in '' bogus 'run extra' 'check a b'; do
+  rc=0; out=$(sh "$guard" $arg 2>&1) || rc=$?
+  [[ $rc -eq 1 && $out == *usage* ]] || fail "usage for '$arg': rc=$rc"
+done
+rc=0; out=$(sh "$guard" check 2>&1) || rc=$?
+[[ $rc -eq 1 && $out == guard=* ]] || fail "real check without state: rc=$rc $out"
+pass 'dispatcher rejects bad usage and fails closed without state'

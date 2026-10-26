@@ -26,6 +26,8 @@ python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __
   "$bluetooth_boot_builder" || fail 'Bluetooth boot builder parses'
 tests/myron-bluetooth-logic || fail 'Bluetooth executable logic checks failed'
 tests/myron-cellular-stage || fail 'cellular stage checks failed'
+tests/myron-cellular-start || fail 'cellular start checks failed'
+tests/myron-ipa-guard || fail 'IPA guard checks failed'
 for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
   sh -n "$fragment" || fail "$fragment parses"
 done
@@ -39,6 +41,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
   "$overlay/usr/local/sbin/myron-cellular-start" \
   "$overlay/usr/local/sbin/myron-cellular-stage" \
+  "$overlay/usr/local/sbin/myron-ipa-guard" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
   "$overlay/usr/local/sbin/myron-coexistence-start" \
   "$overlay/usr/local/sbin/myron-audio-stage" \
@@ -221,11 +224,31 @@ for key in pmic_pwrkey pmic_resin; do
     "$overlay/etc/udev/rules.d/70-myron-hardware-test.rules" ||
     fail "udev rules do not classify $key for Hyprland"
 done
-grep -Fq 'KERNEL=="rmnet_ipa0"' "$overlay/etc/udev/rules.d/70-myron-hardware-test.rules" ||
-  fail 'downstream IPA net port classification is missing'
-grep -Fq 'ENV{ID_MM_PHYSDEV_UID}="qcom-soc"' \
-  "$overlay/etc/udev/rules.d/70-myron-hardware-test.rules" ||
-  fail 'downstream IPA net port is not grouped with the QRTR modem'
+rules=$overlay/etc/udev/rules.d/70-myron-hardware-test.rules
+for port in 'rmnet_ipa*' 'qmapmux*'; do
+  grep -Fxq "SUBSYSTEM==\"net\", KERNEL==\"$port\", ENV{ID_MM_QCOM_SOC}=\"1\", ENV{ID_MM_PHYSDEV_UID}=\"qcom-soc\", ENV{ID_MM_CANDIDATE}=\"1\"" "$rules" ||
+    fail "downstream IPA net port classification is missing or inexact: $port"
+done
+[[ $(grep -c 'ID_MM_QCOM_SOC' "$rules") == 2 ]] || fail 'unexpected extra qcom-soc udev rules'
+marker=$overlay/etc/myron/use-in-tree-rmnet
+[[ -f $marker && ! -L $marker && ! -s $marker ]] || fail 'in-tree rmnet marker is not an empty regular file'
+grep -Fq 'etc/myron/use-in-tree-rmnet' "$compose" && grep -Fq 'use-in-tree-rmnet" -a ! -L' "$compose" ||
+  fail 'composer does not verify the in-tree rmnet marker'
+grep -Fq "stat /etc/myron/use-in-tree-rmnet" "$compose" ||
+  fail 'composer does not verify the marker in the composed image'
+grep -Fq '"$root/usr/local/sbin/myron-ipa-guard"' "$compose" ||
+  fail 'composer does not install the IPA guard as executable'
+dropin=$overlay/etc/systemd/system/ModemManager.service.d/20-myron-radio.conf
+for line in 'Requires=myron-reference-radio.service' 'After=myron-reference-radio.service' \
+  'ConditionPathExists=/run/myron-wireless-ready' \
+  'ConditionPathExists=/run/omamobile-myron/modem-manager-allowed' 'Restart=no'; do
+  grep -Fxq "$line" "$dropin" || fail "ModemManager drop-in lacks: $line"
+done
+guard_unit=$overlay/usr/lib/systemd/system/myron-ipa-guard.service
+grep -Fxq 'ExecStart=/usr/local/sbin/myron-ipa-guard run' "$guard_unit" && grep -Fxq 'Restart=no' "$guard_unit" ||
+  fail 'IPA guard unit is not a single read-only run'
+grep -q '^\[Install\]' "$guard_unit" && fail 'IPA guard unit must have no Install section'
+grep -Fq 'Before=ModemManager.service' "$guard_unit" || fail 'IPA guard is not ordered before ModemManager'
 link=$overlay/etc/systemd/network/10-myron-wlan.link
 grep -Fxq 'OriginalName=wlan*' "$link" ||
   fail 'WLAN link does not match the downstream kernel interface name'
@@ -257,12 +280,17 @@ grep -Fq 'myron-hardware-watchdog.service' "$coexist" ||
   fail 'coexistence bring-up does not require the rollback watchdog'
 grep -Fq 'Before=NetworkManager.service display-manager.service myron-omarchy-qualify.service' "$coexist_unit" ||
   fail 'coexistence service is not ordered before networking, graphics, and qualification'
+main_body=$(sed -n '/^main() {$/,/^}$/p' "$cellular")
 previous=0
 for required in \
+  'check_rmnet_assets' \
   'systemctl start myron-reference-radio.service' \
   'udevadm settle --timeout=30' \
+  'check_radio_result' \
+  'start_guard' \
+  'modem-manager-allowed' \
   'systemctl start ModemManager.service'; do
-  line=$(grep -nF "$required" "$cellular" | cut -d: -f1)
+  line=$(printf '%s\n' "$main_body" | grep -nF "$required" | head -n1 | cut -d: -f1)
   [[ -n $line && $line -gt $previous ]] ||
     fail "cellular order is missing or invalid at: $required"
   previous=$line
@@ -290,13 +318,26 @@ for required in \
   'systemctl --quiet is-active ModemManager.service' \
   'ModemManager did not publish a modem within 180 seconds' \
   'cellular modem does not advertise raw GPS' \
-  'cellular modem does not advertise NMEA GPS'; do
+  'cellular modem does not advertise NMEA GPS' \
+  'in-tree rmnet is not loaded' \
+  'rmnet_core must remain absent' \
+  'systemctl --quiet is-active myron-ipa-guard.service' \
+  '/usr/local/sbin/myron-ipa-guard check' \
+  'IPA guard is not clean'; do
   grep -Fq "$required" "$qualify" ||
     fail "profile qualification lacks: $required"
 done
 grep -Fq 'Requires=myron-reference-radio.service' \
   "$overlay/etc/systemd/system/ModemManager.service.d/20-myron-radio.conf" ||
   fail 'ModemManager is not ordered behind the radio foundation'
+# The cellular profile never disarms: the stage's explicit arm must not be
+# undoable by a concurrent qualifier, and the watchdog restores postmarketOS.
+qualify_cellular_exit=$(grep -nF 'rollback=armed-until-timeout' "$qualify" | cut -d: -f1)
+qualify_disarm_write=$(grep -nF 'hardware-test.disarm.new"' "$qualify" | head -n1 | cut -d: -f1)
+[[ -n $qualify_cellular_exit && -n $qualify_disarm_write && $qualify_cellular_exit -lt $qualify_disarm_write ]] ||
+  fail 'cellular qualification can reach the rollback disarm'
+sed -n "$((qualify_cellular_exit - 6)),$((qualify_cellular_exit + 1))p" "$qualify" | grep -Fq 'exit 0' ||
+  fail 'cellular qualification does not exit before the disarm'
 grep -Fq 'Requires=myron-omarchy-prepare.service myron-hardware-watchdog.service' \
   "$overlay/usr/lib/systemd/system/myron-reference-radio.service" ||
   fail 'radio foundation can start before hardware preparation or without watchdog'

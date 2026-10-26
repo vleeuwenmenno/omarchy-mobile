@@ -1,0 +1,186 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Read-only rmnet_ipa0 guard for the temporary Myron cellular hardware test.
+# Stock ipam.ko can panic when rmnet_ipa0 goes down and is opened again, so
+# this guard only observes: it reads the interface flags from sysfs and counts
+# kernel-journal lines. It never configures, opens or closes a net device and
+# never runs a network tool. State is boot-scoped, aggregate-only and private:
+# counters and empty marker files, never journal text, names or addresses.
+#
+#   run     sample forever (the systemd service)
+#   check   exit 0 only when fresh, boot-scoped and clean; "check pristine"
+#           additionally requires that rmnet_ipa0 has never been up
+#   status  print the aggregate, read-only
+set -eu
+umask 077
+
+state_dir=/run/myron-ipa-guard
+state_file=$state_dir/state
+cursor_file=$state_dir/cursor
+log=/run/myron-host/var/log/myron-omarchy-ipa-guard.log
+net_root=/sys/class/net
+port=rmnet_ipa0
+boot_id_file=/proc/sys/kernel/random/boot_id
+uptime_file=/proc/uptime
+poll_seconds=1
+max_iterations=0
+stale_seconds=15
+fatal_pattern='Kernel panic|Unable to handle kernel|Internal error:|BUG:|Oops:'
+info_pattern='rmnet_ipa|ipa_|ipam'
+
+boot_id=
+samples=0
+up=0
+down=0
+fatal=0
+info=0
+last=absent
+
+fail() {
+	printf 'ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+now_seconds() { awk '{ print int($1) }' "$uptime_file"; }
+
+persist() {
+	mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+	if [ -f "$log" ] && [ "$(wc -c <"$log")" -gt 65536 ]; then
+		tail -n 200 "$log" >"$log.new" 2>/dev/null || return 0
+		chmod 0600 "$log.new"
+		mv -f "$log.new" "$log"
+	fi
+	printf '%s boot_id=%s %s\n' "$(date -u +%FT%TZ)" "${boot_id:-unknown}" "$*" >>"$log" 2>/dev/null || true
+}
+
+publish() {
+	tmp=$state_file.tmp.$$
+	printf 'boot_id=%s samples=%s up=%s down=%s fatal=%s info=%s last=%s heartbeat=%s\n' \
+		"$boot_id" "$samples" "$up" "$down" "$fatal" "$info" "$last" "$(now_seconds)" >"$tmp"
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$state_file"
+	for name in up down fatal info; do
+		eval "value=\$$name"
+		[ "$value" = 0 ] || : >"$state_dir/$name"
+	done
+}
+
+# Resume this boot's counters so a guard restart can never forget a down/up.
+load_state() {
+	[ -f "$state_file" ] && [ ! -L "$state_file" ] || return 0
+	line=$(cat "$state_file")
+	[ "$(field "$line" boot_id)" = "$boot_id" ] || return 0
+	for name in samples up down fatal info; do
+		value=$(field "$line" "$name")
+		case "$value" in ''|*[!0-9]*) value=0 ;; esac
+		eval "$name=$value"
+	done
+	value=$(field "$line" last)
+	case "$value" in up|down|absent) last=$value ;; esac
+}
+
+field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | sed -n '1p'; }
+
+read_flags() { cat "$net_root/$port/flags" 2>/dev/null; }
+
+journal_batch() {
+	timeout -k 1 5 journalctl -q -k -b --no-pager -o cat --cursor-file="$cursor_file" 2>/dev/null
+}
+
+count_matches() {
+	printf '%s\n' "$2" | grep -Eic -- "$1" || true
+}
+
+sample_flags() {
+	current=absent
+	if flags=$(read_flags); then
+		case "$flags" in
+		0x[0-9a-fA-F]*) if [ $((flags & 1)) = 1 ]; then current=up; else current=down; fi ;;
+		*) current=absent ;;
+		esac
+	fi
+	if [ "$current" = up ] && [ "$last" != up ]; then
+		up=$((up + 1))
+		persist "event=up count=$up"
+	elif [ "$last" = up ] && [ "$current" != up ]; then
+		down=$((down + 1))
+		persist "event=down count=$down"
+	fi
+	last=$current
+}
+
+sample_journal() {
+	batch=$(journal_batch) || batch=
+	[ -n "$batch" ] || return 0
+	new_fatal=$(count_matches "$fatal_pattern" "$batch")
+	new_info=$(count_matches "$info_pattern" "$batch")
+	if [ "$new_fatal" -gt 0 ]; then
+		fatal=$((fatal + new_fatal))
+		persist "event=fatal count=$fatal"
+	fi
+	info=$((info + new_info))
+}
+
+sample() {
+	sample_flags
+	sample_journal
+	samples=$((samples + 1))
+	publish
+}
+
+cmd_run() {
+	boot_id=$(cat "$boot_id_file")
+	mkdir -p "$state_dir"
+	chmod 0700 "$state_dir"
+	load_state
+	persist "event=start samples=$samples up=$up down=$down fatal=$fatal"
+	iteration=0
+	while :; do
+		sample
+		iteration=$((iteration + 1))
+		[ "$max_iterations" -eq 0 ] || [ "$iteration" -lt "$max_iterations" ] || break
+		sleep "$poll_seconds"
+	done
+}
+
+# Prints the aggregate and returns 0 only for a fresh, clean, boot-scoped state.
+cmd_check() {
+	mode=${1:-}
+	boot_id=$(cat "$boot_id_file" 2>/dev/null || echo unknown)
+	if [ ! -f "$state_file" ] || [ -L "$state_file" ]; then
+		printf 'guard=absent\n'
+		return 1
+	fi
+	line=$(cat "$state_file")
+	if [ "$(field "$line" boot_id)" != "$boot_id" ]; then
+		printf 'guard=stale-boot\n'
+		return 1
+	fi
+	heartbeat=$(field "$line" heartbeat)
+	case "$heartbeat" in ''|*[!0-9]*) printf 'guard=invalid\n'; return 1 ;; esac
+	if [ $(($(now_seconds) - heartbeat)) -gt "$stale_seconds" ]; then
+		printf 'guard=stale\n'
+		return 1
+	fi
+	for name in samples up down fatal info; do
+		value=$(field "$line" "$name")
+		case "$value" in ''|*[!0-9]*) printf 'guard=invalid\n'; return 1 ;; esac
+		eval "$name=$value"
+	done
+	verdict=clean
+	[ "$fatal" = 0 ] && [ "$down" = 0 ] && [ "$up" -le 1 ] || verdict=dirty
+	if [ "$mode" = pristine ]; then
+		{ [ "$up" = 0 ] && [ "$(field "$line" last)" != up ]; } || verdict=dirty
+	fi
+	printf 'guard=%s samples=%s up=%s down=%s fatal=%s info=%s\n' \
+		"$verdict" "$samples" "$up" "$down" "$fatal" "$info"
+	[ "$verdict" = clean ]
+}
+
+# --- main ---
+case "${1:-}" in
+run) [ "$#" = 1 ] || fail 'usage: myron-ipa-guard run|check [pristine]|status'; cmd_run ;;
+check) [ "$#" -le 2 ] || fail 'usage: myron-ipa-guard run|check [pristine]|status'; cmd_check "${2:-}" ;;
+status) cmd_check || true ;;
+*) fail 'usage: myron-ipa-guard run|check [pristine]|status' ;;
+esac

@@ -144,6 +144,12 @@ docker run --rm --privileged --platform linux/arm64 \
     cp -a /runtime-stage/. "$root/"
     tar -C /test-overlay -cf - . | tar --no-same-owner -C "$root" -xf -
     install -d -m0755 "$root/etc/omamobile"
+    # The empty in-tree-rmnet selection marker must arrive as a regular file.
+    test -f "$root/etc/myron/use-in-tree-rmnet" -a ! -L "$root/etc/myron/use-in-tree-rmnet" -a \
+      ! -s "$root/etc/myron/use-in-tree-rmnet"
+    chown 0:0 "$root/etc/myron" "$root/etc/myron/use-in-tree-rmnet"
+    chmod 0755 "$root/etc/myron"
+    chmod 0644 "$root/etc/myron/use-in-tree-rmnet"
     printf "%s\n" "$MYRON_TEST_PROFILE" >"$root/etc/omamobile/myron-test-profile"
     chown 0:0 "$root/etc/omamobile/myron-test-profile"
     chmod 0644 "$root/etc/omamobile/myron-test-profile"
@@ -225,6 +231,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-reference-radio-start" \
       "$root/usr/local/sbin/myron-cellular-start" \
       "$root/usr/local/sbin/myron-cellular-stage" \
+      "$root/usr/local/sbin/myron-ipa-guard" \
       "$root/usr/local/sbin/myron-reference-audio-start" \
       "$root/usr/local/sbin/myron-coexistence-start" \
       "$root/usr/local/sbin/myron-audio-stage" \
@@ -271,7 +278,8 @@ docker run --rm --privileged --platform linux/arm64 \
 e2fsck -fn "$out" >/dev/null
 for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot.conf \
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
-  /usr/local/sbin/myron-omarchy-prepare \
+  /usr/local/sbin/myron-omarchy-prepare /etc/myron/use-in-tree-rmnet \
+  /usr/local/sbin/myron-ipa-guard /usr/lib/systemd/system/myron-ipa-guard.service \
   /usr/local/lib/myron-gpu/modules/msm_kgsl.ko \
   /usr/local/lib/myron-audio /usr/local/lib/myron-charging \
   /usr/local/lib/myron-charging/bin/batterysecret \
@@ -285,6 +293,10 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
     die "root ownership missing: $path"
 done
+debugfs -R 'stat /etc/myron/use-in-tree-rmnet' "$out" 2>/dev/null |
+  grep -Eq '^Inode:.*Type:[[:space:]]*regular' || die 'in-tree rmnet marker is not a regular file'
+debugfs -R 'stat /etc/myron/use-in-tree-rmnet' "$out" 2>/dev/null |
+  grep -Eq 'Size:[[:space:]]*0([[:space:]]|$)' || die 'in-tree rmnet marker is not empty'
 debugfs -R 'stat /etc/systemd/system/systemd-firstboot.service' "$out" 2>/dev/null |
   grep -Fq 'Fast link dest: "/dev/null"' || die 'stock interactive systemd-firstboot is not masked'
 debugfs -R 'stat /etc/systemd/system/sysinit.target.wants/myron-hardware-watchdog.service' \
@@ -301,6 +313,8 @@ case $profile in
       "$out" 2>&1 | grep -Fq 'File not found' || die 'radio foundation is enabled outside the guarded cellular transaction'
     debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/ModemManager.service' \
       "$out" 2>&1 | grep -Fq 'File not found' || die 'ModemManager is enabled outside the guarded cellular transaction'
+    debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-ipa-guard.service' \
+      "$out" 2>&1 | grep -Fq 'File not found' || die 'IPA guard is enabled outside the guarded cellular transaction'
     ;;
 esac
 hash=$(sha256sum <"$out" | cut -d" " -f1)

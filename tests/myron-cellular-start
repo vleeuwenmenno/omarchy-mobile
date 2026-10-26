@@ -1,0 +1,184 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Execute the guarded cellular bring-up transaction's gates and ordering
+# against fake paths and mocked systemctl/udevadm. Nothing touches a phone.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+start=device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-start
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+[[ -x $start ]] || fail 'start script is executable'
+sh -n "$start" || fail 'start script parses as POSIX sh'
+if shellcheck --version >/dev/null 2>&1; then
+  shellcheck -s sh -e SC2086,SC2034,SC2046,SC2015,SC2155 "$start" || fail 'shellcheck'
+fi
+if grep -nE '\[\[[^:]|<<<|(^|[[:space:]])local[[:space:]]|\bfunction\b|\bdeclare\b|&>|<\(' "$start"; then
+  fail 'start script uses shell syntax outside POSIX sh'
+fi
+if grep -nE 'systemctl +(stop|restart|reload|kill|mask|disable)|\bkill\b|modprobe|rmmod|insmod|--set-power-state|connection (down|up)|ip link|\bsudo\b|/dev/(disk|block|sd|mmc)' "$start"; then
+  fail 'start script contains a forbidden stop, reconnect or storage action'
+fi
+pass 'start script syntax and forbidden-action greps'
+
+work=$(mktemp -d /tmp/myron-cellular-start.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+# shellcheck disable=SC1090
+source <(sed '/^# --- main ---$/,$d' "$start")
+
+calls=$work/calls
+runtime=$work/run
+ready=$work/ready
+wireless_ready=$work/wireless-ready
+profile_file=$work/profile
+host_arm=$work/armed
+rmnet_marker=$work/use-in-tree-rmnet
+notes_file=$work/notes
+selector=$work/selector
+module_set_root=$work/sets
+guard=$work/guard
+sys_module=$work/sys-module
+net_root=$work/net
+thermal_root=$work/thermal
+bluetooth_hci=$work/hci0
+guard_wait_steps=2
+expected_kernel=6.12.23-test
+printf 'notes' >"$notes_file"
+expected_notes=$(sha256sum "$notes_file" | awk '{print $1}')
+real_notes=$expected_notes
+module_dir_expected=$module_set_root/$expected_notes
+
+reset() {
+  expected_notes=$real_notes
+  rm -rf "$runtime" "$calls" "$ready" "$wireless_ready" "$sys_module" "$net_root" "$thermal_root" \
+    "$module_set_root" "$bluetooth_hci" "$rmnet_marker" "$selector" "$guard"
+  : >"$calls"
+  mkdir -p "$module_dir_expected" "$thermal_root/thermal_zone0" "$net_root/rmnet_ipa0"
+  printf 'rmnet' >"$module_dir_expected/rmnet.ko"
+  rmnet_sha=$(sha256sum "$module_dir_expected/rmnet.ko" | awk '{print $1}')
+  : >"$rmnet_marker"
+  printf '#!/bin/sh\necho "%s"\n' "$module_dir_expected" >"$selector"; chmod +x "$selector"
+  printf '#!/bin/sh\nexit "${GUARD_RC:-0}"\n' >"$guard"; chmod +x "$guard"
+  : >"$host_arm"; echo cellular >"$profile_file"
+  for m in rmnet rmnet_mem gsim ipam ipanetm rmnet_ctl; do mkdir -p "$sys_module/$m"; done
+  echo battery >"$thermal_root/thermal_zone0/type"; echo 60000 >"$thermal_root/thermal_zone0/temp"
+  active_units=' myron-hardware-watchdog.service '
+  uid=0 kernel=$expected_kernel conflict=1 udev_props='ID_MM_QCOM_SOC=1' settle_rc=0 radio_ready=1
+  guard_active=1 mm_stays=1 hci=0 after_radio=:
+  unset GUARD_RC
+}
+export GUARD_RC=0
+
+id() { printf '%s\n' "$uid"; }
+uname() { printf '%s\n' "$kernel"; }
+sleep() { :; }
+pgrep() { return "$conflict"; }
+udevadm() {
+  if [[ $1 == settle ]]; then echo "udevadm settle" >>"$calls"; return "$settle_rc"; fi
+  [[ $1 == info ]] && { echo "udevadm info" >>"$calls"; printf '%s\n' "$udev_props"; return 0; }
+  echo "udevadm $*" >>"$calls"
+}
+systemctl() {
+  if [[ $1 == --quiet && $2 == is-active ]]; then
+    [[ $active_units == *" $3 "* ]]
+    return
+  fi
+  echo "systemctl $*" >>"$calls"
+  case "$*" in
+  'start myron-reference-radio.service')
+    active_units+=' myron-reference-radio.service '
+    [[ $radio_ready == 1 ]] && echo ready >"$wireless_ready"
+    eval "$after_radio" ;;
+  'start myron-ipa-guard.service') [[ $guard_active == 0 ]] || active_units+=' myron-ipa-guard.service ' ;;
+  'start ModemManager.service') [[ $mm_stays == 0 ]] || active_units+=' ModemManager.service ' ;;
+  esac
+  return 0
+}
+timeout() { while [[ $1 == -k ]]; do shift 2; done; shift; "$@"; }
+install() { mkdir -p "${@: -1}"; }
+runtime=$work/run
+# The script writes /run paths through $runtime; the guard path is a mock.
+run() { ( main ) 2>&1; }
+expect_fail() { local what=$1 want=$2 out rc=0; out=$(run) || rc=$?
+  [[ $rc -ne 0 ]] || fail "$what: succeeded"
+  [[ $out == *"$want"* ]] || fail "$what: expected '$want', got: $out"; }
+no_radio() { ! grep -q 'myron-reference-radio.service\|ModemManager\|ipa-guard' "$calls" || fail "$1 started something"; }
+
+# -- happy path and order -----------------------------------------------------------
+reset
+out=$(run) || fail "start failed: $out"
+[[ $out == *'rmnet=in-tree'*'ipa-guard=active'* ]] || fail "output: $out"
+order=$(grep -nE 'start myron-reference-radio|udevadm settle|udevadm info|start myron-ipa-guard|start ModemManager' "$calls" | cut -d: -f2- | tr '\n' ';')
+[[ $order == 'systemctl start myron-reference-radio.service;udevadm settle;udevadm info;systemctl start myron-ipa-guard.service;systemctl start ModemManager.service;' ]] ||
+  fail "unexpected order: $order"
+[[ -s $runtime/modem-manager-allowed && -s $runtime/radio-backup-verified ]] || fail 'markers not written'
+[[ -s $ready ]] || fail 'ready marker not written'
+rm -rf "$runtime" "$calls"; : >"$calls"
+# already ready: no repeat start
+out=$(run) || fail 'repeat run failed'
+[[ ! -s $calls ]] || fail 'ready boot restarted the transaction'
+pass 'radio, settle, udev check, guard, marker, then ModemManager, once'
+
+# -- pre-radio gates start nothing --------------------------------------------------
+gate() { local what=$1 want=$2 setup=$3
+  reset; eval "$setup"; expect_fail "gate $what" "$want"; no_radio "gate $what"
+  [[ ! -e $runtime/radio-backup-verified && ! -e $runtime/modem-manager-allowed ]] ||
+    fail "gate $what left an arm marker"; }
+gate 'not root' 'must run as root' uid=1000
+gate 'no arm' 'arm is absent' 'rm -f "$host_arm"'
+gate 'watchdog' 'watchdog is not active' "active_units=' '"
+gate 'profile' 'profile is not selected' 'echo coexistence >"$profile_file"'
+gate 'coexistence' 'coexistence profile must remain inactive' "active_units+=' myron-coexistence.service '"
+gate 'bluetooth controller' 'Bluetooth controller must remain absent' 'touch "$bluetooth_hci"'
+gate 'bluetooth transport' 'Bluetooth transport' conflict=0
+gate 'marker absent' 'selection marker' 'rm -f "$rmnet_marker"'
+gate 'marker symlink' 'selection marker' 'rm -f "$rmnet_marker"; ln -s "$host_arm" "$rmnet_marker"'
+gate 'marker directory' 'selection marker' 'rm -f "$rmnet_marker"; mkdir "$rmnet_marker"'
+gate 'kernel release' 'unexpected kernel release' 'kernel=6.12.23-other'
+gate 'kernel notes' 'kernel notes differ' 'expected_notes=0000'
+gate 'selector missing' 'selector is unavailable' 'rm -f "$selector"'
+gate 'selector fails' 'module selection failed' 'printf "#!/bin/sh\nexit 1\n" >"$selector"'
+gate 'selector wrong dir' 'different kernel notes' 'mkdir -p "$work/other"; printf "#!/bin/sh\necho %s\n" "$work/other" >"$selector"'
+gate 'rmnet missing' 'rmnet module is missing' 'rm -f "$module_dir_expected/rmnet.ko"'
+gate 'rmnet symlink' 'rmnet module is missing' 'mv "$module_dir_expected/rmnet.ko" "$work/real.ko"; ln -s "$work/real.ko" "$module_dir_expected/rmnet.ko"'
+gate 'rmnet checksum' 'checksum mismatch' 'echo tampered >>"$module_dir_expected/rmnet.ko"'
+gate 'rmnet_core file' 'rmnet_core must not be present' ': >"$module_dir_expected/rmnet_core.ko"'
+gate 'rmnet_core loaded' 'rmnet_core must not be loaded' 'mkdir "$sys_module/rmnet_core"'
+pass 'pre-radio gates (marker, kernel, notes, selector, rmnet hash, rmnet_core) start nothing'
+
+# -- post-radio gates: radio ran, ModemManager and the marker never follow ----------
+post() { local what=$1 want=$2 setup=$3
+  reset; eval "$setup"; expect_fail "post $what" "$want"
+  grep -Fq 'start ModemManager.service' "$calls" && fail "post $what started ModemManager"
+  grep -Fq 'ipa-guard' "$calls" && fail "post $what started the guard"
+  [[ ! -e $runtime/modem-manager-allowed ]] || fail "post $what wrote the ModemManager marker"
+  [[ ! -e $ready ]] || fail "post $what wrote ready"; }
+post 'settle' 'did not settle' settle_rc=1
+post 'radio not ready' 'radio foundation did not become ready' radio_ready=0
+post 'rmnet unloaded' 'in-tree rmnet is not loaded' 'after_radio='"'"'rmdir "$sys_module/rmnet"'"'"
+post 'rmnet_core appears' 'rmnet_core must remain absent' 'after_radio='"'"'mkdir "$sys_module/rmnet_core"'"'"
+for m in rmnet_mem gsim ipam ipanetm rmnet_ctl; do
+  post "module $m" "required radio module is not loaded: $m" "after_radio='rmdir \"\$sys_module/$m\"'"
+done
+post 'no rmnet_ipa0' 'rmnet_ipa0 does not exist' 'rmdir "$net_root/rmnet_ipa0"'
+post 'udev classification' 'qcom-soc udev classification' 'udev_props=ID_MM_QCOM_SOC=0'
+post 'udev classification absent' 'qcom-soc udev classification' 'udev_props=ID_FOO=1'
+post 'temperature' 'temperature safety limit' 'echo 95000 >"$thermal_root/thermal_zone0/temp"'
+post 'temperature unavailable' 'sensors are unavailable' 'rm -rf "$thermal_root"/thermal_zone0'
+reset; echo 94999 >"$thermal_root/thermal_zone0/temp"; run >/dev/null || fail 'temperature just below the limit rejected'
+pass 'post-radio gates (modules, rmnet_core, rmnet_ipa0, udev, temperature) precede the marker and ModemManager'
+
+# -- guard gate ----------------------------------------------------------------------
+reset; guard_active=0
+expect_fail 'guard not started' 'IPA guard is not active'
+grep -Fq 'start ModemManager.service' "$calls" && fail 'ModemManager started without guard'
+reset; export GUARD_RC=1
+expect_fail 'guard dirty' 'did not report a clean pristine state'
+grep -Fq 'start ModemManager.service' "$calls" && fail 'ModemManager started with a dirty guard'
+[[ ! -e $runtime/modem-manager-allowed ]] || fail 'marker written with a dirty guard'
+export GUARD_RC=0
+reset; mm_stays=0
+expect_fail 'ModemManager did not stay' 'did not remain active'
+[[ ! -e $ready ]] || fail 'ready written without ModemManager'
+pass 'guard must be active and clean before ModemManager; ModemManager must stay up'

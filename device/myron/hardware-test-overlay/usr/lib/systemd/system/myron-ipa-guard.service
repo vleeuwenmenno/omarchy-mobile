@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Read-only Myron rmnet_ipa0 safety guard
+Requires=myron-hardware-watchdog.service
+After=myron-hardware-watchdog.service myron-reference-radio.service
+Before=ModemManager.service NetworkManager.service
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+ConditionPathExists=/run/myron-wireless-ready
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/myron-ipa-guard run
+Restart=no
+RuntimeDirectory=myron-ipa-guard
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+TimeoutStopSec=5s
+
+# Deliberately no [Install] section: only myron-cellular-start starts it, once,
+# before ModemManager. It observes rmnet_ipa0 and never changes it.
