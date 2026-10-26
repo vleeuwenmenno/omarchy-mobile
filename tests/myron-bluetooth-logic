@@ -12,6 +12,36 @@ tmp=$(mktemp -d /tmp/myron-bluetooth-logic.XXXXXX)
 trap 'rm -rf -- "$tmp"' EXIT
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 equal() { [[ $1 == "$2" ]] || fail "$3: expected $2, got $1"; }
+persist() { printf '%s\n' "$*" >>"$tmp/temperature.log"; }
+
+thermal_root=$tmp/thermal-missing
+mkdir -p "$thermal_root"
+if hottest_temperature >/dev/null; then
+  fail 'missing thermal sensors produced a stage temperature'
+fi
+if (require_temperature) >"$tmp/temperature-missing.log" 2>&1; then
+  fail 'stage temperature gate accepted missing sensors'
+fi
+grep -Fq 'reason=temperature-unavailable' "$tmp/temperature.log" ||
+  fail 'stage temperature gate did not record missing sensors'
+
+thermal_root=$tmp/thermal
+mkdir -p "$thermal_root/thermal_zone0" "$thermal_root/thermal_zone1"
+printf '%s\n' mock-sensor >"$thermal_root/thermal_zone0/type"
+printf '%s\n' 74000 >"$thermal_root/thermal_zone0/temp"
+printf '%s\n' cpu-hw-trip-0 >"$thermal_root/thermal_zone1/type"
+printf '%s\n' 95000 >"$thermal_root/thermal_zone1/temp"
+equal "$(hottest_temperature)" '74000 mock-sensor 1' \
+  'stage temperature parser skips hardware-trip pseudo sensors'
+require_temperature
+printf '%s\n' 80000 >"$thermal_root/thermal_zone0/temp"
+if (require_temperature) >"$tmp/temperature-hot.log" 2>&1; then
+  fail 'stage temperature gate accepted 80000 mC'
+fi
+printf '%s\n' invalid >"$thermal_root/thermal_zone0/temp"
+if hottest_temperature >/dev/null; then
+  fail 'invalid stage temperature was accepted'
+fi
 
 mock_bin=$tmp/bin
 mkdir -p "$mock_bin"

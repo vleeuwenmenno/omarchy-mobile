@@ -53,6 +53,7 @@ scan_before_file=
 scan_after_file=
 scan_new_file=
 scan_filter_file=
+thermal_root=/sys/class/thermal
 
 persist() {
 	mkdir -p "$(dirname "$log")"
@@ -99,25 +100,35 @@ check_size() {
 hottest_temperature() {
 	hottest=0
 	hottest_type=unknown
-	for file in /sys/class/thermal/thermal_zone*/temp; do
+	valid_sensors=0
+	for file in "$thermal_root"/thermal_zone*/temp; do
 		[ -r "$file" ] || continue
-		type=$(cat "${file%/temp}/type" 2>/dev/null || printf unknown)
+		type=$(timeout -k 1 2 cat "${file%/temp}/type" 2>/dev/null) || continue
+		[ -n "$type" ] || continue
 		case "$type" in *-trip-*) continue ;; esac
-		value=$(cat "$file" 2>/dev/null || printf 0)
-		case "$value" in ''|*[!0-9]*) value=0 ;; esac
+		value=$(timeout -k 1 2 cat "$file" 2>/dev/null) || continue
+		case "$value" in ''|*[!0-9]*) continue ;; esac
+		[ "$value" -gt 0 ] && [ "$value" -lt 200000 ] || continue
+		valid_sensors=$((valid_sensors + 1))
 		[ "$value" -le "$hottest" ] || {
 			hottest=$value
 			hottest_type=$type
 		}
 	done
-	printf '%s %s\n' "$hottest" "$hottest_type"
+	[ "$valid_sensors" -gt 0 ] || return 1
+	printf '%s %s %s\n' "$hottest" "$hottest_type" "$valid_sensors"
 }
 
 require_temperature() {
-	reading=$(hottest_temperature)
+	if ! reading=$(hottest_temperature); then
+		persist 'stage=temperature result=failed reason=temperature-unavailable'
+		fail 'temperature sensors are unavailable'
+	fi
 	value=${reading%% *}
-	sensor=${reading#* }
-	persist "stage=temperature maximum_mc=$value sensor=$sensor"
+	reading=${reading#* }
+	sensor=${reading%% *}
+	valid_sensors=${reading#* }
+	persist "stage=temperature maximum_mc=$value sensor=$sensor valid_sensors=$valid_sensors"
 	[ "$value" -lt "$maximum_safe_temperature_mc" ] ||
 		fail "temperature safety limit reached: $value mC"
 }

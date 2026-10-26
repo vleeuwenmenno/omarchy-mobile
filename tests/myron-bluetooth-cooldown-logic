@@ -56,4 +56,328 @@ fi
 grep -Fq 'reason=temperature-unavailable' "$tmp/missing.log" ||
 	fail_test 'missing thermal data was not recorded'
 
-printf '%s\n' 'ok - Bluetooth cooldown is bounded, stable and fails closed without sensors'
+governor_root=$tmp/cpufreq
+use_governor_state() {
+	governor_state=$1
+	governor_state_new=$governor_state.new
+	governor_restore=$governor_state.restore
+	governor_restore_new=$governor_restore.new
+}
+use_governor_state "$tmp/governors"
+governors_owed=0
+bluetooth_stage=$tmp/bluetooth-stage
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$1" >>"'"$tmp"'/stage.log"' >"$bluetooth_stage"
+chmod 0755 "$bluetooth_stage"
+mkdir -p "$governor_root/policy0" "$governor_root/policy4"
+printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+printf '%s' performance >"$governor_root/policy4/scaling_governor"
+enter_powersave "$governor_root"
+[[ $(<"$governor_root/policy0/scaling_governor") == powersave ]] ||
+	fail_test 'policy0 did not enter temporary powersave'
+[[ $(<"$governor_root/policy4/scaling_governor") == powersave ]] ||
+	fail_test 'policy4 did not enter temporary powersave'
+restore_governors "$governor_root"
+[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+	fail_test 'policy0 governor was not restored'
+[[ $(<"$governor_root/policy4/scaling_governor") == performance ]] ||
+	fail_test 'policy4 governor was not restored'
+[[ ! -e $governor_state ]] || fail_test 'governor state survived successful restoration'
+[[ ! -e $governor_restore ]] || fail_test 'governor restore snapshot survived successful restoration'
+read_governor() { printf '%s' powersave; return 124; }
+if governor_matches "$governor_root/policy0/scaling_governor" powersave; then
+	fail_test 'matching governor output masked a read failure'
+fi
+read_governor() { timeout -k 1 2 cat "$1" 2>/dev/null; }
+
+use_governor_state "$tmp/stale-governors"
+governors_owed=0
+printf '%s\n' MYRON_CPUFREQ_V1 '0 powersave' 'END 1' >"$governor_state"
+if (enter_powersave "$governor_root") >"$tmp/stale.log" 2>&1; then
+	fail_test 'pre-existing governor journal was overwritten'
+fi
+grep -Fq 'stale CPU frequency governor journal exists' "$tmp/stale.log" ||
+	fail_test 'stale governor journal was not diagnosed'
+[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+	fail_test 'stale journal changed a governor'
+use_governor_state "$tmp/stale-draft-governors"
+governors_owed=0
+printf '%s\n' MYRON_CPUFREQ_V1 >"$governor_state_new"
+if (enter_powersave "$governor_root") >"$tmp/stale-draft.log" 2>&1; then
+	fail_test 'pre-existing governor journal draft was overwritten'
+fi
+grep -Fq 'stale CPU frequency governor journal draft exists' "$tmp/stale-draft.log" ||
+	fail_test 'stale governor journal draft was not diagnosed'
+
+use_governor_state "$tmp/truncated-governors"
+governors_owed=1
+printf '%s\n' MYRON_CPUFREQ_V1 >"$governor_state"
+printf '%s' '0 powersave' >>"$governor_state"
+if restore_governors "$governor_root"; then
+	fail_test 'unterminated governor journal restored successfully'
+fi
+[[ -e $governor_state ]] || fail_test 'invalid governor journal was removed'
+[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+	fail_test 'truncated journal changed a governor'
+
+use_governor_state "$tmp/missing-governors"
+governors_owed=1
+if restore_governors "$governor_root"; then
+	fail_test 'missing governor journal restored successfully'
+fi
+: >"$governor_state"
+if restore_governors "$governor_root"; then
+	fail_test 'empty governor journal restored successfully'
+fi
+[[ -e $governor_state ]] || fail_test 'empty governor journal was removed'
+
+use_governor_state "$tmp/duplicate-governors"
+governors_owed=1
+printf '%s\n' MYRON_CPUFREQ_V1 '0 schedutil' '0 performance' 'END 2' >"$governor_state"
+if restore_governors "$governor_root"; then
+	fail_test 'duplicate governor policy record restored successfully'
+fi
+[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+	fail_test 'duplicate journal changed a governor'
+use_governor_state "$tmp/count-mismatch-governors"
+printf '%s\n' MYRON_CPUFREQ_V1 '0 performance' 'END 2' >"$governor_state"
+if restore_governors "$governor_root"; then
+	fail_test 'count-mismatched governor journal restored successfully'
+fi
+[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+	fail_test 'count-mismatched journal changed a governor'
+
+outside=$tmp/outside
+printf '%s' protected >"$outside"
+use_governor_state "$tmp/traversal-governors"
+governors_owed=1
+printf '%s\n' MYRON_CPUFREQ_V1 '0/../../outside hostile' 'END 1' >"$governor_state"
+if restore_governors "$governor_root"; then
+	fail_test 'path traversal governor journal restored successfully'
+fi
+[[ $(<"$outside") == protected ]] || fail_test 'path traversal escaped CPU frequency root'
+[[ -e $governor_state ]] || fail_test 'traversal journal was removed'
+
+ln -s "$tmp" "$governor_root/policy7"
+use_governor_state "$tmp/symlink-governors"
+governors_owed=1
+printf '%s\n' MYRON_CPUFREQ_V1 '7 protected' 'END 1' >"$governor_state"
+if restore_governors "$governor_root"; then
+	fail_test 'symlinked policy path restored successfully'
+fi
+[[ $(<"$outside") == protected ]] || fail_test 'symlinked policy escaped CPU frequency root'
+
+use_governor_state "$tmp/partial-governors"
+governors_owed=0
+printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+printf '%s' performance >"$governor_root/policy4/scaling_governor"
+enter_powersave "$governor_root"
+write_governor() {
+	[[ $1 != */policy4/scaling_governor || $2 == powersave ]] || return 1
+	printf '%s' "$2" >"$1"
+}
+if restore_governors "$governor_root"; then
+	fail_test 'partial governor restoration failure passed'
+fi
+[[ -e $governor_state ]] || fail_test 'partial restoration removed recovery journal'
+[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+	fail_test 'first policy was not restored before later failure'
+[[ $(<"$governor_root/policy4/scaling_governor") == powersave ]] ||
+	fail_test 'simulated failing policy unexpectedly changed'
+write_governor() { printf '%s' "$2" >"$1"; }
+restore_governors "$governor_root"
+
+use_governor_state "$tmp/disappearing-snapshot-governors"
+governors_owed=0
+printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+printf '%s' performance >"$governor_root/policy4/scaling_governor"
+enter_powersave "$governor_root"
+cmp() {
+	command cmp "$@"
+	status=$?
+	[[ $status -ne 0 ]] || rm -f -- "$governor_restore"
+	return "$status"
+}
+if restore_governors "$governor_root" >"$tmp/disappearing-snapshot.log" 2>&1; then
+	fail_test 'disappearing restore snapshot reported success'
+fi
+unset -f cmp
+[[ -e $governor_state ]] || fail_test 'snapshot disappearance removed recovery journal'
+[[ $(<"$governor_root/policy0/scaling_governor") == powersave ]] ||
+	fail_test 'snapshot disappearance wrote an unvalidated restoration'
+restore_governors "$governor_root"
+
+use_governor_state "$tmp/truncated-second-pass-governors"
+governors_owed=0
+printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+printf '%s' performance >"$governor_root/policy4/scaling_governor"
+enter_powersave "$governor_root"
+cmp() {
+	command cmp "$@"
+	status=$?
+	[[ $status -ne 0 ]] || : >"$governor_restore"
+	return "$status"
+}
+if restore_governors "$governor_root"; then
+	fail_test 'truncated second-pass snapshot reported success'
+fi
+unset -f cmp
+[[ -e $governor_state ]] || fail_test 'second-pass truncation removed recovery journal'
+[[ $(<"$governor_root/policy0/scaling_governor") == powersave ]] ||
+	fail_test 'second-pass truncation wrote an incomplete restoration'
+rm -f -- "$governor_restore"
+restore_governors "$governor_root"
+
+use_governor_state "$tmp/interrupted-second-pass-governors"
+governors_owed=0
+printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+printf '%s' performance >"$governor_root/policy4/scaling_governor"
+enter_powersave "$governor_root"
+interrupted_once=0
+write_governor() {
+	printf '%s' "$2" >"$1"
+	if [[ $interrupted_once -eq 0 ]]; then
+		interrupted_once=1
+		: >"$governor_restore"
+	fi
+}
+if restore_governors "$governor_root"; then
+	fail_test 'interrupted second-pass read reported success'
+fi
+[[ -e $governor_state ]] || fail_test 'interrupted read removed recovery journal'
+[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+	fail_test 'interrupted read did not retain first successful restoration'
+[[ $(<"$governor_root/policy4/scaling_governor") == powersave ]] ||
+	fail_test 'interrupted read continued after snapshot truncation'
+write_governor() { printf '%s' "$2" >"$1"; }
+rm -f -- "$governor_restore"
+restore_governors "$governor_root"
+
+for failure_spec in EXIT0:0:1 EXIT37:37:37 HUP:129:129 INT:130:130 TERM:143:143; do
+	failure_kind=${failure_spec%%:*}
+	failure_rest=${failure_spec#*:}
+	trigger_status=${failure_rest%%:*}
+	expected_status=${failure_rest#*:}
+	use_governor_state "$tmp/failed-restore-$failure_kind-governors"
+	governors_owed=0
+	printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+	printf '%s' performance >"$governor_root/policy4/scaling_governor"
+	enter_powersave "$governor_root"
+	: >"$tmp/stage.log"
+	write_governor() { return 1; }
+	set +e
+	(
+		set -eu
+		cpufreq_root=$governor_root
+		trap restore_governors_on_exit 0
+		trap 'exit 129' HUP
+		trap 'exit 130' INT
+		trap 'exit 143' TERM
+		case "$failure_kind" in
+			EXIT0|EXIT37) exit "$trigger_status" ;;
+			*) kill -"$failure_kind" "$BASHPID" ;;
+		esac
+	) >"$tmp/failed-restore-$failure_kind.log" 2>&1
+	actual_status=$?
+	set -e
+	[[ $actual_status -eq $expected_status ]] ||
+		fail_test "$failure_kind plus restore failure returned $actual_status, expected $expected_status"
+	[[ -e $governor_state ]] || fail_test "$failure_kind restore failure removed recovery journal"
+	grep -Fxq stop "$tmp/stage.log" || fail_test "$failure_kind restore failure did not stop Bluetooth"
+	write_governor() { printf '%s' "$2" >"$1"; }
+	restore_governors "$governor_root"
+done
+
+for signal_spec in HUP:129 INT:130 TERM:143; do
+	signal=${signal_spec%%:*}
+	expected_status=${signal_spec#*:}
+	use_governor_state "$tmp/signal-$signal-governors"
+	governors_owed=0
+	printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+	printf '%s' performance >"$governor_root/policy4/scaling_governor"
+	set +e
+	(
+		cpufreq_root=$governor_root
+		trap restore_governors_on_exit 0
+		trap 'exit 129' HUP
+		trap 'exit 130' INT
+		trap 'exit 143' TERM
+		enter_powersave "$cpufreq_root"
+		kill -"$signal" "$BASHPID"
+		: >"$tmp/signal-$signal-continued"
+	) >"$tmp/signal-$signal.log" 2>&1
+	signal_status=$?
+	set -e
+	[[ $signal_status -eq $expected_status ]] ||
+		fail_test "$signal returned $signal_status instead of $expected_status"
+	[[ ! -e $tmp/signal-$signal-continued ]] || fail_test "execution continued after $signal"
+	[[ ! -e $governor_state ]] || fail_test "$signal restoration left recovery journal"
+	[[ $(<"$governor_root/policy0/scaling_governor") == schedutil ]] ||
+		fail_test "$signal path did not restore policy0"
+	[[ $(<"$governor_root/policy4/scaling_governor") == performance ]] ||
+		fail_test "$signal path did not restore policy4"
+done
+
+use_governor_state "$tmp/readiness-governors"
+governors_owed=0
+printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
+printf '%s' performance >"$governor_root/policy4/scaling_governor"
+enter_powersave "$governor_root"
+write_governor() { return 1; }
+if (complete_governor_window; : >"$tmp/false-ready") >"$tmp/readiness.log" 2>&1; then
+	fail_test 'failed restoration reported successful completion'
+fi
+[[ ! -e $tmp/false-ready ]] || fail_test 'readiness continued after failed restoration'
+grep -Fxq stop "$tmp/stage.log" || fail_test 'failed restoration did not stop Bluetooth'
+[[ -e $governor_state ]] || fail_test 'failed completion removed recovery journal'
+write_governor() { printf '%s' "$2" >"$1"; }
+restore_governors "$governor_root"
+
+posix_functions=$tmp/bluetooth-only-functions.sh
+sed '/^\[ "$(id -u)" = 0 \]/,$d' "$wrapper" >"$posix_functions"
+for posix_spec in EXIT0:1 EXIT37:37 HUP:129 INT:130 TERM:143; do
+	posix_trigger=${posix_spec%%:*}
+	posix_expected=${posix_spec#*:}
+	posix_tmp=$tmp/posix-$posix_trigger
+	set +e
+	TEST_TMP=$posix_tmp TEST_TRIGGER=$posix_trigger /bin/sh -c '
+		. "$1"
+		mkdir -p "$TEST_TMP/cpufreq/policy0" "$TEST_TMP/cpufreq/policy6" "$TEST_TMP/run"
+		printf "%s" schedutil >"$TEST_TMP/cpufreq/policy0/scaling_governor"
+		printf "%s" performance >"$TEST_TMP/cpufreq/policy6/scaling_governor"
+		cpufreq_root=$TEST_TMP/cpufreq
+		governor_state=$TEST_TMP/run/governors
+		governor_state_new=$governor_state.new
+		governor_restore=$governor_state.restore
+		governor_restore_new=$governor_restore.new
+		governors_owed=0
+		bluetooth_stage=$TEST_TMP/stage
+		printf "%s\n" "#!/bin/sh" "printf \"%s\\n\" \"\$1\" >>\"$TEST_TMP/stage.log\"" >"$bluetooth_stage"
+		chmod 0755 "$bluetooth_stage"
+		enter_powersave "$cpufreq_root"
+		cmp() {
+			command cmp "$@"
+			result=$?
+			[ "$result" -ne 0 ] || rm -f -- "$governor_restore"
+			return "$result"
+		}
+		trap restore_governors_on_exit 0
+		trap "exit 129" HUP
+		trap "exit 130" INT
+		trap "exit 143" TERM
+		case "$TEST_TRIGGER" in
+			EXIT0) exit 0 ;;
+			EXIT37) exit 37 ;;
+			*) kill -"$TEST_TRIGGER" "$$" ;;
+		esac
+	' sh "$posix_functions" >"$posix_tmp.log" 2>&1
+	posix_status=$?
+	set -e
+	[[ $posix_status -eq $posix_expected ]] ||
+		fail_test "/bin/sh $posix_trigger restore failure returned $posix_status, expected $posix_expected"
+	grep -Fxq stop "$posix_tmp/stage.log" ||
+		fail_test "/bin/sh $posix_trigger restore failure did not stop Bluetooth"
+	[[ -e $posix_tmp/run/governors ]] ||
+		fail_test "/bin/sh $posix_trigger restore failure removed recovery journal"
+done
+
+printf '%s\n' 'ok - Bluetooth cooldown and CPU governor transaction fail closed'

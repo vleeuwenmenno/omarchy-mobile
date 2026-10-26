@@ -502,22 +502,50 @@ for required in \
   'case "$type" in *-trip-*) continue ;; esac' \
   '[ "$valid_sensors" -gt 0 ] || return 1' \
   'result=waiting reason=temperature-unavailable' \
+  'enter_powersave "$cpufreq_root"' \
+  'restore_governors "$cpufreq_root"' \
+  'MYRON_CPUFREQ_V1' \
+  'prepare_governor_restore_snapshot "$root"' \
+  'command exec 3<"$governor_restore"' \
+  'current_governor=$(read_governor "$1") || return 1' \
+  'CPU frequency governor did not enter powersave' \
+  '[ "$status" -ne 0 ] || status=1' \
+  'stale CPU frequency governor journal exists' \
+  'CPU frequency governor restoration failed; Bluetooth was stopped' \
+  'stage=cooldown governors=restored' \
   'wait_for_cooldown' \
   'stage=cooldown result=ready target_mc=%s stable_seconds=15' \
   'radio foundation must remain stopped' \
   'radio/Wi-Fi readiness marker must remain absent' \
-  '/usr/local/sbin/myron-bluetooth-stage start' \
+  '"$bluetooth_stage" start' \
   'watchdog=armed'; do
   grep -Fq "$required" "$bluetooth_only_start" ||
     fail "Bluetooth-only transaction lacks: $required"
 done
+for required in \
+  'thermal_root=/sys/class/thermal' \
+  'type=$(timeout -k 1 2 cat "${file%/temp}/type" 2>/dev/null) || continue' \
+  'value=$(timeout -k 1 2 cat "$file" 2>/dev/null) || continue' \
+  '[ "$valid_sensors" -gt 0 ] || return 1' \
+  'reason=temperature-unavailable' \
+  'temperature sensors are unavailable'; do
+  grep -Fq "$required" "$bluetooth_stage" ||
+    fail "Bluetooth stage thermal gate lacks: $required"
+done
 cooldown_line=$(grep -n '^wait_for_cooldown$' "$bluetooth_only_start" | cut -d: -f1)
-arm_line=$(grep -n '^/usr/local/sbin/myron-bluetooth-stage arm$' "$bluetooth_only_start" | cut -d: -f1)
+arm_line=$(grep -n '^"\$bluetooth_stage" arm$' "$bluetooth_only_start" | cut -d: -f1)
 case "$cooldown_line:$arm_line" in
   :*|*:) fail 'Bluetooth-only cooldown/arm ordering is missing' ;;
 esac
 ((cooldown_line < arm_line)) ||
   fail 'Bluetooth-only cooldown must complete before arming the one-shot test'
+restore_line=$(grep -n '^complete_governor_window$' "$bluetooth_only_start" | cut -d: -f1)
+ready_line=$(grep -n "^printf 'foundation=minimal" "$bluetooth_only_start" | cut -d: -f1)
+case "$restore_line:$ready_line" in
+  :*|*:) fail 'Bluetooth-only restoration/readiness ordering is missing' ;;
+esac
+((restore_line < ready_line)) ||
+  fail 'Bluetooth-only readiness must not be published before governor restoration'
 for required in \
   'install -m0755 /bluetooth-only-start "$root/usr/local/sbin/myron-coexistence-start"' \
   'printf "%s\n" bluetooth >"$root/etc/omamobile/myron-test-profile"' \

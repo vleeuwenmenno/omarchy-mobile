@@ -96,7 +96,18 @@ docker run --rm --privileged --platform linux/arm64 \
       [[ -z $loop ]] || losetup -d "$loop" 2>/dev/null || true
     }
     trap cleanup EXIT
-    loop=$(losetup --find --show /payload.img)
+    free_loop=$(losetup -f)
+    free_minor=${free_loop#/dev/loop}
+    case $free_minor in ""|*[!0-9]*)
+      printf "error: unsafe free loop device: %s\n" "$free_loop" >&2; exit 1 ;;
+    esac
+    [[ $free_loop == /dev/loop$free_minor ]] || {
+      printf "error: unsafe free loop device: %s\n" "$free_loop" >&2; exit 1;
+    }
+    rm -f -- "$free_loop"
+    mknod -m 0600 "$free_loop" b 7 "$free_minor"
+    losetup "$free_loop" /payload.img
+    loop=$free_loop
     mount -o rw "$loop" "$root"
     grep -Fxq ID=omarchy "$root/etc/os-release"
     test -L "$root/etc/systemd/system/multi-user.target.wants/myron-coexistence.service"
