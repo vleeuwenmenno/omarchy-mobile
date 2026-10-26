@@ -89,6 +89,15 @@ if governor_matches "$governor_root/policy0/scaling_governor" powersave; then
 fi
 read_governor() { timeout -k 1 2 cat "$1" 2>/dev/null; }
 
+use_governor_state "$tmp/mismatched-snapshot-governors"
+governors_owed=1
+printf '%s\n' MYRON_CPUFREQ_V1 '0 schedutil' '4 performance' 'END 2' >"$governor_state"
+printf '%s\n' MYRON_CPUFREQ_V1 '0 performance' '4 performance' 'END 2' >"$governor_restore"
+if prepare_governor_restore_snapshot "$governor_root"; then
+	fail_test 'valid but mismatched governor snapshots compared equal'
+fi
+rm -f -- "$governor_state" "$governor_restore"
+
 use_governor_state "$tmp/stale-governors"
 governors_owed=0
 printf '%s\n' MYRON_CPUFREQ_V1 '0 powersave' 'END 1' >"$governor_state"
@@ -191,16 +200,16 @@ governors_owed=0
 printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
 printf '%s' performance >"$governor_root/policy4/scaling_governor"
 enter_powersave "$governor_root"
-cmp() {
-	command cmp "$@"
-	status=$?
-	[[ $status -ne 0 ]] || rm -f -- "$governor_restore"
-	return "$status"
+eval "$(declare -f governor_files_match | sed '1s/governor_files_match/governor_files_match_real/')"
+governor_files_match() {
+	rm -f -- "$governor_restore"
+	return 0
 }
 if restore_governors "$governor_root" >"$tmp/disappearing-snapshot.log" 2>&1; then
 	fail_test 'disappearing restore snapshot reported success'
 fi
-unset -f cmp
+unset -f governor_files_match
+governor_files_match() { governor_files_match_real "$@"; }
 [[ -e $governor_state ]] || fail_test 'snapshot disappearance removed recovery journal'
 [[ $(<"$governor_root/policy0/scaling_governor") == powersave ]] ||
 	fail_test 'snapshot disappearance wrote an unvalidated restoration'
@@ -211,16 +220,15 @@ governors_owed=0
 printf '%s' schedutil >"$governor_root/policy0/scaling_governor"
 printf '%s' performance >"$governor_root/policy4/scaling_governor"
 enter_powersave "$governor_root"
-cmp() {
-	command cmp "$@"
-	status=$?
-	[[ $status -ne 0 ]] || : >"$governor_restore"
-	return "$status"
+governor_files_match() {
+	: >"$governor_restore"
+	return 0
 }
 if restore_governors "$governor_root"; then
 	fail_test 'truncated second-pass snapshot reported success'
 fi
-unset -f cmp
+unset -f governor_files_match
+governor_files_match() { governor_files_match_real "$@"; }
 [[ -e $governor_state ]] || fail_test 'second-pass truncation removed recovery journal'
 [[ $(<"$governor_root/policy0/scaling_governor") == powersave ]] ||
 	fail_test 'second-pass truncation wrote an incomplete restoration'
@@ -334,6 +342,16 @@ restore_governors "$governor_root"
 
 posix_functions=$tmp/bluetooth-only-functions.sh
 sed '/^\[ "$(id -u)" = 0 \]/,$d' "$wrapper" >"$posix_functions"
+TEST_TMP=$tmp/posix-comparator /bin/sh -c '
+	. "$1"
+	mkdir -p "$TEST_TMP"
+	printf "%s\n" MYRON_CPUFREQ_V1 "0 performance" "END 1" >"$TEST_TMP/left"
+	cp "$TEST_TMP/left" "$TEST_TMP/right"
+	governor_files_match "$TEST_TMP/left" "$TEST_TMP/right" || exit 1
+	printf "%s\n" MYRON_CPUFREQ_V1 "0 schedutil" "END 1" >"$TEST_TMP/right"
+	! governor_files_match "$TEST_TMP/left" "$TEST_TMP/right" || exit 2
+	! governor_files_match "$TEST_TMP/left" "$TEST_TMP/missing" 2>/dev/null || exit 3
+' sh "$posix_functions" || fail_test 'real governor comparator failed under /bin/sh'
 for posix_spec in EXIT0:1 EXIT37:37 HUP:129 INT:130 TERM:143; do
 	posix_trigger=${posix_spec%%:*}
 	posix_expected=${posix_spec#*:}
@@ -354,11 +372,9 @@ for posix_spec in EXIT0:1 EXIT37:37 HUP:129 INT:130 TERM:143; do
 		printf "%s\n" "#!/bin/sh" "printf \"%s\\n\" \"\$1\" >>\"$TEST_TMP/stage.log\"" >"$bluetooth_stage"
 		chmod 0755 "$bluetooth_stage"
 		enter_powersave "$cpufreq_root"
-		cmp() {
-			command cmp "$@"
-			result=$?
-			[ "$result" -ne 0 ] || rm -f -- "$governor_restore"
-			return "$result"
+		governor_files_match() {
+			rm -f -- "$governor_restore"
+			return 0
 		}
 		trap restore_governors_on_exit 0
 		trap "exit 129" HUP

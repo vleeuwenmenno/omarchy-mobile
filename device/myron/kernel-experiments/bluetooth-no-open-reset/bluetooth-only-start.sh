@@ -153,6 +153,35 @@ validate_governor_file() {
 		[ "$records" -gt 0 ] && [ "$declared_records" = "$records" ]
 }
 
+governor_files_match() {
+	left_file=$1
+	right_file=$2
+	match=1
+	command exec 3<"$left_file" || return 1
+	command exec 4<"$right_file" || {
+		command exec 3<&-
+		return 1
+	}
+	while :; do
+		left_line=
+		right_line=
+		if IFS= read -r left_line <&3; then left_status=0; else left_status=$?; fi
+		if IFS= read -r right_line <&4; then right_status=0; else right_status=$?; fi
+		[ "$left_status" -eq "$right_status" ] || {
+			match=0
+			break
+		}
+		[ "$left_status" -eq 0 ] || break
+		[ "$left_line" = "$right_line" ] || {
+			match=0
+			break
+		}
+	done
+	command exec 3<&- || match=0
+	command exec 4<&- || match=0
+	[ "$match" -eq 1 ]
+}
+
 prepare_governor_restore_snapshot() {
 	root=$1
 	validate_governor_file "$root" "$governor_state" || return 1
@@ -166,7 +195,7 @@ prepare_governor_restore_snapshot() {
 		mv -- "$governor_restore_new" "$governor_restore" || return 1
 		validate_governor_file "$root" "$governor_restore" || return 1
 	fi
-	cmp -s -- "$governor_state" "$governor_restore"
+	governor_files_match "$governor_state" "$governor_restore"
 }
 
 write_governor() {
