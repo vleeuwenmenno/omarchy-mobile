@@ -42,7 +42,7 @@ max_iterations=0
 stale_seconds=5
 stall_seconds=5
 min_samples=2
-fatal_pattern='Kernel panic|Unable to handle kernel|Internal error:|BUG:|Oops:'
+fatal_pattern='(^|[[:space:]])(Kernel panic|Unable to handle kernel|Internal error:|BUG:|Oops:)'
 info_pattern='rmnet_ipa|ipa_|ipam'
 
 boot_id=

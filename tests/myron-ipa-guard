@@ -165,6 +165,9 @@ run_once
 check >/dev/null && fail 'fatal journal line is clean'
 fresh; warm; journal_text=$'Unable to handle kernel paging request\nInternal error: Oops\nBUG: scheduling'
 run_once; [[ $(state_get fatal) == 3 ]] || fail 'fatal patterns not all counted'
+fresh; warm; journal_text=$'ramoops: using reserved memory\nspmi_pmic_arb_debug pmic-arb-debug: debug bus disabled by fuse'
+run_once; [[ $(state_get fatal) == 0 ]] || fail 'driver names were mistaken for kernel failures'
+check >/dev/null || fail 'harmless ramoops/debug tags dirtied the guard'
 pass 'journal fatal/info lines are counted; fatal is dirty'
 
 # -- privacy ----------------------------------------------------------------------

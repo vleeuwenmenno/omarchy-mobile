@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Import saved Myron Wi-Fi profiles into the temporary root
+Before=NetworkManager.service
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+ConditionPathIsDirectory=/run/myron-host/etc/NetworkManager/system-connections
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-reference-wifi-import
+RemainAfterExit=yes
+
+[Install]
+RequiredBy=NetworkManager.service

@@ -230,6 +230,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/bin/omamobile-microphone" \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
       "$root/usr/local/sbin/myron-reference-radio-start" \
+      "$root/usr/local/sbin/myron-reference-wifi-import" \
       "$root/usr/local/sbin/myron-cellular-start" \
       "$root/usr/local/sbin/myron-cellular-stage" \
       "$root/usr/local/sbin/myron-ipa-guard" \
@@ -251,6 +252,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-omarchy-prepare" \
       "$root/usr/local/sbin/myron-omarchy-qualify"
     systemctl --root="$root" enable myron-hardware-watchdog.service \
+      myron-reference-wifi-import.service \
       myron-batterysecret.service \
       myron-omarchy-prepare.service \
       myron-omarchy-qualify.service sshd.service \

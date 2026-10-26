@@ -1,0 +1,33 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Saved Wi-Fi profiles only; credentials stay private and cellular is excluded.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+script=device/myron/hardware-test-overlay/usr/local/sbin/myron-reference-wifi-import
+sh -n "$script"
+work=$(mktemp -d /tmp/myron-wifi-import.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+source tests/lib/myron-sh-harness.sh
+mkdir -p "$work/source" "$work/bin"
+sh_patch "$script" "$work/import" "source_dir=$work/source" "destination=$work/runtime"
+printf '#!/bin/sh\necho 0\n' >"$work/bin/id"
+printf '#!/bin/sh\nif [ "$1 $2" = "-c %%u" ]; then echo 0; else exec /usr/bin/stat "$@"; fi\n' >"$work/bin/stat"
+printf '#!/bin/bash\nargs=(); for a; do case $a in -o0|-g0) ;; *) args+=("$a");; esac; done; exec /usr/bin/install "${args[@]}"\n' >"$work/bin/install"
+chmod +x "$work/bin/"*
+printf '[connection]\ntype=wifi\n[wifi-security]\npsk=fixture-secret\n' >"$work/source/wifi"
+printf '[connection]\ntype=802-11-wireless\n' >"$work/source/wifi2"
+printf '[connection]\ntype=gsm\n[gsm]\napn=fixture-apn\n' >"$work/source/cellular"
+printf '[connection]\ntype=wifi\n[gsm]\napn=fixture-apn\n' >"$work/source/mixed"
+chmod 600 "$work/source/"*
+ln -s "$work/source/wifi" "$work/source/linked"
+out=$(PATH="$work/bin:$PATH" sh "$work/import")
+[[ $out == 'result=imported wifi_profiles=2 storage=runtime-only' ]]
+[[ $(find "$work/runtime" -type f | wc -l) == 2 ]]
+[[ -z $(find "$work/runtime" -type f -perm /077) ]]
+! grep -r -q fixture-apn "$work/runtime"
+[[ $(PATH="$work/bin:$PATH" sh "$work/import") == "$out" ]]
+chmod 644 "$work/source/wifi"
+if PATH="$work/bin:$PATH" sh "$work/import" >/dev/null 2>&1; then
+  echo 'not ok - insecure source profile accepted' >&2; exit 1
+fi
+printf '%s\n' 'ok - Wi-Fi import is private, idempotent and excludes cellular and symlinked profiles'

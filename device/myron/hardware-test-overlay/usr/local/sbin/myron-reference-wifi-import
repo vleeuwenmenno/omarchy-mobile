@@ -1,0 +1,44 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Carry only this phone's existing Wi-Fi credentials into the temporary root.
+# Secrets stay in root-only /run keyfiles and never enter the image or logs.
+set -eu
+umask 077
+source_dir=/run/myron-host/etc/NetworkManager/system-connections
+destination=/run/NetworkManager/system-connections
+fail() { printf '%s\n' 'ERROR: Wi-Fi profile import failed' >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail
+[ -d "$source_dir" ] && [ ! -L "$source_dir" ] || fail
+install -d -m0700 "$destination"
+count=0
+for profile in "$source_dir"/*; do
+  [ -f "$profile" ] && [ ! -L "$profile" ] || continue
+  # Only ordinary keyfiles of the Wi-Fi connection type are eligible. Any
+  # cellular section or additional type is rejected, including mixed files.
+  if ! awk '
+    /^[[:space:]]*[#;]/ { next }
+    /^[[:space:]]*\[/ {
+      section = tolower($0); gsub(/[[:space:]\[\]]/, "", section)
+      if (section == "gsm" || section == "cdma") bad = 1
+      next
+    }
+    section == "connection" && /^[[:space:]]*type[[:space:]]*=/ {
+      value = tolower($0); sub(/^[^=]*=/, "", value); gsub(/[[:space:]]/, "", value)
+      if (value == "wifi" || value == "802-11-wireless") wifi++
+      else bad = 1
+    }
+    END { exit !(wifi == 1 && !bad) }
+  ' "$profile"; then continue; fi
+  [ "$(stat -c %u "$profile")" = 0 ] || fail
+  mode=$(stat -c %a "$profile")
+  [ $((0$mode & 077)) = 0 ] || fail
+  digest=$(sha256sum "$profile" | awk '{print $1}')
+  target=$destination/myron-reference-$digest.nmconnection
+  [ ! -L "$target" ] || fail
+  if [ ! -e "$target" ]; then
+    install -m0600 -o0 -g0 "$profile" "$target"
+  fi
+  [ "$(sha256sum "$target" | awk '{print $1}')" = "$digest" ] || fail
+  count=$((count + 1))
+done
+printf 'result=imported wifi_profiles=%s storage=runtime-only\n' "$count"

@@ -13,6 +13,33 @@ not authorize a general deployment, and does not change the device
 descriptor's `external-android` boot method. Slot B contains the owner's
 Android installation and is never part of this test.
 
+## 2026-10-26 v48 cellular test
+
+The repository was merged with upstream `fe65fa6` while preserving the Myron
+integration. The full offline suite passed after adapting the upstream
+repo-add Docker fallback to the existing binfmt policy.
+
+The v48 payload booted through an `init_boot_a`-only update; `boot_a` retained
+the exact postmarketOS rollback hash. Native Hyprland and USB SSH ran, and a
+separate Wayland EGL client reported Zink on Adreno 840 Turnip. No cellular
+data activation was attempted: cellular startup stopped before ModemManager
+because the guard counted two harmless kernel lines as fatal. Unbounded
+`Oops:` and `BUG:` expressions matched `ramoops:` and `pmic-arb-debug:`.
+The guard now requires a token boundary, with regression fixtures for both
+lines. Its up/down/gap counters were not reset to bypass the refusal.
+
+This fresh payload also had no saved Wi-Fi connection. The temporary overlay
+now imports only root-owned, private Wi-Fi profiles from the preserved
+postmarketOS root into `/run/NetworkManager/system-connections` before
+NetworkManager starts. Cellular and mixed profiles are excluded. Credentials
+are not baked into images, committed, or logged. The import is idempotent and
+tested against private, cellular, mixed, symlinked and insecure fixtures.
+
+The v48 test was explicitly restored to postmarketOS with readback verification
+of `init_boot_a`; `boot_a` remained unchanged. The revised v49 candidate still
+needs live cellular qualification. Bluetooth discovery, airplane mode and
+cellular reconnect remain unqualified.
+
 ## r4 live evidence
 
 The r4 Arch root booted the existing
