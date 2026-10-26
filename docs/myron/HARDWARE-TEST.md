@@ -348,22 +348,45 @@ and settles udev. Before ModemManager it requires `rmnet` loaded,
 `rmnet_core` absent, `rmnet_mem`, `gsim`, `ipam`, `ipanetm` and `rmnet_ctl`
 loaded, `rmnet_ipa0` present with `ID_MM_QCOM_SOC=1` (udev classifies
 `rmnet_ipa*` and `qmapmux*`), and the hottest thermal zone below 95000 mC.
-Only then does it start the read-only IPA guard, write
-`/run/omamobile-myron/modem-manager-allowed` and start ModemManager. The
-ModemManager drop-in requires the radio service, `/run/myron-wireless-ready`
-and that marker, and sets `Restart=no`, so an early D-Bus activation cannot
-start it. Neither the radio foundation, the guard nor ModemManager is
-independently enabled.
+Only then does it start the read-only IPA guard, write the boot-scoped
+`/run/omamobile-myron/modem-manager-allowed` (`boot_id=<this boot>`) and start
+ModemManager. The ModemManager drop-in requires the radio service,
+`/run/myron-wireless-ready` and that marker, sets `Restart=no` and replaces
+`ExecStart` with `myron-modemmanager-start`. That wrapper is the actual
+ExecStart boundary: it checks the marker names this boot, then takes an atomic
+`mkdir` admission before `exec`ing `/usr/bin/ModemManager`. A first start that
+crashes or fails still burns the admission, so every later start (systemctl,
+or D-Bus activation through the `dbus-org.freedesktop.ModemManager1.service`
+alias, which systemd resolves to the canonical unit and its drop-ins) is
+refused until reboot. `tests/myron-modemmanager-admission` loads the real
+unit, alias and drop-in with `systemd-analyze` and shows the wrapper is the
+only effective ExecStart behind both names. Neither the radio foundation, the
+guard nor ModemManager is independently enabled.
 
-`myron-ipa-guard` (`myron-ipa-guard.service`, no `[Install]`) only observes:
-it reads `rmnet_ipa0` flags from sysfs and counts kernel-journal lines. It
-never configures, opens or closes a net device. Its boot-scoped state holds
-aggregate up, down, fatal and info counters and markers, and its bounded log
-carries no journal text. It is clean while there is no fatal line, no down
-and at most one up. `myron-ipa-guard check pristine` additionally requires
-that `rmnet_ipa0` has never been up. The graphical qualifier's cellular
-branch requires `rmnet` loaded, `rmnet_core` absent and the guard active and
-clean, and it never disarms rollback in the cellular profile.
+The one-open invariant rests on admission, not on the guard. NetworkManager
+holds every GSM device unmanaged from boot
+(`etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf`,
+`[device-myron-cellular] match-device=type:gsm managed=0`; a runtime-overridable
+default, deliberately not `[keyfile] unmanaged-devices`, which could not be
+lifted, and not applied to `qmapmux*`, the data interface NetworkManager
+configures). While unmanaged, no profile of any kind can auto-activate the
+modem, so a competing or inherited autoconnect profile causes no bearer and no
+data. The composer refuses a payload that ships a GSM or CDMA keyfile.
+
+`myron-ipa-guard` (`myron-ipa-guard.service`, no `[Install]`) is corroborating
+evidence, not proof. It polls `rmnet_ipa0` flags and the carrier change counter
+and counts kernel-journal lines; it never configures, opens or closes a net
+device, and an open and close entirely between two samples is invisible to it.
+It fails closed on what it can see: an unreadable or missing interface, a
+failed journal read, a lost journal cursor, a sampling stall, a restart of the
+guard itself and any observed up, down or carrier change each make the
+aggregate dirty. Its boot-scoped state holds counters and markers only and its
+bounded log carries no journal text. It is clean after two samples with no
+gap, no fatal line, no down and at most one up; `check pristine` also requires
+no up and no observed carrier change. Its output labels itself
+`evidence=corroborating enforcement=networkmanager-admission`. The graphical
+qualifier's cellular branch requires `rmnet` loaded, `rmnet_core` absent and
+the guard active and clean, and never disarms rollback in the cellular profile.
 
 ## Cellular data stage
 
@@ -374,47 +397,73 @@ nothing in the stage stops, disconnects, reconnects or re-enables anything.
 Output and logs carry aggregates only, never identities, addresses, APNs or
 interface names, and failure logs persist fixed reasons. There is no finish
 or disarm command: the watchdog restores postmarketOS at its deadline, and
-the cellular qualifier does not disarm it. Reboot to retry.
+the cellular qualifier does not disarm it. Any failure after the lock needs a
+reboot; nothing is cleaned up, retried or disconnected.
 
-Exact safe sequence (each step is a separate SSH command; stop on any error):
+Exact safe sequence (each step is a separate SSH command; stop on any error).
+Use a watchdog of at least 900 s and run steps 3 to 5 in quick succession:
 
 1. Boot the attended candidate. Do not touch NetworkManager or ModemManager.
+   Keep one SSH login open over USB and one over Wi-Fi.
 2. `myron-cellular-stage identity`: exact device, model, compatible, OS,
    kernel, notes, profile, and the candidate `init_boot` and rollback
    metadata. Aggregate output.
 3. `myron-cellular-stage arm`: runs identity, removes any host
-   `hardware-test.disarm`, proves the watchdog is active with at least 300 s
+   `hardware-test.disarm`, proves the watchdog is active with at least 480 s
    left, and writes a boot-scoped arm marker. No partition is written. The
-   watchdog (default 900 s, 300-1800 s) keeps running toward rollback.
+   watchdog (default 900 s, 600-1800 s) keeps running toward rollback.
 4. `myron-cellular-stage status`, then `qualify`: read-only. Exactly one
-   modem and NetworkManager modem device, SIM ready, home registration,
-   LTE and/or 5G access technology, no bearer, no active, activating or
+   modem and one NetworkManager modem device, held unmanaged; SIM ready, home
+   registration, LTE and/or 5G, no bearer, no active, activating or
    deactivating GSM profile, no autoconnect-enabled GSM profile, guard
-   clean, correct modules, temperature below 95000 mC.
-5. `myron-cellular-stage data ONE-SHOT-CELLULAR-DATA-REBOOT-REQUIRED`
-   (needs at least 240 s of watchdog time left): the exact non-secret token,
-   the arm marker, no host disarm, a pristine guard (`rmnet_ipa0` never up),
-   and a snapshot of connected Wi-Fi/Ethernet links and SSH listener and
-   session counts. Then it takes the mutation lock, creates or updates the
-   profile identified by a fixed UUID (autoconnect off, home-only, APN
+   clean, correct modules, temperature below 95000 mC, both rescue paths
+   usable (USB `usb0` with an address and a connected Wi-Fi link with an
+   address, plus an SSH listener) and no unqualified from-all policy rule
+   ahead of the main table.
+5. `myron-cellular-stage data ONE-SHOT-CELLULAR-DATA-REBOOT-REQUIRED`: the
+   exact non-secret token, the arm marker, no host disarm, a pristine guard
+   and the gates above. It then takes the mutation lock, creates or updates
+   the profile identified by a fixed UUID (autoconnect off, home-only, APN
    `internet` or the single `apn=NAME` record of a root-owned
-   `/etc/omamobile/myron-cellular-apn`, the proven pmOS route rule with
-   metric 700), brings up exactly that UUID on the one modem device, and
-   verifies IPv4, a default route in any table with a policy rule or main
-   default that selects the data interface, NetworkManager DNS matching
-   link-scoped DNS on the data or control link, and one interface-bound
-   HTTPS probe returning exactly 204 from the data interface address with
-   moving transmit and receive counters. Guard checks run before and after,
-   and the link snapshot must not drop. Wi-Fi is never changed.
-6. Reboot. The watchdog restores postmarketOS if the test is left running.
+   `/etc/omamobile/myron-cellular-apn`, metric 700, and explicitly no routing
+   rule, route table or never-default, all read back). It re-checks time,
+   temperature, guard, registration, isolation and the rescue paths, privately
+   snapshots them (exact interfaces, addresses, main-table routes, policy rules
+   ahead of main, SSH listener and session endpoints, in `/run`, mode 0600,
+   never logged), then manages the control device (`nmcli device set CONTROL
+   managed yes`), waits read-only for it to go idle, checks again and brings
+   up exactly that UUID once.
+6. The stage verifies the route contract: the data interface's default route is
+   either in the main table, or in table 1430 selected by exactly one
+   `100: from all oif DATA_IFACE lookup 1430` rule (only sockets bound to the
+   data interface match it; NetworkManager 1.58 installs this rule itself, and
+   the pmOS `32768 from all` rule is not used or accepted). Any unqualified
+   earlier from-all rule is refused and the rules ahead of main may only gain
+   that rule. NetworkManager DNS must match the link-scoped DNS, and one
+   uncached `resolvectl query` scoped to the cellular link must return a public
+   IPv4 address from that link. One HTTPS probe then runs bound to the data
+   interface with `curl --resolve` to that address (host name and TLS stay
+   verified) and must return 204 from the data interface address with moving
+   counters. Finally every recorded rescue fact must still hold (subset
+   preserved; new SSH sessions are fine). Counts only are printed.
+7. Open a fresh SSH login over USB and a fresh one over Wi-Fi from the host and
+   confirm both work. The stage's on-device evidence cannot prove a fresh
+   login; this host-side step does. Then reboot. The watchdog restores
+   postmarketOS if the test is left running.
+
+All waits are bounded by an absolute monotonic deadline derived from the
+watchdog: arm needs 480 s, activation needs 360 s (95 s activation, 35 s late
+polling, 220 s of post-activation checks), polling stops when that reserve is
+gone, and the post-activation checks refuse to start without their 220 s.
 
 `radio-off` and `radio-on` exist but always refuse: ModemManager's
 `SetPowerState` needs a disabled modem, so no safe transition on a registered
 modem is proven. Full airplane-mode UX and any RF-off step are deferred.
 
-`tests/myron-cellular-stage`, `tests/myron-cellular-start` and
-`tests/myron-ipa-guard` cover the gates, order, concurrency, privacy and
-forbidden actions with mocked tools and fake paths.
+`tests/myron-cellular-stage`, `tests/myron-cellular-start`,
+`tests/myron-ipa-guard` and `tests/myron-modemmanager-admission` cover the
+gates, order, concurrency, privacy and forbidden actions with mocked tools and
+fake paths; each also runs its real script as a separate `/bin/sh` process.
 
 ## Battery and charging stage
 

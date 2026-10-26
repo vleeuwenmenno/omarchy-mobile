@@ -26,7 +26,12 @@ fi
 if grep -niE 'imei|imsi|iccid|msisdn|hw-addr|mac-address|inet |ether ' "$guard"; then
   fail 'guard reads identity or address data'
 fi
-pass 'guard syntax and read-only greps'
+# The guard must state that it is evidence, not the enforcement.
+grep -Fq 'CORROBORATING EVIDENCE, not proof' "$guard" || fail 'guard does not call itself evidence'
+grep -Fq 'enforcement=networkmanager-admission' "$guard" || fail 'guard output does not name the enforcement'
+if grep -n 'every unsampled\|unsampled carrier transition' "$guard"; then fail 'guard claims to catch unsampled transitions'; fi
+grep -Fq 'stays invisible' "$guard" || fail 'guard does not state its between-sample limitation'
+pass 'guard syntax, read-only greps and honest evidence claims'
 
 work=$(mktemp -d /tmp/myron-ipa-guard.XXXXXX)
 trap 'rm -rf -- "$work"' EXIT
@@ -46,31 +51,47 @@ mkdir -p "$net_root/rmnet_ipa0"
 
 secret_line='kernel: rmnet_ipa0 owner=IMEI358240051111110 addr=100.77.88.99'
 journal_text=
+journal_rc=0
+cursor_ok=1
 flags=0x1002
 flags_present=1
+carrier_val=1
 now=100
 
 sleep() { :; }
 timeout() { while [[ $1 == -k ]]; do shift 2; done; shift; "$@"; }
 read_flags() { [[ $flags_present == 1 ]] || return 1; printf '%s\n' "$flags"; }
-journal_batch() { printf '%s' "$journal_text"; journal_text=; }
+read_carrier() { [[ -n $carrier_val ]] || return 1; printf '%s\n' "$carrier_val"; }
+journal_batch() {
+  [[ $journal_rc == 0 ]] || return 1
+  mkdir -p "$state_dir"; [[ $cursor_ok == 0 ]] || echo c1 >"$cursor_file"
+  printf '%s' "$journal_text"; journal_text=
+}
 now_seconds() { echo "$now"; }
 
+reset_vars() { boot_id=; samples=0 up=0 down=0 fatal=0 info=0 gaps=0 restarts=0 transitions=0 carrier=na tick=0 last=absent; }
 fresh() {
   rm -rf "$state_dir" "$log"
   echo boot-A >"$boot_id_file"
-  boot_id=; samples=0 up=0 down=0 fatal=0 info=0 last=absent
-  flags=0x1002 flags_present=1 journal_text= now=100
+  reset_vars
+  flags=0x1002 flags_present=1 journal_text= journal_rc=0 cursor_ok=1 carrier_val=1 now=100
 }
-run_once() { max_iterations=1 cmd_run; }
+# One more sample of the running guard; after restart_guard it is a fresh process (which resumes state).
+run_once() { if [[ -z $boot_id ]]; then max_iterations=1 cmd_run; else sample; fi; }
+warm() { run_once; run_once; }      # a clean verdict needs two samples
 state_get() { field "$(cat "$state_file")" "$1"; }
 check() { ( cmd_check "$@" ) 2>&1; }
+restart_guard() { reset_vars; }       # a new process: nothing in memory, state file stays
 
 # -- flag transitions -----------------------------------------------------------
 fresh
 run_once
+out=$(check pristine) && fail 'one sample is already a clean verdict'
+[[ $out == *guard=warming* ]] || fail "one sample: $out"
+run_once
 [[ $(state_get up) == 0 && $(state_get last) == down ]] || fail 'initial down is not neutral'
 out=$(check pristine) || fail "pristine down is not clean: $out"
+[[ $out == *'evidence=corroborating'*'enforcement=networkmanager-admission'* ]] || fail "check does not label itself: $out"
 flags=0x1003; run_once
 [[ $(state_get up) == 1 && $(state_get last) == up && -e $state_dir/up ]] || fail 'up not counted or marked'
 out=$(check) || fail "single up is not clean: $out"
@@ -84,16 +105,48 @@ flags=0x1003; run_once
 check >/dev/null && fail 'reopen is clean'
 pass 'up/down/reopen are counted at flag transitions; reopen and down are dirty'
 
-fresh; flags=0x1003; run_once; flags_present=0; run_once
-[[ $(state_get down) == 1 && $(state_get last) == absent ]] || fail 'removal after up is not a down'
-fresh; flags_present=0; run_once
-[[ $(state_get last) == absent && $(state_get down) == 0 ]] || fail 'absent port counted as down'
-fresh; flags=garbage; run_once
-[[ $(state_get last) == absent ]] || fail 'malformed flags accepted'
-pass 'removal counts as down; absent and malformed flags are neutral'
+# -- fail-closed observation gaps ------------------------------------------------------
+gap_case() { # description expected-reason setup
+  fresh; warm; check pristine >/dev/null || fail "$1: not clean before the gap"
+  eval "$3"; run_once
+  [[ $(state_get gaps) -ge 1 && -e $state_dir/gaps ]] || fail "$1: gap not counted"
+  out=$(check) && fail "$1: a gap is clean"
+  [[ $out == *'guard=dirty'* ]] || fail "$1: $out"
+  check pristine >/dev/null && fail "$1: a gap is pristine"
+  grep -Fq "reason=$2" "$log" || fail "$1: fixed reason not logged"
+}
+gap_case 'interface missing' interface-absent 'flags_present=0'
+gap_case 'flags malformed' flags-unreadable 'flags=garbage'
+gap_case 'journal read failed' journal-failed 'journal_rc=1'
+gap_case 'journal cursor lost' cursor-lost 'rm -f "$cursor_file"; cursor_ok=0'
+gap_case 'sampling stall' stall 'now=130'
+fresh; warm; flags=0x1003; run_once; flags_present=0; run_once
+[[ $(state_get down) == 1 && $(state_get last) == absent && $(state_get gaps) -ge 1 ]] || fail 'removal after up is not a down and a gap'
+# A guard restart is a gap: nothing watched the port while it was gone.
+fresh; warm; restart_guard; now=101; run_once
+[[ $(state_get restarts) == 1 && $(state_get gaps) -ge 1 && $(state_get samples) == 3 ]] || fail 'restart is not an observation gap'
+check >/dev/null && fail 'a restart gap is clean'
+restart_guard; run_once; [[ $(state_get restarts) == 2 ]] || fail 'second restart not counted'
+pass 'missing or unreadable interface, journal failure, cursor loss, stalls and restarts fail closed'
+
+# -- carrier evidence and its stated limit ----------------------------------------------
+fresh; warm
+carrier_val=2; run_once
+[[ $(state_get transitions) == 1 && -e $state_dir/transitions ]] || fail 'observed carrier change not counted'
+check pristine >/dev/null && fail 'pristine accepted an observed carrier change'
+out=$(check) || fail "carrier change taints the expected activation: $out"
+fresh; warm; carrier_val=; run_once; [[ $(state_get transitions) == 0 ]] || fail 'unreadable carrier counted as a change'
+# Limitation: an open and close entirely between two samples that leaves flags and
+# the counter as before is invisible to polling. The guard still reports clean,
+# and says it is corroborating evidence only; admission (NetworkManager, ModemManager)
+# is what enforces one open.
+fresh; warm
+out=$(check pristine) || fail 'between-sample limitation scenario'
+[[ $out == *'evidence=corroborating'* ]] || fail 'guard hides that it is not proof'
+pass 'carrier changes are evidence when observed; between-sample transitions are a stated limitation'
 
 # -- journal --------------------------------------------------------------------
-fresh
+fresh; warm
 journal_text=$'harmless line\nkernel: rmnet_ipa open\nipa_start ok'
 run_once
 [[ $(state_get fatal) == 0 && $(state_get info) == 2 && -e $state_dir/info && ! -e $state_dir/fatal ]] ||
@@ -103,14 +156,14 @@ journal_text=$'Kernel panic - not syncing: ipa'
 run_once
 [[ $(state_get fatal) == 1 && -e $state_dir/fatal ]] || fail 'fatal not counted'
 check >/dev/null && fail 'fatal journal line is clean'
-fresh; journal_text=$'Unable to handle kernel paging request\nInternal error: Oops\nBUG: scheduling'
+fresh; warm; journal_text=$'Unable to handle kernel paging request\nInternal error: Oops\nBUG: scheduling'
 run_once; [[ $(state_get fatal) == 3 ]] || fail 'fatal patterns not all counted'
 pass 'journal fatal/info lines are counted; fatal is dirty'
 
 # -- privacy ----------------------------------------------------------------------
-fresh
+fresh; warm
 journal_text=$secret_line$'\nKernel panic'
-flags=0x1003; run_once
+flags=0x1003; flags_present=0; run_once
 dump=$(cat "$state_file" "$log"; ls "$state_dir"; check || true)
 for secret in IMEI358240051111110 100.77.88.99 owner= rmnet_ipa0 'kernel:'; do
   [[ $dump != *"$secret"* ]] || fail "guard persisted or printed journal or identity data: $secret"
@@ -118,7 +171,7 @@ done
 pass 'guard state, log and output carry aggregates only'
 
 # -- boot scoping, staleness, resume ------------------------------------------------
-fresh; run_once
+fresh; warm
 echo boot-B >"$boot_id_file"
 out=$(check) && fail 'state from another boot accepted'
 [[ $out == *stale-boot* ]] || fail "other-boot output: $out"
@@ -130,15 +183,15 @@ out=$(check) && fail 'stale heartbeat accepted'
 rm -f "$state_file"
 out=$(check) && fail 'absent state accepted'
 [[ $out == *guard=absent* ]] || fail "absent output: $out"
-fresh; flags=0x1003; run_once; flags=0x1002; run_once
-boot_id= samples=0 up=0 down=0 fatal=0 info=0 last=absent now=101
+fresh; warm; flags=0x1003; run_once; flags=0x1002; run_once
+restart_guard; now=101
 run_once
 [[ $(state_get down) == 1 ]] || fail 'restart forgot a down transition'
 echo boot-C >"$boot_id_file"
-boot_id= samples=0 up=0 down=0 fatal=0 info=0 last=absent
+restart_guard; now=100
 run_once
-[[ $(state_get down) == 0 ]] || fail 'counters leaked across boots'
-pass 'state is boot-scoped, heartbeat-fresh and survives a guard restart'
+[[ $(state_get down) == 0 && $(state_get restarts) == 0 ]] || fail 'counters leaked across boots'
+pass 'state is boot-scoped, heartbeat-fresh and survives a guard restart as a gap'
 
 # -- bounded loop and bounded log ---------------------------------------------------
 fresh
@@ -149,6 +202,48 @@ for i in $(seq 1 3000); do printf '%s boot_id=x event=filler padding-padding-pad
 journal_text=$'Kernel panic'; run_once
 [[ $(wc -c <"$log") -lt 70000 ]] || fail 'log is not bounded'
 pass 'loop and log are bounded'
+
+# -- real /bin/sh process -----------------------------------------------------------
+# shellcheck disable=SC1091
+source tests/lib/myron-sh-harness.sh
+shbin=$work/shbin; mkdir -p "$shbin" "$work/shnet/rmnet_ipa0"
+printf '#!/bin/sh\nwhile [ "$1" = -k ]; do shift 2; done; shift; exec "$@"\n' >"$shbin/timeout"
+cat >"$shbin/journalctl" <<EOT
+#!/bin/sh
+for a in "\$@"; do case "\$a" in --cursor-file=*) c=\${a#--cursor-file=} ;; esac; done
+[ "\$(cat $work/journal-rc)" = 0 ] || exit 1
+[ "\$(cat $work/cursor-ok)" = 1 ] && echo c1 >"\$c"
+cat $work/journal-out
+EOT
+printf '#!/bin/sh\nexit 0\n' >"$shbin/sleep"
+chmod +x "$shbin"/*
+shrun() { # iterations
+  rm -rf "$work/shstate" "$work/shlog"
+  sh_patch "$guard" "$work/guard.sh" "state_dir=$work/shstate" "state_file=$work/shstate/state" "cursor_file=$work/shstate/cursor" \
+    "log=$work/shlog" "net_root=$work/shnet" "boot_id_file=$boot_id_file" "uptime_file=$work/shuptime" "poll_seconds=0" \
+    "max_iterations=$1"
+  ( PATH="$shbin:$PATH" sh "$work/guard.sh" run ) 2>&1
+}
+shcheck() {
+  sh_patch "$guard" "$work/guard.sh" "state_dir=$work/shstate" "state_file=$work/shstate/state" "cursor_file=$work/shstate/cursor" \
+    "log=$work/shlog" "net_root=$work/shnet" "boot_id_file=$boot_id_file" "uptime_file=$work/shuptime"
+  ( PATH="$shbin:$PATH" sh "$work/guard.sh" check "$@" ) 2>&1
+}
+echo boot-S >"$boot_id_file"; echo '100.00 0' >"$work/shuptime"; echo 0x1002 >"$work/shnet/rmnet_ipa0/flags"; echo 1 >"$work/shnet/rmnet_ipa0/carrier_changes"
+echo 0 >"$work/journal-rc"; echo 1 >"$work/cursor-ok"; printf 'harmless\n' >"$work/journal-out"
+shrun 3 >/dev/null || fail 'sh guard run failed'
+out=$(shcheck pristine) || fail "sh guard is not clean: $out"
+[[ $out == *'samples=3'*'gaps=0'*'enforcement=networkmanager-admission'* ]] || fail "sh guard aggregate: $out"
+echo 1 >"$work/journal-rc"; shrun 3 >/dev/null || fail 'sh guard run with a failing journal exited'
+out=$(shcheck) && fail 'sh guard accepts a failing journal'; [[ $out == *guard=dirty*gaps=3* ]] || fail "sh journal failure: $out"
+echo 0 >"$work/journal-rc"; echo 0 >"$work/cursor-ok"; shrun 3 >/dev/null
+shcheck >/dev/null && fail 'sh guard accepts a lost cursor'
+echo 1 >"$work/cursor-ok"; rm -f "$work/shnet/rmnet_ipa0/flags"; shrun 3 >/dev/null
+shcheck >/dev/null && fail 'sh guard accepts a missing interface'
+echo 0x1003 >"$work/shnet/rmnet_ipa0/flags"; shrun 3 >/dev/null
+out=$(shcheck pristine) && fail 'sh pristine accepted an up interface'
+shcheck >/dev/null || fail 'sh single up is not clean'
+pass 'real /bin/sh runs: clean, journal failure, cursor loss, missing interface and up'
 
 # -- real dispatcher -----------------------------------------------------------------
 for arg in '' bogus 'run extra' 'check a b'; do

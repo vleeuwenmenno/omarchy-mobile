@@ -28,6 +28,7 @@ tests/myron-bluetooth-logic || fail 'Bluetooth executable logic checks failed'
 tests/myron-cellular-stage || fail 'cellular stage checks failed'
 tests/myron-cellular-start || fail 'cellular start checks failed'
 tests/myron-ipa-guard || fail 'IPA guard checks failed'
+tests/myron-modemmanager-admission || fail 'ModemManager admission checks failed'
 for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
   sh -n "$fragment" || fail "$fragment parses"
 done
@@ -42,6 +43,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/sbin/myron-cellular-start" \
   "$overlay/usr/local/sbin/myron-cellular-stage" \
   "$overlay/usr/local/sbin/myron-ipa-guard" \
+  "$overlay/usr/local/sbin/myron-modemmanager-start" \
   "$overlay/usr/local/sbin/myron-reference-audio-start" \
   "$overlay/usr/local/sbin/myron-coexistence-start" \
   "$overlay/usr/local/sbin/myron-audio-stage" \
@@ -244,6 +246,19 @@ for line in 'Requires=myron-reference-radio.service' 'After=myron-reference-radi
   'ConditionPathExists=/run/omamobile-myron/modem-manager-allowed' 'Restart=no'; do
   grep -Fxq "$line" "$dropin" || fail "ModemManager drop-in lacks: $line"
 done
+for line in 'ExecStart=' 'ExecStart=/usr/local/sbin/myron-modemmanager-start'; do
+  grep -Fxq "$line" "$dropin" || fail "ModemManager drop-in lacks the one-start wrapper: $line"
+done
+nm_conf=$overlay/etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf
+grep -Fxq '[device-myron-cellular]' "$nm_conf" && grep -Fxq 'match-device=type:gsm' "$nm_conf" && grep -Fxq 'managed=0' "$nm_conf" ||
+  fail 'NetworkManager does not hold GSM devices unmanaged at boot'
+[[ $(grep -c '^[a-z]' "$nm_conf") == 2 ]] || fail 'unexpected extra NetworkManager inhibit settings'
+# qmapmux* is the data interface NetworkManager configures during activation: never unmanaged.
+if grep -rnE 'unmanaged-devices.*(qmapmux|rmnet)|interface-name:(qmapmux|rmnet)' "$overlay/etc/NetworkManager"; then
+  fail 'NetworkManager is told to leave a modem data interface unmanaged'
+fi
+grep -Fq 'unexpected GSM or CDMA NetworkManager keyfile' "$compose" || fail 'composer does not reject a shipped GSM keyfile'
+grep -Fq 'ModemManager D-Bus alias is not the canonical unit' "$compose" || fail 'composer does not check the ModemManager alias'
 guard_unit=$overlay/usr/lib/systemd/system/myron-ipa-guard.service
 grep -Fxq 'ExecStart=/usr/local/sbin/myron-ipa-guard run' "$guard_unit" && grep -Fxq 'Restart=no' "$guard_unit" ||
   fail 'IPA guard unit is not a single read-only run'

@@ -45,6 +45,10 @@ if grep -nE 'connection (modify|up) ' "$stage" | grep -vE 'uuid "\$target_uuid"'
 fi
 grep -Fq 'connection.uuid "$target_uuid"' "$stage" || tfail 'profile is not created with the fixed UUID'
 grep -Fq 'gsm.home-only yes' "$stage" || tfail 'profile is not home-only'
+grep -Fq 'nmcli device set "$control" managed yes' "$stage" || tfail 'stage does not manage the control device explicitly'
+[[ $(grep -c 'device set' "$stage") == 1 ]] || tfail 'stage changes device management in more than one place'
+grep -Fq 'ipv4.routing-rules ""' "$stage" || tfail 'stage does not clear inherited routing rules'
+if grep -nE 'ipv4\.routing-rules +(priority|from)|from all table' "$stage"; then tfail 'stage installs its own from-all routing rule'; fi
 # Failure logs never carry variables: persist only the fixed message.
 grep -Fq 'persist "result=failed message=$1"' "$stage" || tfail 'failure logging can persist variable detail'
 if printf '%s\n' "$joined" | grep -E 'timeout -k [0-9]+ [0-9]+ (mmcli|nmcli|curl|resolvectl|ip)' | grep -vE '2>/dev/null|>/dev/null 2>&1'; then
@@ -52,7 +56,7 @@ if printf '%s\n' "$joined" | grep -E 'timeout -k [0-9]+ [0-9]+ (mmcli|nmcli|curl
 fi
 grep -Fq 'connection.autoconnect no' "$stage" || tfail 'stage does not set autoconnect off'
 grep -Fq 'curl -q --interface' "$stage" || tfail 'curl does not ignore its config file first'
-for flag in '--retry 0' "--noproxy '*'" '--proto =https' '--tlsv1.2' '--max-time' '--max-filesize' '--max-redirs 0'; do
+for flag in '--retry 0' '--resolve' "--noproxy '*'" '--proto =https' '--tlsv1.2' '--max-time' '--max-filesize' '--max-redirs 0'; do
   grep -Fq -- "$flag" "$stage" || tfail "probe lacks $flag"
 done
 # No finish or disarm command, and the host disarm marker is only ever removed.
@@ -94,6 +98,8 @@ sys_module=$work/sys-module
 thermal_root=$work/thermal
 bluetooth_hci=$work/hci0
 expected_kernel=6.12.23-test
+rescue_before=$runtime_dir/rescue.before
+rescue_after=$runtime_dir/rescue.after
 init_boot_size=16
 boot_size=32
 qualify_steps=2
@@ -124,11 +130,12 @@ payload_sha=$(printf payload | sha256sum | awk '{print $1}')
 
 reset() {
   rm -rf "$runtime_dir" "$calls" "$log" "$apn_config" "$net_root" "$bluetooth_hci" "$host_state" \
-    "$sys_module" "$thermal_root" "$work/activated" "$work"/arrive.* "$work/dtmodel" \
+    "$sys_module" "$thermal_root" "$work/activated" "$work/managed" "$work/profile-created" "$work/auto-activated" "$work/late-autoconnect" "$work"/arrive.* "$work/dtmodel" \
     "$init_boot_rollback" "$boot_rollback" "$work"/real* "$arm_marker"
   : >"$calls"
-  mkdir -p "$net_root/rmnet_data0" "$net_root/rmnet_ipa0" "$net_root/wlan0" "$host_state" "$dt_root" \
+  mkdir -p "$net_root/rmnet_data0" "$net_root/rmnet_ipa0" "$net_root/wlan0" "$net_root/usb0" "$host_state" "$dt_root" \
     "$thermal_root/thermal_zone0"
+  echo up >"$net_root/wlan0/operstate"; echo unknown >"$net_root/usb0/operstate"
   for m in rmnet rmnet_mem gsim ipam ipanetm rmnet_ctl; do mkdir -p "$sys_module/$m"; done
   echo battery >"$thermal_root/thermal_zone0/type"; echo 60000 >"$thermal_root/thermal_zone0/temp"
   : >"$cellular_ready"; echo ready >"$wireless_ready"; echo cellular >"$profile_file"
@@ -148,12 +155,15 @@ reset() {
   hci=0 modems=1 unlock=-- reg=home packet=attached power=on state=registered
   access_len=2 access1=lte access2=5gnr bearers=0
   nm_ok=0 m_profile_exists=0 autoconnect_reply=no up_rc=0 up_activates=1 activated=0
-  gsm_state=disconnected gsm_devices=1 m_active_gsm=0 m_active_after=0 m_busy_state=activating
+  gsm_state=disconnected gsm_boot=unmanaged gsm_devices=1 m_active_gsm=0 m_active_after=0 m_busy_state=activating
   m_rows='' m_auto='' m_own_auto=no m_homeonly=yes m_id_reply=myron-cellular m_uuid_by_name=$secret_uuid
-  m_bound=ttyMODEM0 m_wifi=connected m_wifi_after=connected m_eth=connected m_eth_after=connected m_listeners_after='LISTEN 0 128 0.0.0.0:22\n'
-  m_listeners='LISTEN 0 128 0.0.0.0:22\n' m_sessions='ESTAB 0 0 x:22 y:1\n' m_sessions_after='ESTAB 0 0 x:22 y:1\n'
+  m_bound=ttyMODEM0 m_wifi=connected m_wifi_after=connected m_listeners_after='LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n'
+  m_listeners='LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n' m_sessions='0 0 x:22 y:1\n' m_sessions_after='0 0 x:22 y:1\n'
   curl_code=204 curl_local=$secret_ip dns_lines=1 addr_lines=1 m_default_lines=1 m_route_table=1430
   rule_line="100:	from all oif rmnet_data0 lookup 1430 proto kernel"
+  m_pre_rule='' m_post_rule='' m_usb=1 m_usb_addr_after=same m_wifi_addr=$secret_wifi_ip m_wifi_addr_after=same
+  m_usb_route_lost=0 m_profile_rules='' m_profile_table=0 m_profile_never=no cell_dns_ok=1 cell_dns_ip=203.0.113.80
+  wifi_dns_ok=1 up_delay=0 sleep_advance=0 managed_state_after=disconnected autoactivate=0
   m_main_default='default via 192.168.1.1 dev wlan0 metric 600'
   m_link_dns_data=$secret_dns m_link_dns_control='' m_counter_move=both
   route_get_dev=rmnet_data0
@@ -163,134 +173,9 @@ reset() {
   noisy=1
 }
 
-id() { printf '%s\n' "$uid"; }
-uname() { printf '%s\n' "$kernel"; }
-sleep() { :; }
-pgrep() { return "$conflict"; }
-systemctl() {
-  if [[ $1 == --quiet && $2 == is-active ]]; then [[ $active_units == *" $3 "* ]]; return; fi
-  if [[ $1 == show ]]; then printf '%s\n' "$wd_enter"; return 0; fi
-  echo "systemctl $*" >>"$calls"
-  return 0
-}
+# shellcheck disable=SC1091
+source tests/lib/myron-cellular-mocks.sh
 guard_check() { echo "guard ${*:-plain}" >>"$guard_log"; return "$guard_rc"; }
-timeout() { while [[ $1 == -k ]]; do shift 2; done; shift; "$@"; }
-stat() { printf '%s\n' "$stat_reply"; }
-leak() { [[ $noisy == 1 ]] && printf 'raw %s %s %s %s\n' "$secret_imei" "$secret_iccid" "$secret_ip" "$secret_apn" >&2 || true; }
-mmcli() {
-  if [[ $1 == -L ]]; then
-    leak
-    for ((i = 0; i < modems; i++)); do echo "/org/freedesktop/ModemManager1/Modem/$i [Qualcomm] myron"; done
-  elif [[ $1 == -m && $3 == -K ]]; then
-    leak
-    cat <<EOF
-modem.generic.state                         : $state
-modem.generic.power-state                   : $power
-modem.generic.unlock-required               : $unlock
-modem.generic.sim                           : /org/freedesktop/ModemManager1/SIM/0
-modem.generic.bearers.length                : $bearers
-modem.generic.access-technologies.length    : $access_len
-modem.generic.access-technologies.value[1]  : $access1
-modem.generic.access-technologies.value[2]  : $access2
-modem.generic.equipment-identifier          : $secret_imei
-modem.generic.own-numbers.length            : 1
-modem.generic.own-numbers.value[1]          : $secret_number
-modem.3gpp.registration-state               : $reg
-modem.3gpp.packet-service-state             : $packet
-modem.3gpp.imei                             : $secret_imei
-sim.properties.iccid                        : $secret_iccid
-EOF
-  else
-    echo "mmcli $*" >>"$calls"
-  fi
-}
-nmcli() {
-  case "$*" in
-  'general status') return "$nm_ok" ;;
-  '-t -f DEVICE,TYPE,STATE device status')
-    if [[ -e $work/activated ]]; then echo "wlan0:wifi:$m_wifi_after"; else echo "wlan0:wifi:$m_wifi"; fi
-    if [[ -e $work/activated ]]; then echo "usb9:ethernet:$m_eth_after"; else echo "usb9:ethernet:$m_eth"; fi
-    for ((i = 0; i < gsm_devices; i++)); do echo "ttyMODEM$i:gsm:$gsm_state"; done
-    return 0 ;;
-  '-t -f UUID,NAME,TYPE,STATE connection show')
-    echo 'aaaaaaaa-0000-4000-8000-000000000001:home-wifi:802-11-wireless:activated'
-    if [[ -e $work/activated ]]; then echo "$secret_uuid:myron-cellular:gsm:activated"
-    elif [[ $m_profile_exists == 1 ]]; then echo "$secret_uuid:myron-cellular:gsm:"; fi
-    for ((i = 0; i < m_active_gsm; i++)); do echo "bbbbbbbb-0000-4000-8000-00000000000$i:other$i:gsm:$m_busy_state"; done
-    [[ ! -e $work/activated ]] || for ((i = 0; i < m_active_after; i++)); do echo "cccccccc-0000-4000-8000-00000000000$i:late$i:gsm:activated"; done
-    [[ -z $m_rows ]] || printf '%b\n' "$m_rows"
-    return 0 ;;
-  '-t -f UUID,TYPE,AUTOCONNECT connection show')
-    echo 'aaaaaaaa-0000-4000-8000-000000000001:802-11-wireless:yes'
-    [[ $m_profile_exists == 0 ]] || echo "$secret_uuid:gsm:$m_own_auto"
-    [[ -z $m_auto ]] || printf '%b\n' "$m_auto"
-    return 0 ;;
-  "-g connection.autoconnect connection show uuid $secret_uuid") echo "$autoconnect_reply"; return ;;
-  "-g gsm.home-only connection show uuid $secret_uuid") echo "$m_homeonly"; return ;;
-  "-g connection.id connection show uuid $secret_uuid") echo "$m_id_reply"; return ;;
-  '-g connection.uuid connection show id myron-cellular') echo "$m_uuid_by_name"; return ;;
-  "-g GENERAL.DEVICES connection show uuid $secret_uuid") echo "$m_bound"; return ;;
-  '-g GENERAL.IP-IFACE device show ttyMODEM0') echo rmnet_data0; return ;;
-  '-t -f IP4.DNS device show ttyMODEM0')
-    for ((i = 0; i < dns_lines; i++)); do echo "IP4.DNS[$((i + 1))]:$secret_dns"; done
-    return 0 ;;
-  esac
-  local marker=no
-  [[ -d $mutation_marker ]] && marker=yes
-  echo "nmcli marker=$marker $*" >>"$calls"
-  leak
-  if [[ $* == "connection up uuid $secret_uuid ifname ttyMODEM0" ]]; then
-    [[ $up_activates == 0 ]] || : >"$work/activated"
-    return "$up_rc"
-  fi
-  return 0
-}
-ip() {
-  case "$*" in
-  '-4 -o addr show dev rmnet_data0 scope global')
-    for ((i = 0; i < addr_lines; i++)); do echo "3: rmnet_data0    inet $secret_ip/30 scope global rmnet_data0"; done ;;
-  '-4 route show table all default dev rmnet_data0')
-    for ((i = 0; i < m_default_lines; i++)); do
-      if [[ $m_route_table == main ]]; then echo "default via 10.0.0.1 dev rmnet_data0 metric 700"
-      else echo "default via 10.0.0.1 dev rmnet_data0 table $m_route_table metric 700"; fi
-    done ;;
-  '-4 route show table main default') [[ -z $m_main_default ]] || printf '%b\n' "$m_main_default" ;;
-  '-4 rule show') printf '0:\tfrom all lookup local\n%s\n32766:\tfrom all lookup main\n' "$rule_line" ;;
-  "-4 route get $secret_dns oif rmnet_data0") echo "$secret_dns dev $route_get_dev table 1430 src $secret_ip" ;;
-  *) echo "ip $*" >>"$calls" ;;
-  esac
-}
-resolvectl() {
-  case "$*" in
-  'dns rmnet_data0') [[ -z $m_link_dns_data ]] || echo "Link 7 (rmnet_data0): $m_link_dns_data" ;;
-  'dns ttyMODEM0') [[ -z $m_link_dns_control ]] || echo "Link 8 (ttyMODEM0): $m_link_dns_control" ;;
-  *) return 1 ;;
-  esac
-}
-ss() {
-  case "$*" in
-  '-H -ltn sport = :22')
-    if [[ -e $work/activated ]]; then printf '%b' "$m_listeners_after"; else printf '%b' "$m_listeners"; fi ;;
-  '-H -tn state established sport = :22')
-    if [[ -e $work/activated ]]; then printf '%b' "$m_sessions_after"; else printf '%b' "$m_sessions"; fi ;;
-  *) return 1 ;;
-  esac
-}
-curl() {
-  echo "curl $*" >>"$calls"
-  leak
-  # A curl that loads a hostile config because -q was not first prints garbage.
-  if [[ $1 != -q ]]; then printf '999 %s' "$secret_ip"; return 0; fi
-  local dir=$net_root/rmnet_data0/statistics
-  case "$m_counter_move" in
-  both|tx) echo $(( $(cat "$dir/tx_packets") + 5 )) >"$dir/tx_packets" ;;
-  esac
-  case "$m_counter_move" in
-  both|rx) echo $(( $(cat "$dir/rx_packets") + 5 )) >"$dir/rx_packets" ;;
-  esac
-  printf '%s %s' "$curl_code" "$curl_local"
-}
-
 run() { ( "$@" ) 2>&1; }
 expect_fail() { # description expected-substring command...
   local what=$1 want=$2 out rc=0; shift 2
@@ -337,7 +222,7 @@ id_gate 'no host arm' 'arm is absent' 'rm -f "$host_armed"'
 id_gate 'host arm symlink' 'arm is absent' 'mv "$host_armed" "$work/real-arm"; ln -s "$work/real-arm" "$host_armed"'
 id_gate 'arm extra line' 'arm metadata is invalid' 'echo extra >>"$host_armed"'
 id_gate 'arm bad payload' 'arm metadata is invalid' 'printf "payload_sha256=zz\nwatchdog_seconds=900\n" >"$host_armed"'
-id_gate 'watchdog short' 'duration metadata' 'printf "payload_sha256=%s\nwatchdog_seconds=60\n" "$payload_sha" >"$host_armed"'
+id_gate 'watchdog short' 'duration metadata' 'printf "payload_sha256=%s\nwatchdog_seconds=300\n" "$payload_sha" >"$host_armed"'
 id_gate 'watchdog long' 'duration metadata' 'printf "payload_sha256=%s\nwatchdog_seconds=9000\n" "$payload_sha" >"$host_armed"'
 id_gate 'rollback complete' 'rollback already completed' ': >"$rollback_complete"'
 id_gate 'candidate missing' 'candidate init_boot metadata' 'rm -f "$init_boot_sha_file"'
@@ -369,9 +254,9 @@ expect_fail 'arm without identity' 'unexpected kernel release' cmd_arm
 reset; active_units=' '
 expect_fail 'arm without watchdog' 'watchdog is not active' cmd_arm
 [[ ! -e $arm_marker ]] || tfail 'arm marker written without watchdog'
-reset; echo '700.00 0' >"$uptime_file"        # 900 - (700 - 100) = 300: exactly enough
+reset; echo '520.00 0' >"$uptime_file"        # 900 - (520 - 100) = 480: exactly enough
 expect_ok 'arm at the minimum deadline' cmd_arm >/dev/null
-reset; echo '701.00 0' >"$uptime_file"        # 299: too close
+reset; echo '521.00 0' >"$uptime_file"        # 479: too close
 expect_fail 'arm near deadline' 'deadline is too close' cmd_arm
 [[ ! -e $arm_marker ]] || tfail 'arm marker written with an insufficient deadline'
 reset; wd_enter=; expect_fail 'arm unknown deadline' 'deadline is unavailable' cmd_arm
@@ -442,7 +327,8 @@ gates() {
   gate 'access length junk' 'access technology is not LTE or 5G' 'access_len=--' "$c" "$t"
   gate 'two gsm devices' 'exactly one NetworkManager modem device' gsm_devices=2 "$c" "$t"
   gate 'no gsm device' 'exactly one NetworkManager modem device' gsm_devices=0 "$c" "$t"
-  gate 'gsm device busy' 'modem control device is not idle' gsm_state=connecting "$c" "$t"
+  gate 'gsm device busy' 'not held unmanaged' gsm_boot=connecting "$c" "$t"
+  gate 'gsm device managed at boot' 'not held unmanaged' gsm_boot=disconnected "$c" "$t"
   gate 'gsm already activating' 'active, activating or deactivating' m_active_gsm=1 "$c" "$t"
   gate 'gsm deactivating' 'active, activating or deactivating' 'm_active_gsm=1 m_busy_state=deactivating' "$c" "$t"
   gate 'gsm activated elsewhere' 'active, activating or deactivating' 'm_active_gsm=1 m_busy_state=activated' "$c" "$t"
@@ -461,6 +347,14 @@ gates() {
   gate 'target UUID under another type' 'belongs to another profile' 'm_rows="$secret_uuid:myron-cellular:802-11-wireless:"' "$c" "$t"
   gate 'bearer length missing' 'modem bearer already exists' 'bearers=' "$c" "$t"
   gate 'bearer exists' 'modem bearer already exists' bearers=1 "$c" "$t"
+  gate 'USB rescue link absent' 'USB rescue link is not usable' m_usb=0 "$c" "$t"
+  gate 'USB rescue link down' 'USB rescue link is not usable' 'echo down >"$net_root/usb0/operstate"' "$c" "$t"
+  gate 'Wi-Fi rescue link absent' 'Wi-Fi rescue link is not usable' m_wifi=disconnected "$c" "$t"
+  gate 'Wi-Fi rescue link down' 'Wi-Fi rescue link is not usable' 'echo down >"$net_root/wlan0/operstate"' "$c" "$t"
+  gate 'no SSH listener' 'no SSH listener is usable' "m_listeners=''" "$c" "$t"
+  gate 'priority 100 from-all conflict' 'unqualified policy rule precedes' 'm_pre_rule="100:\tfrom all lookup 1430"' "$c" "$t"
+  gate 'from-all blackhole conflict' 'unqualified policy rule precedes' 'm_pre_rule="50:\tfrom all unreachable"' "$c" "$t"
+  gate 'from-0.0.0.0/0 conflict' 'unqualified policy rule precedes' 'm_pre_rule="100:\tfrom 0.0.0.0/0 lookup 1430"' "$c" "$t"
 }
 gates cmd_qualify
 # LTE-only, 5G-only and mixed pass.
@@ -498,7 +392,7 @@ nm_untouched 'data unarmed'
 dgate 'arm marker from another boot' 'not armed for this boot' 'echo boot_id=boot-Y >"$arm_marker"'
 dgate 'arm marker symlink' 'not armed for this boot' 'mv "$arm_marker" "$work/real-armed"; ln -s "$work/real-armed" "$arm_marker"'
 dgate 'host disarm present' 'rollback was disarmed' ': >"$host_disarm"'
-dgate 'deadline too close' 'deadline is too close' "echo '761.00 0' >\"\$uptime_file\""
+dgate 'deadline too close' 'deadline is too close' "echo '641.00 0' >\"\$uptime_file\""
 dgate 'unknown deadline' 'deadline is unavailable' 'wd_enter='
 dgate 'guard not pristine' 'IPA guard is not clean' 'guard_rc=1'
 pass 'data needs the exact token, the stage arm, no host disarm and a deadline, before any mutation'
@@ -524,7 +418,17 @@ grep -E 'connection (add|modify)' "$calls" | grep -vqF 'gsm.home-only yes' && tf
 grep -E 'connection add' "$calls" | grep -qF "connection.uuid $secret_uuid" || tfail 'profile is not created with the fixed UUID'
 grep -E 'connection add' "$calls" | grep -qF 'ifname ttyMODEM0' || tfail 'profile is not created for the exact device'
 grep -Fq 'gsm.apn internet' "$calls" || tfail 'default APN is not internet'
-grep -Fq 'ipv4.routing-rules priority 32768 from all table 1430' "$calls" || tfail 'profile lacks the reference routing rule'
+grep -Fq 'ipv4.routing-rules ' "$calls" && grep -E 'connection (add|modify)' "$calls" | grep -qE 'ipv4\.routing-rules (priority|from)' && tfail 'profile installs its own routing rule'
+grep -E 'connection modify' "$calls" | grep -qF 'ipv4.routing-rules  ipv6' || tfail 'profile modify does not clear inherited routing rules'
+order=$(grep -nE 'connection (add|modify)|device set|connection up' "$calls" | sed -E 's/^[0-9]+:nmcli marker=yes //; s/ (type|uuid|ttyMODEM0).*//' | tr '\n' ';')
+[[ $order == 'connection add;connection modify;device set;connection up;' ]] || tfail "NetworkManager call order: $order"
+grep -Fq 'nmcli marker=yes device set ttyMODEM0 managed yes' "$calls" || tfail 'control device was managed outside the lock'
+[[ $(grep -c 'device set' "$calls") == 1 ]] || tfail 'control device managed more than once'
+grep -F 'resolvectl query' "$calls" | grep -qF -- '--cache=no' && grep -F 'resolvectl query' "$calls" | grep -qF -- '-i rmnet_data0 connectivitycheck.gstatic.com' ||
+  tfail 'DNS was not queried uncached through the cellular link'
+[[ $(grep -c 'resolvectl query' "$calls") == 1 ]] || tfail 'more than one DNS query'
+grep -Fq -- '--resolve connectivitycheck.gstatic.com:443:203.0.113.80' "$calls" || tfail 'curl does not connect to the validated cellular answer'
+grep -Fq 'https://connectivitycheck.gstatic.com/generate_204' "$calls" || tfail 'curl no longer uses the real host name'
 grep -Eq 'connection (down|delete|reapply)|disconnect|--enable|systemctl|mmcli|radio' "$calls" && tfail 'data disconnected, stopped or touched radio'
 curl_line=$(grep '^curl ' "$calls")
 [[ $curl_line == 'curl -q --interface rmnet_data0 '* && $curl_line == *'--retry 0'* && $curl_line == *'--proto =https'* &&
@@ -533,12 +437,78 @@ curl_line=$(grep '^curl ' "$calls")
   tfail "HTTPS probe is not curl -q first, m_bound, bounded and HTTPS-only: $curl_line"
 [[ $(grep -c '^curl ' "$calls") == 1 ]] || tfail 'more than one probe'
 guards=$(sed 's/^guard //' "$guard_log" | tr '\n' ',')
-[[ $guards == 'plain,pristine,plain,plain,' ]] || tfail "guard checks before/after: $guards"
+[[ $guards == 'plain,pristine,plain,pristine,pristine,pristine,plain,plain,' ]] || tfail "guard checks before/after: $guards"
 before=$(wc -l <"$calls")
 expect_fail 'second attempt' 'already taken this boot' cmd_data "$TOKEN"
 [[ $(wc -l <"$calls") == "$before" ]] || tfail 'second attempt ran commands'
 expect_fail 'radio-off after data' 'radio-off is unavailable' cmd_radio_refused radio-off
 pass 'data takes the shared lock before NM mutation, binds UUID and device, sets autoconnect=no, activates once, guards before and after'
+
+# -- P1-1: nothing can auto-activate the modem before authorization -----------------------
+# The mock models NetworkManager: a managed GSM device with an autoconnect profile
+# activates by itself. The device is unmanaged at boot, so every refusal below must
+# happen before the device is ever managed, and no bearer or data may appear.
+no_auto() { [[ ! -e $work/managed && ! -e $work/auto-activated && ! -e $work/activated ]] || tfail "$1: the control device was managed or activated"
+  grep -Eq 'device set|connection up' "$calls" && tfail "$1: managed or activated" || true; }
+for case in 'competing gsm autoconnect|m_auto="dddddddd-0000-4000-8000-000000000001:gsm:yes"' \
+  'inherited (unset) autoconnect|m_auto="dddddddd-0000-4000-8000-000000000001:gsm:"' \
+  'own profile autoconnect|m_profile_exists=1 m_own_auto=yes' \
+  'a bearer exists|bearers=1' 'busy gsm connection|m_active_gsm=1' 'managed already|gsm_boot=disconnected'; do
+  reset; armed; eval "${case##*|}"
+  rc=0; out=$(run cmd_data "$TOKEN") || rc=$?
+  [[ $rc -ne 0 ]] || tfail "data with ${case%%|*} succeeded"
+  no_auto "${case%%|*}"
+  [[ ! -d $mutation_marker ]] || tfail "${case%%|*} burned the lock before authorization"
+done
+for cmd in cmd_status cmd_qualify cmd_identity cmd_arm; do reset; armed; run "$cmd" >/dev/null 2>&1 || true; no_auto "$cmd"; done
+# Appearing between the gates and the management step: caught before the device is managed.
+reset; armed
+pre_managed_hook() { : >"$work/late-autoconnect"; }
+expect_fail 'autoconnect profile appears at the last instant' 'autoconnect enabled exists' cmd_data "$TOKEN"
+pre_managed_hook() { :; }
+no_auto 'late autoconnect'
+[[ -d $mutation_marker ]] || tfail 'late autoconnect did not keep the lock'
+# Staleness between the gates and the management step.
+last_case() { local what=$1 want=$2 hook=$3
+  reset; armed
+  eval "pre_managed_hook() { $hook; }"
+  expect_fail "stale: $what" "$want" cmd_data "$TOKEN"
+  pre_managed_hook() { :; }
+  no_auto "stale $what"
+  grep -Eq 'connection (down|delete|reapply)|disconnect' "$calls" && tfail "stale $what disconnected"
+  [[ -d $mutation_marker ]] || tfail "stale $what released the lock"
+}
+last_case 'temperature' 'temperature safety limit' 'echo 99000 >"$thermal_root/thermal_zone0/temp"'
+last_case 'registration' 'registration changed' 'reg=searching'
+last_case 'roaming' 'registration changed' 'reg=roaming'
+last_case 'deadline' 'deadline is too close' 'mock_time 150'
+last_case 'guard' 'IPA guard is not clean' 'guard_rc=1'
+last_case 'bearer' 'modem bearer already exists' 'bearers=1'
+pass 'P1-1: an unmanaged GSM device cannot auto-activate; every gate fails before it is managed'
+
+# -- P2-1: absolute deadline ------------------------------------------------------------------
+# Polling is bound by the deadline, not only a step count.
+reset; armed; reg=searching qualify_steps=1000 sleep_advance=1
+expect_fail 'registration wait is deadline-bounded' 'deadline is too close' cmd_data "$TOKEN"
+[[ $(cut -d. -f1 "$uptime_file") -le 645 ]] || tfail 'registration polling ran past the deadline budget'
+no_auto 'bounded wait'
+reset; reg=searching qualify_steps=1000 sleep_advance=1
+expect_fail 'qualify wait is deadline-bounded' 'deadline is too close' cmd_qualify
+# Success that lands near the deadline: the activation is allowed (it started with enough time)
+# but the post-activation checks refuse to run without their budget, and nothing is undone.
+reset; armed; up_delay=290 sleep_advance=1
+expect_fail 'delayed success near expiry' 'too close for the post-activation checks' cmd_data "$TOKEN"
+grep -q '^curl ' "$calls" && tfail 'probe ran with no deadline left'
+grep -Eq 'connection (down|delete|reapply)|disconnect' "$calls" && tfail 'delayed success disconnected'
+[[ $(cat "$data_state") == activated ]] || tfail 'delayed success state'
+reset; armed; up_delay=270 sleep_advance=1
+expect_ok 'delayed success with enough time' cmd_data "$TOKEN" >/dev/null
+# Late polling is bound by the deadline too.
+reset; armed; up_activates=0 up_rc=1 up_delay=100 sleep_advance=1 late_steps=1000
+rc=0; out=$(run cmd_data "$TOKEN") || rc=$?
+[[ $rc -ne 0 && $out == *'activation failed'* ]] || tfail "late polling: $out"
+[[ $(cut -d. -f1 "$uptime_file") -le 785 ]] || tfail 'late polling ran past the post-activation budget'
+pass 'P2-1: deadline is absolute; polling, late activation and post-activation checks are bounded by it'
 
 # Concurrency: two simultaneous data commands, exactly one reaches NetworkManager.
 reset; armed
@@ -606,10 +576,27 @@ post_fail 'link DNS other server on both' 'link-scoped DNS' 'm_link_dns_data=203
 post_fail 'packets do not move' 'did not move packets' m_counter_move=none
 post_fail 'only transmit moves' 'did not move packets' m_counter_move=tx
 post_fail 'only receive moves' 'did not move packets' m_counter_move=rx
-post_fail 'Wi-Fi link lost' 'rescue link or SSH session was lost' 'm_wifi_after=disconnected'
-post_fail 'Ethernet link lost' 'rescue link or SSH session was lost' 'm_eth_after=disconnected'
-post_fail 'SSH listener lost' 'rescue link or SSH session was lost' 'm_listeners_after='
-post_fail 'SSH session lost' 'rescue link or SSH session was lost' 'm_sessions_after='
+changed='a rescue link, route, rule or SSH endpoint changed'
+post_fail 'Wi-Fi link lost' "$changed" 'm_wifi_after=disconnected'
+post_fail 'Wi-Fi address lost' "$changed" 'm_wifi_addr_after=lost'
+post_fail 'Wi-Fi address replaced, same count' "$changed" 'm_wifi_addr_after=other'
+post_fail 'unmanaged USB address lost' "$changed" 'm_usb_addr_after=lost'
+post_fail 'unmanaged USB address replaced, same count' "$changed" 'm_usb_addr_after=other'
+post_fail 'USB route lost' "$changed" 'm_usb_route_lost=1'
+post_fail 'SSH listener lost' "$changed" 'm_listeners_after='
+post_fail 'SSH listener replaced, same count' "$changed" "m_listeners_after='LISTEN 0 128 0.0.0.0:2222 0.0.0.0:*\\n'"
+post_fail 'SSH session lost' "$changed" 'm_sessions_after='
+post_fail 'SSH session replaced, same count' "$changed" "m_sessions_after='0 0 x:22 z:9\\n'"
+post_fail 'unqualified from-all rule appears at priority 100' 'unqualified policy rule precedes' 'rule_line="100:	from all lookup 1430"'
+post_fail 'unqualified from-all rule appears later but before main' 'unqualified policy rule precedes' 'm_post_rule="32000:\tfrom all lookup 77"'
+post_fail 'unexpected scoped rule appears' 'unexpected policy rule was added' 'm_post_rule="90:\tfrom all oif wlan0 lookup 99"'
+post_fail 'cell DNS broken while Wi-Fi DNS works' 'DNS query through the cellular link failed' 'cell_dns_ok=0 wifi_dns_ok=1'
+post_fail 'cell DNS answer is private' 'not a public IPv4' 'cell_dns_ip=192.168.1.1'
+post_fail 'cell DNS answer is CGNAT' 'not a public IPv4' 'cell_dns_ip=100.77.1.1'
+post_fail 'cell DNS answer is loopback' 'not a public IPv4' 'cell_dns_ip=127.0.0.1'
+post_fail 'cell DNS answer is unspecified' 'not a public IPv4' 'cell_dns_ip=0.0.0.0'
+post_fail 'cell DNS answer is not an address' 'not a public IPv4' 'cell_dns_ip=notanaddress'
+post_fail 'delayed activation leaves no time for post checks' 'too close for the post-activation checks' 'up_delay=300 sleep_advance=1'
 post_fail 'DNS routed elsewhere' 'not routed through the cellular interface' 'route_get_dev=wlan0'
 post_fail 'probe 000' 'HTTPS probe' curl_code=000
 post_fail 'probe 200 (captive portal)' 'HTTPS probe' curl_code=200
@@ -634,9 +621,12 @@ grep -Eq 'wlan0|wifi|rfkill' "$calls" && tfail 'data touched Wi-Fi'
 reset; armed
 out=$(expect_ok 'oif rule' cmd_data "$TOKEN")
 [[ $out == *'policy=oif-rule'* ]] || tfail "oif-rule output: $out"
+# The profile's own from-all rule (priority 32768, after main) is not accepted as the route contract.
 reset; armed; rule_line="32768:	from all lookup 1430"
-out=$(expect_ok 'from-all rule with another main default' cmd_data "$TOKEN")
-[[ $out == *'policy=from-all-rule'* ]] || tfail "from-all output: $out"
+expect_fail 'from-all rule after main' 'no policy rule safely selects' cmd_data "$TOKEN"
+# An earlier rescue-scoped rule from the system is harmless and preserved.
+reset; armed; m_pre_rule="10:\tfrom all to 172.16.42.0/24 lookup main"
+expect_ok 'earlier destination-scoped rescue rule' cmd_data "$TOKEN" >/dev/null
 # DNS may be scoped on the data or the control link.
 reset; armed; m_link_dns_data= m_link_dns_control=$secret_dns
 expect_ok 'control-link DNS' cmd_data "$TOKEN" >/dev/null
@@ -645,8 +635,36 @@ expect_ok 'data-link DNS among several' cmd_data "$TOKEN" >/dev/null
 # Counters and rescue state are aggregate and unchanged-or-better passes.
 reset; armed; m_sessions_after='ESTAB 0 0 x:22 y:1\nESTAB 0 0 x:22 y:2\n'
 out=$(expect_ok 'more sessions are fine' cmd_data "$TOKEN")
-[[ $out == *'tx_delta=5 rx_delta=5'*'rescue_links=2 ssh_listeners=1 ssh_sessions=2'* ]] || tfail "aggregate output: $out"
+[[ $out == *'dns_query=ok'*'tx_delta=5 rx_delta=5'*'rescue_addresses=2 rescue_routes=3 ssh_listeners=1 ssh_sessions=2 rescue=preserved'* ]] || tfail "aggregate output: $out"
 pass 'route shapes, data/control DNS, packet counters and rescue-state aggregates'
+
+# Route contract inputs: an inherited or pre-existing profile cannot carry its own routing.
+for case in "m_profile_rules='priority 32768 from 0.0.0.0/0 table 1430'" 'm_profile_table=1430' 'm_profile_never=yes'; do
+  reset; armed; m_profile_exists=1; eval "$case"
+  expect_fail "inherited profile: $case" 'carries its own routing configuration' cmd_data "$TOKEN"
+  no_auto "inherited profile $case"
+  [[ -d $mutation_marker ]] || tfail 'inherited profile check did not keep the lock'
+done
+# Broken cellular DNS with working Wi-Fi DNS: the probe never runs.
+reset; armed; cell_dns_ok=0 wifi_dns_ok=1
+expect_fail 'broken cellular DNS' 'DNS query through the cellular link failed' cmd_data "$TOKEN"
+grep -q '^curl ' "$calls" && tfail 'probe ran although the cellular DNS query failed'
+grep -F 'resolvectl query' "$calls" | grep -vqF -- '-i rmnet_data0' && tfail 'DNS query was not scoped to the cellular link'
+# A resolver answer that was served by Wi-Fi is refused even if the address looks public.
+reset; armed
+resolvectl() { case "$*" in
+  'dns rmnet_data0') echo "Link 7 (rmnet_data0): $m_link_dns_data" ;;
+  'query '*) echo "resolvectl $*" >>"$calls"; printf 'connectivitycheck.gstatic.com: 203.0.113.99    -- link: wlan0\n' ;;
+  *) return 1 ;; esac; }
+expect_fail 'answer from another link' 'did not come from the cellular link' cmd_data "$TOKEN"
+source tests/lib/myron-cellular-mocks.sh
+# Private rescue evidence: exact state stays in /run mode 0600, only counts reach logs and output.
+reset; armed; out=$(expect_ok 'rescue evidence' cmd_data "$TOKEN")
+[[ -s $rescue_before && -s $rescue_after && -z $(find "$rescue_before" "$rescue_after" -perm /077) ]] || tfail 'rescue evidence is missing or not private'
+grep -Fq "$secret_wifi_ip" "$rescue_before" || tfail 'rescue evidence does not hold the exact Wi-Fi address'
+no_identity "$out$(cat "$log")"
+grep -Fq 'stage=rescue usable=yes' "$log" || tfail 'rescue usability was not recorded'
+pass 'inherited profile routing, broken cellular DNS, foreign-link answers and private rescue evidence'
 
 # -- privacy and hostile tools -------------------------------------------------------
 reset; armed; noisy=1
@@ -734,6 +752,60 @@ reset; armed; expect_ok data cmd_data "$TOKEN" >/dev/null
 for cmd in radio-off radio-on; do expect_fail "$cmd after data" 'is unavailable' cmd_radio_refused "$cmd"; done
 grep -Eq 'mmcli|power' "$calls" && tfail 'radio refusal touched the modem'
 pass 'radio-off and radio-on are always refused without touching the modem'
+
+# -- real /bin/sh process runs ---------------------------------------------------------------
+# shellcheck disable=SC1091
+source tests/lib/myron-sh-harness.sh
+sh_scenario_file=$work/scenario
+sh_bin=$work/shbin
+sh_mocks "$sh_bin" "$sh_scenario_file" "$PWD/tests/lib/myron-cellular-mocks.sh" \
+  id uname sleep pgrep systemctl timeout stat mmcli nmcli ip resolvectl ss curl
+printf '#!/bin/bash\nset +eu\nsource %q\necho "guard ${*:-plain}" >>"$guard_log"\nexit "$guard_rc"\n' "$sh_scenario_file" >"$work/guard-mock"
+chmod +x "$work/guard-mock"
+sh_stage() { # args... : the real stage as a /bin/sh process against this scenario
+  sh_scenario "$sh_scenario_file" tests/lib/myron-cellular-mocks.sh
+  sh_patch "$stage" "$work/stage.sh" "runtime_dir=$runtime_dir" "mutation_marker=$mutation_marker" "arm_marker=$arm_marker" \
+    "data_state=$data_state" "log=$log" "host_state=$host_state" "host_armed=$host_armed" "host_disarm=$host_disarm" \
+    "init_boot_sha_file=$init_boot_sha_file" "rollback_complete=$rollback_complete" "init_boot_rollback=$init_boot_rollback" \
+    "boot_rollback=$boot_rollback" "profile_file=$profile_file" "cellular_ready=$cellular_ready" "wireless_ready=$wireless_ready" \
+    "apn_config=$apn_config" "os_release=$os_release" "dt_root=$dt_root" "notes_file=$notes_file" "uptime_file=$uptime_file" \
+    "boot_id_file=$boot_id_file" "net_root=$net_root" "sys_module=$sys_module" "thermal_root=$thermal_root" \
+    "bluetooth_hci=$bluetooth_hci" "guard=$work/guard-mock" "expected_kernel=$expected_kernel" "expected_notes=$expected_notes" \
+    "rollback_init_boot_sha=$rollback_init_boot_sha" "rollback_boot_sha=$rollback_boot_sha" "init_boot_size=$init_boot_size" \
+    "boot_size=$boot_size" "target_uuid=$target_uuid" "qualify_steps=$qualify_steps" "late_steps=$late_steps" \
+    "rescue_before=$rescue_before" "rescue_after=$rescue_after"
+  ( cd / && PATH="$sh_bin:$PATH" sh "$work/stage.sh" "$@" ) 2>&1
+}
+sh_ok() { local what=$1 out rc=0; shift; out=$(sh_stage "$@") || rc=$?; [[ $rc -eq 0 ]] || tfail "sh: $what: rc=$rc: $out"; no_identity "$out"; printf '%s\n' "$out"; }
+sh_fail() { local what=$1 want=$2 out rc=0; shift 2; out=$(sh_stage "$@") || rc=$?
+  [[ $rc -ne 0 ]] || tfail "sh: $what: succeeded"; [[ $out == *"$want"* ]] || tfail "sh: $what: expected '$want', got: $out"; no_identity "$out"; }
+reset; armed
+out=$(sh_ok 'status' status); [[ $out == *'ipa_guard=clean'*'data_attempted=no'* ]] || tfail "sh status: $out"
+out=$(sh_ok 'qualify' qualify); [[ $out == *'result=ready'*'rescue=usable'*'control=unmanaged'* ]] || tfail "sh qualify: $out"
+[[ ! -s $calls ]] || tfail 'sh qualify mutated'
+sh_fail 'wrong token' 'confirmation token' data wrong
+[[ ! -s $calls && ! -d $mutation_marker ]] || tfail 'sh bad token ran commands'
+reset; armed; m_auto="dddddddd-0000-4000-8000-000000000001:gsm:yes"
+sh_fail 'competing autoconnect' 'autoconnect enabled exists' data "$TOKEN"
+no_auto 'sh competing autoconnect'
+reset; armed; cell_dns_ok=0
+sh_fail 'broken cellular DNS' 'DNS query through the cellular link failed' data "$TOKEN"
+grep -q '^curl ' "$calls" && tfail 'sh probe ran with broken cellular DNS'
+reset; armed; m_usb_addr_after=other
+sh_fail 'equal-count USB replacement' "$changed" data "$TOKEN"
+reset; armed
+out=$(sh_ok 'data' data "$TOKEN")
+[[ $out == *'result=ready'*'policy=oif-rule'*'dns_query=ok'*'https=204'*'rescue=preserved'*'fresh SSH login'* ]] || tfail "sh data: $out"
+[[ $(grep -c 'connection up' "$calls") == 1 && $(grep -c 'device set' "$calls") == 1 ]] || tfail 'sh data did not manage and activate exactly once'
+[[ $(grep -E 'nmcli marker=' "$calls" | grep -vc 'marker=yes') == 0 ]] || tfail 'sh data mutated NetworkManager before the lock'
+sh_fail 'second data' 'already taken this boot' data "$TOKEN"
+rc=0; out=$(sh_stage radio-off) || rc=$?; [[ $rc -eq 1 && $out == *'radio-off is unavailable'* ]] || tfail "sh radio-off: $rc $out"
+rc=0; out=$(sh_stage finish) || rc=$?; [[ $rc -eq 2 && $out == *usage* ]] || tfail "sh finish: $rc $out"
+reset; armed; up_delay=290 sleep_advance=1
+sh_fail 'delayed success' 'too close for the post-activation checks' data "$TOKEN"
+reset; armed; sleep_advance=1 reg=searching qualify_steps=1000
+sh_fail 'deadline-bounded wait' 'deadline is too close' data "$TOKEN"
+pass 'real /bin/sh runs of status, qualify, data, refusals, deadline and rescue contracts behave as sourced'
 
 # -- usage ---------------------------------------------------------------------------
 for arg in '' bogus 'status extra' 'identity x' 'arm x' 'qualify x' 'radio-off x' 'data' 'data a b' 'finish' 'disarm'; do

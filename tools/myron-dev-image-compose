@@ -232,6 +232,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-cellular-start" \
       "$root/usr/local/sbin/myron-cellular-stage" \
       "$root/usr/local/sbin/myron-ipa-guard" \
+      "$root/usr/local/sbin/myron-modemmanager-start" \
       "$root/usr/local/sbin/myron-reference-audio-start" \
       "$root/usr/local/sbin/myron-coexistence-start" \
       "$root/usr/local/sbin/myron-audio-stage" \
@@ -253,6 +254,22 @@ docker run --rm --privileged --platform linux/arm64 \
       myron-omarchy-prepare.service \
       myron-omarchy-qualify.service sshd.service \
       systemd-networkd.service >/dev/null
+    # No cellular profile may ship in the payload: a GSM keyfile with autoconnect
+    # would activate the modem by itself. The stage creates its one profile.
+    if test -d "$root/etc/NetworkManager/system-connections" &&
+      grep -rEq "^(type=(gsm|cdma)|\[gsm\])" "$root/etc/NetworkManager/system-connections"; then
+      echo "unexpected GSM or CDMA NetworkManager keyfile in the payload" >&2
+      exit 1
+    fi
+    # D-Bus activation names the ModemManager alias; where it exists it must be
+    # the canonical unit (so the one-start drop-in applies), never a copy.
+    mm_alias="$root/etc/systemd/system/dbus-org.freedesktop.ModemManager1.service"
+    if test -e "$mm_alias" || test -L "$mm_alias"; then
+      case "$(readlink "$mm_alias" 2>/dev/null || true)" in
+        /usr/lib/systemd/system/ModemManager.service|/lib/systemd/system/ModemManager.service) ;;
+        *) echo "ModemManager D-Bus alias is not the canonical unit" >&2; exit 1 ;;
+      esac
+    fi
     # Omarchy Mobile has its own non-interactive first-boot service.  Arch
     # stock prompt otherwise blocks sysinit.target behind Plymouth forever.
     systemctl --root="$root" mask systemd-firstboot.service >/dev/null
@@ -280,6 +297,8 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
   /usr/local/sbin/myron-omarchy-prepare /etc/myron/use-in-tree-rmnet \
   /usr/local/sbin/myron-ipa-guard /usr/lib/systemd/system/myron-ipa-guard.service \
+  /usr/local/sbin/myron-modemmanager-start /etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf \
+  /etc/systemd/system/ModemManager.service.d/20-myron-radio.conf \
   /usr/local/lib/myron-gpu/modules/msm_kgsl.ko \
   /usr/local/lib/myron-audio /usr/local/lib/myron-charging \
   /usr/local/lib/myron-charging/bin/batterysecret \

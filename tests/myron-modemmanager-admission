@@ -1,0 +1,145 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# ModemManager gets at most one start per boot at its real ExecStart boundary:
+# the wrapper's atomic admission, run as /bin/sh processes, plus the actual
+# unit, alias and drop-in arrangement loaded by systemd-analyze. Nothing
+# touches a phone.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+overlay=device/myron/hardware-test-overlay
+wrapper=$overlay/usr/local/sbin/myron-modemmanager-start
+dropin=$overlay/etc/systemd/system/ModemManager.service.d/20-myron-radio.conf
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+[[ -x $wrapper ]] || fail 'wrapper is executable'
+sh -n "$wrapper" && bash -n "$wrapper" || fail 'wrapper parses'
+if shellcheck --version >/dev/null 2>&1; then shellcheck -s sh "$wrapper" || fail 'shellcheck'; fi
+if grep -nE '\[\[[^:]|<<<|(^|[[:space:]])local[[:space:]]|\bfunction\b|\bdeclare\b|&>|<\(' "$wrapper"; then fail 'wrapper uses shell syntax outside POSIX sh'; fi
+if grep -vE '^[[:space:]]*#' "$wrapper" | grep -nE 'systemctl|\bkill\b|restart|nmcli|mmcli|\bip\b|modprobe|rmmod|connection'; then fail 'wrapper does more than admit and exec'; fi
+grep -Fq 'mkdir "$admission"' "$wrapper" || fail 'admission is not an atomic mkdir'
+[[ $(grep -c '^exec ' "$wrapper") == 1 ]] || fail 'wrapper does not exec exactly once'
+for line in 'ExecStart=' 'ExecStart=/usr/local/sbin/myron-modemmanager-start' 'Restart=no' \
+  'ConditionPathExists=/run/omamobile-myron/modem-manager-allowed' 'ConditionPathExists=/run/myron-wireless-ready'; do
+  grep -Fxq "$line" "$dropin" || fail "drop-in lacks: $line"
+done
+[[ $(grep -c '^ExecStart=' "$dropin") == 2 ]] || fail 'drop-in must clear then set a single ExecStart'
+pass 'wrapper and drop-in statics'
+
+work=$(mktemp -d /tmp/myron-mm-admission.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+# shellcheck disable=SC1091
+source tests/lib/myron-sh-harness.sh
+runtime=$work/run; mkdir -p "$runtime"
+echo boot-M >"$work/boot-id"
+cat >"$work/ModemManager" <<EOT
+#!/bin/sh
+echo started >>$work/mm-starts
+exit \$(cat $work/mm-rc 2>/dev/null || echo 0)
+EOT
+chmod +x "$work/ModemManager"
+sh_patch "$wrapper" "$work/wrapper.sh" "runtime=$runtime" "allowed=$runtime/modem-manager-allowed" \
+  "admission=$runtime/modem-manager-admission" "boot_id_file=$work/boot-id" "modem_manager=$work/ModemManager"
+start_mm() { ( sh "$work/wrapper.sh" ) 2>&1; }
+fresh() { rm -rf "$runtime" "$work/mm-starts" "$work/mm-rc"; mkdir -p "$runtime"; }
+starts() { [[ -f $work/mm-starts ]] && wc -l <"$work/mm-starts" || echo 0; }
+
+# no permission, stale permission, symlinked permission: refused, admission untouched
+fresh; rc=0; out=$(start_mm) || rc=$?
+[[ $rc -ne 0 && $out == *'permission marker is absent'* && ! -e $runtime/modem-manager-admission && $(starts) == 0 ]] || fail "no permission: $out"
+fresh; echo boot_id=boot-OLD >"$runtime/modem-manager-allowed"; rc=0; out=$(start_mm) || rc=$?
+[[ $rc -ne 0 && $out == *'not for this boot'* && ! -e $runtime/modem-manager-admission && $(starts) == 0 ]] || fail "stale permission: $out"
+fresh; echo checked >"$runtime/modem-manager-allowed"; rc=0; out=$(start_mm) || rc=$?
+[[ $rc -ne 0 && $(starts) == 0 ]] || fail 'the old unscoped marker content is accepted'
+fresh; echo boot_id=boot-M >"$work/real"; ln -s "$work/real" "$runtime/modem-manager-allowed"; rc=0; out=$(start_mm) || rc=$?
+[[ $rc -ne 0 && $(starts) == 0 ]] || fail 'symlinked permission accepted'
+pass 'missing, stale-boot, legacy and symlinked permission markers are refused before admission'
+
+# first start succeeds, every later start (systemctl, D-Bus activation) is refused
+fresh; echo boot_id=boot-M >"$runtime/modem-manager-allowed"
+out=$(start_mm) || fail "first start: $out"
+[[ $(starts) == 1 && $(cat "$runtime/modem-manager-admission/boot-id") == boot-M ]] || fail 'first start not admitted once'
+for attempt in second dbus-activation third; do
+  rc=0; out=$(start_mm) || rc=$?
+  [[ $rc -ne 0 && $out == *'already admitted this boot'* && $(starts) == 1 ]] || fail "$attempt start was not refused: $out"
+done
+# a first start that FAILS still burns the admission
+fresh; echo boot_id=boot-M >"$runtime/modem-manager-allowed"; echo 3 >"$work/mm-rc"
+rc=0; out=$(start_mm) || rc=$?
+[[ $rc -eq 3 && $(starts) == 1 ]] || fail "failing first start: rc=$rc"
+echo 0 >"$work/mm-rc"
+rc=0; out=$(start_mm) || rc=$?
+[[ $rc -ne 0 && $(starts) == 1 && $out == *'already admitted'* ]] || fail 'start after a failed first start was admitted'
+# the permission marker is reusable only if the admission is also reset, which needs a reboot
+rm -f "$work/mm-rc"
+pass 'one start per boot, including after a failed first start and via repeated D-Bus activation'
+
+# concurrency: parallel starts (systemctl racing D-Bus activation), exactly one runs
+fresh; echo boot_id=boot-M >"$runtime/modem-manager-allowed"
+for i in 1 2 3 4 5 6; do ( rc=0; start_mm >"$work/out$i" 2>&1 || rc=$?; echo $rc >"$work/rc$i" ) & done
+wait
+ok=0; for i in 1 2 3 4 5 6; do [[ $(cat "$work/rc$i") == 0 ]] && ok=$((ok + 1)); done
+[[ $ok == 1 && $(starts) == 1 ]] || fail "parallel starts: $ok succeeded, $(starts) ran"
+pass 'parallel starts: exactly one reaches ModemManager'
+
+# The real arrangement: the distribution unit (Type=dbus, base Restart=on-abort,
+# Alias=dbus-org.freedesktop.ModemManager1.service) with the alias symlink in /etc
+# that D-Bus activation names, our drop-in on the canonical unit, loaded by systemd.
+if command -v systemd-analyze >/dev/null 2>&1; then
+  root=$work/root
+  mkdir -p "$root/usr/lib/systemd/system" "$root/etc/systemd/system/ModemManager.service.d" "$root/usr/bin" \
+    "$root/usr/local/sbin" "$root/usr/share/dbus-1/system-services"
+  cat >"$root/usr/lib/systemd/system/ModemManager.service" <<'EOT'
+[Unit]
+Description=Modem Manager
+After=polkit.service
+Requires=polkit.service
+[Service]
+Type=dbus
+BusName=org.freedesktop.ModemManager1
+ExecStart=/usr/bin/ModemManager
+StandardError=null
+Restart=on-abort
+[Install]
+WantedBy=multi-user.target
+Alias=dbus-org.freedesktop.ModemManager1.service
+EOT
+  printf '[Socket]\nListenStream=/run/dbus/system_bus_socket\n' >"$root/usr/lib/systemd/system/dbus.socket"
+  printf '[Service]\nExecStart=/bin/true\n' >"$root/usr/lib/systemd/system/polkit.service"
+  printf '[Service]\nExecStart=/bin/true\n' >"$root/usr/lib/systemd/system/myron-reference-radio.service"
+  printf '[D-BUS Service]\nName=org.freedesktop.ModemManager1\nExec=/bin/false\nUser=root\nSystemdService=dbus-org.freedesktop.ModemManager1.service\n' \
+    >"$root/usr/share/dbus-1/system-services/org.freedesktop.ModemManager1.service"
+  ln -s /usr/lib/systemd/system/ModemManager.service "$root/etc/systemd/system/dbus-org.freedesktop.ModemManager1.service"
+  cp "$dropin" "$root/etc/systemd/system/ModemManager.service.d/"
+  printf '#!/bin/sh\n' >"$root/usr/bin/ModemManager"; chmod +x "$root/usr/bin/ModemManager"
+  cp "$wrapper" "$root/usr/local/sbin/myron-modemmanager-start"
+  for unit in ModemManager.service dbus-org.freedesktop.ModemManager1.service; do
+    out=$(systemd-analyze --root="$root" verify "$unit" 2>&1 || true)
+    [[ $out != *'is not executable'* && $out != *'not found'* ]] || fail "unit $unit does not load cleanly with the drop-in: $out"
+    # Remove the wrapper: systemd must now complain about the WRAPPER, proving the
+    # effective ExecStart behind both names is the wrapper and not /usr/bin/ModemManager.
+    mv "$root/usr/local/sbin/myron-modemmanager-start" "$root/usr/local/sbin/hidden"
+    out=$(systemd-analyze --root="$root" verify "$unit" 2>&1 || true)
+    mv "$root/usr/local/sbin/hidden" "$root/usr/local/sbin/myron-modemmanager-start"
+    [[ $out == *'/usr/local/sbin/myron-modemmanager-start'* ]] || fail "effective ExecStart behind $unit is not the wrapper: $out"
+    # and with the drop-in removed the base ExecStart would be used (the test can tell)
+    mv "$root/etc/systemd/system/ModemManager.service.d" "$root/etc/systemd/system/dropin-off"
+    rm -f "$root/usr/bin/ModemManager"
+    out=$(systemd-analyze --root="$root" verify "$unit" 2>&1 || true)
+    mv "$root/etc/systemd/system/dropin-off" "$root/etc/systemd/system/ModemManager.service.d"
+    printf '#!/bin/sh\n' >"$root/usr/bin/ModemManager"; chmod +x "$root/usr/bin/ModemManager"
+    [[ $out == *'/usr/bin/ModemManager'* ]] || fail "the test cannot tell the base ExecStart from the wrapper for $unit: $out"
+  done
+  # Restart=no and the one-start conditions are the unit's effective settings.
+  grep -Fxq 'Restart=no' "$root/etc/systemd/system/ModemManager.service.d/20-myron-radio.conf" || fail 'Restart=no is not in the arrangement'
+  pass 'systemd loads the canonical unit and the D-Bus alias with the wrapper as the only effective ExecStart'
+else
+  printf 'ok - # skip: systemd-analyze unavailable; unit/alias arrangement not loaded\n'
+fi
+
+# The image composer carries the wrapper, executable and root-owned, and checks the arrangement.
+compose=tools/myron-dev-image-compose
+grep -Fq '"$root/usr/local/sbin/myron-modemmanager-start"' "$compose" || fail 'composer does not install the wrapper as executable'
+grep -Fq 'usr/local/sbin/myron-modemmanager-start' "$compose" || fail 'composer does not verify the wrapper in the image'
+pass 'composer installs and verifies the wrapper'

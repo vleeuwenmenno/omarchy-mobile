@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The one ModemManager ExecStart for the Myron cellular hardware test. Stock
+# ipam.ko can panic when rmnet_ipa0 is opened again, so ModemManager gets at
+# most one start per boot, however it is requested: systemctl, the canonical
+# unit, or D-Bus activation through the dbus-org.freedesktop.ModemManager1
+# alias (systemd applies the canonical unit's drop-ins to all of them).
+#
+# Permission is the boot-scoped marker written by myron-cellular-start after
+# the radio foundation, in-tree rmnet and the IPA guard checks. Admission is an
+# atomic mkdir taken BEFORE ModemManager runs, so a first start that crashes or
+# fails still burns it and every later start is refused until reboot. Nothing
+# here restarts, stops or retries anything.
+set -eu
+umask 077
+
+runtime=/run/omamobile-myron
+allowed=$runtime/modem-manager-allowed
+admission=$runtime/modem-manager-admission
+boot_id_file=/proc/sys/kernel/random/boot_id
+modem_manager=/usr/bin/ModemManager
+
+fail() {
+	printf 'ERROR: ModemManager admission: %s\n' "$*" >&2
+	exit 1
+}
+
+boot=$(cat "$boot_id_file" 2>/dev/null) || fail 'boot identity is unavailable'
+[ -n "$boot" ] || fail 'boot identity is unavailable'
+[ -f "$allowed" ] && [ ! -L "$allowed" ] || fail 'permission marker is absent'
+[ "$(cat "$allowed" 2>/dev/null)" = "boot_id=$boot" ] ||
+	fail 'permission marker is not for this boot'
+mkdir "$admission" 2>/dev/null || fail 'ModemManager was already admitted this boot; reboot to retry'
+printf '%s\n' "$boot" >"$admission/boot-id"
+exec "$modem_manager"

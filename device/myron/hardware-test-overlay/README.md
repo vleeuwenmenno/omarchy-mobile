@@ -79,7 +79,10 @@ capabilities, but it does not enable GNSS, mobile data, SMS or voice calls.
 
 The `cellular` profile additionally selects the in-tree `rmnet` stack through
 the empty marker `etc/myron/use-in-tree-rmnet`, verifies it before the radio
-starts, runs the read-only `myron-ipa-guard` before ModemManager, and gates
-ModemManager behind `/run/omamobile-myron/modem-manager-allowed`. The
+starts, runs the read-only `myron-ipa-guard` (corroborating evidence) before
+ModemManager, and gates ModemManager behind a boot-scoped
+`/run/omamobile-myron/modem-manager-allowed` and the one-start
+`myron-modemmanager-start` wrapper. NetworkManager holds GSM devices unmanaged
+until the stage's one-shot step. The
 guarded `myron-cellular-stage` allows exactly one data activation per boot
 and never disarms rollback; see `docs/myron/HARDWARE-TEST.md`.

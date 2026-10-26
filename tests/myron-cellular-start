@@ -42,6 +42,9 @@ sys_module=$work/sys-module
 net_root=$work/net
 thermal_root=$work/thermal
 bluetooth_hci=$work/hci0
+nm_inhibit=$work/nm-inhibit.conf
+mm_wrapper=$work/mm-wrapper
+boot_id_file=$work/boot-id
 guard_wait_steps=2
 expected_kernel=6.12.23-test
 printf 'notes' >"$notes_file"
@@ -52,7 +55,7 @@ module_dir_expected=$module_set_root/$expected_notes
 reset() {
   expected_notes=$real_notes
   rm -rf "$runtime" "$calls" "$ready" "$wireless_ready" "$sys_module" "$net_root" "$thermal_root" \
-    "$module_set_root" "$bluetooth_hci" "$rmnet_marker" "$selector" "$guard"
+    "$module_set_root" "$bluetooth_hci" "$rmnet_marker" "$selector" "$guard" "$nm_inhibit" "$mm_wrapper"
   : >"$calls"
   mkdir -p "$module_dir_expected" "$thermal_root/thermal_zone0" "$net_root/rmnet_ipa0"
   printf 'rmnet' >"$module_dir_expected/rmnet.ko"
@@ -61,6 +64,8 @@ reset() {
   printf '#!/bin/sh\necho "%s"\n' "$module_dir_expected" >"$selector"; chmod +x "$selector"
   printf '#!/bin/sh\nexit "${GUARD_RC:-0}"\n' >"$guard"; chmod +x "$guard"
   : >"$host_arm"; echo cellular >"$profile_file"
+  printf '[device-myron-cellular]\nmatch-device=type:gsm\nmanaged=0\n' >"$nm_inhibit"
+  printf '#!/bin/sh\n' >"$mm_wrapper"; chmod +x "$mm_wrapper"; echo boot-K >"$boot_id_file"
   for m in rmnet rmnet_mem gsim ipam ipanetm rmnet_ctl; do mkdir -p "$sys_module/$m"; done
   echo battery >"$thermal_root/thermal_zone0/type"; echo 60000 >"$thermal_root/thermal_zone0/temp"
   active_units=' myron-hardware-watchdog.service '
@@ -113,6 +118,8 @@ order=$(grep -nE 'start myron-reference-radio|udevadm settle|udevadm info|start 
 [[ $order == 'systemctl start myron-reference-radio.service;udevadm settle;udevadm info;systemctl start myron-ipa-guard.service;systemctl start ModemManager.service;' ]] ||
   fail "unexpected order: $order"
 [[ -s $runtime/modem-manager-allowed && -s $runtime/radio-backup-verified ]] || fail 'markers not written'
+[[ $(cat "$runtime/modem-manager-allowed") == 'boot_id=boot-K' ]] || fail 'ModemManager permission is not boot-scoped'
+[[ -z $(find "$runtime/modem-manager-allowed" -perm /077) ]] || fail 'ModemManager permission marker is not private'
 [[ -s $ready ]] || fail 'ready marker not written'
 rm -rf "$runtime" "$calls"; : >"$calls"
 # already ready: no repeat start
@@ -135,6 +142,12 @@ gate 'bluetooth transport' 'Bluetooth transport' conflict=0
 gate 'marker absent' 'selection marker' 'rm -f "$rmnet_marker"'
 gate 'marker symlink' 'selection marker' 'rm -f "$rmnet_marker"; ln -s "$host_arm" "$rmnet_marker"'
 gate 'marker directory' 'selection marker' 'rm -f "$rmnet_marker"; mkdir "$rmnet_marker"'
+gate 'NetworkManager inhibit missing' 'NetworkManager GSM boot inhibit is missing' 'rm -f "$nm_inhibit"'
+gate 'NetworkManager inhibit not unmanaged' 'NetworkManager GSM boot inhibit is missing' 'printf "[device-myron-cellular]\nmatch-device=type:gsm\nmanaged=1\n" >"$nm_inhibit"'
+gate 'NetworkManager inhibit not gsm' 'NetworkManager GSM boot inhibit is missing' 'printf "[device-myron-cellular]\nmatch-device=type:wifi\nmanaged=0\n" >"$nm_inhibit"'
+gate 'NetworkManager inhibit symlink' 'NetworkManager GSM boot inhibit is missing' 'mv "$nm_inhibit" "$work/real.conf"; ln -s "$work/real.conf" "$nm_inhibit"'
+gate 'ModemManager wrapper missing' 'admission wrapper is missing' 'rm -f "$mm_wrapper"'
+gate 'ModemManager wrapper not executable' 'admission wrapper is missing' 'chmod -x "$mm_wrapper"'
 gate 'kernel release' 'unexpected kernel release' 'kernel=6.12.23-other'
 gate 'kernel notes' 'kernel notes differ' 'expected_notes=0000'
 gate 'selector missing' 'selector is unavailable' 'rm -f "$selector"'
@@ -182,3 +195,42 @@ reset; mm_stays=0
 expect_fail 'ModemManager did not stay' 'did not remain active'
 [[ ! -e $ready ]] || fail 'ready written without ModemManager'
 pass 'guard must be active and clean before ModemManager; ModemManager must stay up'
+
+# -- real /bin/sh process ---------------------------------------------------------------
+# shellcheck disable=SC1091
+source tests/lib/myron-sh-harness.sh
+shbin=$work/shbin; mkdir -p "$shbin"
+sh_mock() { printf '#!/bin/sh\n%s\n' "$2" >"$shbin/$1"; chmod +x "$shbin/$1"; }
+sh_mock id 'echo 0'
+sh_mock uname "echo $expected_kernel"
+sh_mock sleep ':'
+sh_mock pgrep 'exit 1'
+sh_mock timeout 'while [ "$1" = -k ]; do shift 2; done; shift; exec "$@"'
+sh_mock install 'for last; do :; done; mkdir -p "$last"'
+sh_mock udevadm "case \$1 in settle) exit \$(cat $work/shsettle 2>/dev/null || echo 0) ;; info) echo ID_MM_QCOM_SOC=1 ;; esac"
+sh_mock systemctl "if [ \"\$1\" = --quiet ]; then grep -Fxq \"\$3\" $work/shactive; exit; fi
+echo \"systemctl \$*\" >>$work/shcalls
+case \"\$*\" in
+'start myron-reference-radio.service') echo myron-reference-radio.service >>$work/shactive; echo ready >$wireless_ready ;;
+'start myron-ipa-guard.service') echo myron-ipa-guard.service >>$work/shactive ;;
+'start ModemManager.service') [ -e $work/shmm-dies ] || echo ModemManager.service >>$work/shactive ;;
+esac"
+shstart() { # runs the real script as a /bin/sh process
+  rm -f "$work/shcalls" "$work/shactive" "$work/shsettle" "$work/shmm-dies"; printf 'myron-hardware-watchdog.service\n' >"$work/shactive"
+  sh_patch "$start" "$work/start.sh" "expected_kernel=$expected_kernel" "expected_notes=$expected_notes" "rmnet_sha=$rmnet_sha" \
+    "runtime=$runtime" "ready=$ready" "wireless_ready=$wireless_ready" "profile_file=$profile_file" "host_arm=$host_arm" \
+    "rmnet_marker=$rmnet_marker" "nm_inhibit=$nm_inhibit" "mm_wrapper=$mm_wrapper" "boot_id_file=$boot_id_file" \
+    "notes_file=$notes_file" "selector=$selector" "module_set_root=$module_set_root" "guard=$guard" "sys_module=$sys_module" \
+    "net_root=$net_root" "thermal_root=$thermal_root" "bluetooth_hci=$bluetooth_hci" "guard_wait_steps=2"
+  ( cd / && PATH="$shbin:$PATH" sh "$work/start.sh" ) 2>&1
+}
+reset; out=$(shstart) || fail "sh start failed: $out"
+[[ $out == *'rmnet=in-tree'*'ipa-guard=active'* && $(cat "$runtime/modem-manager-allowed") == boot_id=boot-K ]] || fail "sh start output: $out"
+order=$(grep -E 'start (myron|ModemManager)' "$work/shcalls" | tr '\n' ';')
+[[ $order == 'systemctl start myron-reference-radio.service;systemctl start myron-ipa-guard.service;systemctl start ModemManager.service;' ]] || fail "sh start order: $order"
+reset; rm -f "$nm_inhibit"; rc=0; out=$(shstart) || rc=$?
+[[ $rc -ne 0 && $out == *'GSM boot inhibit is missing'* && ! -e $work/shcalls ]] || fail "sh start without inhibit: $out"
+reset; export GUARD_RC=1; rc=0; out=$(shstart) || rc=$?; export GUARD_RC=0
+[[ $rc -ne 0 && $out == *'clean pristine'* && ! -e $runtime/modem-manager-allowed ]] || fail "sh start with a dirty guard: $out"
+grep -Fq 'start ModemManager.service' "$work/shcalls" && fail 'sh start ran ModemManager with a dirty guard'
+pass 'real /bin/sh runs of the start transaction: order, boot-scoped permission, inhibit and guard gates'

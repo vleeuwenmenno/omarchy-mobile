@@ -19,6 +19,9 @@ wireless_ready=/run/myron-wireless-ready
 profile_file=/etc/omamobile/myron-test-profile
 host_arm=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
 rmnet_marker=/etc/myron/use-in-tree-rmnet
+nm_inhibit=/etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf
+mm_wrapper=/usr/local/sbin/myron-modemmanager-start
+boot_id_file=/proc/sys/kernel/random/boot_id
 notes_file=/sys/kernel/notes
 selector=/usr/local/sbin/myron-attempt79-module-dir
 module_set_root=/usr/local/lib/myron-gki-module-sets
@@ -84,6 +87,11 @@ check_profile_gates() {
 check_rmnet_assets() {
 	[ -f "$rmnet_marker" ] && [ ! -L "$rmnet_marker" ] ||
 		fail 'in-tree rmnet selection marker is not a regular file'
+	[ -f "$nm_inhibit" ] && [ ! -L "$nm_inhibit" ] &&
+		grep -Fxq 'match-device=type:gsm' "$nm_inhibit" && grep -Fxq 'managed=0' "$nm_inhibit" ||
+		fail 'NetworkManager GSM boot inhibit is missing'
+	[ -f "$mm_wrapper" ] && [ -x "$mm_wrapper" ] && [ ! -L "$mm_wrapper" ] ||
+		fail 'ModemManager admission wrapper is missing'
 	[ "$(uname -r)" = "$expected_kernel" ] ||
 		fail "unexpected kernel release: $(uname -r)"
 	notes=$(sha256sum "$notes_file" | awk '{print $1}')
@@ -141,8 +149,9 @@ main() {
 	check_radio_result
 	start_guard
 	# ModemManager may be D-Bus activated early; its drop-in refuses to run
-	# until this marker exists.
-	printf '%s\n' checked >"$runtime/modem-manager-allowed"
+	# until this boot-scoped marker exists, and its admission wrapper then
+	# allows exactly one start.
+	printf 'boot_id=%s\n' "$(cat "$boot_id_file")" >"$runtime/modem-manager-allowed"
 	chmod 0600 "$runtime/modem-manager-allowed"
 	systemctl start ModemManager.service
 	systemctl --quiet is-active ModemManager.service ||

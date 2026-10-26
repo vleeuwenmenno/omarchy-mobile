@@ -1,15 +1,30 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# Read-only rmnet_ipa0 guard for the temporary Myron cellular hardware test.
-# Stock ipam.ko can panic when rmnet_ipa0 goes down and is opened again, so
-# this guard only observes: it reads the interface flags from sysfs and counts
-# kernel-journal lines. It never configures, opens or closes a net device and
-# never runs a network tool. State is boot-scoped, aggregate-only and private:
-# counters and empty marker files, never journal text, names or addresses.
+# Read-only rmnet_ipa0 observer for the temporary Myron cellular hardware test.
+# Stock ipam.ko can panic when rmnet_ipa0 goes down and is opened again.
+#
+# This guard is CORROBORATING EVIDENCE, not proof. It polls interface flags
+# and counts kernel-journal lines, so it cannot see an open and close that
+# both fall between two samples, or anything before it started. The invariant
+# "nothing opens rmnet_ipa0 before the one explicit activation" therefore does
+# not rest on this guard: it is enforced by admission. The NetworkManager GSM
+# device is held unmanaged at boot, ModemManager starts once per boot through
+# an atomic admission wrapper, and the stage manages the device only inside
+# the one-shot mutation. What this guard adds is a fail-closed record of what
+# it did observe: an unreadable or missing interface, a failed journal read, a
+# lost journal cursor, a sampling stall, a guard restart, an observed flag
+# change or an observed carrier counter change each make the state dirty
+# instead of clean. A transition entirely between two samples stays invisible.
+#
+# It only observes: it reads sysfs and counts journal lines, never configures,
+# opens or closes a net device and never runs a network tool. State is
+# boot-scoped, aggregate-only and private: counters and empty marker files,
+# never journal text, names or addresses.
 #
 #   run     sample forever (the systemd service)
-#   check   exit 0 only when fresh, boot-scoped and clean; "check pristine"
-#           additionally requires that rmnet_ipa0 has never been up
+#   check   exit 0 only when fresh, boot-scoped, gap-free and clean;
+#           "check pristine" additionally requires that rmnet_ipa0 was never
+#           observed up and its carrier counter never observed to change
 #   status  print the aggregate, read-only
 set -eu
 umask 077
@@ -25,6 +40,8 @@ uptime_file=/proc/uptime
 poll_seconds=1
 max_iterations=0
 stale_seconds=15
+stall_seconds=5
+min_samples=2
 fatal_pattern='Kernel panic|Unable to handle kernel|Internal error:|BUG:|Oops:'
 info_pattern='rmnet_ipa|ipa_|ipam'
 
@@ -34,6 +51,11 @@ up=0
 down=0
 fatal=0
 info=0
+gaps=0
+restarts=0
+transitions=0
+carrier=na
+tick=0
 last=absent
 
 fail() {
@@ -55,34 +77,55 @@ persist() {
 
 publish() {
 	tmp=$state_file.tmp.$$
-	printf 'boot_id=%s samples=%s up=%s down=%s fatal=%s info=%s last=%s heartbeat=%s\n' \
-		"$boot_id" "$samples" "$up" "$down" "$fatal" "$info" "$last" "$(now_seconds)" >"$tmp"
+	printf 'boot_id=%s samples=%s up=%s down=%s fatal=%s info=%s gaps=%s restarts=%s transitions=%s carrier=%s last=%s heartbeat=%s\n' \
+		"$boot_id" "$samples" "$up" "$down" "$fatal" "$info" "$gaps" "$restarts" "$transitions" "$carrier" "$last" "$tick" >"$tmp"
 	chmod 0600 "$tmp"
 	mv -f "$tmp" "$state_file"
-	for name in up down fatal info; do
+	for name in up down fatal info gaps restarts transitions; do
 		eval "value=\$$name"
 		[ "$value" = 0 ] || : >"$state_dir/$name"
 	done
 }
 
+field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | sed -n '1p'; }
+
 # Resume this boot's counters so a guard restart can never forget a down/up.
+# Resuming is itself an observation gap: nothing watched the interface while
+# the guard was not running.
 load_state() {
 	[ -f "$state_file" ] && [ ! -L "$state_file" ] || return 0
 	line=$(cat "$state_file")
 	[ "$(field "$line" boot_id)" = "$boot_id" ] || return 0
-	for name in samples up down fatal info; do
+	for name in samples up down fatal info gaps restarts transitions; do
 		value=$(field "$line" "$name")
 		case "$value" in ''|*[!0-9]*) value=0 ;; esac
 		eval "$name=$value"
 	done
 	value=$(field "$line" last)
 	case "$value" in up|down|absent) last=$value ;; esac
+	value=$(field "$line" carrier)
+	case "$value" in na|[0-9]*) carrier=$value ;; esac
+	value=$(field "$line" heartbeat)
+	case "$value" in ''|*[!0-9]*) value=0 ;; esac
+	tick=$value
+	if [ "$samples" -gt 0 ]; then
+		restarts=$((restarts + 1))
+		gap restart
+	fi
 }
 
-field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | sed -n '1p'; }
+# Fixed reasons only: never journal text, names or addresses.
+gap() {
+	gaps=$((gaps + 1))
+	persist "event=gap count=$gaps reason=$1"
+}
 
 read_flags() { cat "$net_root/$port/flags" 2>/dev/null; }
 
+read_carrier() { cat "$net_root/$port/carrier_changes" 2>/dev/null; }
+
+# Exit status is the journal's: a failed or timed-out read is a gap, not a
+# quiet interval.
 journal_batch() {
 	timeout -k 1 5 journalctl -q -k -b --no-pager -o cat --cursor-file="$cursor_file" 2>/dev/null
 }
@@ -96,8 +139,12 @@ sample_flags() {
 	if flags=$(read_flags); then
 		case "$flags" in
 		0x[0-9a-fA-F]*) if [ $((flags & 1)) = 1 ]; then current=up; else current=down; fi ;;
-		*) current=absent ;;
+		*) gap flags-unreadable ;;
 		esac
+	else
+		# The guard only runs once rmnet_ipa0 exists, so a missing or
+		# unreadable port is never a neutral reading.
+		gap interface-absent
 	fi
 	if [ "$current" = up ] && [ "$last" != up ]; then
 		up=$((up + 1))
@@ -109,8 +156,33 @@ sample_flags() {
 	last=$current
 }
 
+# The kernel's carrier change counter can reveal a transition that the flag
+# samples missed, when the counter moved between two samples. It is evidence
+# only, and a counter that returns to its old value or is unreadable shows
+# nothing. A moved counter makes the pristine check fail but does not taint a
+# later, expected activation.
+sample_carrier() {
+	if value=$(read_carrier); then
+		case "$value" in
+		''|*[!0-9]*) ;;
+		*)
+			if [ "$carrier" != na ] && [ "$value" != "$carrier" ]; then
+				transitions=$((transitions + 1))
+				persist "event=carrier-change count=$transitions"
+			fi
+			carrier=$value ;;
+		esac
+	fi
+}
+
 sample_journal() {
-	batch=$(journal_batch) || batch=
+	if ! batch=$(journal_batch); then
+		gap journal-failed
+		return 0
+	fi
+	# journalctl records its position only after it printed entries; a boot
+	# always has kernel entries, so a missing cursor means the position was lost.
+	[ -s "$cursor_file" ] || gap cursor-lost
 	[ -n "$batch" ] || return 0
 	new_fatal=$(count_matches "$fatal_pattern" "$batch")
 	new_info=$(count_matches "$info_pattern" "$batch")
@@ -122,9 +194,15 @@ sample_journal() {
 }
 
 sample() {
+	now=$(now_seconds)
+	if [ "$samples" -gt 0 ] && [ $((now - tick)) -gt $((poll_seconds + stall_seconds)) ]; then
+		gap stall
+	fi
 	sample_flags
+	sample_carrier
 	sample_journal
 	samples=$((samples + 1))
+	tick=$(now_seconds)
 	publish
 }
 
@@ -133,7 +211,7 @@ cmd_run() {
 	mkdir -p "$state_dir"
 	chmod 0700 "$state_dir"
 	load_state
-	persist "event=start samples=$samples up=$up down=$down fatal=$fatal"
+	persist "event=start samples=$samples up=$up down=$down fatal=$fatal gaps=$gaps"
 	iteration=0
 	while :; do
 		sample
@@ -143,7 +221,9 @@ cmd_run() {
 	done
 }
 
-# Prints the aggregate and returns 0 only for a fresh, clean, boot-scoped state.
+# Prints the aggregate and returns 0 only for a fresh, clean, gap-free,
+# boot-scoped state. The aggregate always states what it is: corroborating
+# evidence, with NetworkManager admission as the enforcement.
 cmd_check() {
 	mode=${1:-}
 	boot_id=$(cat "$boot_id_file" 2>/dev/null || echo unknown)
@@ -162,18 +242,19 @@ cmd_check() {
 		printf 'guard=stale\n'
 		return 1
 	fi
-	for name in samples up down fatal info; do
+	for name in samples up down fatal info gaps restarts transitions; do
 		value=$(field "$line" "$name")
 		case "$value" in ''|*[!0-9]*) printf 'guard=invalid\n'; return 1 ;; esac
 		eval "$name=$value"
 	done
 	verdict=clean
-	[ "$fatal" = 0 ] && [ "$down" = 0 ] && [ "$up" -le 1 ] || verdict=dirty
+	[ "$fatal" = 0 ] && [ "$down" = 0 ] && [ "$up" -le 1 ] && [ "$gaps" = 0 ] && [ "$restarts" = 0 ] || verdict=dirty
+	[ "$samples" -ge "$min_samples" ] || verdict=warming
 	if [ "$mode" = pristine ]; then
-		{ [ "$up" = 0 ] && [ "$(field "$line" last)" != up ]; } || verdict=dirty
+		{ [ "$up" = 0 ] && [ "$transitions" = 0 ] && [ "$(field "$line" last)" != up ]; } || verdict=dirty
 	fi
-	printf 'guard=%s samples=%s up=%s down=%s fatal=%s info=%s\n' \
-		"$verdict" "$samples" "$up" "$down" "$fatal" "$info"
+	printf 'guard=%s samples=%s up=%s down=%s fatal=%s info=%s gaps=%s restarts=%s transitions=%s evidence=corroborating enforcement=networkmanager-admission\n' \
+		"$verdict" "$samples" "$up" "$down" "$fatal" "$info" "$gaps" "$restarts" "$transitions"
 	[ "$verdict" = clean ]
 }
 
