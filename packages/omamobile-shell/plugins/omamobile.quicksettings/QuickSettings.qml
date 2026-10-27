@@ -97,7 +97,12 @@ Item {
       brightness: brightness.available ? brightness.percent : null,
       volume: audio.available ? Math.round(audio.volume * 100) : null,
       wifiPanel: wifiPicker.opened,
-      bluetoothPanel: bluetoothPanelItem.opened
+      bluetoothPanel: bluetoothPanelItem.opened,
+      barClearance: Math.round(topBarClearance),
+      sheetY: Math.round(sheet.y),
+      sheetHeight: Math.round(sheet.height),
+      sheetBottom: Math.round(sheet.y + sheet.height),
+      windowHeight: Math.round(window.height)
     })
   }
 
@@ -1115,13 +1120,17 @@ Item {
   readonly property int tileHeight: Math.max(64, Style.space(68))
   readonly property int editTileHeight: Math.max(56, Style.space(60))
   readonly property int editColumns: 3
+  // Keep the sheet below a visible top bar. This follows the live bar API,
+  // including device-specific heights such as Myron's camera-safe 88 px bar.
+  readonly property real topBarClearance: shell && shell.bar && !shell.bar.barHidden && shell.bar.position === "top"
+    ? Math.max(0, Number(shell.bar.barSize) || 0) : 0
   readonly property int pageRows: {
     var most = 0
     for (var i = 0; i < tilePages.length; i++) most = Math.max(most, tilePages[i].length)
     return Math.max(1, Math.ceil(most / 2))
   }
   // Edit mode scrolls past this, so the sheet stays on screen.
-  readonly property real editMaxHeight: Math.max(200, window.height - Style.gapsOut * 2 - root.pad * 4 - Math.max(44, Style.space(48)) - Style.space(40))
+  readonly property real editMaxHeight: Math.max(200, window.height - root.topBarClearance - Style.gapsOut * 2 - root.pad * 4 - Math.max(44, Style.space(48)) - Style.space(40))
 
   PanelWindow {
     id: window
@@ -1151,7 +1160,7 @@ Item {
       x: Style.gapsOut
       width: parent.width - Style.gapsOut * 2
       height: content.implicitHeight + sheet.contentTopInset + sheet.contentBottomInset
-      y: Style.gapsOut - (height + Style.gapsOut * 2) * (1 - root.reveal) + drag.offset
+      y: root.topBarClearance + Style.gapsOut - (height + root.topBarClearance + Style.gapsOut * 2) * (1 - root.reveal) + drag.offset
       color: Commons.Color.popups.background
       borderSpec: Border.surfaceSpec("popups", "border", Commons.Color.popups.border, Math.max(1, Style.space(2)))
       radius: Style.cornerRadius

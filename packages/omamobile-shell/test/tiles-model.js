@@ -22,6 +22,16 @@ test("the sheet has a backend for every catalog tile", () => {
   for (const { id } of M.CATALOG) assert.ok(block.includes(`"${id}":`), `backend for ${id}`)
 })
 
+test("the sheet clears a visible top bar", () => {
+  const qml = fs.readFileSync(path.join(__dirname, "../plugins/omamobile.quicksettings/QuickSettings.qml"), "utf8")
+  assert.match(qml, /readonly property real topBarClearance: shell && shell\.bar/)
+  assert.match(qml, /shell\.bar\.position === "top"/)
+  assert.match(qml, /y: root\.topBarClearance \+ Style\.gapsOut/)
+  assert.match(qml, /height \+ root\.topBarClearance \+ Style\.gapsOut \* 2/)
+  assert.match(qml, /window\.height - root\.topBarClearance/)
+  assert.match(qml, /sheetBottom: Math\.round\(sheet\.y \+ sheet\.height\)/)
+})
+
 test("the default keeps the old ten tiles and leads with the most used", () => {
   for (const id of ["wifi", "bluetooth", "mobile-data", "rotation-lock", "torch", "dnd", "location", "nfc", "fingerprint", "keyboard"])
     assert.ok(M.DEFAULT_LAYOUT.includes(id), id)
