@@ -757,6 +757,10 @@ done
 grep -Fq '/speaker-reference/experiments/speaker-pipewire-bridge/bridge.py' "$compose" ||
   fail 'composer does not install the reviewed speaker bridge'
 for required in \
+  '/shell-source/plugins/DeviceProfile.js' \
+  '/shell-source/plugins/omamobile.bar/Bar.qml' \
+  '/shell-source/plugins/omamobile.launcher/Launcher.qml' \
+  '/shell-source/version' \
   '/shell-source/plugins/omamobile.quicksettings/QuickSettings.qml' \
   '/shell-source/plugins/omamobile.quicksettings/tile-action.sh' \
   '/shell-source/plugins/omamobile.quicksettings/tile-state.sh' \
@@ -764,6 +768,8 @@ for required in \
   grep -Fq "$required" "$compose" ||
     fail "composer does not carry live-qualified shell source: $required"
 done
+grep -Fq 'shell override differs from the repository' "$compose" ||
+  fail 'composer does not byte-verify its shell overrides'
 grep -Fq '"$root/usr/local/sbin/myron-bluetooth-stage"' "$compose" ||
   fail 'composer does not explicitly install the Bluetooth runner as executable'
 pass 'Bluetooth bring-up is exact, one-shot, bounded, private and independently supervised'

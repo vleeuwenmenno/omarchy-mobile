@@ -289,7 +289,17 @@ docker run --rm --privileged --platform linux/arm64 \
         "$root/usr/local/libexec/myron-audio-experiment/speaker-probe.sh"
     fi
     # Carry the live-qualified temporary shell fixes into this test payload.
+    # The Myron geometry files are a matched set: Bar and Launcher import the
+    # shared device profile, and the installed version must describe them.
     # Proper package promotion follows after hardware coexistence is proven.
+    install -Dm0644 /shell-source/plugins/DeviceProfile.js \
+      "$root/usr/share/omamobile/shell/plugins/DeviceProfile.js"
+    install -Dm0644 /shell-source/plugins/omamobile.bar/Bar.qml \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml"
+    install -Dm0644 /shell-source/plugins/omamobile.launcher/Launcher.qml \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml"
+    install -Dm0644 /shell-source/version \
+      "$root/usr/share/omamobile/shell/version"
     install -Dm0644 /shell-source/plugins/omamobile.quicksettings/QuickSettings.qml \
       "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml"
     install -Dm0755 /shell-source/plugins/omamobile.quicksettings/tile-action.sh \
@@ -468,6 +478,22 @@ if [[ $boot_policy == main ]]; then
     fi
   done
 fi
+# Every repository shell override must be byte-identical in the payload. This
+# catches stale base-image copies and incomplete matched-set updates.
+for spec in \
+  '/usr/share/omamobile/shell/plugins/DeviceProfile.js|packages/omamobile-shell/plugins/DeviceProfile.js' \
+  '/usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml|packages/omamobile-shell/plugins/omamobile.bar/Bar.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml|packages/omamobile-shell/plugins/omamobile.launcher/Launcher.qml' \
+  '/usr/share/omamobile/shell/version|packages/omamobile-shell/version' \
+  '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml|packages/omamobile-shell/plugins/omamobile.quicksettings/QuickSettings.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/tile-action.sh|packages/omamobile-shell/plugins/omamobile.quicksettings/tile-action.sh' \
+  '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/tile-state.sh|packages/omamobile-shell/plugins/omamobile.quicksettings/tile-state.sh' \
+  '/usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml|packages/omamobile-shell/plugins/omamobile.switcher/Switcher.qml'; do
+  image_path=${spec%%|*}
+  repository_path=${spec#*|}
+  [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$repository_path")" ]] ||
+    die "shell override differs from the repository: $image_path"
+done
 for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot.conf \
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
   /usr/local/sbin/myron-omarchy-prepare /etc/myron/use-in-tree-rmnet \
@@ -481,6 +507,10 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/sbin/myron-bluetooth-qca-probe \
   /usr/local/libexec/myron-speaker/bridge.py /usr/local/bin/myron-speaker-sink \
   /usr/local/bin/myron-microphone-source /usr/local/sbin/myron-microphone-bridge \
+  /usr/share/omamobile/shell/plugins/DeviceProfile.js \
+  /usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml \
+  /usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml \
+  /usr/share/omamobile/shell/version \
   /usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml \
   /usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml \
   /etc/backend_conf.xml /etc/card-defs.xml; do
