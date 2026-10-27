@@ -21,6 +21,13 @@ for (const descriptor of ["", "CODENAME=cheetah\n", "CODENAME=felix\n", " CODENA
 
 const bar = fs.readFileSync("plugins/omamobile.bar/Bar.qml", "utf8")
 const launcher = fs.readFileSync("plugins/omamobile.launcher/Launcher.qml", "utf8")
+const sharedProfile = fs.readFileSync("plugins/DeviceProfile.js", "utf8")
+const barProfile = fs.readFileSync("plugins/omamobile.bar/DeviceProfile.js", "utf8")
+const launcherProfile = fs.readFileSync("plugins/omamobile.launcher/DeviceProfile.js", "utf8")
+assert.strictEqual(barProfile, sharedProfile)
+assert.strictEqual(launcherProfile, barProfile)
+assert.match(bar, /import "DeviceProfile\.js" as DeviceProfile/)
+assert.match(launcher, /import "DeviceProfile\.js" as DeviceProfile/)
 assert.match(bar, /objectName: "myronCameraPill"/)
 assert.match(bar, /visible: root\.deviceProfile\.codename === "myron"/)
 assert.match(bar, /anchors\.leftMargin: Style\.spacing\.huge \+ root\.sideInset/)

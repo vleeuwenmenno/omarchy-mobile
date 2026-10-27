@@ -8,7 +8,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import qs.services as OmarchyServices
-import "../DeviceProfile.js" as DeviceProfile
+import "DeviceProfile.js" as DeviceProfile
 import "LauncherModel.js" as LauncherModel
 
 // The phone's home surface, after Omalauncher: one bar at the bottom of the

@@ -294,6 +294,10 @@ docker run --rm --privileged --platform linux/arm64 \
     # Proper package promotion follows after hardware coexistence is proven.
     install -Dm0644 /shell-source/plugins/DeviceProfile.js \
       "$root/usr/share/omamobile/shell/plugins/DeviceProfile.js"
+    install -Dm0644 /shell-source/plugins/omamobile.bar/DeviceProfile.js \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.bar/DeviceProfile.js"
+    install -Dm0644 /shell-source/plugins/omamobile.launcher/DeviceProfile.js \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.launcher/DeviceProfile.js"
     install -Dm0644 /shell-source/plugins/omamobile.bar/Bar.qml \
       "$root/usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml"
     install -Dm0644 /shell-source/plugins/omamobile.launcher/Launcher.qml \
@@ -482,6 +486,8 @@ fi
 # catches stale base-image copies and incomplete matched-set updates.
 for spec in \
   '/usr/share/omamobile/shell/plugins/DeviceProfile.js|packages/omamobile-shell/plugins/DeviceProfile.js' \
+  '/usr/share/omamobile/shell/plugins/omamobile.bar/DeviceProfile.js|packages/omamobile-shell/plugins/omamobile.bar/DeviceProfile.js' \
+  '/usr/share/omamobile/shell/plugins/omamobile.launcher/DeviceProfile.js|packages/omamobile-shell/plugins/omamobile.launcher/DeviceProfile.js' \
   '/usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml|packages/omamobile-shell/plugins/omamobile.bar/Bar.qml' \
   '/usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml|packages/omamobile-shell/plugins/omamobile.launcher/Launcher.qml' \
   '/usr/share/omamobile/shell/version|packages/omamobile-shell/version' \
@@ -508,6 +514,8 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/libexec/myron-speaker/bridge.py /usr/local/bin/myron-speaker-sink \
   /usr/local/bin/myron-microphone-source /usr/local/sbin/myron-microphone-bridge \
   /usr/share/omamobile/shell/plugins/DeviceProfile.js \
+  /usr/share/omamobile/shell/plugins/omamobile.bar/DeviceProfile.js \
+  /usr/share/omamobile/shell/plugins/omamobile.launcher/DeviceProfile.js \
   /usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml \
   /usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml \
   /usr/share/omamobile/shell/version \

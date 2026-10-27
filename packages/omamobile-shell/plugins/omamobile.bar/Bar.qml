@@ -8,7 +8,7 @@ import Quickshell.Services.UPower
 import Quickshell.Wayland
 import qs.Commons
 import qs.Commons as Commons
-import "../DeviceProfile.js" as DeviceProfile
+import "DeviceProfile.js" as DeviceProfile
 import "StatusModel.js" as StatusModel
 
 // Phone status bar, a full `bar` option that replaces omarchy.bar.

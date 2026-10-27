@@ -758,6 +758,8 @@ grep -Fq '/speaker-reference/experiments/speaker-pipewire-bridge/bridge.py' "$co
   fail 'composer does not install the reviewed speaker bridge'
 for required in \
   '/shell-source/plugins/DeviceProfile.js' \
+  '/shell-source/plugins/omamobile.bar/DeviceProfile.js' \
+  '/shell-source/plugins/omamobile.launcher/DeviceProfile.js' \
   '/shell-source/plugins/omamobile.bar/Bar.qml' \
   '/shell-source/plugins/omamobile.launcher/Launcher.qml' \
   '/shell-source/version' \
