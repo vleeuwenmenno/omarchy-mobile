@@ -519,6 +519,28 @@ cmp -s "$R/audio-request.expect" "$R/run/myron-main/audio-experiment.request" ||
   fail 'audio stage added kernel to the generic pending token'
 pass 'audio stage adds volatile kernel proof without changing generic pending/success compatibility'
 
+# The combined profile deliberately masks exactly three legacy-audio units in
+# /etc. Those reviewed /dev/null links must not trip the broad myron-* shadow
+# guard, while every other high-priority override remains forbidden.
+make_stage cellular-audio
+printf '%s\n' audio-cellular-speaker >"$R/newroot/etc/omamobile/myron-cellular-audio-experiment"
+cp device/myron/main-overlay/usr/local/sbin/myron-audio-experiment "$R/newroot/usr/local/sbin/"
+chmod 0755 "$R/newroot/usr/local/sbin/myron-audio-experiment"
+mkdir -p "$R/newroot/etc/systemd/system/multi-user.target.wants"
+ln -s /usr/lib/systemd/system/myron-cellular.service \
+  "$R/newroot/etc/systemd/system/multi-user.target.wants/myron-cellular.service"
+for unit in myron-reference-audio-foundation myron-speaker-bridge myron-microphone-bridge; do
+  ln -s /dev/null "$R/newroot/etc/systemd/system/$unit.service"
+done
+run_stage cellular-audio || { cat "$R/out" "$R/markers"; fail 'cellular-audio stage fixture does not reach switch_root'; }
+printf 'mode=audio-cellular-speaker\nboot_id=11111111-2222-3333-4444-555555555555\nimage_id=%s\nkernel=6.12.23-audio-test\n' \
+  "$uuid_hex" >"$R/cellular-audio-request.expect"
+cmp -s "$R/cellular-audio-request.expect" "$R/run/myron-main/cellular-audio-experiment.request" ||
+  { cat "$R/markers" "$R/out";
+    diff -u "$R/cellular-audio-request.expect" "$R/run/myron-main/cellular-audio-experiment.request" || true;
+    fail 'cellular-audio stage request is not exact mode/boot/image/kernel proof'; }
+pass 'combined stage admits only the three exact reviewed legacy-audio masks'
+
 # fault -> reason (the fault is a wrapper failure; "-trunc" makes a copy succeed but leave an empty file)
 stage_fault() { # NAME FAULT_LINE REASON [PREP...]
   local name=$1 line=$2 reason=$3; shift 3
@@ -553,6 +575,11 @@ stage_fault shadow-usrlocal '' omarchy-critical-unit-shadowed "mkdir -p @R@/newr
 stage_fault shadow-extra-dropin '' omarchy-critical-unit-shadowed "echo x >@R@/newroot/usr/lib/systemd/system/myron-cellular.service.d/50-x.conf"
 stage_fault shadow-guard-dropin '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/usr/lib/systemd/system/myron-hardware-watchdog.service.d; : >@R@/newroot/usr/lib/systemd/system/myron-hardware-watchdog.service.d/90-myron-main.conf"
 stage_fault shadow-wide '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/etc/systemd/system/service.d"
+stage_fault shadow-myron-prefix '' omarchy-critical-unit-shadowed ": >@R@/newroot/etc/systemd/system/myron-unreviewed.service"
+stage_fault shadow-audio-mask-target '' omarchy-critical-unit-shadowed "ln -s /tmp/not-dev-null @R@/newroot/etc/systemd/system/myron-speaker-bridge.service"
+stage_fault shadow-audio-mask-regular '' omarchy-critical-unit-shadowed ": >@R@/newroot/etc/systemd/system/myron-speaker-bridge.service"
+stage_fault shadow-audio-mask-usrlocal '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/usr/local/lib/systemd/system; ln -s /dev/null @R@/newroot/usr/local/lib/systemd/system/myron-speaker-bridge.service"
+stage_fault shadow-audio-mask-control '' omarchy-critical-unit-shadowed "mkdir -p @R@/newroot/etc/systemd/system.control; ln -s /dev/null @R@/newroot/etc/systemd/system.control/myron-speaker-bridge.service"
 # a partial unwind: the first four mounts are already moved when the device move fails
 stage_fault dev-move 'mount-once -o move @R@/dev *' dev-move-failed
 for what in proc sys config run; do

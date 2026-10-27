@@ -19,6 +19,7 @@ stage_copied() {
 # the provided main drop-in. A same-named unit or drop-in in a higher-priority
 # location would shadow the guard, recovery or qualifier.
 stage_unit_shadowed() {
+	null_target=$(printf '/%s/%s' dev null)
 	for unit_name in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-cellular-audio-experiment myron-omarchy-qualify \
 		myron-omarchy-prepare myron-cellular myron-batterysecret; do
 		for unit_dir in /newroot/etc/systemd/system /newroot/etc/systemd/system.control \
@@ -43,9 +44,20 @@ stage_unit_shadowed() {
 		fi
 	done
 	# Type- and prefix-wide drop-ins in the high-priority trees apply to every unit.
-	for unit_dir in /newroot/etc/systemd/system /newroot/usr/local/lib/systemd/system /newroot/run/systemd/system; do
+	for unit_dir in /newroot/etc/systemd/system /newroot/etc/systemd/system.control \
+		/newroot/usr/local/lib/systemd/system /newroot/run/systemd/system \
+		/newroot/run/systemd/system.control /newroot/run/systemd/transient; do
 		for unit_obj in "$unit_dir/service.d" "$unit_dir"/myron-*; do
-			if [ -e "$unit_obj" ] || [ -L "$unit_obj" ]; then return 0; fi
+			if [ -e "$unit_obj" ] || [ -L "$unit_obj" ]; then
+				case $unit_obj in
+				/newroot/etc/systemd/system/myron-reference-audio-foundation.service | \
+				/newroot/etc/systemd/system/myron-speaker-bridge.service | \
+				/newroot/etc/systemd/system/myron-microphone-bridge.service)
+					[ -L "$unit_obj" ] && [ "$(/bin/readlink "$unit_obj" 2>/dev/null)" = "$null_target" ] || return 0
+					;;
+				*) return 0 ;;
+				esac
+			fi
 		done
 	done
 	return 1
