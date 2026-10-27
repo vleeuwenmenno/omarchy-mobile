@@ -11,7 +11,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 Usage: tools/myron-dev-image-compose \
-  [--profile coexistence|cellular|audio-speaker|audio-microphone] \
+  [--profile coexistence|cellular|audio-speaker|audio-microphone|audio-cellular-speaker] \
   [--boot-policy temporary|main] \
   --base-image ABSOLUTE_RAW_EXT4 \
   --module-stage ABSOLUTE_DIR \
@@ -34,7 +34,9 @@ and audio activation remain disabled until an attended, separately gated test.
 the persistent Omarchy main root: it adds the main-only overlay (guard unit,
 recovery units, control) on top of the temporary overlay. Cellular remains
 the effective init profile. Audio experiment profiles require `main`, carry
-one probe each, block cellular admission, and always recover to postmarketOS.
+one probe each and always recover to postmarketOS. The explicit
+`audio-cellular-speaker` profile admits the normal registered modem first but
+keeps data, GNSS and Bluetooth blocked; its audio service is attended-only.
 EOF
 }
 
@@ -60,17 +62,17 @@ while (($#)); do
   esac
 done
 case $profile in
-  coexistence|cellular|audio-speaker|audio-microphone) ;;
+  coexistence|cellular|audio-speaker|audio-microphone|audio-cellular-speaker) ;;
   *) die "unsupported hardware-test profile: $profile" ;;
 esac
 case $boot_policy in
   temporary)
-    [[ $profile != audio-speaker && $profile != audio-microphone ]] ||
+    [[ $profile != audio-speaker && $profile != audio-microphone && $profile != audio-cellular-speaker ]] ||
       die 'audio experiment profiles require --boot-policy main'
     ;;
   main)
-    [[ $profile == cellular || $profile == audio-speaker || $profile == audio-microphone ]] ||
-      die 'boot policy main supports only --profile cellular|audio-speaker|audio-microphone'
+    [[ $profile == cellular || $profile == audio-speaker || $profile == audio-microphone || $profile == audio-cellular-speaker ]] ||
+      die 'boot policy main supports only --profile cellular|audio-speaker|audio-microphone|audio-cellular-speaker'
     ;;
   *) die "unsupported boot policy: $boot_policy" ;;
 esac
@@ -146,13 +148,16 @@ alarm_fetch package
 image=$(alarm_build_image "$ROOT")
 effective_profile=$profile
 audio_experiment=
+cellular_audio_experiment=
 case $profile in
   audio-speaker|audio-microphone) effective_profile=cellular; audio_experiment=$profile ;;
+  audio-cellular-speaker) effective_profile=cellular; cellular_audio_experiment=$profile ;;
 esac
 docker run --rm --privileged --platform linux/arm64 \
   -e MYRON_TEST_PROFILE="$effective_profile" \
   -e MYRON_COMPOSE_PROFILE="$profile" \
   -e MYRON_AUDIO_EXPERIMENT="$audio_experiment" \
+  -e MYRON_CELLULAR_AUDIO_EXPERIMENT="$cellular_audio_experiment" \
   -e MYRON_BOOT_POLICY="$boot_policy" \
   -v "$out:/payload.img" \
   -v "$modules:/module-stage:ro" \
@@ -221,6 +226,7 @@ docker run --rm --privileged --platform linux/arm64 \
         "$root/usr/lib/systemd/system/omamobile-gnss-prepare.service" \
         "$root/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf" \
         "$root/usr/lib/systemd/system/myron-audio-experiment.service" \
+        "$root/usr/lib/systemd/system/myron-cellular-audio-experiment.service" \
         "$root/etc/polkit-1/rules.d/50-myron-cellular-enable.rules" \
         "$root/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules" \
         "$root/etc/polkit-1/rules.d/50-myron-location.rules"
@@ -228,11 +234,17 @@ docker run --rm --privileged --platform linux/arm64 \
     printf "%s\n" "$MYRON_TEST_PROFILE" >"$root/etc/omamobile/myron-test-profile"
     chown 0:0 "$root/etc/omamobile/myron-test-profile"
     chmod 0644 "$root/etc/omamobile/myron-test-profile"
-    rm -f "$root/etc/omamobile/myron-audio-experiment"
+    rm -f "$root/etc/omamobile/myron-audio-experiment" \
+      "$root/etc/omamobile/myron-cellular-audio-experiment"
     if test -n "$MYRON_AUDIO_EXPERIMENT"; then
       printf "%s\n" "$MYRON_AUDIO_EXPERIMENT" >"$root/etc/omamobile/myron-audio-experiment"
       chown 0:0 "$root/etc/omamobile/myron-audio-experiment"
       chmod 0644 "$root/etc/omamobile/myron-audio-experiment"
+    fi
+    if test -n "$MYRON_CELLULAR_AUDIO_EXPERIMENT"; then
+      printf "%s\n" "$MYRON_CELLULAR_AUDIO_EXPERIMENT" >"$root/etc/omamobile/myron-cellular-audio-experiment"
+      chown 0:0 "$root/etc/omamobile/myron-cellular-audio-experiment"
+      chmod 0644 "$root/etc/omamobile/myron-cellular-audio-experiment"
     fi
     if test "$MYRON_AUDIO_EXPERIMENT" != audio-microphone; then
       rm -f "$root/usr/local/sbin/myron-audio-microphone-probe"
@@ -291,7 +303,8 @@ docker run --rm --privileged --platform linux/arm64 \
     install -Dm0755 /speaker-reference/scripts/myron-speaker-watchdog.py \
       "$root/usr/local/libexec/myron-speaker/watchdog.py"
     rm -f "$root/usr/local/libexec/myron-audio-experiment/speaker-probe.sh"
-    if test "$MYRON_AUDIO_EXPERIMENT" = audio-speaker; then
+    if test "$MYRON_AUDIO_EXPERIMENT" = audio-speaker ||
+       test "$MYRON_CELLULAR_AUDIO_EXPERIMENT" = audio-cellular-speaker; then
       install -Dm0755 /audio-experiment-source/attempt78-live-audio-speaker-probe.sh \
         "$root/usr/local/libexec/myron-audio-experiment/speaker-probe.sh"
     fi
@@ -404,6 +417,23 @@ docker run --rm --privileged --platform linux/arm64 \
         systemctl --root="$root" enable myron-audio-experiment.service >/dev/null
         rm -f "$root/usr/local/libexec/myron-speaker/probe.py"
         ;;
+      audio-cellular-speaker)
+        # Cellular and Wi-Fi rescue start normally, but qualification stays
+        # disabled so the pending boot and independent guard remain armed.
+        # The static audio service is started explicitly only after live radio
+        # and rescue inspection.
+        systemctl --root="$root" disable myron-batterysecret.service \
+          myron-omarchy-qualify.service myron-coexistence.service \
+          myron-audio-experiment.service >/dev/null 2>&1 || true
+        systemctl --root="$root" unmask ModemManager.service >/dev/null
+        systemctl --root="$root" disable ModemManager.service >/dev/null 2>&1 || true
+        systemctl --root="$root" enable myron-reference-wifi-import.service \
+          myron-omarchy-prepare.service myron-cellular.service >/dev/null
+        systemctl --root="$root" disable myron-cellular-publish.service >/dev/null 2>&1 || true
+        systemctl --root="$root" mask myron-reference-audio-foundation.service \
+          myron-speaker-bridge.service myron-microphone-bridge.service >/dev/null
+        rm -f "$root/usr/local/libexec/myron-speaker/probe.py"
+        ;;
     esac
     sync
     umount /mnt/payload
@@ -428,6 +458,7 @@ if [[ $boot_policy == main ]]; then
     /etc/polkit-1/rules.d/50-myron-location.rules \
     /usr/lib/systemd/system/myron-main-recover.service \
     /usr/local/sbin/myron-audio-experiment /usr/lib/systemd/system/myron-audio-experiment.service \
+    /usr/lib/systemd/system/myron-cellular-audio-experiment.service \
     /usr/lib/systemd/system/myron-omarchy-qualify.service.d/90-myron-main.conf; do
     debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
       die "root ownership missing: $path"
@@ -446,7 +477,11 @@ if [[ $boot_policy == main ]]; then
     '/usr/local/bin/myron-mobile-data|device/myron/main-overlay/usr/local/bin/myron-mobile-data' \
     '/usr/local/sbin/myron-mobile-data-policy|device/myron/main-overlay/usr/local/sbin/myron-mobile-data-policy' \
     '/usr/local/bin/omamobile-gnss|device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss' \
-    '/usr/local/sbin/myron-cellular-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage'; do
+    '/usr/local/sbin/myron-cellular-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage' \
+    '/usr/local/sbin/myron-audio-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-audio-stage' \
+    '/usr/local/sbin/myron-audio-experiment|device/myron/main-overlay/usr/local/sbin/myron-audio-experiment' \
+    '/usr/lib/systemd/system/myron-audio-experiment.service|device/myron/main-overlay/usr/lib/systemd/system/myron-audio-experiment.service' \
+    '/usr/lib/systemd/system/myron-cellular-audio-experiment.service|device/myron/main-overlay/usr/lib/systemd/system/myron-cellular-audio-experiment.service'; do
     image_path=${spec%%|*}
     repository_path=${spec#*|}
     [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$repository_path")" ]] ||
@@ -493,7 +528,7 @@ if [[ $boot_policy == main ]]; then
   fi
   # No higher-priority location may shadow a critical main unit, and the only
   # drop-ins in /usr/lib are the provided main ones, byte for byte.
-  for unit in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-omarchy-qualify myron-omarchy-prepare \
+  for unit in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-cellular-audio-experiment myron-omarchy-qualify myron-omarchy-prepare \
     myron-cellular myron-batterysecret; do
     for dir in /etc/systemd/system /etc/systemd/system.control /usr/local/lib/systemd/system; do
       for path in "$dir/$unit.service" "$dir/$unit.service.d"; do
@@ -614,12 +649,45 @@ case $profile in
         die 'microphone image lacks its root-owned bounded probe'
     fi
     ;;
+  audio-cellular-speaker)
+    [[ $(debugfs -R 'cat /etc/omamobile/myron-test-profile' "$out" 2>/dev/null) == cellular ]] ||
+      die 'cellular-audio image changed the effective main-init profile'
+    [[ $(debugfs -R 'cat /etc/omamobile/myron-cellular-audio-experiment' "$out" 2>/dev/null) == "$profile" ]] ||
+      die 'cellular-audio image lacks its exact experiment mode'
+    debugfs -R 'stat /etc/omamobile/myron-audio-experiment' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'cellular-audio image contains the isolated-audio marker'
+    debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-cellular.service' \
+      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'cellular-audio image does not enable cellular'
+    debugfs -R 'stat /etc/systemd/system/NetworkManager.service.requires/myron-reference-wifi-import.service' \
+      "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die 'cellular-audio image lacks Wi-Fi rescue import'
+    for unit in myron-audio-experiment myron-cellular-audio-experiment myron-omarchy-qualify myron-coexistence myron-batterysecret; do
+      debugfs -R "stat /etc/systemd/system/multi-user.target.wants/$unit.service" \
+        "$out" 2>&1 | grep -Fq 'File not found' || die "$unit is enabled in the attended cellular-audio image"
+    done
+    debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-cellular-publish.service' \
+      "$out" 2>&1 | grep -Fq 'File not found' || die 'cellular publisher is enabled in the cellular-audio image'
+    debugfs -R 'stat /etc/systemd/system/ModemManager.service' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'ModemManager is masked in the cellular-audio image'
+    for unit in myron-reference-audio-foundation myron-speaker-bridge myron-microphone-bridge; do
+      debugfs -R "stat /etc/systemd/system/$unit.service" "$out" 2>/dev/null |
+        grep -Fq 'Fast link dest: "/dev/null"' || die "$unit is not masked in the cellular-audio image"
+    done
+    [[ $(debugfs -R 'cat /usr/local/libexec/myron-audio-experiment/speaker-probe.sh' "$out" 2>/dev/null | sha256sum | cut -d' ' -f1) == "$(sha256sum <"$speaker_experiment" | cut -d' ' -f1)" ]] ||
+      die 'cellular-audio image lacks the exact pinned speaker probe'
+    debugfs -R 'stat /usr/local/libexec/myron-speaker/probe.py' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'cellular-audio image contains the old non-audible speaker probe'
+    debugfs -R 'stat /usr/local/sbin/myron-audio-microphone-probe' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'cellular-audio image contains the microphone experiment probe'
+    ;;
 esac
 hash=$(sha256sum <"$out" | cut -d" " -f1)
 printf '%s  %s\n' "$hash" "$(basename -- "$out")" >"$out.sha256"
 chmod 0600 "$out.sha256"
 activation=temporary-hardware-test
 [[ $boot_policy != main ]] || activation=persistent-main
-case $profile in audio-speaker|audio-microphone) activation=persistent-main-audio-experiment ;; esac
+case $profile in
+  audio-speaker|audio-microphone) activation=persistent-main-audio-experiment ;;
+  audio-cellular-speaker) activation=persistent-main-cellular-audio-experiment ;;
+esac
 printf 'status=composed\nimage=%s\nsha256=%s\nprofile=%s\neffective_profile=%s\nactivation=%s\ndeployment_authorized=false\nboot_policy=%s\n' \
   "$out" "$hash" "$profile" "$effective_profile" "$activation" "$boot_policy"

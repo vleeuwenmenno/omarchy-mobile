@@ -17,6 +17,15 @@ readonly arm=$runtime_dir/audio-stage.armed
 readonly state=/run/myron-host/var/lib/omarchy-mobile/audio-stage.state
 readonly log=/run/myron-host/var/log/myron-omarchy-audio-stage.log
 readonly disarm=/run/myron-host/var/lib/omarchy-mobile/hardware-test.disarm
+readonly expect_cellular=${MYRON_AUDIO_EXPECT_CELLULAR:-0}
+readonly modem_admission=${MYRON_AUDIO_MODEM_ADMISSION:-$runtime_dir/modem-manager-admission}
+readonly gnss_admission=${MYRON_AUDIO_GNSS_ADMISSION:-$runtime_dir/gnss-admission}
+readonly cellular_data_runtime=${MYRON_AUDIO_CELLULAR_DATA_RUNTIME:-/run/myron-cellular-stage}
+readonly data_state=${MYRON_AUDIO_DATA_STATE:-$cellular_data_runtime/data.state}
+readonly data_mutation=${MYRON_AUDIO_DATA_MUTATION:-$cellular_data_runtime/mutation}
+readonly qmap_link=${MYRON_AUDIO_QMAP_LINK:-/sys/class/net/qmapmux0.0}
+readonly bluetooth_hci=${MYRON_AUDIO_BLUETOOTH_HCI:-/sys/class/bluetooth/hci0}
+readonly ipa_guard=${MYRON_AUDIO_IPA_GUARD:-/usr/local/sbin/myron-ipa-guard}
 boot_id=
 adsp=
 
@@ -81,6 +90,34 @@ require_guard_running() {
 	kill -0 "$pid" 2>/dev/null || fail 'hardware guard MainPID is not live'
 }
 
+require_cellular_policy() {
+	case "$expect_cellular" in
+	0)
+		! pgrep -x ModemManager >/dev/null ||
+			fail 'ModemManager or GNSS must not run in the isolated audio boot'
+		;;
+	1)
+		systemctl --quiet is-active myron-cellular.service || fail 'cellular service is not active'
+		systemctl --quiet is-active ModemManager.service || fail 'ModemManager is not active'
+		pgrep -x ModemManager >/dev/null || fail 'ModemManager process is absent'
+		[ -d "$modem_admission" ] && [ ! -L "$modem_admission" ] ||
+			fail 'ModemManager admission marker is missing or unsafe'
+		[ "$(cat "$modem_admission/boot-id" 2>/dev/null || true)" = "$boot_id" ] ||
+			fail 'ModemManager admission marker is not current'
+		[ ! -e "$gnss_admission" ] && [ ! -L "$gnss_admission" ] ||
+			fail 'GNSS admission marker exists'
+		systemctl --quiet is-active myron-ipa-guard.service || fail 'IPA guard is not active'
+		"$ipa_guard" check pristine >/dev/null 2>&1 || fail 'IPA guard is not pristine'
+		[ ! -e "$data_mutation" ] && [ ! -L "$data_mutation" ] || fail 'mobile-data mutation marker exists'
+		[ ! -e "$data_state" ] && [ ! -L "$data_state" ] || fail 'mobile-data state exists'
+		[ ! -e "$qmap_link" ] && [ ! -L "$qmap_link" ] || fail 'packet-data qmap link exists'
+		[ ! -e "$bluetooth_hci" ] && [ ! -L "$bluetooth_hci" ] || fail 'Bluetooth controller exists'
+		! pgrep -x btattach >/dev/null 2>&1 || fail 'Bluetooth transport is active'
+		;;
+	*) fail 'cellular expectation is invalid' ;;
+	esac
+}
+
 load_module() {
 	file=$1
 	module_name=${2:-}
@@ -108,9 +145,8 @@ require_common() {
 	[ -s /run/myron-wireless-ready ] || fail 'radio/Wi-Fi firmware foundation is not ready'
 	systemctl --quiet is-active myron-reference-radio.service ||
 		fail 'radio foundation service is not active'
-	! pgrep -x ModemManager >/dev/null ||
-		fail 'ModemManager or GNSS must not run in the audio boot'
 	require_guard_running
+	require_cellular_policy
 	[ "$(cat /sys/module/firmware_class/parameters/path 2>/dev/null || true)" = \
 		'/run/myron-wireless/firmware/' ] || fail 'Myron firmware view is not active'
 	check_hash "$source_script" "$source_sha"

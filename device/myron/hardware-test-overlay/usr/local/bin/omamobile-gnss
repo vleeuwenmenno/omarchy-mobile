@@ -6,6 +6,7 @@ set -eu
 mmcli=${OMAMOBILE_MYRON_MMCLI:-/usr/bin/mmcli}
 modem=${OMAMOBILE_MYRON_MODEM:-any}
 audio_experiment=/etc/omamobile/myron-audio-experiment
+cellular_audio_experiment=/etc/omamobile/myron-cellular-audio-experiment
 admission=/run/omamobile-myron/gnss-admission
 allow_dir=/var/lib/omamobile-location
 allow_marker=$allow_dir/enabled
@@ -27,7 +28,8 @@ as_root() {
 }
 
 refuse_audio_experiment() {
-  [ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] || {
+  [ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] &&
+    [ ! -e "$cellular_audio_experiment" ] && [ ! -L "$cellular_audio_experiment" ] || {
     printf '%s\n' 'omamobile-gnss: blocked by the one-shot audio experiment' >&2
     exit 1
   }

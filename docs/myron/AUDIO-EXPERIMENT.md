@@ -21,6 +21,11 @@ probe, and enables only the selected audio experiment. The experiment consumes
 its request before its explicit radio start pulls hardware preparation in as a
 dependency.
 
+The separately gated registered-radio coexistence profile is documented in
+[`AUDIO-CELLULAR-EXPERIMENT.md`](AUDIO-CELLULAR-EXPERIMENT.md). It uses a
+different marker and approval boundary; neither isolated profile widens into
+that experiment.
+
 ## Safety contract
 
 Admission requires all of the following in the current boot:

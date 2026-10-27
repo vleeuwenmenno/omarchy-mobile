@@ -18,8 +18,8 @@ pending=$main_state/pending
 success=$main_state/success
 latch=$main_state/latch
 evidence=$main_state/cellular-evidence
-request=$runtime/audio-experiment.request
-consumed=$runtime/audio-experiment.consumed
+request=${MYRON_AUDIO_REQUEST:-$runtime/audio-experiment.request}
+consumed=${MYRON_AUDIO_CONSUMED:-$runtime/audio-experiment.consumed}
 probe_started=$audio_runtime/probe-started
 audio_mutated=$audio_runtime/audio-mutated
 result_file=$audio_runtime/result
@@ -39,9 +39,33 @@ omamobile_runtime=${MYRON_AUDIO_OMAMOBILE_RUNTIME:-/run/omamobile-myron}
 wireless_ready=${MYRON_AUDIO_WIRELESS_READY:-/run/myron-wireless-ready}
 modem_admission=${MYRON_AUDIO_MODEM_ADMISSION:-$omamobile_runtime/modem-manager-admission}
 gnss_admission=${MYRON_AUDIO_GNSS_ADMISSION:-$omamobile_runtime/gnss-admission}
+expect_cellular=${MYRON_AUDIO_EXPECT_CELLULAR:-0}
+cellular_ready=${MYRON_AUDIO_CELLULAR_READY:-/run/myron-cellular-ready}
+cellular_stage=${MYRON_AUDIO_CELLULAR_STAGE:-/usr/local/sbin/myron-cellular-stage}
+ipa_guard=${MYRON_AUDIO_IPA_GUARD:-/usr/local/sbin/myron-ipa-guard}
+cellular_data_runtime=${MYRON_AUDIO_CELLULAR_DATA_RUNTIME:-/run/myron-cellular-stage}
+data_state=${MYRON_AUDIO_DATA_STATE:-$cellular_data_runtime/data.state}
+data_mutation=${MYRON_AUDIO_DATA_MUTATION:-$cellular_data_runtime/mutation}
+qmap_link=${MYRON_AUDIO_QMAP_LINK:-/sys/class/net/qmapmux0.0}
+bluetooth_hci=${MYRON_AUDIO_BLUETOOTH_HCI:-/sys/class/bluetooth/hci0}
+thermal_root=${MYRON_AUDIO_THERMAL_ROOT:-/sys/class/thermal}
+uptime_file=${MYRON_AUDIO_UPTIME_FILE:-/proc/uptime}
+settle_seconds=${MYRON_AUDIO_CELLULAR_SETTLE_SECONDS:-60}
+settle_poll_seconds=${MYRON_AUDIO_CELLULAR_SETTLE_POLL_SECONDS:-2}
+prearm_pmic_limit=${MYRON_AUDIO_PREARM_PMIC_LIMIT_MC:-65000}
+settle_pmic_limit=${MYRON_AUDIO_SETTLE_PMIC_LIMIT_MC:-68000}
+hottest_limit=${MYRON_AUDIO_HOTTEST_LIMIT_MC:-95000}
+boundary_file=${MYRON_AUDIO_BOUNDARY_FILE:-$main_state/cellular-audio-experiment.stage}
+rescue_helper=${MYRON_AUDIO_RESCUE_HELPER:-}
+guard_remaining_helper=${MYRON_AUDIO_GUARD_REMAINING_HELPER:-}
+guard_deadline_seconds=${MYRON_AUDIO_GUARD_DEADLINE_SECONDS:-1200}
+guard_start_min_seconds=${MYRON_AUDIO_GUARD_START_MIN_SECONDS:-720}
+guard_arm_min_seconds=${MYRON_AUDIO_GUARD_ARM_MIN_SECONDS:-600}
+guard_stage_min_seconds=${MYRON_AUDIO_GUARD_STAGE_MIN_SECONDS:-120}
 speaker_sha=${MYRON_AUDIO_SPEAKER_SHA:-6f8fca8b0920ef9a3a949f099b16472646a472a2657bd32a03b36a2c68736095}
 guard_unit=myron-hardware-watchdog.service
 guard_pid=
+modem_pid=
 mode=
 final_result=failed
 finishing=0
@@ -53,6 +77,7 @@ persist() {
 	[ "$size" -lt 65536 ] || return 0
 	printf 'boot_id=%s mode=%s %s\n' "$(cat "$boot_id_file" 2>/dev/null || echo unknown)" \
 		"${mode:-unknown}" "$*" >>"$log" 2>/dev/null || true
+	[ "$expect_cellular" != 1 ] || { sync -f "$log" 2>/dev/null || sync; }
 }
 fail() { persist "result=failed reason=$1"; say_error "$1"; exit 1; }
 
@@ -93,6 +118,66 @@ is_uuid() {
 }
 unit_property() { "$systemctl_cmd" show "$1" -p "$2" --value 2>/dev/null; }
 
+monotonic_seconds() { awk '{ print int($1) }' "$uptime_file"; }
+
+temperature_by_type() {
+	wanted=$1
+	scan_stop=$(($(monotonic_seconds) + 10))
+	for file in "$thermal_root"/thermal_zone*/temp; do
+		[ "$(monotonic_seconds)" -lt "$scan_stop" ] || return 1
+		[ -r "$file" ] || continue
+		[ "$("$timeout_cmd" -k 1 2 cat "${file%/temp}/type" 2>/dev/null || true)" = "$wanted" ] || continue
+		value=$("$timeout_cmd" -k 1 2 cat "$file" 2>/dev/null || true)
+		case $value in ''|*[!0-9]*) return 1 ;; esac
+		[ "$value" -gt 0 ] && [ "$value" -lt 200000 ] || return 1
+		printf '%s\n' "$value"
+		return 0
+	done
+	return 1
+}
+
+hottest_temperature() {
+	hottest=0
+	valid=0
+	scan_stop=$(($(monotonic_seconds) + 10))
+	for file in "$thermal_root"/thermal_zone*/temp; do
+		[ "$(monotonic_seconds)" -lt "$scan_stop" ] || return 1
+		[ -r "$file" ] || continue
+		type=$("$timeout_cmd" -k 1 2 cat "${file%/temp}/type" 2>/dev/null || true)
+		case $type in ''|*-trip-*) continue ;; esac
+		value=$("$timeout_cmd" -k 1 2 cat "$file" 2>/dev/null || true)
+		case $value in ''|*[!0-9]*) continue ;; esac
+		[ "$value" -gt 0 ] && [ "$value" -lt 200000 ] || continue
+		valid=$((valid + 1))
+		[ "$value" -le "$hottest" ] || hottest=$value
+	done
+	[ "$valid" -gt 0 ] || return 1
+	printf '%s\n' "$hottest"
+}
+
+require_temperatures() {
+	pmic_limit=$1
+	pmic=$(temperature_by_type pmih010x_lite_tz) || fail 'PMIC temperature is unavailable'
+	hottest=$(hottest_temperature) || fail 'temperature sensors are unavailable'
+	[ "$pmic" -le "$pmic_limit" ] || fail "PMIC temperature safety limit reached: $pmic mC"
+	[ "$hottest" -lt "$hottest_limit" ] || fail "temperature safety limit reached: $hottest mC"
+}
+
+write_boundary() {
+	boundary=$1
+	shift
+	mkdir -p "$(dirname "$boundary_file")" || fail 'cellular-audio stage directory is unavailable'
+	tmp=$boundary_file.tmp.$$
+	{
+		printf 'mode=%s\nboot_id=%s\nboundary=%s\n' "$mode" "$(cat "$boot_id_file")" "$boundary"
+		printf '%s\n' "$*"
+	} >"$tmp" || fail 'could not write cellular-audio stage record'
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$boundary_file" || fail 'could not publish cellular-audio stage record'
+	sync -f "$boundary_file" 2>/dev/null || sync
+	persist "stage=boundary boundary=$boundary $*"
+}
+
 check_guard() {
 	active=$(unit_property "$guard_unit" ActiveState || true)
 	sub=$(unit_property "$guard_unit" SubState || true)
@@ -103,6 +188,23 @@ check_guard() {
 	[ "$pid" -gt 1 ] || fail 'main guard MainPID is not live'
 	kill -0 "$pid" 2>/dev/null || fail 'main guard MainPID is not live'
 	if [ -z "$guard_pid" ]; then guard_pid=$pid; else [ "$pid" = "$guard_pid" ] || fail 'main guard MainPID changed'; fi
+}
+
+guard_remaining() {
+	if [ -n "$guard_remaining_helper" ]; then
+		"$guard_remaining_helper"
+		return
+	fi
+	entered=$(unit_property "$guard_unit" ActiveEnterTimestampMonotonic || true)
+	case $entered in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' $((guard_deadline_seconds - ($(monotonic_seconds) - entered / 1000000)))
+}
+
+require_guard_remaining() {
+	minimum=$1
+	remaining=$(guard_remaining) || fail 'main guard deadline is unavailable'
+	case $remaining in ''|*[!0-9]*) fail 'main guard remaining time is invalid' ;; esac
+	[ "$remaining" -ge "$minimum" ] || fail "main guard deadline is too close: $remaining seconds remain"
 }
 
 check_no_cellular() {
@@ -135,11 +237,110 @@ check_no_cellular() {
 	[ ! -L "$gnss_admission" ] || fail 'GNSS admission marker is linked'
 }
 
+check_combined_rescue() {
+	if [ -n "$rescue_helper" ]; then
+		"$rescue_helper" || fail 'USB/Wi-Fi rescue gate failed'
+		return
+	fi
+	[ "$(unit_property sshd.service ActiveState || true)" = active ] || fail 'sshd is not active'
+	[ -d /sys/class/net/usb0 ] || fail 'USB rescue interface is absent'
+	[ -d /sys/class/net/wlan0 ] || fail 'Wi-Fi rescue interface is absent'
+	"$timeout_cmd" -k 1 5 ip -4 -o addr show dev usb0 scope global 2>/dev/null | grep -q . ||
+		fail 'USB rescue address is absent'
+	"$timeout_cmd" -k 1 5 ip -4 -o addr show dev wlan0 scope global 2>/dev/null | grep -q . ||
+		fail 'Wi-Fi rescue address is absent'
+}
+
+combined_status() {
+	status_output=$("$timeout_cmd" -s TERM -k 2 20 "$cellular_stage" registration-status 2>/dev/null) ||
+		fail 'cellular status helper failed'
+	printf '%s\n' "$status_output" | grep -Fq 'modem_count=1 ' || fail 'exactly one modem is not present'
+	printf '%s\n' "$status_output" | grep -Fq 'sim=ready ' || fail 'SIM is not ready'
+	printf '%s\n' "$status_output" | grep -Fq 'packet=home-attached ' || fail 'modem is not home-attached'
+	printf '%s\n' "$status_output" | grep -Fq 'access=lte-or-5g' || fail 'modem access is not LTE or 5G'
+	printf '%s\n' "$status_output" | grep -Eq '^data_attempted=no data_state=none$' ||
+		fail 'mobile-data mutation already started'
+}
+
+check_combined_cellular() {
+	[ "$(unit_property ModemManager.service LoadState || true)" != masked ] || fail 'ModemManager is masked'
+	[ "$(unit_property ModemManager.service ActiveState || true)" = active ] || fail 'ModemManager is not active'
+	[ "$(unit_property ModemManager.service SubState || true)" = running ] || fail 'ModemManager is not running'
+	[ -n "$(unit_property ModemManager.service InvocationID || true)" ] || fail 'ModemManager was not admitted in this boot'
+	pid=$(unit_property ModemManager.service MainPID || true)
+	case $pid in ''|*[!0-9]*) fail 'ModemManager MainPID is invalid' ;; esac
+	[ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null || fail 'ModemManager MainPID is not live'
+	if [ -z "$modem_pid" ]; then modem_pid=$pid; else [ "$pid" = "$modem_pid" ] || fail 'ModemManager MainPID changed'; fi
+	[ "$(unit_property myron-cellular.service ActiveState || true)" = active ] || fail 'cellular service is not active'
+	[ "$("$systemctl_cmd" is-enabled myron-cellular.service 2>/dev/null || true)" = enabled ] ||
+		fail 'cellular service is not enabled'
+	[ "$(unit_property myron-coexistence.service ActiveState || true)" = inactive ] || fail 'coexistence service is active'
+	[ "$("$systemctl_cmd" is-enabled myron-coexistence.service 2>/dev/null || true)" = disabled ] ||
+		fail 'coexistence service is not disabled'
+	for legacy_audio_unit in myron-reference-audio-foundation.service myron-speaker-bridge.service myron-microphone-bridge.service; do
+		[ "$(unit_property "$legacy_audio_unit" LoadState || true)" = masked ] ||
+			fail "legacy audio service is not masked: $legacy_audio_unit"
+		[ "$(unit_property "$legacy_audio_unit" ActiveState || true)" = inactive ] ||
+			fail "legacy audio service is active: $legacy_audio_unit"
+		[ -z "$(unit_property "$legacy_audio_unit" InvocationID || true)" ] ||
+			fail "legacy audio service was admitted: $legacy_audio_unit"
+	done
+	"$pgrep_cmd" -x ModemManager >/dev/null 2>&1 || fail 'ModemManager process is absent'
+	[ -d "$modem_admission" ] && [ ! -L "$modem_admission" ] || fail 'ModemManager admission marker is missing or unsafe'
+	[ "$(cat "$modem_admission/boot-id" 2>/dev/null || true)" = "$(cat "$boot_id_file")" ] ||
+		fail 'ModemManager admission marker is not current'
+	[ ! -e "$gnss_admission" ] && [ ! -L "$gnss_admission" ] || fail 'GNSS admission marker exists'
+	[ -s "$cellular_ready" ] && [ ! -L "$cellular_ready" ] || fail 'cellular readiness marker is absent'
+	[ "$(unit_property myron-ipa-guard.service ActiveState || true)" = active ] || fail 'IPA guard is not active'
+	"$ipa_guard" check pristine >/dev/null 2>&1 || fail 'IPA guard is not pristine'
+	combined_status
+	[ ! -e "$data_mutation" ] && [ ! -L "$data_mutation" ] || fail 'mobile-data mutation marker exists'
+	[ ! -e "$data_state" ] && [ ! -L "$data_state" ] || fail 'mobile-data state exists'
+	[ ! -e "$qmap_link" ] && [ ! -L "$qmap_link" ] || fail 'packet-data qmap link exists'
+	[ ! -e "$bluetooth_hci" ] && [ ! -L "$bluetooth_hci" ] || fail 'Bluetooth controller exists'
+	! "$pgrep_cmd" -x btattach >/dev/null 2>&1 || fail 'Bluetooth transport is active'
+}
+
+check_cellular_policy() {
+	case $expect_cellular in
+		0) check_no_cellular ;;
+		1) check_combined_cellular ;;
+		*) fail 'cellular expectation is invalid' ;;
+	esac
+}
+
+settle_combined_cellular() {
+	check_guard
+	require_guard_remaining "$guard_start_min_seconds"
+	check_combined_cellular
+	check_combined_rescue
+	require_temperatures "$settle_pmic_limit"
+	write_boundary cellular-started "modem_pid=$modem_pid data=blocked gnss=blocked bluetooth=absent"
+	start=$(monotonic_seconds) || fail 'monotonic clock is unavailable'
+	deadline=$((start + settle_seconds))
+	while [ "$(monotonic_seconds)" -lt "$deadline" ]; do
+		check_guard
+		check_combined_cellular
+		require_temperatures "$settle_pmic_limit"
+		sleep "$settle_poll_seconds"
+	done
+	check_guard
+	require_guard_remaining "$guard_arm_min_seconds"
+	check_combined_cellular
+	check_combined_rescue
+	require_temperatures "$prearm_pmic_limit"
+	pmic=$(temperature_by_type pmih010x_lite_tz) || fail 'PMIC temperature is unavailable'
+	write_boundary registration-stable "modem_pid=$modem_pid stable_seconds=$settle_seconds pmic_mc=$pmic data=blocked gnss=blocked bluetooth=absent ipa_guard=pristine"
+}
+
 check_fresh_attempt() {
 	[ "$(id -u)" = 0 ] || [ -n "${MYRON_AUDIO_TEST_ROOT:-}" ] || fail 'root is required'
 	safe_input "$mode_file" || fail 'experiment mode is unsafe'
 	mode=$(cat "$mode_file" 2>/dev/null || true)
-	case $mode in audio-speaker|audio-microphone) ;; *) fail 'experiment mode is invalid' ;; esac
+	case $expect_cellular:$mode in
+		0:audio-speaker|0:audio-microphone|1:audio-cellular-speaker) ;;
+		*) fail 'experiment mode or cellular expectation is invalid' ;;
+	esac
 	safe_input "$profile_file" && [ "$(cat "$profile_file")" = cellular ] ||
 		fail 'effective main profile is not cellular'
 	boot_id=$(cat "$boot_id_file" 2>/dev/null || true)
@@ -169,7 +370,7 @@ check_fresh_attempt() {
 	[ ! -e "$consumed" ] && [ ! -L "$consumed" ] || fail 'experiment request was already consumed'
 	[ ! -e "$probe_started" ] && [ ! -L "$probe_started" ] || fail 'an audio probe already started this boot'
 	check_guard
-	check_no_cellular
+	check_cellular_policy
 	! "$pgrep_cmd" -x agmplay >/dev/null 2>&1 || fail 'agmplay is already running'
 	! "$pgrep_cmd" -x agmcap >/dev/null 2>&1 || fail 'agmcap is already running'
 }
@@ -180,6 +381,7 @@ consume_request() {
 	sync
 	safe_file "$consumed" || fail 'consumed experiment request is unsafe'
 	persist 'stage=request result=consumed replay=blocked'
+	[ "$expect_cellular" != 1 ] || write_boundary request-consumed 'request=consumed replay=blocked'
 }
 
 invalidate_cellular_evidence() {
@@ -194,7 +396,11 @@ invalidate_cellular_evidence() {
 
 before_hardware() {
 	check_guard
-	check_no_cellular
+	check_cellular_policy
+	if [ "$expect_cellular" = 1 ]; then
+		require_guard_remaining "$guard_stage_min_seconds"
+		require_temperatures "$settle_pmic_limit"
+	fi
 }
 
 stage() {
@@ -236,6 +442,7 @@ check_readiness() {
 mark_probe_started() {
 	mkdir "$probe_started" 2>/dev/null || fail 'an audio probe already started this boot'
 	printf 'mode=%s\n' "$mode" >"$probe_started/mode"
+	[ "$expect_cellular" != 1 ] || write_boundary probe-started "modem_pid=$modem_pid kind=speaker duration_ms=250 level_dbfs=-45"
 }
 
 run_speaker_probe() {
@@ -258,6 +465,7 @@ run_speaker_probe() {
 	grep -Fq 'PASS: one 250 ms stereo speaker probe completed at approximately -45 dBFS; TFA returned to Powerdown' "$probe_log" ||
 		fail 'speaker probe did not report the exact pass condition'
 	persist 'stage=probe result=pass kind=speaker duration_ms=250 frequency_hz=440 level_dbfs=-45 route=TDM-LPAIF-RX-PRIMARY'
+	[ "$expect_cellular" != 1 ] || write_boundary probe-result "modem_pid=$modem_pid result=pass kind=speaker duration_ms=250 level_dbfs=-45 tfa=Powerdown"
 }
 
 run_microphone_probe() {
@@ -343,20 +551,25 @@ run_experiment() {
 	check_fresh_attempt
 	consume_request
 	invalidate_cellular_evidence
-	before_hardware
-	install -d -m0700 "$omamobile_runtime"
-	printf '%s\n' verified-read-only-backup >"$omamobile_runtime/radio-backup-verified"
-	"$systemctl_cmd" start myron-reference-radio.service || fail 'radio foundation failed'
-	[ -s "$wireless_ready" ] || [ -n "${MYRON_AUDIO_TEST_ROOT:-}" ] || fail 'radio foundation readiness is absent'
+	if [ "$expect_cellular" = 1 ]; then
+		settle_combined_cellular
+		write_boundary audio-arm "modem_pid=$modem_pid data=blocked gnss=blocked bluetooth=absent"
+	else
+		before_hardware
+		install -d -m0700 "$omamobile_runtime"
+		printf '%s\n' verified-read-only-backup >"$omamobile_runtime/radio-backup-verified"
+		"$systemctl_cmd" start myron-reference-radio.service || fail 'radio foundation failed'
+		[ -s "$wireless_ready" ] || [ -n "${MYRON_AUDIO_TEST_ROOT:-}" ] || fail 'radio foundation readiness is absent'
+	fi
 	stage arm
 	touch "$audio_mutated"
 	for name in mapper transport adsp codecs devnodes fastrpc; do stage "$name"; done
-	[ "$mode" != audio-speaker ] || stage speaker-dsp
+	case $mode in audio-speaker|audio-cellular-speaker) stage speaker-dsp ;; esac
 	check_readiness
 	before_hardware
 	mark_probe_started
 	case $mode in
-		audio-speaker) run_speaker_probe ;;
+		audio-speaker|audio-cellular-speaker) run_speaker_probe ;;
 		audio-microphone) run_microphone_probe ;;
 	esac
 	final_result=complete

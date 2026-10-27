@@ -1094,6 +1094,16 @@ cmd_status() {
 	[ "$mode" = temp ] || printf 'mode=main operation=%s\n' "$(timeout -k 1 15 "$op" status 2>/dev/null || echo unavailable)"
 }
 
+# Read-only subset for the attended cellular+audio experiment. Unlike status,
+# this never calls myron-cellular-op, which is intentionally blocked by that
+# experiment's separate marker.
+cmd_registration_status() {
+	attempted=no; [ ! -d "$mutation_marker" ] || attempted=yes
+	read_modem || true
+	summary
+	printf 'data_attempted=%s data_state=%s\n' "$attempted" "$(cat "$data_state" 2>/dev/null || echo none)"
+}
+
 check_identity() {
 	require_root
 	[ "$(uname -r)" = "$expected_kernel" ] || fail 'unexpected kernel release'
@@ -1408,7 +1418,7 @@ cmd_radio_refused() {
 }
 
 usage() {
-	printf 'usage: %s status|identity|arm|qualify|data CONFIRMATION-TOKEN|main-op CONFIRMATION-TOKEN|main-run attended|qualified|main-standalone-proof|radio-off|radio-on\n' "${0##*/}" >&2
+	printf 'usage: %s status|registration-status|identity|arm|qualify|data CONFIRMATION-TOKEN|main-op CONFIRMATION-TOKEN|main-run attended|qualified|main-standalone-proof|radio-off|radio-on\n' "${0##*/}" >&2
 	exit 2
 }
 
@@ -1432,6 +1442,7 @@ data|main-op|main-run) [ "$#" = 1 ] || usage ;;
 esac
 case "$command" in
 status) cmd_status ;;
+registration-status) cmd_registration_status ;;
 identity|arm|qualify|data)
 	[ "$mode" = temp ] || cmd_refuse_in_main "$command"
 	case "$command" in

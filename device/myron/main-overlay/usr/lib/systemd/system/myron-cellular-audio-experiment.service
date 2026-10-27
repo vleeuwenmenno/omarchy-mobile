@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# Attended one-shot coexistence experiment.  Cellular starts normally first;
+# the audio transaction is never enabled and must be started explicitly after
+# USB/Wi-Fi rescue and modem registration have been inspected.
+[Unit]
+Description=Attended Myron cellular and AudioReach speaker experiment
+Requires=myron-hardware-watchdog.service myron-cellular.service
+After=myron-hardware-watchdog.service myron-cellular.service NetworkManager.service
+Before=myron-omarchy-qualify.service
+Conflicts=myron-coexistence.service myron-reference-audio-foundation.service myron-speaker-bridge.service myron-microphone-bridge.service
+ConditionPathExists=/etc/omamobile/myron-cellular-audio-experiment
+ConditionPathExists=/run/myron-main/cellular-audio-experiment.request
+OnFailure=myron-main-recover.service
+
+[Service]
+Type=oneshot
+Environment=MYRON_AUDIO_MODE_FILE=/etc/omamobile/myron-cellular-audio-experiment
+Environment=MYRON_AUDIO_REQUEST=/run/myron-main/cellular-audio-experiment.request
+Environment=MYRON_AUDIO_CONSUMED=/run/myron-main/cellular-audio-experiment.consumed
+Environment=MYRON_AUDIO_EXPECT_CELLULAR=1
+ExecStart=/usr/local/sbin/myron-audio-experiment run
+ExecStopPost=/usr/local/sbin/myron-audio-experiment finish
+TimeoutStartSec=10min
+TimeoutStopSec=150
+StandardOutput=journal
+StandardError=journal

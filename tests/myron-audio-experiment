@@ -14,6 +14,7 @@ source tests/lib/myron-sh-harness.sh
 runner=device/myron/main-overlay/usr/local/sbin/myron-audio-experiment
 mic_probe=device/myron/main-overlay/usr/local/sbin/myron-audio-microphone-probe
 unit=device/myron/main-overlay/usr/lib/systemd/system/myron-audio-experiment.service
+combined_unit=device/myron/main-overlay/usr/lib/systemd/system/myron-cellular-audio-experiment.service
 stage=device/myron/hardware-test-overlay/usr/local/sbin/myron-audio-stage
 bridge=device/myron/hardware-test-overlay/usr/local/sbin/myron-microphone-bridge
 compose=tools/myron-dev-image-compose
@@ -49,8 +50,8 @@ grep -Fq "cat /usr/local/libexec/myron-audio-experiment/speaker-probe.sh" "$comp
   fail 'composer does not byte-verify the speaker probe in the image'
 pass 'speaker source is vendored, MIT-cited, pinned and image-byte-verified without sibling checkout dependency'
 
-grep -Fq '[--profile coexistence|cellular|audio-speaker|audio-microphone]' "$compose" ||
-  fail 'composer does not expose two explicit audio modes'
+grep -Fq '[--profile coexistence|cellular|audio-speaker|audio-microphone|audio-cellular-speaker]' "$compose" ||
+  fail 'composer does not expose isolated and combined audio modes'
 grep -Fq 'audio experiment profiles require --boot-policy main' "$compose" ||
   fail 'composer permits temporary audio experiment images'
 grep -Fq 'effective_profile=cellular' "$compose" || fail 'audio profiles do not retain the cellular init contract'
@@ -71,6 +72,10 @@ grep -Fq 'speaker image contains the microphone experiment probe' "$compose" ||
   fail 'speaker image does not reject the microphone probe'
 grep -Fq 'microphone image contains the speaker experiment probe' "$compose" ||
   fail 'microphone image does not reject the speaker probe'
+grep -Fq 'myron-omarchy-qualify myron-coexistence myron-batterysecret' "$compose" ||
+  fail 'combined audio image does not verify every disabled guard-related service'
+grep -Fq 'cellular-audio image contains the old non-audible speaker probe' "$compose" ||
+  fail 'combined audio image does not reject the stale speaker probe'
 pass 'composer separates audio images, retains effective cellular profile and applies main overlay to both'
 
 grep -Fxq 'Before=myron-omarchy-qualify.service myron-cellular.service ModemManager.service' "$unit" ||
@@ -99,6 +104,24 @@ grep -Fq 'audio-experiment.request' "$init_stage" ||
 grep -Fq '[ "$(grep -c . "$pending")" = 2 ]' "$runner" ||
   fail 'audio runner does not preserve the existing two-line generic pending format'
 pass 'unit ordering, deadline and live-PID guard contracts are explicit; kernel proof stays audio-specific'
+
+grep -Fxq 'Requires=myron-hardware-watchdog.service myron-cellular.service' "$combined_unit" ||
+  fail 'combined unit does not require the guarded cellular transaction'
+grep -Fxq 'Environment=MYRON_AUDIO_EXPECT_CELLULAR=1' "$combined_unit" ||
+  fail 'combined unit does not select the explicit cellular gate'
+grep -Fxq 'ConditionPathExists=/run/myron-main/cellular-audio-experiment.request' "$combined_unit" ||
+  fail 'combined unit lacks its separate initramfs request gate'
+grep -Fxq 'OnFailure=myron-main-recover.service' "$combined_unit" ||
+  fail 'combined unit lacks automatic main recovery'
+if grep -Fq '[Install]' "$combined_unit"; then fail 'combined audio service can be enabled accidentally'; fi
+if grep -F 'Conflicts=' "$combined_unit" | grep -Fq 'ModemManager'; then
+  fail 'combined unit conflicts with the modem it must preserve'
+fi
+grep -Fq 'audio_request_path=/run/myron-main/cellular-audio-experiment.request' "$init_stage" ||
+  fail 'main init does not create the separate combined request'
+grep -Fq 'MYRON_AUDIO_EXPECT_CELLULAR' "$stage" ||
+  fail 'audio stage does not enforce combined cellular policy'
+pass 'combined service is static, separately requested, radio-preserving and recovery-supervised'
 
 grep -Fq 'duration=${MYRON_MIC_SECONDS:-3}' "$bridge" || fail 'legacy microphone bridge default is not tightly bounded'
 grep -Fq '[ "$duration" -ge 1 ] && [ "$duration" -le 3 ]' "$bridge" ||
@@ -169,15 +192,18 @@ case ${1:-}:$unit:$property in
   show:myron-hardware-watchdog.service:ActiveState) cat "$root/guard-active" ;;
   show:myron-hardware-watchdog.service:SubState) cat "$root/guard-sub" ;;
   show:myron-hardware-watchdog.service:MainPID) cat "$root/guard-pid" ;;
-  show:ModemManager.service:LoadState) printf '%s\n' masked ;;
-  show:ModemManager.service:ActiveState) cat "$root/mm-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:ModemManager.service:LoadState) test ! -e "$root/combined" && printf '%s\n' masked || printf '%s\n' loaded ;;
+  show:ModemManager.service:ActiveState) test ! -e "$root/combined" && { cat "$root/mm-active" 2>/dev/null || printf '%s\n' inactive; } || printf '%s\n' active ;;
+  show:ModemManager.service:SubState) test ! -e "$root/combined" && printf '%s\n' dead || printf '%s\n' running ;;
+  show:ModemManager.service:MainPID) cat "$root/modem-pid" 2>/dev/null || printf '%s\n' 0 ;;
   show:ModemManager.service:InvocationID) cat "$root/mm-invocation" 2>/dev/null || true ;;
-  show:myron-cellular.service:ActiveState) cat "$root/cellular-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:myron-cellular.service:ActiveState) test ! -e "$root/combined" && { cat "$root/cellular-active" 2>/dev/null || printf '%s\n' inactive; } || printf '%s\n' active ;;
+  show:myron-ipa-guard.service:ActiveState) test ! -e "$root/combined" && printf '%s\n' inactive || printf '%s\n' active ;;
   show:myron-coexistence.service:ActiveState) cat "$root/coexistence-active" 2>/dev/null || printf '%s\n' inactive ;;
   show:myron-reference-audio-foundation.service:LoadState|show:myron-speaker-bridge.service:LoadState|show:myron-microphone-bridge.service:LoadState) printf '%s\n' masked ;;
   show:myron-reference-audio-foundation.service:ActiveState|show:myron-speaker-bridge.service:ActiveState|show:myron-microphone-bridge.service:ActiveState) cat "$root/legacy-audio-active" 2>/dev/null || printf '%s\n' inactive ;;
   show:myron-reference-audio-foundation.service:InvocationID|show:myron-speaker-bridge.service:InvocationID|show:myron-microphone-bridge.service:InvocationID) cat "$root/legacy-audio-invocation" 2>/dev/null || true ;;
-  is-enabled:myron-cellular.service:) printf '%s\n' disabled ;;
+  is-enabled:myron-cellular.service:) test ! -e "$root/combined" && printf '%s\n' disabled || printf '%s\n' enabled ;;
   is-enabled:myron-coexistence.service:) printf '%s\n' disabled ;;
   start:*) printf 'systemctl %s\n' "$*" >>"$root/calls" ;;
   *) exit 1 ;;
@@ -242,9 +268,55 @@ SH
   chmod +x "$case_root"/bin/*
 }
 
+combined_fixture() {
+  fixture audio-cellular-speaker
+  : >"$case_root/combined"
+  mv "$case_root/runtime/audio-experiment.request" \
+    "$case_root/runtime/cellular-audio-experiment.request"
+  printf '%s\n' "$guard_two" >"$case_root/modem-pid"
+  printf '%s\n' admitted >"$case_root/mm-invocation"
+  : >"$case_root/pgrep-ModemManager"
+  mkdir -p "$case_root/omamobile/modem-manager-admission" \
+    "$case_root/thermal/thermal_zone0" "$case_root/thermal/thermal_zone1"
+  printf '%s\n' "$boot_id" >"$case_root/omamobile/modem-manager-admission/boot-id"
+  printf '%s\n' ready >"$case_root/cellular-ready"
+  printf '%s\n' pmih010x_lite_tz >"$case_root/thermal/thermal_zone0/type"
+  printf '%s\n' 57000 >"$case_root/thermal/thermal_zone0/temp"
+  printf '%s\n' cpu-thermal >"$case_root/thermal/thermal_zone1/type"
+  printf '%s\n' 52000 >"$case_root/thermal/thermal_zone1/temp"
+  cat >"$case_root/bin/cellular-stage" <<'SH'
+#!/bin/sh
+test "${1:-}" = registration-status
+printf '%s\n' 'modem_count=1 modem_state=registered sim=ready packet=home-attached access=lte-or-5g'
+printf '%s\n' 'data_attempted=no data_state=none'
+SH
+  cat >"$case_root/bin/ipa-guard" <<'SH'
+#!/bin/sh
+test "${1:-}" = check && test "${2:-}" = pristine
+SH
+  cat >"$case_root/bin/rescue" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  cat >"$case_root/bin/guard-remaining" <<'SH'
+#!/bin/sh
+printf '%s\n' 1000
+SH
+  chmod +x "$case_root/bin/cellular-stage" "$case_root/bin/ipa-guard" "$case_root/bin/rescue" \
+    "$case_root/bin/guard-remaining"
+}
+
 audio_command() {
-  local speaker_fake_sha
+  local speaker_fake_sha request consumed expect_cellular
   speaker_fake_sha=$(sha256sum <"$case_root/bin/speaker-probe" | cut -d' ' -f1)
+  request=$case_root/runtime/audio-experiment.request
+  consumed=$case_root/runtime/audio-experiment.consumed
+  expect_cellular=0
+  if [[ -e $case_root/combined ]]; then
+    request=$case_root/runtime/cellular-audio-experiment.request
+    consumed=$case_root/runtime/cellular-audio-experiment.consumed
+    expect_cellular=1
+  fi
   env \
     CASE_ROOT="$case_root" \
     MYRON_AUDIO_TEST_ROOT="$case_root" \
@@ -254,6 +326,8 @@ audio_command() {
     MYRON_AUDIO_MAIN_STATE="$case_root/main" \
     MYRON_AUDIO_HOST_STATE="$case_root/host" \
     MYRON_AUDIO_RUNTIME="$case_root/runtime" \
+    MYRON_AUDIO_REQUEST="$request" \
+    MYRON_AUDIO_CONSUMED="$consumed" \
     MYRON_AUDIO_EXPERIMENT_RUNTIME="$case_root/audio-runtime" \
     MYRON_AUDIO_BOOT_ID_FILE="$case_root/boot-id" \
     MYRON_AUDIO_LOG="$case_root/audio.log" \
@@ -270,6 +344,19 @@ audio_command() {
     MYRON_AUDIO_MICROPHONE_PROBE="$case_root/bin/microphone-probe" \
     MYRON_AUDIO_OMAMOBILE_RUNTIME="$case_root/omamobile" \
     MYRON_AUDIO_WIRELESS_READY="$case_root/wireless-ready" \
+    MYRON_AUDIO_EXPECT_CELLULAR="$expect_cellular" \
+    MYRON_AUDIO_CELLULAR_READY="$case_root/cellular-ready" \
+    MYRON_AUDIO_CELLULAR_STAGE="$case_root/bin/cellular-stage" \
+    MYRON_AUDIO_IPA_GUARD="$case_root/bin/ipa-guard" \
+    MYRON_AUDIO_DATA_STATE="$case_root/omamobile/data.state" \
+    MYRON_AUDIO_DATA_MUTATION="$case_root/omamobile/data-mutation" \
+    MYRON_AUDIO_QMAP_LINK="$case_root/qmapmux0.0" \
+    MYRON_AUDIO_BLUETOOTH_HCI="$case_root/hci0" \
+    MYRON_AUDIO_THERMAL_ROOT="$case_root/thermal" \
+    MYRON_AUDIO_CELLULAR_SETTLE_SECONDS=0 \
+    MYRON_AUDIO_BOUNDARY_FILE="$case_root/main/cellular-audio-experiment.stage" \
+    MYRON_AUDIO_RESCUE_HELPER="$case_root/bin/rescue" \
+    MYRON_AUDIO_GUARD_REMAINING_HELPER="$case_root/bin/guard-remaining" \
     sh "$runner" "$@"
 }
 
@@ -323,6 +410,47 @@ grep -Fq 'kind=microphone format=mono-s16le-48000 frames=48000 nonzero=321 raw=d
 [[ ! -e $case_root/audio-runtime/microphone-probe.log ]] || fail 'microphone probe output survived cleanup'
 expect_recover audio-microphone-complete
 pass 'microphone mode is separate, aggregate-only, cleaned and automatically recovered'
+
+# Combined profile keeps the registered modem and pristine IPA guard live,
+# blocks packet data/GNSS/Bluetooth, settles once, then runs one speaker probe.
+combined_fixture
+run_audio
+[[ $audio_rc == 0 ]] || { cat "$case_root/output"; fail 'combined cellular-audio fixture did not complete'; }
+[[ $(cat "$case_root/probes") == speaker ]] || fail 'combined mode did not run exactly one speaker probe'
+[[ $(grep -c '^stage ' "$case_root/calls") == 8 ]] || fail 'combined mode did not run exactly eight audio stages'
+if grep -Fq 'systemctl start myron-reference-radio.service' "$case_root/calls"; then
+  fail 'combined mode restarted the already-live radio foundation'
+fi
+[[ -f $case_root/runtime/cellular-audio-experiment.consumed &&
+   ! -e $case_root/runtime/cellular-audio-experiment.request ]] ||
+  fail 'combined request was not consumed once before audio work'
+grep -Fxq 'boundary=probe-result' "$case_root/main/cellular-audio-experiment.stage" ||
+  fail 'combined mode did not durably publish the final probe boundary'
+grep -Fq 'data=blocked gnss=blocked bluetooth=absent' "$case_root/audio.log" ||
+  fail 'combined durable log lacks the radio exclusion boundary'
+expect_recover audio-cellular-speaker-complete
+pass 'combined mode preserves registered radio, blocks data/GNSS/Bluetooth, probes once and recovers'
+
+combined_fixture
+printf '%s\n' 66000 >"$case_root/thermal/thermal_zone0/temp"
+run_audio
+[[ $audio_rc != 0 ]] || fail 'combined mode armed audio above the 65 C PMIC gate'
+expect_no_probe
+expect_recover audio-experiment-failed
+combined_fixture
+mkdir "$case_root/omamobile/gnss-admission"
+run_audio
+[[ $audio_rc != 0 ]] || fail 'combined mode accepted prior GNSS admission'
+expect_no_probe
+expect_recover audio-experiment-failed
+combined_fixture
+printf '#!/bin/sh\nprintf "%%s\\n" 600\n' >"$case_root/bin/guard-remaining"
+chmod +x "$case_root/bin/guard-remaining"
+run_audio
+[[ $audio_rc != 0 ]] || fail 'combined mode started too close to the MAIN guard deadline'
+expect_no_probe
+expect_recover audio-experiment-failed
+pass 'combined PMIC, GNSS and remaining-guard gates fail before any audio probe'
 
 # Wrong boot, wrong image/kernel and an already committed boot all fail before
 # request consumption or hardware mutation, while still requesting recovery.
@@ -447,3 +575,31 @@ sh_patch device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss "$entry
 blocked GNSS "$entry/gnss" status
 [[ ! -e $entry/runtime/gnss-admission ]] || fail 'blocked GNSS created admission state'
 pass 'ModemManager, GNSS, cellular and mobile-data entry points behaviorally block audio-mode admission'
+
+# Combined mode deliberately admits the cellular service and ModemManager,
+# while every packet-data and location entry point refuses its separate marker.
+for file in \
+  device/myron/main-overlay/usr/local/sbin/myron-cellular-op \
+  device/myron/main-overlay/usr/local/bin/myron-mobile-data \
+  device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss \
+  device/myron/main-overlay/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf \
+  device/myron/main-overlay/usr/lib/systemd/system/omamobile-gnss-prepare.service; do
+  grep -Fq 'myron-cellular-audio-experiment' "$file" ||
+    fail "$file does not block combined-mode data or GNSS mutation"
+done
+marker2=$entry/myron-cellular-audio-experiment
+rm -f "$marker"
+printf '%s\n' audio-cellular-speaker >"$marker2"
+sh_patch device/myron/main-overlay/usr/local/sbin/myron-cellular-op "$entry/combined-cellular-op" \
+  "audio_experiment=$entry/no-isolated-marker" "cellular_audio_experiment=$marker2" \
+  "log=$entry/combined-cellular-op.log"
+blocked combined-cellular-op "$entry/combined-cellular-op" status
+sh_patch device/myron/main-overlay/usr/local/bin/myron-mobile-data "$entry/combined-mobile-data" \
+  "audio_experiment=$entry/no-isolated-marker" "cellular_audio_experiment=$marker2"
+blocked combined-mobile-data "$entry/combined-mobile-data" on
+sh_patch device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss "$entry/combined-gnss" \
+  "audio_experiment=$entry/no-isolated-marker" "cellular_audio_experiment=$marker2" \
+  "admission=$entry/runtime/gnss-admission"
+blocked combined-GNSS "$entry/combined-gnss" status
+[[ ! -e $entry/runtime/gnss-admission ]] || fail 'blocked combined GNSS created admission state'
+pass 'combined marker behaviorally blocks packet data and GNSS while leaving radio admission available'

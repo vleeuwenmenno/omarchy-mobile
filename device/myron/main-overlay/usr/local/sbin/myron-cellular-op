@@ -59,6 +59,7 @@ nm_conf=/etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf
 apn_config=/etc/omamobile/myron-cellular-apn
 profile_file=/etc/omamobile/myron-test-profile
 audio_experiment=/etc/omamobile/myron-audio-experiment
+cellular_audio_experiment=/etc/omamobile/myron-cellular-audio-experiment
 unit_dir=/usr/lib/systemd/system
 polkit_rule=/etc/polkit-1/rules.d/50-myron-cellular-enable.rules
 rescue_before=/run/myron-cellular-stage/rescue.before
@@ -749,7 +750,8 @@ usage() {
 [ "$#" -ge 1 ] || usage
 command=$1
 shift
-[ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] || {
+[ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] &&
+	[ ! -e "$cellular_audio_experiment" ] && [ ! -L "$cellular_audio_experiment" ] || {
 	[ "$command" != evidence-check ] || printf '%s\n' 'evidence=invalid'
 	fail 'cellular operation and evidence are blocked by the one-shot audio experiment'
 }
