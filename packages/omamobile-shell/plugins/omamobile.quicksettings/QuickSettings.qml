@@ -14,8 +14,8 @@ import "TilesModel.js" as TilesModel
 
 // Pull-down quick settings for the phone. The sheet drops from the top edge
 // over the status bar, collapsed as on Android: a clock header, the first
-// four tiles and brightness. A pull down on the sheet (or a tap on its
-// handle) expands it to every tile, a page of eight at a time with a
+// four tiles and brightness. A pull down on the sheet or its handle (or a
+// tap on the handle) expands it to every tile, a page of eight at a time with a
 // sideways swipe between pages, and volume. Tap outside it, swipe it up, or
 // press Escape to put it away. The Wi-Fi and Bluetooth tiles' chevrons (or a
 // long-press) open the panels in WifiPanel.qml and BluetoothPanel.qml.
@@ -1132,6 +1132,7 @@ Item {
   readonly property int tileHeight: Math.max(64, Style.space(68))
   readonly property int editTileHeight: Math.max(56, Style.space(60))
   readonly property int editColumns: 3
+  readonly property real handlePullThreshold: Math.max(18, Style.space(24))
   // Keep the sheet below a visible top bar. This follows the live bar API,
   // including device-specific heights such as Myron's camera-safe 88 px bar.
   readonly property real topBarClearance: shell && shell.bar && !shell.bar.barHidden && shell.bar.position === "top"
@@ -1599,8 +1600,9 @@ Item {
           }
         }
 
-        // ---------- Handle: a visible cue that the sheet swipes back up
-        // Collapsed, a tap on it (or a pull down anywhere) expands the sheet.
+        // ---------- Handle: tap or pull it down to expand the collapsed sheet.
+        // This handler owns the handle's touch sequence, so the full-sheet
+        // swipe layer behind the content cannot steal it.
         Item {
           visible: !root.editing
           width: parent.width
@@ -1615,11 +1617,32 @@ Item {
           }
 
           MouseArea {
+            id: handleGesture
             anchors.horizontalCenter: parent.horizontalCenter
             width: Math.max(96, Style.space(120))
             height: parent.height
             cursorShape: Qt.PointingHandCursor
-            onClicked: root.expanded = !root.expanded
+            preventStealing: true
+            property real pressY: 0
+            property bool expandedByPull: false
+
+            onPressed: function(mouse) {
+              pressY = mouse.y
+              expandedByPull = false
+            }
+            onPositionChanged: function(mouse) {
+              // Expanding moves this handle lower in the new layout. Handle
+              // only the first qualifying movement so that relayout cannot
+              // turn the same gesture back into a tap or a second action.
+              if (expandedByPull || root.expanded) return
+              if (mouse.y - pressY >= root.handlePullThreshold) {
+                expandedByPull = true
+                root.expanded = true
+              }
+            }
+            onClicked: {
+              if (!expandedByPull) root.expanded = !root.expanded
+            }
           }
         }
       }

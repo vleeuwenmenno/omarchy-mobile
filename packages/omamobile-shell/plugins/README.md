@@ -83,8 +83,8 @@ hardware keys:
 
 A sheet that slides down from the top edge over the status bar, styled as an
 Omarchy popup (popups background and border). It opens collapsed, as on
-Android: a clock and date header, the first four tiles and brightness. A pull
-down on the sheet (or a tap on the handle at its foot) expands it to every
+Android: a clock and date header, the first four tiles and brightness. Pulling
+down on the sheet or its handle (or tapping the handle) expands it to every
 tile, eight to a page in two columns with a sideways swipe between pages,
 then brightness and volume. Tap the scrim, swipe the sheet up, or press Escape
 to close it.

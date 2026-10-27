@@ -32,6 +32,14 @@ test("the sheet clears a visible top bar", () => {
   assert.match(qml, /sheetBottom: Math\.round\(sheet\.y \+ sheet\.height\)/)
 })
 
+test("the collapsed handle expands on a downward pull without replaying a tap", () => {
+  const qml = fs.readFileSync(path.join(__dirname, "../plugins/omamobile.quicksettings/QuickSettings.qml"), "utf8")
+  assert.match(qml, /readonly property real handlePullThreshold: Math\.max\(18, Style\.space\(24\)\)/)
+  assert.match(qml, /id: handleGesture[\s\S]*preventStealing: true/)
+  assert.match(qml, /mouse\.y - pressY >= root\.handlePullThreshold[\s\S]*expandedByPull = true[\s\S]*root\.expanded = true/)
+  assert.match(qml, /if \(!expandedByPull\) root\.expanded = !root\.expanded/)
+})
+
 test("privacy tiles refresh while open and Myron data can turn both ways", () => {
   const qml = fs.readFileSync(path.join(__dirname, "../plugins/omamobile.quicksettings/QuickSettings.qml"), "utf8")
   assert.match(qml, /interval: 2000[\s\S]*running: root\.opened[\s\S]*location\.refresh\(\)/)
