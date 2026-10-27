@@ -13,6 +13,45 @@ not authorize a general deployment, and does not change the device
 descriptor's `external-android` boot method. Slot B contains the owner's
 Android installation and is never part of this test.
 
+## 2026-10-27 persistent MAIN cellular and location retest
+
+A real qualified mobile-data activation repeatedly crashed ModemManager just
+after `qmapmux0.0` was created. A captured core and AArch64 disassembly showed
+an indirect call through address `0x30`. The call mapped to
+`transaction_complete()` in `src/mm-netlink.c`: removing the transaction from
+its owning hash table freed it before the function read
+`tr->completion_fn`. Downstream patch 0011 now copies that callback before the
+removal. ModemManager and libmm-glib were rebuilt as
+`1.25.95.r20261005-2`, installed together with pkgrel 1 rollback packages kept
+root-only on the phone, and loaded by a fresh boot.
+
+The first service start occurred while the normal post-boot Hyprland
+qualification was still active. It refused before arming or creating the
+per-boot mutation marker. After qualification reported `pending=absent` and
+`success=current`, the production qualified path activated once and sealed in
+23 seconds. It reported link-scoped DNS and HTTPS 204, NetworkManager kept the
+GSM profile activated, `qmapmux0.0` stayed up, and ModemManager kept the same
+PID throughout. No SIGSEGV, service exit or recovery reboot occurred. Fresh
+USB and Wi-Fi SSH logins both passed.
+
+The quick-settings packet gate was then exercised on the live bearer. A
+cellular-interface-bound HTTPS probe returned 204, timed out while the owned
+ingress and egress `clsact` drop filters were active, and returned 204 again
+after the gate was removed. The bearer remained activated and ModemManager's
+PID did not change. The actual tile-state helper reported `On`, `Off`, then
+`On`, with the final state left on.
+
+The Location tile was also exercised through the running shell. Off removed
+the permission marker, kept GeoClue and the preparation unit inactive, denied
+an exact-accuracy client, and left every GNSS source off. On restored
+permission while leaving the receiver idle. An exact-accuracy GeoClue request
+then started the MSB preparation and powered Qualcomm GNSS only for the client;
+after it exited, raw GPS and NMEA were off again and only MSB assistance
+remained selected. This indoor bounded run produced a 25 km fallback and no
+GGA satellite fix (`quality=0`, `satellites=0`), so it is not fresh GPS
+evidence. The private client output, which contained coordinates, was deleted.
+Location was left on with the receiver idle.
+
 ## 2026-10-26 v48 cellular test
 
 The repository was merged with upstream `fe65fa6` while preserving the Myron
