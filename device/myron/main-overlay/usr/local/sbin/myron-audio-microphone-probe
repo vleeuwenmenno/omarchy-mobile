@@ -1,0 +1,87 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Derived from myron-postmarketos Attempt 78's proven one-second mic probe.
+# Source commit: a19c29b25a5e87d18a8234159694844a485fd497
+# Source SHA-256: e16d7edcb08e0abc999e757f8af5ac4d796c7521dd8ac50ce2723c448daa8ff8
+# Raw capture and tool output live only in /run and are removed on every exit.
+set -eu
+
+expected_confirmation=CAPTURE-ONE-SECOND-BUILTIN-MIC
+capture=
+capture_log=
+old_cap=
+old_mux=
+old_volume=
+child=
+cleanup_ok=yes
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+get_value() { amixer -c 0 cget "name=$1" | sed -n 's/^  : values=//p' | tail -n 1; }
+set_value() { amixer -q -c 0 cset "name=$1" "$2"; }
+cleanup() {
+	rc=$?
+	trap - EXIT HUP INT TERM
+	[ -z "$child" ] || kill "$child" >/dev/null 2>&1 || cleanup_ok=no
+	[ -z "$child" ] || wait "$child" >/dev/null 2>&1 || true
+	[ -z "$old_cap" ] || set_value 'TX_AIF1_CAP Mixer DEC2' "$old_cap" || cleanup_ok=no
+	[ -z "$old_mux" ] || set_value 'TX DMIC MUX2' "$old_mux" || cleanup_ok=no
+	[ -z "$old_volume" ] || set_value 'TX_DEC2 Volume' "$old_volume" || cleanup_ok=no
+	[ -z "$capture" ] || rm -f -- "$capture"
+	[ -z "$capture_log" ] || rm -f -- "$capture_log"
+	[ "$cleanup_ok" = yes ] || exit 1
+	exit "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+
+[ "$(id -u)" = 0 ] || fail 'run this probe as root'
+[ "${CONFIRM_AUDIO_MIC_CAPTURE:-}" = "$expected_confirmation" ] ||
+	fail 'set CONFIRM_AUDIO_MIC_CAPTURE=CAPTURE-ONE-SECOND-BUILTIN-MIC'
+grep -Fq canoe-mtp-snd-card /proc/asound/cards 2>/dev/null || fail 'Canoe ALSA card is not registered'
+[ -c /dev/snd/controlC0 ] || fail 'missing physical ALSA control device'
+command -v agmcap >/dev/null || fail 'agmcap is not installed'
+command -v timeout >/dev/null || fail 'timeout is not installed'
+for config in /etc/card-defs.xml /etc/backend_conf.xml /etc/acdbdata/acdb_cal.acdb; do
+	[ -r "$config" ] || fail "missing AudioReach input: $config"
+done
+! pgrep -x agmcap >/dev/null 2>&1 || fail 'another AGM capture process is active'
+! pgrep -x agmplay >/dev/null 2>&1 || fail 'AGM playback must remain inactive'
+
+old_cap=$(get_value 'TX_AIF1_CAP Mixer DEC2')
+old_mux=$(get_value 'TX DMIC MUX2')
+old_volume=$(get_value 'TX_DEC2 Volume')
+set_value 'TX_AIF1_CAP Mixer DEC2' 1
+set_value 'TX DMIC MUX2' DMIC0
+set_value 'TX_DEC2 Volume' 85
+
+capture=$(mktemp /run/myron-mic.XXXXXX.wav)
+capture_log=$(mktemp /run/myron-mic.XXXXXX.log)
+timeout -s TERM -k 2 5 agmcap "$capture" \
+	-D 100 -d 101 -c 1 -r 48000 -b 16 -T 1 \
+	-i CODEC_DMA-LPAIF_RXTX-TX-3 \
+	-skv 0xB1000001 -dkv 0xA3000001 -ikv 1 >"$capture_log" 2>&1 &
+child=$!
+wait "$child" || fail 'one-second AudioReach microphone capture failed or timed out'
+child=
+
+bytes=$(wc -c <"$capture" | tr -d ' ')
+stats=$(dd if="$capture" bs=44 skip=1 2>/dev/null | od -An -v -td2 | awk '
+	{ for (i = 1; i <= NF; i++) { frames++; if ($i + 0 != 0) nonzero++ } }
+	END { printf "%d %d", frames, nonzero }')
+# Intentional split of two decimal aggregate fields.
+# shellcheck disable=SC2086
+set -- $stats
+[ "$bytes" -gt 44 ] || fail 'capture contains no PCM payload'
+[ "$1" -gt 0 ] && [ "$1" -le 48000 ] || fail 'capture frame count is outside one second'
+[ "$2" -gt 0 ] && [ "$2" -le "$1" ] || fail 'capture contains no nonzero samples'
+
+# Restore before publishing success. The EXIT trap repeats this idempotently.
+set_value 'TX_AIF1_CAP Mixer DEC2' "$old_cap"
+set_value 'TX DMIC MUX2' "$old_mux"
+set_value 'TX_DEC2 Volume' "$old_volume"
+rm -f -- "$capture" "$capture_log"
+old_cap=''
+old_mux=''
+old_volume=''
+capture=''
+capture_log=''
+printf 'format=mono-s16le-48000\nframes=%s\nnonzero_samples=%s\ncapture_discarded=yes\ncontrols_restored=yes\n' "$1" "$2"

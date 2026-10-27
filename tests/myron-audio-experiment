@@ -1,0 +1,449 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline fault matrix for persistent-main-derived, one-shot audio experiments.
+# Uses only temporary files and fake commands; no audio or hardware is touched.
+# shellcheck disable=SC2016
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+# shellcheck source=/dev/null
+source tests/lib/myron-sh-harness.sh
+
+runner=device/myron/main-overlay/usr/local/sbin/myron-audio-experiment
+mic_probe=device/myron/main-overlay/usr/local/sbin/myron-audio-microphone-probe
+unit=device/myron/main-overlay/usr/lib/systemd/system/myron-audio-experiment.service
+stage=device/myron/hardware-test-overlay/usr/local/sbin/myron-audio-stage
+bridge=device/myron/hardware-test-overlay/usr/local/sbin/myron-microphone-bridge
+compose=tools/myron-dev-image-compose
+init_stage=device/myron/main-initramfs/stage.sh
+speaker=device/myron/audio-experiment/attempt78-live-audio-speaker-probe.sh
+provenance=device/myron/audio-experiment/README.md
+
+for file in "$runner" "$mic_probe" "$stage" "$bridge" "$init_stage"; do
+  sh -n "$file" || fail "$file does not parse as POSIX sh"
+  bash -n "$file" || fail "$file does not parse as bash"
+done
+bash -n "$compose" || fail 'composer does not parse'
+grep -Fq 'tests/myron-audio-experiment' tests/all || fail 'tests/all does not run this test'
+pass 'audio experiment scripts parse and tests/all runs this test'
+
+speaker_sha=6f8fca8b0920ef9a3a949f099b16472646a472a2657bd32a03b36a2c68736095
+[[ $(sha256sum <"$speaker" | cut -d' ' -f1) == "$speaker_sha" ]] ||
+  fail 'vendored speaker probe differs from reviewed Attempt 78 bytes'
+grep -Fq "$speaker_sha" "$provenance" || fail 'speaker provenance lacks pinned checksum'
+grep -Fq 'a19c29b25a5e87d18a8234159694844a485fd497' "$provenance" ||
+  fail 'speaker provenance lacks reviewed public commit'
+grep -Fq 'SPDX-License-Identifier: MIT' "$provenance" || fail 'speaker provenance lacks MIT SPDX declaration'
+if grep -Fq '/home/menno/Work/myron-postmarketos' "$compose"; then
+  fail 'composer depends on a sibling myron-postmarketos checkout'
+fi
+grep -Fq '/audio-experiment-source/attempt78-live-audio-speaker-probe.sh' "$compose" ||
+  fail 'composer does not install the in-repository speaker probe'
+grep -Fq "speaker_experiment_sha=$speaker_sha" "$compose" ||
+  fail 'composer does not pin the reviewed speaker checksum'
+grep -Fq "sha256sum <\"\$speaker_experiment\"" "$compose" ||
+  fail 'composer does not byte-verify the in-repository speaker source'
+grep -Fq "cat /usr/local/libexec/myron-audio-experiment/speaker-probe.sh" "$compose" ||
+  fail 'composer does not byte-verify the speaker probe in the image'
+pass 'speaker source is vendored, MIT-cited, pinned and image-byte-verified without sibling checkout dependency'
+
+grep -Fq '[--profile coexistence|cellular|audio-speaker|audio-microphone]' "$compose" ||
+  fail 'composer does not expose two explicit audio modes'
+grep -Fq 'audio experiment profiles require --boot-policy main' "$compose" ||
+  fail 'composer permits temporary audio experiment images'
+grep -Fq 'effective_profile=cellular' "$compose" || fail 'audio profiles do not retain the cellular init contract'
+grep -Fq 'if test "$MYRON_BOOT_POLICY" = main; then' "$compose" ||
+  fail 'main overlay is not selected solely by main boot policy'
+grep -Fq 'test "$MYRON_COMPOSE_PROFILE" = cellular' "$compose" ||
+  fail 'cellular publisher is not restricted away from audio profiles'
+grep -Fq 'mask ModemManager.service' "$compose" || fail 'audio compose path does not mask ModemManager'
+grep -Fq 'myron-reference-audio-foundation.service myron-speaker-bridge.service' "$compose" ||
+  fail 'audio compose path does not mask legacy audio services'
+grep -Fq 'myron-microphone-bridge.service >/dev/null' "$compose" ||
+  fail 'audio compose path does not mask the legacy microphone bridge'
+grep -Fq 'myron-omarchy-qualify.service myron-coexistence.service' "$compose" ||
+  fail 'audio compose path does not disable coexistence services'
+grep -Fq 'myron-cellular.service myron-cellular-publish.service' "$compose" ||
+  fail 'audio compose path does not disable cellular services'
+grep -Fq 'speaker image contains the microphone experiment probe' "$compose" ||
+  fail 'speaker image does not reject the microphone probe'
+grep -Fq 'microphone image contains the speaker experiment probe' "$compose" ||
+  fail 'microphone image does not reject the speaker probe'
+pass 'composer separates audio images, retains effective cellular profile and applies main overlay to both'
+
+grep -Fxq 'Before=myron-omarchy-qualify.service myron-cellular.service ModemManager.service' "$unit" ||
+  fail 'audio unit does not precede qualification and radio admission'
+grep -Fq 'disable myron-reference-wifi-import.service' "$compose" ||
+  fail 'audio compose path permits automatic Wi-Fi import before request consumption'
+grep -Fq 'myron-batterysecret.service myron-omarchy-prepare.service' "$compose" ||
+  fail 'audio compose path permits automatic hardware preparation before request consumption'
+grep -Fxq 'OnFailure=myron-main-recover.service' "$unit" || fail 'audio unit lacks automatic main recovery'
+grep -Fxq 'ExecStopPost=/usr/local/sbin/myron-audio-experiment finish' "$unit" ||
+  fail 'audio unit lacks the recovery/cleanup exit hook'
+grep -Fxq 'TimeoutStartSec=10min' "$unit" || fail 'audio unit lacks its sub-guard deadline'
+grep -Fq 'guard_deadline_seconds=1200' device/myron/main-overlay/usr/local/sbin/myron-main-os ||
+  fail 'main guard deadline is not the expected 1200 seconds'
+for proof in 'ActiveState' 'SubState' 'MainPID' 'kill -0'; do
+  grep -Fq "$proof" "$runner" || fail "experiment runner lacks strong guard proof: $proof"
+  grep -Fq "$proof" "$stage" || fail "audio stage lacks strong guard proof: $proof"
+done
+if sed -n '/^arm_test()/,/^require_arm()/p' "$stage" |
+  grep -F 'is-active myron-hardware-watchdog.service'; then
+  fail 'audio arm stage still uses the active/exited-compatible guard check'
+fi
+grep -Fq 'kernel=%s' "$init_stage" || fail 'main init request lacks a kernel field'
+grep -Fq 'audio-experiment.request' "$init_stage" ||
+  fail 'main init does not create the audio-specific request'
+grep -Fq '[ "$(grep -c . "$pending")" = 2 ]' "$runner" ||
+  fail 'audio runner does not preserve the existing two-line generic pending format'
+pass 'unit ordering, deadline and live-PID guard contracts are explicit; kernel proof stays audio-specific'
+
+grep -Fq 'duration=${MYRON_MIC_SECONDS:-3}' "$bridge" || fail 'legacy microphone bridge default is not tightly bounded'
+grep -Fq '[ "$duration" -ge 1 ] && [ "$duration" -le 3 ]' "$bridge" ||
+  fail 'legacy microphone bridge accepts more than three seconds'
+if grep -Fq 86400 "$bridge"; then fail 'legacy microphone bridge retains the 86400-second bound'; fi
+grep -Fq 'mktemp /run/myron-mic.' "$mic_probe" || fail 'microphone probe raw capture is not runtime-only'
+grep -Fq -- '-T 1' "$mic_probe" || fail 'microphone capture is not limited to one second'
+grep -Fq 'timeout -s TERM -k 2 5 agmcap' "$mic_probe" || fail 'microphone loader lacks a five-second bound'
+grep -Fq 'capture_discarded=yes' "$mic_probe" || fail 'microphone probe does not report capture disposal'
+grep -Fq 'controls_restored=yes' "$mic_probe" || fail 'microphone probe does not report control restoration'
+if grep -Eq '/data|/var|peak_absolute|capture_bytes' "$mic_probe"; then
+  fail 'microphone probe persists or reports raw/unique sample detail'
+fi
+pass 'microphone path is one second, aggregate-only, runtime-only and restores controls'
+
+work=$(mktemp -d /tmp/myron-audio-experiment.XXXXXX)
+guard_one=''
+guard_two=''
+cleanup_test() {
+  [[ -z $guard_one ]] || kill "$guard_one" >/dev/null 2>&1 || true
+  [[ -z $guard_two ]] || kill "$guard_two" >/dev/null 2>&1 || true
+  rm -rf -- "$work"
+}
+trap cleanup_test EXIT
+sleep 600 & guard_one=$!
+sleep 600 & guard_two=$!
+
+boot_id=11111111-2222-3333-4444-555555555555
+other_boot=99999999-2222-3333-4444-555555555555
+image_id=0123456789abcdef0123456789abcdef
+kernel=$(uname -r)
+case_root=
+audio_rc=0
+
+make_script() { chmod +x "$1"; }
+fixture() {
+  local mode=${1:-audio-speaker}
+  case_root=$work/case
+  rm -rf -- "$case_root"
+  mkdir -p "$case_root/bin" "$case_root/main" "$case_root/host" "$case_root/runtime" "$case_root/etc" "$case_root/omamobile"
+  printf '%s\n' "$mode" >"$case_root/etc/mode"
+  printf '%s\n' cellular >"$case_root/etc/profile"
+  printf '%s\n' "$boot_id" >"$case_root/boot-id"
+  printf '%s\n' "$boot_id" >"$case_root/runtime/boot-id"
+  printf '%s\n' "$image_id" >"$case_root/runtime/image-id"
+  printf '%s\n' "$kernel" >"$case_root/runtime/kernel-release"
+  printf 'boot_id=%s\nimage_id=%s\n' "$boot_id" "$image_id" >"$case_root/main/pending"
+  printf 'mode=main\nboot_id=%s\nimage_id=%s\n' "$boot_id" "$image_id" >"$case_root/host/hardware-test.armed"
+  printf 'mode=%s\nboot_id=%s\nimage_id=%s\nkernel=%s\n' "$mode" "$boot_id" "$image_id" "$kernel" \
+    >"$case_root/runtime/audio-experiment.request"
+  printf 'old-cellular-evidence\n' >"$case_root/main/cellular-evidence"
+  chmod 0644 "$case_root/etc/mode" "$case_root/etc/profile" "$case_root/boot-id" \
+    "$case_root/runtime/boot-id" "$case_root/runtime/image-id" "$case_root/runtime/kernel-release"
+  chmod 0600 "$case_root/main/pending" "$case_root/main/cellular-evidence" \
+    "$case_root/host/hardware-test.armed" "$case_root/runtime/audio-experiment.request"
+  printf '%s\n' active >"$case_root/guard-active"
+  printf '%s\n' running >"$case_root/guard-sub"
+  printf '%s\n' "$guard_one" >"$case_root/guard-pid"
+  printf '%s\n' "$guard_two" >"$case_root/guard-alt-pid"
+  : >"$case_root/calls"
+
+  cat >"$case_root/bin/systemctl" <<'SH'
+#!/bin/sh
+root=${CASE_ROOT:?}
+unit=${2:-}
+property=${4:-}
+case ${1:-}:$unit:$property in
+  show:myron-hardware-watchdog.service:ActiveState) cat "$root/guard-active" ;;
+  show:myron-hardware-watchdog.service:SubState) cat "$root/guard-sub" ;;
+  show:myron-hardware-watchdog.service:MainPID) cat "$root/guard-pid" ;;
+  show:ModemManager.service:LoadState) printf '%s\n' masked ;;
+  show:ModemManager.service:ActiveState) cat "$root/mm-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:ModemManager.service:InvocationID) cat "$root/mm-invocation" 2>/dev/null || true ;;
+  show:myron-cellular.service:ActiveState) cat "$root/cellular-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:myron-coexistence.service:ActiveState) cat "$root/coexistence-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:myron-reference-audio-foundation.service:LoadState|show:myron-speaker-bridge.service:LoadState|show:myron-microphone-bridge.service:LoadState) printf '%s\n' masked ;;
+  show:myron-reference-audio-foundation.service:ActiveState|show:myron-speaker-bridge.service:ActiveState|show:myron-microphone-bridge.service:ActiveState) cat "$root/legacy-audio-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:myron-reference-audio-foundation.service:InvocationID|show:myron-speaker-bridge.service:InvocationID|show:myron-microphone-bridge.service:InvocationID) cat "$root/legacy-audio-invocation" 2>/dev/null || true ;;
+  is-enabled:myron-cellular.service:) printf '%s\n' disabled ;;
+  is-enabled:myron-coexistence.service:) printf '%s\n' disabled ;;
+  start:*) printf 'systemctl %s\n' "$*" >>"$root/calls" ;;
+  *) exit 1 ;;
+esac
+SH
+  cat >"$case_root/bin/pgrep" <<'SH'
+#!/bin/sh
+test -e "${CASE_ROOT:?}/pgrep-${2:-unknown}"
+SH
+  cat >"$case_root/bin/pkill" <<'SH'
+#!/bin/sh
+printf 'pkill %s\n' "$*" >>"${CASE_ROOT:?}/calls"
+SH
+  cat >"$case_root/bin/audio-stage" <<'SH'
+#!/bin/sh
+root=${CASE_ROOT:?}
+printf 'stage %s\n' "$1" >>"$root/calls"
+if test -f "$root/change-guard-stage" && test "$(cat "$root/change-guard-stage")" = "$1"; then
+  cp "$root/guard-alt-pid" "$root/guard-pid"
+fi
+if test -f "$root/fail-stage" && test "$(cat "$root/fail-stage")" = "$1"; then exit 1; fi
+SH
+  cat >"$case_root/bin/readiness" <<'SH'
+#!/bin/sh
+printf '%s\n' readiness >>"${CASE_ROOT:?}/calls"
+SH
+  cat >"$case_root/bin/powerdown" <<'SH'
+#!/bin/sh
+printf '%s\n' powerdown >>"${CASE_ROOT:?}/calls"
+test ! -e "$CASE_ROOT/fail-powerdown"
+SH
+  cat >"$case_root/bin/main-os" <<'SH'
+#!/bin/sh
+printf 'main-os %s\n' "$*" >>"${CASE_ROOT:?}/calls"
+test ! -e "$CASE_ROOT/fail-recovery"
+SH
+  cat >"$case_root/bin/timeout" <<'SH'
+#!/bin/sh
+root=${CASE_ROOT:?}
+probe=no
+for arg do
+  case $arg in "$root/bin/speaker-probe"|"$root/bin/microphone-probe") probe=yes ;; esac
+done
+if test "$probe" = yes && test -e "$root/timeout-probe"; then
+  rm -f "$root/timeout-probe"
+  exit 124
+fi
+test "${1:-}" != -s || shift 2
+test "${1:-}" != -k || shift 2
+shift
+exec "$@"
+SH
+  printf '#!/bin/sh\nprintf "%%s\\n" speaker >>%s\nprintf "%%s\\n" "%s"\n' \
+    "$case_root/probes" \
+    'PASS: one 250 ms stereo speaker probe completed at approximately -45 dBFS; TFA returned to Powerdown' \
+    >"$case_root/bin/speaker-probe"
+  cat >"$case_root/bin/microphone-probe" <<'SH'
+#!/bin/sh
+printf '%s\n' microphone >>"${CASE_ROOT:?}/probes"
+printf '%s\n' 'format=mono-s16le-48000' 'frames=48000' 'nonzero_samples=321' 'capture_discarded=yes' 'controls_restored=yes'
+SH
+  chmod +x "$case_root"/bin/*
+}
+
+audio_command() {
+  local speaker_fake_sha
+  speaker_fake_sha=$(sha256sum <"$case_root/bin/speaker-probe" | cut -d' ' -f1)
+  env \
+    CASE_ROOT="$case_root" \
+    MYRON_AUDIO_TEST_ROOT="$case_root" \
+    MYRON_AUDIO_EXPECTED_KERNEL="$kernel" \
+    MYRON_AUDIO_MODE_FILE="$case_root/etc/mode" \
+    MYRON_AUDIO_PROFILE_FILE="$case_root/etc/profile" \
+    MYRON_AUDIO_MAIN_STATE="$case_root/main" \
+    MYRON_AUDIO_HOST_STATE="$case_root/host" \
+    MYRON_AUDIO_RUNTIME="$case_root/runtime" \
+    MYRON_AUDIO_EXPERIMENT_RUNTIME="$case_root/audio-runtime" \
+    MYRON_AUDIO_BOOT_ID_FILE="$case_root/boot-id" \
+    MYRON_AUDIO_LOG="$case_root/audio.log" \
+    MYRON_AUDIO_SYSTEMCTL="$case_root/bin/systemctl" \
+    MYRON_AUDIO_PGREP="$case_root/bin/pgrep" \
+    MYRON_AUDIO_PKILL="$case_root/bin/pkill" \
+    MYRON_AUDIO_TIMEOUT="$case_root/bin/timeout" \
+    MYRON_AUDIO_STAGE="$case_root/bin/audio-stage" \
+    MYRON_AUDIO_READINESS_HELPER="$case_root/bin/readiness" \
+    MYRON_AUDIO_POWERDOWN="$case_root/bin/powerdown" \
+    MYRON_AUDIO_MAIN_OS="$case_root/bin/main-os" \
+    MYRON_AUDIO_SPEAKER_PROBE="$case_root/bin/speaker-probe" \
+    MYRON_AUDIO_SPEAKER_SHA="$speaker_fake_sha" \
+    MYRON_AUDIO_MICROPHONE_PROBE="$case_root/bin/microphone-probe" \
+    MYRON_AUDIO_OMAMOBILE_RUNTIME="$case_root/omamobile" \
+    MYRON_AUDIO_WIRELESS_READY="$case_root/wireless-ready" \
+    sh "$runner" "$@"
+}
+
+run_audio() {
+  audio_rc=0
+  audio_command run >"$case_root/output" 2>&1 || audio_rc=$?
+}
+
+expect_recover() {
+  local reason=$1
+  grep -Fxq "main-os recover --reason $reason" "$case_root/calls" ||
+    fail "automatic recovery reason differs: wanted $reason"
+}
+expect_no_probe() {
+  [[ ! -e $case_root/probes ]] || fail 'a refused experiment reached a probe'
+}
+
+# Successful speaker: exact ordered stages, one probe, evidence invalidation,
+# cleanup and normal recovery. Re-entry cannot replay the consumed request.
+fixture audio-speaker
+run_audio
+[[ $audio_rc == 0 ]] || { cat "$case_root/output"; fail 'speaker fixture did not complete'; }
+[[ $(cat "$case_root/probes") == speaker ]] || fail 'speaker mode did not run exactly one speaker probe'
+[[ $(grep -c '^stage ' "$case_root/calls") == 8 ]] || fail 'speaker mode did not run exactly eight hardware stages'
+[[ $(grep '^stage ' "$case_root/calls" | tr '\n' ' ') == 'stage arm stage mapper stage transport stage adsp stage codecs stage devnodes stage fastrpc stage speaker-dsp ' ]] ||
+  fail 'speaker hardware stages are missing, repeated or out of order'
+[[ ! -e $case_root/main/cellular-evidence ]] || fail 'speaker experiment retained cellular evidence'
+[[ -f $case_root/runtime/audio-experiment.consumed && ! -e $case_root/runtime/audio-experiment.request ]] ||
+  fail 'speaker request was not consumed atomically before hardware work'
+[[ ! -e $case_root/audio-runtime/speaker-probe.log ]] || fail 'speaker probe output survived cleanup'
+grep -Fxq powerdown "$case_root/calls" || fail 'speaker completion did not force powerdown'
+expect_recover audio-speaker-complete
+run_audio
+[[ $audio_rc != 0 ]] || fail 'consumed speaker request replayed in the same boot'
+[[ $(wc -l <"$case_root/probes") == 1 ]] || fail 'same-boot replay ran a second speaker probe'
+pass 'speaker mode consumes once, stages once, probes once, powers down and automatically recovers'
+
+# Successful microphone remains separated from speaker and persists aggregate
+# values only; its temporary capture output is removed by the runner.
+fixture audio-microphone
+run_audio
+[[ $audio_rc == 0 ]] || { cat "$case_root/output"; fail 'microphone fixture did not complete'; }
+[[ $(cat "$case_root/probes") == microphone ]] || fail 'microphone mode did not run exactly one microphone probe'
+[[ $(grep -c '^stage ' "$case_root/calls") == 7 ]] || fail 'microphone mode ran a speaker-only or repeated stage'
+if grep -Fq 'stage speaker-dsp' "$case_root/calls"; then fail 'microphone mode ran speaker DSP stage'; fi
+if grep -Eq 'peak|sample|raw_data|capture_bytes' "$case_root/audio.log"; then
+  fail 'microphone persistent log contains raw or unique sample detail'
+fi
+grep -Fq 'kind=microphone format=mono-s16le-48000 frames=48000 nonzero=321 raw=discarded' "$case_root/audio.log" ||
+  fail 'microphone persistent log lacks bounded aggregate result'
+[[ ! -e $case_root/audio-runtime/microphone-probe.log ]] || fail 'microphone probe output survived cleanup'
+expect_recover audio-microphone-complete
+pass 'microphone mode is separate, aggregate-only, cleaned and automatically recovered'
+
+# Wrong boot, wrong image/kernel and an already committed boot all fail before
+# request consumption or hardware mutation, while still requesting recovery.
+fixture; sed -i "s/$boot_id/$other_boot/" "$case_root/main/pending"; run_audio
+[[ $audio_rc != 0 ]] || fail 'wrong pending boot was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; sed -i "s/$image_id/deadbeefdeadbeefdeadbeefdeadbeef/" "$case_root/main/pending"; run_audio
+[[ $audio_rc != 0 ]] || fail 'wrong pending image was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; sed -i 's/^kernel=.*/kernel=wrong-kernel/' "$case_root/runtime/audio-experiment.request"; run_audio
+[[ $audio_rc != 0 ]] || fail 'wrong request kernel was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; : >"$case_root/main/success"; run_audio
+[[ $audio_rc != 0 ]] || fail 'committed boot was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+pass 'wrong boot/image/kernel and committed boot fail closed before hardware mutation'
+
+# Guard must be active/running with a stable live PID, not active/exited.
+fixture; printf '%s\n' exited >"$case_root/guard-sub"; run_audio
+[[ $audio_rc != 0 ]] || fail 'active/exited guard was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; printf '%s\n' 99999999 >"$case_root/guard-pid"; run_audio
+[[ $audio_rc != 0 ]] || fail 'dead guard PID was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; printf '%s\n' mapper >"$case_root/change-guard-stage"; run_audio
+[[ $audio_rc != 0 ]] || fail 'changed guard PID was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+[[ $(grep -c '^stage ' "$case_root/calls") == 2 ]] || fail 'changed guard PID was not caught before the next stage'
+pass 'active/exited, dead and changed watchdog PIDs fail before probe'
+
+# Prior MM/GNSS admission blocks the experiment even when currently inactive.
+fixture; printf '%s\n' admitted-invocation >"$case_root/mm-invocation"; run_audio
+[[ $audio_rc != 0 ]] || fail 'prior ModemManager admission was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; mkdir "$case_root/omamobile/gnss-admission"; run_audio
+[[ $audio_rc != 0 ]] || fail 'prior GNSS admission was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; printf '%s\n' active >"$case_root/coexistence-active"; run_audio
+[[ $audio_rc != 0 ]] || fail 'active coexistence service was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+fixture; printf '%s\n' admitted >"$case_root/legacy-audio-invocation"; run_audio
+[[ $audio_rc != 0 ]] || fail 'prior legacy audio admission was accepted'; expect_no_probe; expect_recover audio-experiment-failed
+pass 'ModemManager, GNSS, coexistence and legacy-audio admission evidence fail closed before AudioReach'
+
+# Partial stage failure, probe timeout and cleanup failure each stop progress,
+# clean/power down and recover. None gets a second probe.
+fixture; printf '%s\n' codecs >"$case_root/fail-stage"; run_audio
+[[ $audio_rc != 0 ]] || fail 'partial hardware-stage failure was accepted'; expect_no_probe
+[[ $(grep -c '^stage ' "$case_root/calls") == 5 ]] || fail 'partial stage failure did not stop at codecs'
+grep -Fxq powerdown "$case_root/calls" || fail 'partial stage failure did not power down'; expect_recover audio-experiment-failed
+fixture; : >"$case_root/timeout-probe"; run_audio
+[[ $audio_rc != 0 ]] || fail 'probe timeout was accepted'
+[[ ! -e $case_root/probes ]] || fail 'timeout wrapper executed the probe'
+grep -Fxq powerdown "$case_root/calls" || fail 'probe timeout did not power down'; expect_recover audio-experiment-timeout
+fixture; : >"$case_root/fail-powerdown"; run_audio
+[[ $audio_rc != 0 ]] || fail 'cleanup failure returned success'
+[[ $(wc -l <"$case_root/probes") == 1 ]] || fail 'cleanup failure changed the one-probe limit'
+expect_recover audio-cleanup-failed
+pass 'partial stage, timeout and cleanup failures stop once, power down where possible and recover'
+
+# ExecStopPost retries a failed recovery call without relabeling a completed
+# probe as a failure. It never re-enters hardware or runs another probe.
+fixture; : >"$case_root/fail-recovery"; run_audio
+[[ $audio_rc != 0 && $(wc -l <"$case_root/probes") == 1 ]] ||
+  fail 'failed first recovery did not fail the service while staying one-shot'
+[[ $(grep -c '^main-os recover' "$case_root/calls") == 1 ]] || fail 'first recovery was not attempted exactly once'
+rm -f "$case_root/fail-recovery"
+audio_command finish >"$case_root/finish-output" 2>&1 || fail 'ExecStopPost recovery retry failed'
+[[ $(grep -c '^main-os recover --reason audio-speaker-complete$' "$case_root/calls") == 2 ]] ||
+  fail 'ExecStopPost changed the completed-probe recovery reason'
+[[ $(wc -l <"$case_root/probes") == 1 ]] || fail 'ExecStopPost replayed the probe'
+pass 'ExecStopPost retries recovery with the completed mode reason and never replays hardware'
+
+# Admission barriers cover all external entry points and cellular evidence.
+for file in \
+  device/myron/hardware-test-overlay/usr/local/sbin/myron-modemmanager-start \
+  device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-start \
+  device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage \
+  device/myron/main-overlay/usr/local/sbin/myron-cellular-op \
+  device/myron/main-overlay/usr/local/bin/myron-mobile-data \
+  device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss; do
+  grep -Fq 'myron-audio-experiment' "$file" || fail "$file does not block the audio experiment"
+done
+grep -Fq 'gnss-admission' device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss ||
+  fail 'GNSS mutations do not leave boot-scoped admission evidence'
+grep -Fq 'evidence=invalid' device/myron/main-overlay/usr/local/sbin/myron-cellular-op ||
+  fail 'cellular evidence-check is not invalidated by audio mode'
+
+# Execute each external admission boundary with an audio marker. Every one
+# must refuse before it can grant admission, start a service or mutate state.
+entry=$work/entry
+entry_bin=$entry/bin
+marker=$entry/myron-audio-experiment
+mkdir -p "$entry_bin" "$entry/runtime"
+printf '%s\n' audio-speaker >"$marker"
+printf '%s\n' "$boot_id" >"$entry/boot-id"
+printf '#!/bin/sh\nprintf "0\\n"\n' >"$entry_bin/id"
+chmod +x "$entry_bin/id"
+blocked() {
+  local name=$1 script=$2 out rc=0
+  shift 2
+  out=$(PATH="$entry_bin:$PATH" sh "$script" "$@" 2>&1) || rc=$?
+  [[ $rc != 0 && $out == *'audio experiment'* ]] ||
+    fail "$name did not behaviorally block audio mode: rc=$rc output=$out"
+}
+
+sh_patch device/myron/hardware-test-overlay/usr/local/sbin/myron-modemmanager-start "$entry/mm" \
+  "audio_experiment=$marker" "boot_id_file=$entry/boot-id" "runtime=$entry/runtime" \
+  "allowed=$entry/runtime/modem-manager-allowed" "admission=$entry/runtime/modem-manager-admission" \
+  "modem_manager=$entry/ModemManager"
+blocked ModemManager "$entry/mm"
+[[ ! -e $entry/runtime/modem-manager-admission ]] || fail 'blocked ModemManager created admission state'
+
+sh_patch device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-start "$entry/cellular-start" \
+  "audio_experiment=$marker"
+blocked cellular-start "$entry/cellular-start"
+
+sh_patch device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage "$entry/cellular-stage" \
+  "audio_experiment=$marker"
+blocked cellular-stage "$entry/cellular-stage" status
+
+sh_patch device/myron/main-overlay/usr/local/sbin/myron-cellular-op "$entry/cellular-op" \
+  "audio_experiment=$marker" "log=$entry/cellular-op.log"
+blocked cellular-op "$entry/cellular-op" status
+
+sh_patch device/myron/main-overlay/usr/local/bin/myron-mobile-data "$entry/mobile-data" \
+  "audio_experiment=$marker"
+blocked mobile-data "$entry/mobile-data" on
+
+sh_patch device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss "$entry/gnss" \
+  "audio_experiment=$marker" "admission=$entry/runtime/gnss-admission"
+blocked GNSS "$entry/gnss" status
+[[ ! -e $entry/runtime/gnss-admission ]] || fail 'blocked GNSS created admission state'
+pass 'ModemManager, GNSS, cellular and mobile-data entry points behaviorally block audio-mode admission'

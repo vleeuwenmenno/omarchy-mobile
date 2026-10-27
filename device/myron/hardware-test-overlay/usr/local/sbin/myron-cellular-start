@@ -18,6 +18,7 @@ runtime=/run/omamobile-myron
 ready=/run/myron-cellular-ready
 wireless_ready=/run/myron-wireless-ready
 profile_file=/etc/omamobile/myron-test-profile
+audio_experiment=/etc/omamobile/myron-audio-experiment
 host_arm=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
 rmnet_marker=/etc/myron/use-in-tree-rmnet
 nm_inhibit=/etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf
@@ -67,6 +68,8 @@ require_temperature() {
 
 check_profile_gates() {
 	[ "$(id -u)" = 0 ] || fail 'must run as root'
+	[ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] ||
+		fail 'cellular admission is blocked by the one-shot audio experiment'
 	[ -f "$host_arm" ] ||
 		fail 'temporary hardware-test arm is absent'
 	systemctl --quiet is-active myron-hardware-watchdog.service ||

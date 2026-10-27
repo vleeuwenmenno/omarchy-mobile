@@ -70,6 +70,17 @@ mapper_is_bound() {
 		-maxdepth 1 -name 'rproc_qcom_common.pd-mapper.*' 2>/dev/null | grep -q .
 }
 
+require_guard_running() {
+	active=$(systemctl show myron-hardware-watchdog.service -p ActiveState --value 2>/dev/null || true)
+	sub=$(systemctl show myron-hardware-watchdog.service -p SubState --value 2>/dev/null || true)
+	pid=$(systemctl show myron-hardware-watchdog.service -p MainPID --value 2>/dev/null || true)
+	[ "$active" = active ] || fail 'hardware guard is not active'
+	[ "$sub" = running ] || fail 'hardware guard is not running'
+	case $pid in ''|*[!0-9]*) fail 'hardware guard MainPID is invalid' ;; esac
+	[ "$pid" -gt 1 ] || fail 'hardware guard MainPID is not live'
+	kill -0 "$pid" 2>/dev/null || fail 'hardware guard MainPID is not live'
+}
+
 load_module() {
 	file=$1
 	module_name=${2:-}
@@ -99,6 +110,7 @@ require_common() {
 		fail 'radio foundation service is not active'
 	! pgrep -x ModemManager >/dev/null ||
 		fail 'ModemManager or GNSS must not run in the audio boot'
+	require_guard_running
 	[ "$(cat /sys/module/firmware_class/parameters/path 2>/dev/null || true)" = \
 		'/run/myron-wireless/firmware/' ] || fail 'Myron firmware view is not active'
 	check_hash "$source_script" "$source_sha"
@@ -135,8 +147,7 @@ finish_stage() {
 arm_test() {
 	find_adsp
 	[ "$(cat "$adsp/state")" = offline ] || fail 'ADSP must be offline on a clean boot'
-	systemctl --quiet is-active myron-hardware-watchdog.service ||
-		fail 'the original rollback watchdog is no longer active'
+	require_guard_running
 	previous=$(read_state)
 	case "$previous" in
 		'') ;;

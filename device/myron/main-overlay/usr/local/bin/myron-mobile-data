@@ -23,6 +23,7 @@ set -u
 public_file=/run/myron-cellular/state
 boot_id_file=/proc/sys/kernel/random/boot_id
 enable_unit=myron-cellular-enable.service
+audio_experiment=/etc/omamobile/myron-audio-experiment
 modem_prefix=/org/freedesktop/ModemManager1/Modem/
 
 t() { timeout 2 "$@" 2>/dev/null; }
@@ -97,8 +98,18 @@ cmd_state() {
 }
 
 case "${1:-}" in
-state) cmd_state ;;
+state)
+	if [ -e "$audio_experiment" ] || [ -L "$audio_experiment" ]; then
+		printf '%s\n' 'data=none' 'data_status=Blocked by audio experiment' 'data_enable=0' 'data_busy=1'
+	else
+		cmd_state
+	fi
+	;;
 on)
+	[ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] || {
+		printf '%s\n' 'Mobile data is blocked by the one-shot audio experiment.' >&2
+		exit 1
+	}
 	compute
 	[ "$enable" = 1 ] || { printf 'Mobile data cannot be started now: %s\n' "${note:-unavailable}" >&2; exit 1; }
 	exec systemctl start --no-block "$enable_unit"

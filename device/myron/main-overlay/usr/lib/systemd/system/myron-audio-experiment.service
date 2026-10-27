@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=One-shot Myron main-boot audio experiment
+Requires=myron-hardware-watchdog.service
+After=myron-hardware-watchdog.service
+Before=myron-omarchy-qualify.service myron-cellular.service ModemManager.service
+Conflicts=myron-cellular.service myron-coexistence.service ModemManager.service myron-reference-audio-foundation.service myron-speaker-bridge.service myron-microphone-bridge.service
+ConditionPathExists=/etc/omamobile/myron-audio-experiment
+ConditionPathExists=/run/myron-main/audio-experiment.request
+OnFailure=myron-main-recover.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-audio-experiment run
+ExecStopPost=/usr/local/sbin/myron-audio-experiment finish
+TimeoutStartSec=10min
+TimeoutStopSec=150
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

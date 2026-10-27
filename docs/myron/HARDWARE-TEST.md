@@ -215,6 +215,13 @@ persistent log identifies the last attempted operation. Do not retry a failed
 stage in the same boot. Speaker output is not part of these stages and remains
 a separate low-volume safety test.
 
+Persistent-main-derived follow-up images now have separate `audio-speaker` and
+`audio-microphone` modes with one-shot admission, stronger live-PID watchdog
+checks, cellular/ModemManager/GNSS exclusion and automatic recovery. They
+remain offline-only and have not been deployed or run. Their approval boundary,
+expected result, stop conditions, rollback and residual risk are in
+[AUDIO-EXPERIMENT.md](AUDIO-EXPERIMENT.md).
+
 ## Artifact record
 
 The exact r4 pair that produced the evidence above is private and untracked:

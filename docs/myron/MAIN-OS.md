@@ -32,8 +32,8 @@ only, mode 700):
 | --- | --- |
 | `rootfs.img` | the Omarchy payload, a mutable ext4 image, root, mode 600, one link |
 | `rootfs.meta` | `size=<bytes>` and `fs_uuid=<32 hex>` of the deployed image |
-| `pending` | `boot_id` of the boot in progress and the image id, written durably before the payload is mounted |
-| `success` | `boot_id` and image id of the last qualified boot |
+| `pending` | exactly `boot_id` of the boot in progress and the image id, written durably before the payload is mounted |
+| `success` | exactly `boot_id` and image id of the last qualified boot |
 | `latch` | recovery latch; only `resume` removes it |
 | `guard.log` | bounded guard and control log |
 
@@ -53,7 +53,9 @@ final name, set mode 600 and owner root, `fsync`, then `mv` it into place.
 3. Select (above) before the USB gadget exists.
 4. Write the pending token (the kernel `boot_id`) durably, then loop-mount the
    payload and check: systemd, `ID=omarchy`, the unsigned development marker,
-   profile `cellular`, the main guard unit, the recovery unit and the control.
+   effective profile `cellular`, the main guard unit, the recovery unit and the
+   control. An audio experiment additionally needs one exact audio mode, its
+   runner, unit and enabled link.
 5. Copy BusyBox and its musl loader to `/run/myron-main/`, create the NCM-only
    USB rescue gadget (no ACM, no console, no shell), write the compatibility arm
    marker `hardware-test.armed` with `mode=main`, and move the mounts.
@@ -65,8 +67,8 @@ final name, set mode 600 and owner root, `fsync`, then `mv` it into place.
    executable proof, BusyBox run, control parse), the token files with
    readback, and the gadget. Immediately before the first mount move the arm,
    tokens, pending token and absence of a latch are verified again. The stage
-   also refuses a payload in which a critical main unit (guard, recover,
-   qualify, prepare, cellular, battery-secret) is shadowed by a unit or drop-in
+   also refuses a payload in which a critical main unit (guard, recover, audio
+   experiment, qualify, prepare, cellular, battery-secret) is shadowed by a unit or drop-in
    in `/etc`, `/usr/local/lib` or `/run`, or has any `/usr/lib` drop-in other
    than the provided `90-myron-main.conf`; the composer checks the same on the
    image and compares the drop-ins byte for byte.
@@ -85,7 +87,9 @@ The existing hardware units gate on `hardware-test.armed` and on
 with the main guard (same name, different job):
 
 * `guard-preflight` as `ExecStartPre`: the pending token must be this boot's
-  `boot_id`, no latch, state trusted; otherwise the unit fails.
+  `boot_id` and the running image ID, with no latch and trusted state;
+  otherwise the unit fails. This strengthens admission without changing the
+  established two-line pending/success formats.
 * `guard` waits up to 1200 s of uptime. A commit ends it with exit 0 and the
   unit stays active (`RemainAfterExit=yes`), so nothing that requires it is
   stopped and no 900 s timer remains. At the deadline it takes the lock,
@@ -109,11 +113,21 @@ with the main guard (same name, different job):
   it rechecks that the same Hyprland process is still alive (the 90 s stability
   window ends before the EGL and radio probes).
 
-Only the cellular profile is supported. The main boot starts the modem and
-Wi-Fi baseline but does not activate cellular data. `myron-cellular-stage`
-refuses the main runtime in `require_runtime_gates`: its time gates depend on
-the temporary rollback deadline. Audio and Bluetooth stay isolated from the
-cellular profile, as before.
+Production MAIN still supports only the cellular profile. The main boot starts
+the modem and Wi-Fi baseline but does not activate cellular data.
+`myron-cellular-stage` refuses the main runtime in `require_runtime_gates`: its
+time gates depend on the temporary rollback deadline.
+
+Two offline-only experimental compose profiles, `audio-speaker` and
+`audio-microphone`, keep the effective init profile `cellular` but add an exact
+audio marker and a separate mode/image/probe. Their generic pending and success
+tokens stay unchanged. The init instead creates a volatile, audio-specific
+request bound to mode, boot, image and kernel. Normal preparation,
+qualification, battery, cellular and publisher target links are disabled;
+ModemManager is masked; the one-shot runner consumes the request before it
+starts preparation/radio hardware. It always latches recovery and normally
+reboots to postmarketOS without committing the boot. See
+[AUDIO-EXPERIMENT.md](AUDIO-EXPERIMENT.md).
 
 ### Control
 
@@ -146,7 +160,9 @@ stays `temporary`):
 
 ```fish
 tools/myron-dev-image-compose --boot-policy main --profile cellular \
-  --base-image /abs/base.ext4 --module-stage /abs/modules --runtime-stage /abs/runtime \
+  --base-image /abs/base.ext4 --module-stage /abs/modules \
+  --module-assets-archive /abs/systemd-vt-device-assets.tar.gz \
+  --runtime-stage /abs/runtime --runtime-manifest /abs/myron-runtime-assets.tsv \
   --bluetooth-probe /abs/probe.py --speaker-reference-repo /abs/ref \
   --firstboot-conf /abs/firstboot.conf --ssh-key /abs/owner.pub --out /abs/main-rootfs.img
 ```
@@ -244,8 +260,9 @@ Run it once, by hand. It is not an automatic service.
 ## Limitations
 
 * Not a release configuration. The payload is the unsigned development image.
-* Cellular profile only; no automatic data activation; no audio or Bluetooth
-  coexistence.
+* Production MAIN remains cellular-only with no automatic data activation.
+  Audio profiles are explicit, uncommitted experiments that always recover;
+  they never claim audio/cellular coexistence.
 * No same-boot fallback after `switch_root`; the guard's 1200 s deadline plus a
   normal reboot is the recovery path, and a hang that stops the guard and the
   kernel needs the human's force-restart.
@@ -254,6 +271,6 @@ Run it once, by hand. It is not an automatic service.
 * Marking slot A successful is the separate, manual step above; the main
   boot itself writes no partition metadata.
 * The NCM host interface profile is the operator's, as before.
-* Tests: `tests/myron-main` (also run by `tests/all`). It uses fixtures and
-  mocks, plus the original AArch64 BusyBox under `qemu-aarch64-static` when the
+* Tests: `tests/myron-main` and `tests/myron-audio-experiment` (also run by
+  `tests/all`). They use fixtures and mocks, plus the original AArch64 BusyBox under `qemu-aarch64-static` when the
   pinned base image and the tools are present. No device was touched.

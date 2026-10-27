@@ -314,6 +314,10 @@ cmd_guard_preflight() {
 		say 'result=preflight-failed reason=pending-token-not-current'
 		exit 78
 	fi
+	if [ "$(kv "$main/pending" image_id)" != "$(cat "$runtime_dir/image-id" 2>/dev/null || true)" ]; then
+		say 'result=preflight-failed reason=pending-image-not-current'
+		exit 78
+	fi
 	log_line 'guard-preflight ok'
 }
 

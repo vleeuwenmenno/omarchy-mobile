@@ -5,10 +5,26 @@ set -eu
 
 mmcli=${OMAMOBILE_MYRON_MMCLI:-/usr/bin/mmcli}
 modem=${OMAMOBILE_MYRON_MODEM:-any}
+audio_experiment=/etc/omamobile/myron-audio-experiment
+admission=/run/omamobile-myron/gnss-admission
 
 usage() {
   printf '%s\n' 'usage: omamobile-gnss on|off|force|unforce|status [--json]' >&2
   exit 2
+}
+
+refuse_audio_experiment() {
+  [ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] || {
+    printf '%s\n' 'omamobile-gnss: blocked by the one-shot audio experiment' >&2
+    exit 1
+  }
+}
+
+mark_admission() {
+  install -d -m0700 /run/omamobile-myron
+  [ ! -L "$admission" ] || { printf '%s\n' 'omamobile-gnss: unsafe admission marker' >&2; exit 1; }
+  mkdir -p "$admission"
+  printf '%s\n' "$(cat /proc/sys/kernel/random/boot_id)" >"$admission/boot-id"
 }
 
 status_data() {
@@ -41,6 +57,8 @@ status() {
 }
 
 enable() {
+  refuse_audio_experiment
+  mark_admission
   pgrep -x ModemManager >/dev/null 2>&1 || {
     printf '%s\n' 'omamobile-gnss: ModemManager is not running' >&2
     exit 1
@@ -62,6 +80,8 @@ enable() {
 }
 
 disable() {
+  refuse_audio_experiment
+  mark_admission
   pgrep -x ModemManager >/dev/null 2>&1 || exit 0
   "$mmcli" -m "$modem" \
     --location-disable-gps-nmea \
@@ -74,6 +94,9 @@ disable() {
 case ${1:-} in
   on|force) enable ;;
   off|unforce) disable ;;
-  status) status "${2:-}" ;;
+  status)
+    refuse_audio_experiment
+    status "${2:-}"
+    ;;
   *) usage ;;
 esac

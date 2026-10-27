@@ -19,6 +19,7 @@ allowed=$runtime/modem-manager-allowed
 admission=$runtime/modem-manager-admission
 boot_id_file=/proc/sys/kernel/random/boot_id
 modem_manager=/usr/bin/ModemManager
+audio_experiment=/etc/omamobile/myron-audio-experiment
 
 fail() {
 	printf 'ERROR: ModemManager admission: %s\n' "$*" >&2
@@ -26,6 +27,8 @@ fail() {
 }
 
 boot=$(cat "$boot_id_file" 2>/dev/null) || fail 'boot identity is unavailable'
+[ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] ||
+	fail 'blocked by the one-shot audio experiment'
 [ -n "$boot" ] || fail 'boot identity is unavailable'
 [ -f "$allowed" ] && [ ! -L "$allowed" ] || fail 'permission marker is absent'
 [ "$(cat "$allowed" 2>/dev/null)" = "boot_id=$boot" ] ||

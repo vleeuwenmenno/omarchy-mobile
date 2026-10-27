@@ -125,7 +125,9 @@ w=$(world b); m=$w/var/lib/omarchy-mobile/main
 out=$(pick "$w" begin); id=$(sed -n 's/^begin //p' <<<"$out")
 [[ $id == "$(cat /proc/sys/kernel/random/boot_id)" ]] || fail 'pending token is not the kernel boot id'
 [[ $(stat -c %a "$m/pending") == 600 ]] || fail 'pending mode'
+[[ $(grep -c . "$m/pending") == 2 ]] || fail 'pending token format changed from two lines'
 grep -Fxq "image_id=$uuid_hex" "$m/pending" || fail 'pending lacks image id'
+! grep -q '^kernel=' "$m/pending" || fail 'generic pending token unexpectedly contains a kernel field'
 # an unqualified boot: pending still present at the next init
 expect "$(pick "$w" | head -1)" 'pmos stale-pending-latched' 'stale pending selects pmOS'
 [[ -f $m/latch ]] || fail 'stale pending did not set the latch'
@@ -340,6 +342,7 @@ pass 'selector + control cycle: qualified -> Omarchy, unqualified -> pmOS latch,
 reset omarchy 30; pend
 ctl guard-preflight || fail 'preflight with a current pending token'
 reset omarchy 30; pend "$other"; ctl guard-preflight >"$work/o" 2>&1 && fail 'preflight accepted a stale token'; grep -Fq 'pending-token-not-current' "$work/o" || fail 'preflight reason'
+reset omarchy 30; pend; echo different-image >"$fix/run/image-id"; ctl guard-preflight >"$work/o" 2>&1 && fail 'preflight accepted a pending token for another image'; grep -Fq 'pending-image-not-current' "$work/o" || fail 'preflight image reason'
 reset omarchy 30; pend; : >"$m/latch"; ctl guard-preflight >/dev/null 2>&1 && fail 'preflight under latch'
 reset pmos 30; pend; ctl guard-preflight >/dev/null 2>&1 && fail 'preflight outside Omarchy'
 # timeout: latch, normal reboot, then forced plain reboot, never a bootloader, no partition tool
@@ -436,6 +439,7 @@ while read -r ft fp; do
   printf '%s\ncase "$1" in -f) echo /dev/loop7 ;; esac\nexit 0\n' "$header" >"$R/bin/losetup"
   printf '%s\n[ -x "$1/$2" ] || exit 1\nexit 0\n' "$header" >"$R/bin/chroot"
   printf '%s\ncase "$1" in --install|true) exit 0 ;; sh) [ -f "$3" ] || exit 1; exit 0 ;; esac\nexit 1\n' "$header" >"$R/bin/busybox"
+  printf '#!/bin/sh\nprintf "%%s\\n" 6.12.23-audio-test\n' >"$R/bin/uname"
   printf '%s\nexit 0\n' "$header" >"$R/bin/switch_root"
   chmod +x "$R"/bin/*
 }
@@ -495,6 +499,26 @@ cmp -s "$R/armed.expect" "$R/hostroot/$armed" || fail 'stage ok: armed file is n
 grep -Fxq 'boot_id=11111111-2222-3333-4444-555555555555' "$R/hostroot/var/lib/omarchy-mobile/main/pending" || fail 'stage ok: pending token'
 pass 'stage runs to switch_root against the fake root: exact armed marker, runtime tokens and pending token'
 
+# Audio extends the current boot proof with a volatile four-line request. The
+# durable generic pending token remains the exact existing two-line format.
+make_stage audio
+printf '%s\n' audio-speaker >"$R/newroot/etc/omamobile/myron-audio-experiment"
+cp device/myron/main-overlay/usr/local/sbin/myron-audio-experiment "$R/newroot/usr/local/sbin/"
+chmod 0755 "$R/newroot/usr/local/sbin/myron-audio-experiment"
+mkdir -p "$R/newroot/etc/systemd/system/multi-user.target.wants"
+ln -s /usr/lib/systemd/system/myron-audio-experiment.service \
+  "$R/newroot/etc/systemd/system/multi-user.target.wants/myron-audio-experiment.service"
+run_stage audio || { cat "$R/out" "$R/markers"; fail 'audio stage fixture does not reach switch_root'; }
+printf 'mode=audio-speaker\nboot_id=11111111-2222-3333-4444-555555555555\nimage_id=%s\nkernel=6.12.23-audio-test\n' \
+  "$uuid_hex" >"$R/audio-request.expect"
+cmp -s "$R/audio-request.expect" "$R/run/myron-main/audio-experiment.request" ||
+  fail 'audio stage request is not exact mode/boot/image/kernel proof'
+[[ $(grep -c . "$R/hostroot/var/lib/omarchy-mobile/main/pending") == 2 ]] ||
+  fail 'audio stage changed the generic pending format'
+! grep -q '^kernel=' "$R/hostroot/var/lib/omarchy-mobile/main/pending" ||
+  fail 'audio stage added kernel to the generic pending token'
+pass 'audio stage adds volatile kernel proof without changing generic pending/success compatibility'
+
 # fault -> reason (the fault is a wrapper failure; "-trunc" makes a copy succeed but leave an empty file)
 stage_fault() { # NAME FAULT_LINE REASON [PREP...]
   local name=$1 line=$2 reason=$3; shift 3
@@ -545,9 +569,9 @@ pass 'real stage under fault injection: arm open/rename/sync, guard/control/Busy
 out=$(tools/myron-dev-image-compose --boot-policy bogus 2>&1) && fail 'composer accepted a bogus policy'
 grep -Fq 'unsupported boot policy' <<<"$out" || fail 'composer bogus policy message'
 out=$(tools/myron-dev-image-compose --boot-policy main 2>&1) && fail 'composer accepted main with the coexistence profile'
-grep -Fq 'supports only --profile cellular' <<<"$out" || fail 'composer main profile message'
+grep -Fq 'supports only --profile cellular|audio-speaker|audio-microphone' <<<"$out" || fail 'composer main profile message'
 grep -Fq 'boot_policy=temporary' tools/myron-dev-image-compose || fail 'composer default policy must stay temporary'
-pass 'composer: default temporary, main only with cellular, unknown policy refused'
+pass 'composer: default temporary, main only with cellular or explicit audio experiments, unknown policy refused'
 
 B=tools/myron-build-main-init-boot
 out=$($B 2>&1) && fail 'builder with no arguments'; grep -Fq -- '--base-init-boot is required' <<<"$out" || fail 'builder base message'

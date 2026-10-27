@@ -19,7 +19,7 @@ stage_copied() {
 # the provided main drop-in. A same-named unit or drop-in in a higher-priority
 # location would shadow the guard, recovery or qualifier.
 stage_unit_shadowed() {
-	for unit_name in myron-hardware-watchdog myron-main-recover myron-omarchy-qualify \
+	for unit_name in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-omarchy-qualify \
 		myron-omarchy-prepare myron-cellular myron-batterysecret; do
 		for unit_dir in /newroot/etc/systemd/system /newroot/etc/systemd/system.control \
 			/newroot/usr/local/lib/systemd/system /newroot/run/systemd/system \
@@ -99,9 +99,23 @@ newroot_mounted=1
 /bin/grep -Fqx 'development-only: unsigned package repository' \
 	/newroot/var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned ||
 	fail_boot omarchy-unsigned-marker-missing
-# Only the cellular profile is supported by the main boot for now.
+# The effective main-init profile remains cellular. Audio experiment images
+# carry a second, exact mode marker; they must not widen this init contract.
 [ "$(/bin/cat /newroot/etc/omamobile/myron-test-profile 2>/dev/null)" = cellular ] ||
 	fail_boot omarchy-profile-not-cellular
+main_experiment_mode=$(/bin/cat /newroot/etc/omamobile/myron-audio-experiment 2>/dev/null || true)
+case $main_experiment_mode in
+	'') ;;
+	audio-speaker|audio-microphone)
+		[ -x /newroot/usr/local/sbin/myron-audio-experiment ] ||
+			fail_boot omarchy-audio-experiment-runner-missing
+		[ -f /newroot/usr/lib/systemd/system/myron-audio-experiment.service ] ||
+			fail_boot omarchy-audio-experiment-unit-missing
+		[ -L /newroot/etc/systemd/system/multi-user.target.wants/myron-audio-experiment.service ] ||
+			fail_boot omarchy-audio-experiment-not-enabled
+		;;
+	*) fail_boot omarchy-audio-experiment-mode-invalid ;;
+esac
 # The payload must carry the main guard unit (same unit name the hardware units
 # require) and the main control, never the temporary partition-writing watchdog.
 guard_unit=/newroot/usr/lib/systemd/system/myron-hardware-watchdog.service
@@ -144,6 +158,20 @@ stage_put "$main_image_id" /run/myron-main/image-id || fail_boot main-runtime-im
 /bin/chmod 0600 /run/myron-main/boot-id /run/myron-main/image-id || fail_boot main-runtime-token-chmod-failed
 [ "$(/bin/cat /run/myron-main/boot-id 2>/dev/null)" = "$main_id" ] || fail_boot main-runtime-boot-id-mismatch
 [ "$(/bin/cat /run/myron-main/image-id 2>/dev/null)" = "$main_image_id" ] || fail_boot main-runtime-image-id-mismatch
+if [ -n "$main_experiment_mode" ]; then
+	main_kernel=$(/bin/uname -r 2>/dev/null) || fail_boot main-runtime-kernel-failed
+	case $main_kernel in ''|*[!A-Za-z0-9._+-]*) fail_boot main-runtime-kernel-failed ;; esac
+	stage_put "$main_kernel" /run/myron-main/kernel-release || fail_boot main-runtime-kernel-failed
+	/bin/chmod 0600 /run/myron-main/kernel-release || fail_boot main-runtime-token-chmod-failed
+	audio_request=$(printf 'mode=%s\nboot_id=%s\nimage_id=%s\nkernel=%s' \
+		"$main_experiment_mode" "$main_id" "$main_image_id" "$main_kernel")
+	stage_put "$audio_request" /run/myron-main/audio-experiment.request ||
+		fail_boot main-audio-request-write-failed
+	/bin/chmod 0600 /run/myron-main/audio-experiment.request ||
+		fail_boot main-audio-request-chmod-failed
+	[ "$(/bin/cat /run/myron-main/audio-experiment.request 2>/dev/null)" = "$audio_request" ] ||
+		fail_boot main-audio-request-mismatch
+fi
 
 # NCM only: rescue network, no console, no shell on the gadget.
 role_path=/sys/class/usb_role/a600000.ssusb-role-switch/role
@@ -218,6 +246,10 @@ main_verify_attempt || fail_boot main-pending-verify-failed
 [ ! -e "$main_dir/latch" ] && [ ! -L "$main_dir/latch" ] || fail_boot main-latch-appeared
 [ "$(/bin/cat /run/myron-main/boot-id 2>/dev/null)" = "$main_id" ] || fail_boot main-runtime-boot-id-mismatch
 [ "$(/bin/cat /run/myron-main/image-id 2>/dev/null)" = "$main_image_id" ] || fail_boot main-runtime-image-id-mismatch
+[ -z "$main_experiment_mode" ] ||
+	{ [ "$(/bin/cat /run/myron-main/kernel-release 2>/dev/null)" = "$main_kernel" ] &&
+	[ "$(/bin/cat /run/myron-main/audio-experiment.request 2>/dev/null)" = "$audio_request" ] ||
+	fail_boot main-audio-request-mismatch; }
 [ -x /run/myron-main/bin/busybox ] && [ -f /run/myron-main/myron-main-os ] || fail_boot main-runtime-missing
 [ -f "$guard_unit" ] && [ ! -L "$guard_unit" ] || fail_boot omarchy-main-guard-unit-missing
 

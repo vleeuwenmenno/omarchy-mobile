@@ -68,7 +68,7 @@ Audio additionally refuses to start unless the radio bridge completed cleanly
 and no ModemManager process exists. Its qualification therefore requires a
 fresh, separate boot before modem or GNSS testing.
 
-The image composer therefore has two mutually exclusive profiles. The default
+The image composer therefore has four mutually exclusive requested profiles. The default
 `coexistence` profile starts radio, Bluetooth, AudioReach and the protected
 speaker path while keeping ModemManager masked. The `cellular` profile starts
 only the radio foundation and ModemManager; Bluetooth and every AudioReach
@@ -76,6 +76,13 @@ bridge remain stopped. In either profile the rollback watchdog stays armed
 until native DSI/GPU qualification and the selected profile checks succeed.
 For `cellular`, qualification requires a published modem with raw and NMEA GPS
 capabilities, but it does not enable GNSS, mobile data, SMS or voice calls.
+
+The `audio-speaker` and `audio-microphone` profiles require persistent-main
+boot policy and keep `cellular` only as the effective main-init contract. Each
+image carries one selected experiment probe, disables normal qualification and
+cellular target links, masks ModemManager, consumes a boot/image/kernel-bound
+request before hardware preparation, runs once, cleans up and invokes MAIN
+recovery. See `docs/myron/AUDIO-EXPERIMENT.md`.
 
 The `cellular` profile additionally selects the in-tree `rmnet` stack through
 the empty marker `etc/myron/use-in-tree-rmnet`, verifies it before the radio

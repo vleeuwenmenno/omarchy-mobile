@@ -59,6 +59,7 @@ rollback_complete=$host_state/hardware-test.rollback-complete
 init_boot_rollback=/run/myron-host/home/menno/myron-init_boot_a-rollback-20261025.img
 boot_rollback=/run/myron-host/home/menno/myron-boot_a-rollback-20261026.img
 profile_file=/etc/omamobile/myron-test-profile
+audio_experiment=/etc/omamobile/myron-audio-experiment
 cellular_ready=/run/myron-cellular-ready
 wireless_ready=/run/myron-wireless-ready
 apn_config=/etc/omamobile/myron-cellular-apn
@@ -1422,6 +1423,8 @@ cmd_refuse_in_main() {
 [ "$#" -ge 1 ] || usage
 command=$1
 shift
+[ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] ||
+	fail 'cellular operation is blocked by the one-shot audio experiment'
 [ ! -e "$main_boot_id_marker" ] || mode=main
 case "$command" in
 data|main-op|main-run) [ "$#" = 1 ] || usage ;;

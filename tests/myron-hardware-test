@@ -456,7 +456,9 @@ grep -Fq 'pgrep -x ModemManager' "$audio" ||
   fail 'audio does not reject a boot where modem or GNSS userspace is active'
 for required in \
   'audio-stage.state' 'myron-omarchy-audio-stage.log' \
-  'the original rollback watchdog is no longer active' \
+  'hardware guard is not active' \
+  'hardware guard is not running' \
+  'hardware guard MainPID is not live' \
   'stage=arm action=remove-graphical-disarm watchdog=continued' \
   'stabilization=radio-begin seconds=20' \
   'stage=arm result=complete watchdog=continued radio_stable_seconds=20' \
