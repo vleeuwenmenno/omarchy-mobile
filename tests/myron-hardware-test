@@ -33,6 +33,7 @@ tests/myron-ipa-guard || fail 'IPA guard checks failed'
 tests/myron-wifi-import || fail 'Wi-Fi profile import checks failed'
 tests/myron-watchdog || fail 'rollback watchdog checks failed'
 tests/myron-modemmanager-admission || fail 'ModemManager admission checks failed'
+tests/myron-runtime-toggles || fail 'runtime toggle checks failed'
 for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
   sh -n "$fragment" || fail "$fragment parses"
 done

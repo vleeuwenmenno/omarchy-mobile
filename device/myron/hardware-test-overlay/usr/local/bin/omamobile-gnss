@@ -7,10 +7,22 @@ mmcli=${OMAMOBILE_MYRON_MMCLI:-/usr/bin/mmcli}
 modem=${OMAMOBILE_MYRON_MODEM:-any}
 audio_experiment=/etc/omamobile/myron-audio-experiment
 admission=/run/omamobile-myron/gnss-admission
+allow_dir=/var/lib/omamobile-location
+allow_marker=$allow_dir/enabled
+geoclue_unit=geoclue.service
 
 usage() {
   printf '%s\n' 'usage: omamobile-gnss on|off|force|unforce|status [--json]' >&2
   exit 2
+}
+
+as_root() {
+  action=$1
+  if [ "$(id -u)" != 0 ]; then
+    case $action in on|off) exec systemctl start "omamobile-gnss-location@$action.service" ;; esac
+    printf '%s\n' 'omamobile-gnss: force/unforce require root' >&2
+    exit 1
+  fi
 }
 
 refuse_audio_experiment() {
@@ -46,7 +58,9 @@ status() {
     enabled=yes
   fi
   location=off
-  [ "$enabled" = no ] || location=on
+  if [ -f "$allow_marker" ] && [ ! -L "$allow_marker" ]; then
+    location=on
+  fi
   if [ "${1:-}" = --json ]; then
     printf '{"location":"%s","running":"%s","forced":"no","powered":"%s","agent":"on","lto_age_hours":"unknown","installed":%s}\n' \
       "$location" "$enabled" "$enabled" "$installed"
@@ -56,7 +70,7 @@ status() {
   fi
 }
 
-enable() {
+enable_receiver() {
   refuse_audio_experiment
   mark_admission
   pgrep -x ModemManager >/dev/null 2>&1 || {
@@ -79,9 +93,7 @@ enable() {
   trap - EXIT HUP INT TERM
 }
 
-disable() {
-  refuse_audio_experiment
-  mark_admission
+disable_receiver() {
   pgrep -x ModemManager >/dev/null 2>&1 || exit 0
   "$mmcli" -m "$modem" \
     --location-disable-gps-nmea \
@@ -91,9 +103,40 @@ disable() {
   "$mmcli" -m "$modem" --location-disable-agps-msa >/dev/null 2>&1 || true
 }
 
+allow_location() {
+  refuse_audio_experiment
+  mark_admission
+  [ ! -L "$allow_dir" ] || { printf '%s\n' 'omamobile-gnss: unsafe permission directory' >&2; exit 1; }
+  [ ! -L "$allow_marker" ] || { printf '%s\n' 'omamobile-gnss: unsafe permission marker' >&2; exit 1; }
+  install -d -o root -g root -m0755 "$allow_dir"
+  tmp=$allow_dir/.enabled.$$
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  printf '%s\n' enabled >"$tmp"
+  chown root:root "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$allow_marker"
+  trap - EXIT HUP INT TERM
+}
+
+disallow_location() {
+  refuse_audio_experiment
+  mark_admission
+  [ ! -L "$allow_dir" ] || { printf '%s\n' 'omamobile-gnss: unsafe permission directory' >&2; exit 1; }
+  [ ! -L "$allow_marker" ] || { printf '%s\n' 'omamobile-gnss: unsafe permission marker' >&2; exit 1; }
+  rm -f "$allow_marker"
+  timeout -k 1 10 systemctl stop "$geoclue_unit" >/dev/null 2>&1 || {
+    disable_receiver
+    printf '%s\n' 'omamobile-gnss: GeoClue did not stop' >&2
+    exit 1
+  }
+  disable_receiver
+}
+
 case ${1:-} in
-  on|force) enable ;;
-  off|unforce) disable ;;
+  on) as_root on; allow_location ;;
+  off) as_root off; disallow_location ;;
+  force) as_root force; enable_receiver ;;
+  unforce) as_root unforce; disable_receiver ;;
   status)
     refuse_audio_experiment
     status "${2:-}"

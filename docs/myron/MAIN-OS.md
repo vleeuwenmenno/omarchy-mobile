@@ -261,6 +261,11 @@ Run it once, by hand. It is not an automatic service.
 
 * Not a release configuration. The payload is the unsigned development image.
 * Production MAIN remains cellular-only with no automatic data activation.
+  Once its qualified bearer is active, the quick-settings Off state uses an
+  owned `tc clsact` packet gate on `qmapmux` rather than disconnecting IPA;
+  On removes only that owned gate. The bearer and modem remain untouched.
+  Location is a persistent GeoClue permission: Off prevents D-Bus activation,
+  while On lets GeoClue power Qualcomm GNSS only during an application request.
   Audio profiles are explicit, uncommitted experiments that always recover;
   they never claim audio/cellular coexistence.
 * No same-boot fallback after `switch_root`; the guard's 1200 s deadline plus a

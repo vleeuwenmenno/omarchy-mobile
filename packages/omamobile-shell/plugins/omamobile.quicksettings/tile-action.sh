@@ -91,9 +91,16 @@ case $tile in
     ;;
   mobile-data)
     if command -v myron-mobile-data >/dev/null 2>&1; then
-      # Myron: only the supported start exists. Off, reconnect and radio changes
-      # are refused by the helper, never by a guessed nmcli call.
-      exec myron-mobile-data "$want"
+      # Never disconnect Myron's unsafe IPA path. Off starts a packet-only
+      # qmapmux gate; on removes that gate or asks the proven one-shot helper
+      # to activate a bearer when none exists.
+      if [ "$want" = off ]; then
+        exec systemctl start myron-mobile-data-block.service
+      fi
+      if systemctl is-active --quiet myron-mobile-data-block.service 2>/dev/null; then
+        exec systemctl stop myron-mobile-data-block.service
+      fi
+      exec myron-mobile-data on
     fi
     exec omamobile-sit data "$want"
     ;;

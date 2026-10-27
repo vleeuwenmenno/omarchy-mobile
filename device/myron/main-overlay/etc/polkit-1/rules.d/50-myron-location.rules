@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: MIT
+// Active local user menno may only START the two exact location permission
+// units. Root performs and validates the bounded operation.
+polkit.addRule(function(action, subject) {
+  var unit = action.lookup("unit");
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      subject.local && subject.active && subject.user == "menno" &&
+      (unit == "omamobile-gnss-location@on.service" ||
+       unit == "omamobile-gnss-location@off.service") &&
+      action.lookup("verb") == "start") {
+    return polkit.Result.YES;
+  }
+});

@@ -105,7 +105,7 @@ Microphone, Screenshot and Screen record start under "Add tiles".
 | --- | --- |
 | Wi-Fi | `Networking.wifiEnabled` (NetworkManager); status shows the SSID. The chevron or a long-press opens the Wi-Fi picker (below) |
 | Bluetooth | `omarchy-bluetooth-power on/off`, the same rfkill path as Omarchy's Bluetooth panel. The chevron or a long-press opens the Bluetooth panel (below) |
-| Mobile data | `omamobile-sit data on/off` (omamobile-modem-sit), which starts or stops `omamobile-sit-data.service` through polkit; on while that unit is active, with the operator and technology from `/run/omamobile-sit/state.json`. "No modem" until omamobile-sitd publishes that file |
+| Mobile data | `omamobile-sit data on/off` on supported SIT devices. Myron keeps its proven one-shot IPA bearer connected: Off installs a qmapmux-only `tc` packet gate and On removes it, so the UI never disconnects or reopens the unsafe modem link. Initial activation still uses the attended-evidence service through polkit |
 | Airplane mode | Wi-Fi, Bluetooth and WWAN rfkill switches together; on when all are soft-blocked. Turning it off unblocks only the ones that were on (`~/.local/state/omamobile/airplane-restore`). NFC keeps its own tile, and the modem's radio (`omamobile-sit radio`) is not touched, since turning that back on needs a reboot today |
 | Hotspot | `nmcli device wifi hotspot con-name Hotspot` (NetworkManager makes the SSID and password; the Wi-Fi client link drops while it runs) and `nmcli connection down Hotspot`. Long-press opens the Wi-Fi picker |
 | Battery saver | power-profiles-daemon's `power-saver` profile, through `omarchy-powerprofiles-set autodetect power-saver/balanced` (remembered per AC or battery) |
@@ -115,7 +115,7 @@ Microphone, Screenshot and Screen record start under "Add tiles".
 | Microphone | Mute of PipeWire's default source; "No microphone" without one |
 | Screenshot | Puts the sheet away, then `omarchy-capture-screenshot fullscreen` (file, clipboard and a notification) |
 | Screen record | `omarchy-capture-screenrecording --fullscreen`, a second tap `--stop-recording`; "No recorder" without gpu-screen-recorder |
-| Location | `omamobile-gnss on` and `off` (omamobile-gnss), through polkit; "In use" while the receiver runs, "No GNSS" without the command or the vendor files |
+| Location | `omamobile-gnss on` and `off`, through exact systemd/polkit units. On grants GeoClue permission but leaves GNSS idle; an app request shows "In use" and powers Qualcomm GNSS only for that request. Off removes permission, stops GeoClue and disables GNSS |
 | NFC | the controller's rfkill switch (`rfkill block nfc`, `rfkill unblock nfc`); "No NFC" until a controller probes (RADIOS-CAMERA-PLAN section 3) |
 | Rotation lock | `omamobile-autorotate` (omamobile-sensors): locked by `~/.local/state/omamobile/rotation-lock`; unlocking also enables the service. "No sensor" while the sensor proxy has no accelerometer |
 | Torch | The rear flash LED in torch mode (`brightnessctl --device=white:torch`); "No flash LED" without it |

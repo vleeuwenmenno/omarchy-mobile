@@ -1,0 +1,114 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline checks for Myron's safe packet gate and location permission policy.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+main=device/myron/main-overlay
+hardware=device/myron/hardware-test-overlay
+policy=$main/usr/local/sbin/myron-mobile-data-policy
+block_unit=$main/usr/lib/systemd/system/myron-mobile-data-block.service
+data_polkit=$main/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules
+gnss=$hardware/usr/local/bin/omamobile-gnss
+gnss_unit=$main/usr/lib/systemd/system/omamobile-gnss-location@.service
+gnss_dropin=$main/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf
+gnss_polkit=$main/etc/polkit-1/rules.d/50-myron-location.rules
+
+for script in "$policy" "$gnss"; do
+  sh -n "$script" || fail "$script parses"
+  [[ -x $script ]] || fail "$script is executable"
+done
+for required in \
+  '"$tc" qdisc add dev "$iface" clsact' \
+  '"$tc" filter add dev "$iface" ingress protocol all pref 1 matchall action drop' \
+  '"$tc" filter add dev "$iface" egress protocol all pref 1 matchall action drop' \
+  'result=blocked bearer=unchanged' 'result=allowed bearer=unchanged'; do
+  grep -Fq "$required" "$policy" || fail "packet gate lacks: $required"
+done
+if grep -nE 'nmcli|mmcli|rfkill|ip +link +(set|del)|qdisc +(replace|change)|connection +(up|down)|device +(connect|disconnect)' "$policy"; then
+  fail 'packet gate can mutate modem, NetworkManager, radio or link state'
+fi
+grep -Fxq 'RemainAfterExit=yes' "$block_unit" || fail 'packet gate unit does not remember ownership'
+grep -Fxq 'ExecStart=/usr/local/sbin/myron-mobile-data-policy block' "$block_unit" || fail 'packet gate start'
+grep -Fxq 'ExecStop=/usr/local/sbin/myron-mobile-data-policy allow' "$block_unit" || fail 'packet gate stop'
+grep -Fxq 'RuntimeDirectory=myron-mobile-data-block' "$block_unit" || fail 'packet gate writable runtime state'
+grep -Fxq 'RuntimeDirectoryMode=0700' "$block_unit" || fail 'packet gate runtime state permissions'
+grep -Fq 'action.lookup("unit") == "myron-mobile-data-block.service"' "$data_polkit" || fail 'packet gate polkit unit'
+grep -Fq '(verb == "start" || verb == "stop")' "$data_polkit" || fail 'packet gate polkit verbs'
+[[ $(grep -c 'polkit.Result.YES' "$data_polkit") == 1 ]] || fail 'packet gate polkit grants more than once'
+
+work=$(mktemp -d /tmp/myron-runtime-toggles.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+mkdir -p "$work/bin" "$work/net/qmapmux0.0"
+uid=$(id -u); gid=$(id -g)
+sed \
+  -e "s|^tc=.*|tc=$work/bin/tc|" \
+  -e "s|^ip=.*|ip=$work/bin/ip|" \
+  -e "s|^state_dir=.*|state_dir=$work/state|" \
+  -e "s|^net_root=.*|net_root=$work/net|" \
+  -e "s|^root_uid=.*|root_uid=$uid|" \
+  -e "s|^root_gid=.*|root_gid=$gid|" \
+  "$policy" >"$work/policy"
+chmod +x "$work/policy"
+cat >"$work/bin/ip" <<EOF
+#!/bin/sh
+case "\$*" in
+  *' address show '*) echo '19: qmapmux0.0 inet 10.0.0.2/30 scope global qmapmux0.0' ;;
+  *' route show default '*) echo 'default via 10.0.0.1 dev qmapmux0.0 metric 700' ;;
+  *) exit 1 ;;
+esac
+EOF
+cat >"$work/bin/tc" <<EOF
+#!/bin/sh
+echo "\$*" >>"$work/calls"
+case "\$1 \$2" in
+  'qdisc show') [ ! -e "$work/clsact" ] || echo 'qdisc clsact ffff: parent ffff:fff1' ;;
+  'qdisc add') touch "$work/clsact" ;;
+  'qdisc del') rm -f "$work/clsact" ;;
+  'filter add')
+    n=\$(cat "$work/filter-count" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" >"$work/filter-count"
+    [ ! -e "$work/fail-filter-\$n" ]
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$work/bin/ip" "$work/bin/tc"
+: >"$work/calls"
+"$work/policy" block >/dev/null || fail 'packet gate block fixture'
+[[ -e $work/clsact && $(cat "$work/filter-count") == 2 ]] || fail 'packet gate did not install two filters'
+[[ $(cat "$work/state/owned-interface") == qmapmux0.0 ]] || fail 'packet gate ownership record'
+"$work/policy" block >/dev/null 2>&1 && fail 'packet gate accepted a second owner'
+"$work/policy" allow >/dev/null || fail 'packet gate allow fixture'
+[[ ! -e $work/clsact && ! -e $work/state/owned-interface ]] || fail 'packet gate did not clean up'
+touch "$work/clsact"; : >"$work/calls"
+"$work/policy" block >/dev/null 2>&1 && fail 'packet gate replaced a foreign clsact qdisc'
+"$work/policy" allow >/dev/null || fail 'allow without ownership is not idempotent'
+[[ -e $work/clsact ]] || fail 'allow deleted a foreign clsact qdisc'
+rm -f "$work/clsact"; : >"$work/filter-count"; echo x >"$work/fail-filter-2"
+"$work/policy" block >/dev/null 2>&1 && fail 'packet gate accepted a partial filter install'
+[[ ! -e $work/clsact ]] || fail 'partial packet gate was not rolled back'
+pass 'mobile data off owns a reversible qmapmux-only packet gate and never disconnects IPA'
+
+for required in \
+  'allow_marker=$allow_dir/enabled' \
+  'timeout -k 1 10 systemctl stop "$geoclue_unit"' \
+  'exec systemctl start "omamobile-gnss-location@$action.service"' \
+  'case ${1:-} in' \
+  'on) as_root on; allow_location' \
+  'off) as_root off; disallow_location' \
+  'force) as_root force; enable_receiver'; do
+  grep -Fq "$required" "$gnss" || fail "location helper lacks: $required"
+done
+grep -Fxq 'ExecStart=/usr/local/bin/omamobile-gnss %i' "$gnss_unit" || fail 'location permission unit'
+grep -Fxq 'ConditionPathExists=/var/lib/omamobile-location/enabled' "$gnss_dropin" || fail 'GeoClue permission condition'
+grep -Fxq 'ConditionPathExists=!/etc/omamobile/myron-audio-experiment' "$gnss_dropin" || fail 'GeoClue audio exclusion'
+for unit in omamobile-gnss-location@on.service omamobile-gnss-location@off.service; do
+  grep -Fq "unit == \"$unit\"" "$gnss_polkit" || fail "location polkit lacks $unit"
+done
+grep -Fq 'action.lookup("verb") == "start"' "$gnss_polkit" || fail 'location polkit verb'
+[[ $(grep -c 'polkit.Result.YES' "$gnss_polkit") == 1 ]] || fail 'location polkit grants more than once'
+! grep -q '^\[Install\]' "$gnss_unit" || fail 'location permission unit is enableable'
+pass 'location off gates GeoClue; on permits app-driven GNSS; polkit admits only exact on/off units'

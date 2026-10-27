@@ -1,0 +1,95 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Block or allow packets on Myron's already-active cellular data netdev.
+# This never disconnects, reconnects, configures or powers the IPA/modem path.
+set -eu
+umask 077
+
+tc=/usr/bin/tc
+ip=/usr/bin/ip
+state_dir=/run/myron-mobile-data-block
+owner_file=$state_dir/owned-interface
+net_root=/sys/class/net
+root_uid=0
+root_gid=0
+
+fail() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
+require_root() { [ "$(id -u)" = "$root_uid" ] || fail 'must run as root'; }
+valid_iface() {
+  case $1 in qmapmux*.*) ;; *) return 1 ;; esac
+  suffix=${1#qmapmux}
+  left=${suffix%%.*}
+  right=${suffix#*.}
+  [ "$left" != "$suffix" ] || return 1
+  case $left in ''|*[!0-9]*) return 1 ;; esac
+  case $right in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 15 ]
+}
+
+resolve_iface() {
+  set -- "$net_root"/qmapmux*
+  [ "$#" = 1 ] && [ -e "$1" ] || fail 'exactly one cellular data interface is required'
+  iface=${1##*/}
+  valid_iface "$iface" || fail 'the cellular data interface name is invalid'
+  "$ip" -4 -o address show dev "$iface" scope global 2>/dev/null | grep -q . ||
+    fail 'the cellular data interface has no IPv4 address'
+  "$ip" -4 route show default dev "$iface" 2>/dev/null | grep -q . ||
+    fail 'the cellular data interface is not an active default route'
+}
+
+safe_owner_file() {
+  [ -f "$owner_file" ] && [ ! -L "$owner_file" ] || return 1
+  [ "$(stat -c '%u:%g:%a' "$owner_file" 2>/dev/null || true)" = "$root_uid:$root_gid:600" ] || return 1
+  [ "$(grep -c . "$owner_file" 2>/dev/null || true)" = 1 ] || return 1
+  iface=$(cat "$owner_file")
+  valid_iface "$iface"
+}
+
+block() {
+  [ ! -e "$state_dir" ] || [ -d "$state_dir" ] || fail 'unsafe policy state path'
+  [ ! -L "$state_dir" ] || fail 'unsafe policy state directory'
+  [ ! -e "$owner_file" ] && [ ! -L "$owner_file" ] || fail 'a packet gate is already recorded'
+  resolve_iface
+  if "$tc" qdisc show dev "$iface" | grep -q 'qdisc clsact '; then
+    fail 'the cellular data interface already has an unowned clsact qdisc'
+  fi
+  cleanup=1
+  cleanup_block() {
+    [ "$cleanup" = 0 ] || "$tc" qdisc del dev "$iface" clsact >/dev/null 2>&1 || true
+  }
+  trap cleanup_block EXIT HUP INT TERM
+  "$tc" qdisc add dev "$iface" clsact
+  "$tc" filter add dev "$iface" ingress protocol all pref 1 matchall action drop
+  "$tc" filter add dev "$iface" egress protocol all pref 1 matchall action drop
+  mkdir -p "$state_dir"
+  chown "$root_uid:$root_gid" "$state_dir"
+  chmod 0700 "$state_dir"
+  printf '%s\n' "$iface" >"$owner_file"
+  chmod 0600 "$owner_file"
+  cleanup=0
+  trap - EXIT HUP INT TERM
+  printf '%s\n' 'result=blocked bearer=unchanged'
+}
+
+allow() {
+  if [ ! -e "$owner_file" ] && [ ! -L "$owner_file" ]; then
+    printf '%s\n' 'result=allowed bearer=unchanged'
+    return 0
+  fi
+  safe_owner_file || fail 'the packet-gate ownership record is unsafe'
+  if [ -e "$net_root/$iface" ]; then
+    if "$tc" qdisc show dev "$iface" | grep -q 'qdisc clsact '; then
+      "$tc" qdisc del dev "$iface" clsact
+    fi
+  fi
+  rm -f "$owner_file"
+  rmdir "$state_dir" 2>/dev/null || true
+  printf '%s\n' 'result=allowed bearer=unchanged'
+}
+
+require_root
+case ${1:-} in
+  block) block ;;
+  allow) allow ;;
+  *) fail 'usage: myron-mobile-data-policy block|allow' ;;
+esac

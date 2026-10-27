@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+# User-visible Mobile Data off without an unsafe IPA disconnect. The bearer
+# remains connected; clsact drops ingress and egress only on qmapmux.
+[Unit]
+Description=Block Myron cellular packet traffic without disconnecting IPA
+ConditionPathExists=/run/myron-main/boot-id
+After=myron-cellular-watch.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/myron-mobile-data-policy block
+ExecStop=/usr/local/sbin/myron-mobile-data-policy allow
+TimeoutStartSec=10
+TimeoutStopSec=10
+UMask=0077
+RuntimeDirectory=myron-mobile-data-block
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+CapabilityBoundingSet=CAP_NET_ADMIN

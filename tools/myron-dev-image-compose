@@ -203,6 +203,7 @@ docker run --rm --privileged --platform linux/arm64 \
       done < <(find /main-overlay -mindepth 1 -print0)
       chmod 0755 "$root/usr/local/sbin/myron-main-os" "$root/usr/local/sbin/myron-cellular-op" \
         "$root/usr/local/sbin/myron-cellular-reboot-failsafe" \
+        "$root/usr/local/sbin/myron-mobile-data-policy" \
         "$root/usr/local/sbin/myron-audio-experiment" \
         "$root/usr/local/sbin/myron-audio-microphone-probe" \
         "$root/usr/local/bin/myron-mobile-data"
@@ -215,8 +216,13 @@ docker run --rm --privileged --platform linux/arm64 \
         "$root/usr/lib/systemd/system/myron-cellular-enable.service" \
         "$root/usr/lib/systemd/system/myron-cellular-watch.service" \
         "$root/usr/lib/systemd/system/myron-cellular-publish.service" \
+        "$root/usr/lib/systemd/system/myron-mobile-data-block.service" \
+        "$root/usr/lib/systemd/system/omamobile-gnss-location@.service" \
+        "$root/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf" \
         "$root/usr/lib/systemd/system/myron-audio-experiment.service" \
-        "$root/etc/polkit-1/rules.d/50-myron-cellular-enable.rules"
+        "$root/etc/polkit-1/rules.d/50-myron-cellular-enable.rules" \
+        "$root/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules" \
+        "$root/etc/polkit-1/rules.d/50-myron-location.rules"
     fi
     printf "%s\n" "$MYRON_TEST_PROFILE" >"$root/etc/omamobile/myron-test-profile"
     chown 0:0 "$root/etc/omamobile/myron-test-profile"
@@ -413,6 +419,11 @@ if [[ $boot_policy == main ]]; then
     /usr/lib/systemd/system/myron-cellular-op-failed.service /usr/lib/systemd/system/myron-cellular-attended.service \
     /usr/lib/systemd/system/myron-cellular-enable.service /usr/lib/systemd/system/myron-cellular-watch.service \
     /usr/lib/systemd/system/myron-cellular-publish.service /etc/polkit-1/rules.d/50-myron-cellular-enable.rules \
+    /usr/local/sbin/myron-mobile-data-policy /usr/lib/systemd/system/myron-mobile-data-block.service \
+    /etc/polkit-1/rules.d/50-myron-mobile-data-block.rules \
+    /usr/lib/systemd/system/omamobile-gnss-location@.service \
+    /usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf \
+    /etc/polkit-1/rules.d/50-myron-location.rules \
     /usr/lib/systemd/system/myron-main-recover.service \
     /usr/local/sbin/myron-audio-experiment /usr/lib/systemd/system/myron-audio-experiment.service \
     /usr/lib/systemd/system/myron-omarchy-qualify.service.d/90-myron-main.conf; do
@@ -431,6 +442,8 @@ if [[ $boot_policy == main ]]; then
   for spec in \
     '/usr/local/sbin/myron-cellular-op|device/myron/main-overlay/usr/local/sbin/myron-cellular-op' \
     '/usr/local/bin/myron-mobile-data|device/myron/main-overlay/usr/local/bin/myron-mobile-data' \
+    '/usr/local/sbin/myron-mobile-data-policy|device/myron/main-overlay/usr/local/sbin/myron-mobile-data-policy' \
+    '/usr/local/bin/omamobile-gnss|device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss' \
     '/usr/local/sbin/myron-cellular-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage'; do
     image_path=${spec%%|*}
     repository_path=${spec#*|}
@@ -450,6 +463,20 @@ if [[ $boot_policy == main ]]; then
       ! in_image "$dir/$unit" || die "operation unit is shadowed: $dir/$unit"
       ! in_image "$dir/$unit.d" || die "operation unit has a drop-in directory: $dir/$unit.d"
     done
+  done
+  for spec in \
+    '/usr/lib/systemd/system/myron-mobile-data-block.service|device/myron/main-overlay/usr/lib/systemd/system/myron-mobile-data-block.service' \
+    '/usr/lib/systemd/system/omamobile-gnss-location@.service|device/myron/main-overlay/usr/lib/systemd/system/omamobile-gnss-location@.service' \
+    '/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf|device/myron/main-overlay/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf' \
+    '/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules|device/myron/main-overlay/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules' \
+    '/etc/polkit-1/rules.d/50-myron-location.rules|device/myron/main-overlay/etc/polkit-1/rules.d/50-myron-location.rules'; do
+    image_path=${spec%%|*}
+    repository_path=${spec#*|}
+    [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$repository_path")" ]] ||
+      die "runtime policy differs from the repository: $image_path"
+  done
+  for unit in myron-mobile-data-block.service omamobile-gnss-location@.service; do
+    ! in_image "/etc/systemd/system/multi-user.target.wants/$unit" || die "runtime policy unit is enabled: $unit"
   done
   for unit in myron-cellular-op.timer myron-cellular-attended.service myron-cellular-enable.service myron-cellular-watch.service; do
     ! in_image "/etc/systemd/system/multi-user.target.wants/$unit" || die "operation unit is enabled: $unit"

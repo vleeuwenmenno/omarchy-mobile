@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Root half of Myron's Location permission switch. Only on/off instances are
+# admitted by the exact polkit rule; the helper validates the action again.
+[Unit]
+Description=Set Omarchy Mobile location permission to %i
+ConditionPathExists=/run/myron-main/boot-id
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/omamobile-gnss %i
+TimeoutStartSec=20

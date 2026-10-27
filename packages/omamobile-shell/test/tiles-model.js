@@ -32,6 +32,13 @@ test("the sheet clears a visible top bar", () => {
   assert.match(qml, /sheetBottom: Math\.round\(sheet\.y \+ sheet\.height\)/)
 })
 
+test("privacy tiles refresh while open and Myron data can turn both ways", () => {
+  const qml = fs.readFileSync(path.join(__dirname, "../plugins/omamobile.quicksettings/QuickSettings.qml"), "utf8")
+  assert.match(qml, /interval: 2000[\s\S]*running: root\.opened[\s\S]*location\.refresh\(\)/)
+  assert.match(qml, /"mobile-data", enabled \? "off" : "on"/)
+  assert.ok(!qml.includes("if (enabled || myronStarting"))
+})
+
 test("the default keeps the old ten tiles and leads with the most used", () => {
   for (const id of ["wifi", "bluetooth", "mobile-data", "rotation-lock", "torch", "dnd", "location", "nfc", "fingerprint", "keyboard"])
     assert.ok(M.DEFAULT_LAYOUT.includes(id), id)
