@@ -19,7 +19,8 @@ for patch in \
   0007-qcom-soc-recognize-driverless-qmapmux-links.patch \
   0008-qcom-soc-configure-rmnet-ipa-datapath.patch \
   0009-qmi-identify-loc-client-as-afw.patch \
-  0010-qmi-loc-operation-mode-response.patch; do
+  0010-qmi-loc-operation-mode-response.patch \
+  0011-netlink-fix-transaction-use-after-free.patch; do
   test -s "$patch"
   grep -Fq "$patch" PKGBUILD
 done
@@ -29,5 +30,7 @@ grep -Fq 'RMNET_IOCTL_ADD_MUX_CHANNEL' 0008-qcom-soc-configure-rmnet-ipa-datapat
 grep -Fq 'QMI_LOC_CLIENT_TYPE_AFW' 0009-qmi-identify-loc-client-as-afw.patch
 grep -Fq 'loc_location_position_report_indication_cb' 0009-qmi-identify-loc-client-as-afw.patch
 grep -Fq 'operation mode command accepted' 0010-qmi-loc-operation-mode-response.patch
+grep -Fq 'completion_fn = tr->completion_fn' 0011-netlink-fix-transaction-use-after-free.patch
+grep -Fq 'completion_fn (task, hdr, &error)' 0011-netlink-fix-transaction-use-after-free.patch
 
-printf '%s\n' 'ok - ModemManager pins the proven Myron IPA and GNSS patch stack'
+printf '%s\n' 'ok - ModemManager pins the proven Myron IPA/GNSS stack and keeps netlink callbacks alive'

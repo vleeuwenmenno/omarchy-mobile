@@ -8,6 +8,7 @@ It pins the same upstream revision and carries the Myron-specific patches for:
 - QMAP mux setup through the downstream RMNET ioctl ABI;
 - serialized carrier-configuration requests;
 - AFW LOC registration, position-report conversion, and operation-mode races.
+- the netlink transaction completion use-after-free exposed by qmap link setup.
 
 Build `packages/libqmi` first.  The AFW patch calls generated APIs absent from
 the 1.38.0 release package:

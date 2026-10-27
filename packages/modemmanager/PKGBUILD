@@ -13,7 +13,7 @@ pkgname=(
   libmm-glib
 )
 pkgver=1.25.95.r20261005
-pkgrel=1
+pkgrel=2
 pkgdesc="Mobile broadband modem management service (Myron downstream Qualcomm support)"
 url="https://www.freedesktop.org/wiki/Software/ModemManager/"
 arch=(aarch64)
@@ -61,6 +61,7 @@ _myron_patches=(
   0008-qcom-soc-configure-rmnet-ipa-datapath.patch
   0009-qmi-identify-loc-client-as-afw.patch
   0010-qmi-loc-operation-mode-response.patch
+  0011-netlink-fix-transaction-use-after-free.patch
 )
 source=(
   "$_archive.tar.gz::https://gitlab.freedesktop.org/mobile-broadband/ModemManager/-/archive/$_commit/$_archive.tar.gz"
@@ -77,6 +78,7 @@ sha256sums=(
   '9ac7d9a4607ba1b4216bb24dcd8f3674c846d9b688e4f7940a4bf5b49e5333c4'
   '59b12e06dc1c75ed4c9c30b35f09be2d95a2cd50edd1ebf58cfc1f1f5188653a'
   '0360d6d611b7b167ace890efd1925c0b80e872b151b53de182290fa4905771de'
+  '7e1b9c4caca3ce4c2cc8831212e51e85ecfb43e44e0729e3f8f7a0a3693e2c23'
 )
 
 prepare() {

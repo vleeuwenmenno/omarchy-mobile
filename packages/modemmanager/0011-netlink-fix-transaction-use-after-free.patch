@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Menno <menno@example.invalid>
+Date: Tue, 27 Oct 2026 17:15:00 +0100
+Subject: [PATCH] netlink: keep completion callback across transaction removal
+
+The transaction hash table owns and frees each Transaction.  The receive path
+removed a completed transaction and then called tr->completion_fn through the
+freed object.  Whether that worked depended on the slice allocator retaining
+the old contents.
+
+On Myron this crashed ModemManager immediately after qmapmux0.0 was created:
+the callback address had become 0x30 by the time transaction_complete() tried
+to call it.  Copy the function pointer before removal, as the function already
+does for the task and sequence id.
+---
+ src/mm-netlink.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/mm-netlink.c b/src/mm-netlink.c
+index 1234567..89abcde 100644
+--- a/src/mm-netlink.c
++++ b/src/mm-netlink.c
+@@ -229,9 +229,11 @@ transaction_complete (Transaction     *tr,
+ {
+     GTask *task;
++    MsgFunc completion_fn;
+     guint32 sequence_id;
+ 
+     task = g_steal_pointer (&tr->completion_task);
+     sequence_id = tr->sequence_id;
++    completion_fn = tr->completion_fn;
+ 
+     g_hash_table_remove (tr->self->transactions,
+                          GUINT_TO_POINTER (tr->sequence_id));
+@@ -240,7 +242,7 @@ transaction_complete (Transaction     *tr,
+     if (!saved_errno) {
+         GError *error = NULL;
+ 
+-        if (!tr->completion_fn (task, hdr, &error))
++        if (!completion_fn (task, hdr, &error))
+             g_task_return_error (task, error);
+     } else {
+         g_task_return_new_error (task, G_IO_ERROR, g_io_error_from_errno (saved_errno),
+-- 
+2.55.0
