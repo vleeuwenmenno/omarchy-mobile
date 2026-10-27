@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Myron cellular + speaker coexistence experiment
 
-Status: implemented for offline composition and mocked testing only. No image
-from this profile has been copied to the phone, booted, or started.
+Status: hardware-tested on 2026-10-27. Registered LTE/5G and the guarded
+speaker path coexisted through one complete probe and automatic pmOS recovery.
+Subjective audibility still requires the attended listener's confirmation.
 
 `audio-cellular-speaker` is an attended persistent-MAIN experiment for the
 smallest useful radio/audio boundary: one normally admitted ModemManager,
@@ -60,6 +61,43 @@ fastboot when ModemManager, GNSS and AudioReach were mixed. GNSS is excluded
 here, but recurrence remains possible. This kernel exposes no proven pstore
 record for that reset, so the synced boundary identifies the last completed
 stage but cannot prove the kernel cause.
+
+## 2026-10-27 hardware result
+
+The exact combined rootfs was
+`4ce269728ccd5e9d36cc02a26162c34ae21771db70c89dca94e1101f4a3f83e6`
+before its first mount. The first boot failed closed before pivot with
+`omarchy-critical-unit-shadowed`: the broad initramfs guard rejected the three
+intentional legacy-audio `/dev/null` masks. No radio/audio experiment ran. The
+guard was narrowed in commit `73dfe212a6041a8468dc40505ad6658cde6619aa`
+to admit only those three exact masks while rejecting every other high-priority
+override. The retry used this reviewed `init_boot_a` image:
+
+```
+ff7b25339ceb23a00e719b891dfee0ece24f44b3adda99f47fe5d7bdf9f9d5ad
+```
+
+On boot `d58d98f4-e9d5-4217-a3ad-f3b8413e9d8e`, live pre-start inspection
+showed one registered, SIM-ready, home-attached LTE/5G modem; no data attempt or
+state, `qmapmux0.0`, GNSS admission, Bluetooth controller or `btattach`; a
+pristine IPA guard; addressed USB and Wi-Fi rescue; active SSH; PMIC 43.274 C;
+and hottest valid non-trip sensor 73.7 C. ModemManager PID 4473 and the MAIN
+guard remained stable through the 60-second settle and every audio stage.
+
+The durable final boundary was:
+
+```
+mode=audio-cellular-speaker
+boot_id=d58d98f4-e9d5-4217-a3ad-f3b8413e9d8e
+boundary=probe-result
+modem_pid=4473 result=pass kind=speaker duration_ms=250 level_dbfs=-45 tfa=Powerdown
+```
+
+Logs record exactly one probe after mapper, transport, ADSP, codecs, devnodes,
+FastRPC and speaker-DSP readiness. Cleanup stopped streams, restored controls
+and powered TFA down. Recovery completed normally into pmOS boot
+`002580a8-1c82-4729-8e8e-1958d94a4885` with latch reason
+`audio-cellular-speaker-complete`. There was no fastboot entry or hard reset.
 
 ## Offline composition
 
