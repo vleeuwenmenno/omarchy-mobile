@@ -115,7 +115,7 @@ Microphone, Screenshot and Screen record start under "Add tiles".
 | Microphone | Mute of PipeWire's default source; "No microphone" without one |
 | Screenshot | Puts the sheet away, then `omarchy-capture-screenshot fullscreen` (file, clipboard and a notification) |
 | Screen record | `omarchy-capture-screenrecording --fullscreen`, a second tap `--stop-recording`; "No recorder" without gpu-screen-recorder |
-| Location | `omamobile-gnss on` and `off`, through exact systemd/polkit units. On grants GeoClue permission but leaves GNSS idle; an app request shows "In use" and powers Qualcomm GNSS only for that request. Off removes permission, stops GeoClue and disables GNSS |
+| Location | `omamobile-gnss on` and `off`, through exact systemd/polkit units. On grants GeoClue permission and prepares MSB assistance without powering raw/NMEA; an app request shows "In use" and powers Qualcomm GNSS only for that request. Off removes permission, stops GeoClue and disables GNSS |
 | NFC | the controller's rfkill switch (`rfkill block nfc`, `rfkill unblock nfc`); "No NFC" until a controller probes (RADIOS-CAMERA-PLAN section 3) |
 | Rotation lock | `omamobile-autorotate` (omamobile-sensors): locked by `~/.local/state/omamobile/rotation-lock`; unlocking also enables the service. "No sensor" while the sensor proxy has no accelerometer |
 | Torch | The rear flash LED in torch mode (`brightnessctl --device=white:torch`); "No flash LED" without it |

@@ -266,6 +266,8 @@ Run it once, by hand. It is not an automatic service.
   On removes only that owned gate. The bearer and modem remain untouched.
   Location is a persistent GeoClue permission: Off prevents D-Bus activation,
   while On lets GeoClue power Qualcomm GNSS only during an application request.
+  A root prerequisite selects the qualified MSB-assisted mode before GeoClue
+  starts; it does not enable raw or NMEA collection by itself.
   Audio profiles are explicit, uncommitted experiments that always recover;
   they never claim audio/cellular coexistence.
 * No same-boot fallback after `switch_root`; the guard's 1200 s deadline plus a

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# Prepare Qualcomm MSB assistance before an allowed GeoClue activation.
+[Unit]
+Description=Prepare assisted GNSS for Myron location requests
+ConditionPathExists=/var/lib/omamobile-location/enabled
+ConditionPathExists=!/etc/omamobile/myron-audio-experiment
+Before=geoclue.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/omamobile-gnss prepare
+RemainAfterExit=yes
+TimeoutStartSec=20

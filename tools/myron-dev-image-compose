@@ -218,6 +218,7 @@ docker run --rm --privileged --platform linux/arm64 \
         "$root/usr/lib/systemd/system/myron-cellular-publish.service" \
         "$root/usr/lib/systemd/system/myron-mobile-data-block.service" \
         "$root/usr/lib/systemd/system/omamobile-gnss-location@.service" \
+        "$root/usr/lib/systemd/system/omamobile-gnss-prepare.service" \
         "$root/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf" \
         "$root/usr/lib/systemd/system/myron-audio-experiment.service" \
         "$root/etc/polkit-1/rules.d/50-myron-cellular-enable.rules" \
@@ -422,6 +423,7 @@ if [[ $boot_policy == main ]]; then
     /usr/local/sbin/myron-mobile-data-policy /usr/lib/systemd/system/myron-mobile-data-block.service \
     /etc/polkit-1/rules.d/50-myron-mobile-data-block.rules \
     /usr/lib/systemd/system/omamobile-gnss-location@.service \
+    /usr/lib/systemd/system/omamobile-gnss-prepare.service \
     /usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf \
     /etc/polkit-1/rules.d/50-myron-location.rules \
     /usr/lib/systemd/system/myron-main-recover.service \
@@ -467,6 +469,7 @@ if [[ $boot_policy == main ]]; then
   for spec in \
     '/usr/lib/systemd/system/myron-mobile-data-block.service|device/myron/main-overlay/usr/lib/systemd/system/myron-mobile-data-block.service' \
     '/usr/lib/systemd/system/omamobile-gnss-location@.service|device/myron/main-overlay/usr/lib/systemd/system/omamobile-gnss-location@.service' \
+    '/usr/lib/systemd/system/omamobile-gnss-prepare.service|device/myron/main-overlay/usr/lib/systemd/system/omamobile-gnss-prepare.service' \
     '/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf|device/myron/main-overlay/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf' \
     '/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules|device/myron/main-overlay/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules' \
     '/etc/polkit-1/rules.d/50-myron-location.rules|device/myron/main-overlay/etc/polkit-1/rules.d/50-myron-location.rules'; do
@@ -475,7 +478,7 @@ if [[ $boot_policy == main ]]; then
     [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$repository_path")" ]] ||
       die "runtime policy differs from the repository: $image_path"
   done
-  for unit in myron-mobile-data-block.service omamobile-gnss-location@.service; do
+  for unit in myron-mobile-data-block.service omamobile-gnss-location@.service omamobile-gnss-prepare.service; do
     ! in_image "/etc/systemd/system/multi-user.target.wants/$unit" || die "runtime policy unit is enabled: $unit"
   done
   for unit in myron-cellular-op.timer myron-cellular-attended.service myron-cellular-enable.service myron-cellular-watch.service; do

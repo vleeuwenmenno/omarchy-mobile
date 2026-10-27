@@ -191,6 +191,14 @@ MSB-assisted location path rather than installing the Pixel-specific Broadcom
 GNSS package. The modem still advertises MSA capability, but the helper never
 enables mutually exclusive MSA and MSB together.
 
+The persistent MAIN permission gate was retested on 2026-10-27. GeoClue first
+reported a 25 km GeoIP estimate and then 58, 42 and 39 metre Wi-Fi estimates;
+these are not GNSS evidence. The corrected on-demand transaction selected MSB
+mode before the modem accepted LOC event registration and Start. No successful
+position report arrived during the bounded indoor test, so a fresh outdoor fix
+remains required. Off then stopped GeoClue, reset the preparation unit and
+disabled every GPS/A-GPS source; On restored permission with the receiver idle.
+
 ## Audio incident and hard sequencing rule
 
 Audio was incorrectly started after ModemManager and GNSS activity in the r4
