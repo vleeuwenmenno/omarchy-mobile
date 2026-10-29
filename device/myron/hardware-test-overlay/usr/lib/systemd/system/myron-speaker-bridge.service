@@ -3,6 +3,7 @@
 Description=Protected Myron AudioReach speaker bridge
 After=myron-reference-audio-foundation.service
 ConditionPathExists=/usr/local/libexec/myron-speaker/bridge.py
+ConditionPathExists=/usr/local/libexec/myron-speaker/bridge-session.py
 ConditionPathExists=/run/myron-wireless/mounts/persist/audio/tfa_calr.bin
 
 [Service]
@@ -15,7 +16,7 @@ Environment=MYRON_SPEAKER_MAX_SECONDS=0
 # amplitude and remains below the device-proven 0 dB bridge ceiling.
 Environment=MYRON_SPEAKER_GAIN_DB=-12
 Environment=MYRON_SPEAKER_WAIT_SECONDS=0
-ExecStart=/usr/bin/python3 /usr/local/libexec/myron-speaker/bridge.py
+ExecStart=/usr/bin/python3 /usr/local/libexec/myron-speaker/bridge-session.py
 ExecStopPost=/usr/local/sbin/myron-speaker-powerdown
 Restart=on-failure
 RestartSec=2

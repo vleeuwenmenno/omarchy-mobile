@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+post_install() {
+  echo "omamobile-location-usage: installed, not enabled. Enable it so it watches before"
+  echo "  GeoClue first starts: systemctl enable --now omamobile-location-usage.service"
+}
+post_upgrade() {
+  systemctl daemon-reload 2>/dev/null || true
+  # Restart so a new version's code runs; it re-reads its history and reports
+  # partial coverage honestly if GeoClue is already running.
+  if systemctl is-active -q omamobile-location-usage.service 2>/dev/null; then
+    systemctl restart omamobile-location-usage.service 2>/dev/null || true
+  fi
+}
+pre_remove() {
+  systemctl disable --now omamobile-location-usage.service 2>/dev/null || true
+}

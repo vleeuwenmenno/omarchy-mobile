@@ -10,3 +10,12 @@ destination=${1:?Usage: ./install DESTDIR}
 install -Dm644 README.md "$destination/usr/share/doc/omamobile-apps-myron/README.md"
 install -Dm644 LICENSE "$destination/usr/share/licenses/omamobile-apps-myron/LICENSE"
 install -Dm644 version "$destination/usr/share/omamobile/apps-myron/version"
+# Strata is the default folder handler and "show in folder" provider. The
+# FileManager1 file goes in /usr/local/share, which precedes /usr/share in
+# XDG_DATA_DIRS, so it wins even where another file manager is installed.
+# Strata is also the file chooser: /etc/xdg is read before omamobile-shell's
+# /etc/xdg-desktop-portal file.
+install -Dm644 etc-mimeapps.list "$destination/etc/xdg/mimeapps.list"
+install -Dm644 io.github.lgse.Strata.FileManager1.service \
+  "$destination/usr/local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service"
+install -Dm644 portal/hyprland-portals.conf "$destination/etc/xdg/xdg-desktop-portal/hyprland-portals.conf"

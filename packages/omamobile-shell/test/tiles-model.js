@@ -32,14 +32,6 @@ test("the sheet clears a visible top bar", () => {
   assert.match(qml, /sheetBottom: Math\.round\(sheet\.y \+ sheet\.height\)/)
 })
 
-test("the collapsed handle expands on a downward pull without replaying a tap", () => {
-  const qml = fs.readFileSync(path.join(__dirname, "../plugins/omamobile.quicksettings/QuickSettings.qml"), "utf8")
-  assert.match(qml, /readonly property real handlePullThreshold: Math\.max\(18, Style\.space\(24\)\)/)
-  assert.match(qml, /id: handleGesture[\s\S]*preventStealing: true/)
-  assert.match(qml, /mouse\.y - pressY >= root\.handlePullThreshold[\s\S]*expandedByPull = true[\s\S]*root\.expanded = true/)
-  assert.match(qml, /if \(!expandedByPull\) root\.expanded = !root\.expanded/)
-})
-
 test("privacy tiles refresh while open and Myron data can turn both ways", () => {
   const qml = fs.readFileSync(path.join(__dirname, "../plugins/omamobile.quicksettings/QuickSettings.qml"), "utf8")
   assert.match(qml, /interval: 2000[\s\S]*running: root\.opened[\s\S]*location\.refresh\(\)/)
@@ -71,15 +63,25 @@ test("parseConfig falls back to the default on anything unreadable", () => {
   assert.deepStrictEqual(M.parseConfig("{"), M.DEFAULT_LAYOUT)
   assert.deepStrictEqual(M.parseConfig("[]"), M.DEFAULT_LAYOUT)
   assert.deepStrictEqual(M.parseConfig('{"tiles": "wifi"}'), M.DEFAULT_LAYOUT)
-  assert.deepStrictEqual(M.parseConfig('{"version": 1, "tiles": ["mic", "nope", "wifi"]}'), ["mic", "wifi"])
+  assert.deepStrictEqual(M.parseConfig('{"version": 1, "tiles": ["mic", "nope", "wifi"]}'), ["mic", "wifi", "touch-feedback"])
   assert.deepStrictEqual(M.parseConfig('{"version": 1, "tiles": []}'), [])
 })
 
 test("serialize round-trips through parseConfig", () => {
   const text = M.serialize(["hotspot", "wifi", "bogus"])
   assert.ok(text.endsWith("\n"))
-  assert.deepStrictEqual(JSON.parse(text), { version: 1, tiles: ["hotspot", "wifi"] })
+  assert.deepStrictEqual(JSON.parse(text), { version: 2, tiles: ["hotspot", "wifi"] })
   assert.deepStrictEqual(M.parseConfig(text), ["hotspot", "wifi"])
+})
+
+test("touch feedback starts on page two and stays hidden after saving", () => {
+  assert.strictEqual(M.pages(M.defaults())[1][0], "touch-feedback")
+  const old = M.defaults().filter(id => id !== "touch-feedback")
+  const migrated = M.parseConfig(JSON.stringify({version: 1, tiles: old}))
+  assert.deepStrictEqual(migrated, M.defaults())
+  const hidden = M.remove(migrated, "touch-feedback")
+  assert.deepStrictEqual(M.parseConfig(M.serialize(hidden)), old)
+  assert.ok(M.available(hidden).includes("touch-feedback"))
 })
 
 test("parseList takes JSON or space- and comma-separated ids", () => {
@@ -94,7 +96,7 @@ test("parseList takes JSON or space- and comma-separated ids", () => {
 
 test("available lists the hidden tiles in catalog order", () => {
   const spare = M.available(M.defaults())
-  assert.deepStrictEqual(spare, ["hotspot", "stay-awake", "mic", "screenshot", "screen-record"])
+  assert.deepStrictEqual(spare, ["hotspot", "stay-awake", "mic", "screenshot", "screen-record", "settings"])
   assert.strictEqual(M.available([]).length, M.CATALOG.length)
   assert.deepStrictEqual(M.available(M.CATALOG.map((t) => t.id)), [])
 })

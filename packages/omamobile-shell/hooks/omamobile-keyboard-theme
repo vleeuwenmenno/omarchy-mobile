@@ -1,0 +1,7 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Omarchy's theme-set hook (linked into ~/.config/omarchy/hooks/theme-set.d/ by
+# omamobile-setup-user): rewrite the on-screen keyboard's generated CSS from
+# the new theme. The keyboard reads it when it starts; a running keyboard is
+# not restarted.
+omamobile-settings keyboard-theme install >/dev/null || true

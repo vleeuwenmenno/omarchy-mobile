@@ -5,11 +5,11 @@
 // Node can test the rules in test/tiles-model.js through module.exports.
 //
 // The layout is per user, in ~/.config/omamobile/quicksettings.json:
-//   { "version": 1, "tiles": ["wifi", "bluetooth", ...] }
+//   { "version": 2, "tiles": ["wifi", "bluetooth", ...] }
 // Unknown ids (a tile a later version dropped) and duplicates are skipped;
 // a missing or unreadable file means the default layout.
 
-var VERSION = 1
+var VERSION = 2
 
 // Every tile the sheet knows, in the order the "available" list shows them.
 var CATALOG = [
@@ -20,7 +20,9 @@ var CATALOG = [
   { id: "hotspot", label: "Hotspot" },
   { id: "dnd", label: "Do not disturb" },
   { id: "torch", label: "Torch" },
-  { id: "rotation-lock", label: "Rotation lock" },
+  { id: "touch-feedback", label: "Touch feedback" },
+  { id: "pocket-protection", label: "Pocket protection" },
+  { id: "rotation-lock", label: "Lock rotation" },
   { id: "location", label: "Location" },
   { id: "nfc", label: "NFC" },
   { id: "battery-saver", label: "Battery saver" },
@@ -31,7 +33,8 @@ var CATALOG = [
   { id: "screenshot", label: "Screenshot" },
   { id: "screen-record", label: "Screen record" },
   { id: "fingerprint", label: "Fingerprint" },
-  { id: "keyboard", label: "Keyboard" }
+  { id: "keyboard", label: "Keyboard" },
+  { id: "settings", label: "Settings" }
 ]
 
 // The first four are the collapsed sheet's row, as on Android: the toggles
@@ -39,8 +42,8 @@ var CATALOG = [
 var DEFAULT_LAYOUT = [
   "wifi", "bluetooth", "dnd", "torch",
   "mobile-data", "rotation-lock", "airplane", "location",
-  "battery-saver", "dark-theme", "night-light", "nfc",
-  "fingerprint", "keyboard"
+  "touch-feedback", "battery-saver", "dark-theme", "night-light", "nfc",
+  "fingerprint", "keyboard", "pocket-protection"
 ]
 
 var QUICK_COUNT = 4
@@ -82,7 +85,12 @@ function parseConfig(text) {
   var data = null
   try { data = JSON.parse(String(text || "")) } catch (error) { return defaults() }
   if (!data || typeof data !== "object" || !Array.isArray(data.tiles)) return defaults()
-  return sanitize(data.tiles)
+  var layout = sanitize(data.tiles)
+  // Upgrade saved layouts once. Version 2 saves remember removal; an explicitly
+  // empty layout remains empty. Preserve all existing tiles and their order.
+  if (data.version === 1 && layout.length > 0)
+    layout = add(layout, "touch-feedback", Math.min(PAGE_SIZE, layout.length))
+  return layout
 }
 
 // A layout from the command line: a JSON array, or ids separated by spaces

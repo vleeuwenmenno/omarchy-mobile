@@ -9,4 +9,4 @@ if [ ! -p /run/myron-audio/speaker.pcm ]; then
 fi
 chown root:audio /run/myron-audio/speaker.pcm
 chmod 0660 /run/myron-audio/speaker.pcm
-rm -f /run/myron-audio/bridge-ready
+rm -f /run/myron-audio/bridge-ready /run/myron-audio/stream-ready

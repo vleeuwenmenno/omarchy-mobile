@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT
+# Location-use observer: records which app and process used GeoClue, for the
+# Location panel. It only watches bus metadata (no coordinates) and never
+# starts GeoClue or the GNSS receiver. Ordered before geoclue.service so it is
+# already watching when GeoClue first starts; it does not pull GeoClue in, and
+# there is no D-Bus activation file, so no client can start it either.
+[Unit]
+Description=Omarchy Mobile location-use history
+Wants=dbus.socket
+After=dbus.socket dbus.service
+Before=geoclue.service
+
+[Service]
+Type=dbus
+BusName=org.omamobile.LocationUsage1
+ExecStart=/usr/lib/omamobile-location-usage/omamobile-location-usaged
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=15
+# Root: BecomeMonitor needs it. Nothing else: no capabilities, devices,
+# network or writable path but its own state directory (root-only 0700).
+StateDirectory=omamobile-location-usage
+StateDirectoryMode=0700
+UMask=0077
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

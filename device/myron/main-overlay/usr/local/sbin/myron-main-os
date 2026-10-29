@@ -82,6 +82,24 @@ is_uuid() {
 
 has_latch() { [ -e "$main/latch" ] || [ -L "$main/latch" ]; }
 
+# Explicit owner opt-in for an unqualified development image. This removes
+# only the wall-clock deadline; latch supervision and failure recovery remain.
+# A different image retains the default. Malformed or unsafe policy fails closed.
+guard_policy() {
+	trust_state
+	policy=$main/development-no-timeout
+	if [ -e "$policy" ] || [ -L "$policy" ]; then
+		safe_file "$policy" || die 'unsafe development timeout policy'
+		[ "$(wc -c <"$policy")" -eq 33 ] || die 'malformed development timeout policy'
+		policy_image=$(cat "$policy")
+		case $policy_image in ''|*[!0-9a-f]*) die 'malformed development image id' ;; esac
+		[ "${#policy_image}" -eq 32 ] || die 'malformed development image id'
+		if in_omarchy && [ "$policy_image" = "$(cat "$runtime_dir/image-id")" ]; then
+			guard_deadline_seconds=0
+		fi
+	fi
+}
+
 # success file written for the CURRENT boot and the running image. Outside the
 # Omarchy boot there is no running image id, so only the boot id is compared.
 committed_current() {
@@ -350,6 +368,9 @@ guard_latched() {
 }
 
 cmd_guard() {
+	require_root
+	guard_policy
+	printf '%s\n' "$guard_deadline_seconds" >"$runtime_dir/guard-deadline-seconds"
 	log_line "guard-start deadline=${guard_deadline_seconds}s"
 	start=$(uptime_s)
 	while :; do
@@ -362,7 +383,7 @@ cmd_guard() {
 			exit 0
 		fi
 		now=$(uptime_s)
-		[ $((now - start)) -lt "$guard_deadline_seconds" ] || break
+		[ "$guard_deadline_seconds" -eq 0 ] || [ $((now - start)) -lt "$guard_deadline_seconds" ] || break
 		sleep "$guard_poll_seconds"
 	done
 	guard_timeout
@@ -377,6 +398,7 @@ case $cmd in
 	commit) cmd_commit ;;
 	reboot-normal) cmd_reboot_normal "$@" ;;
 	guard-preflight) cmd_guard_preflight ;;
+	guard-policy) require_root; guard_policy; say "guard_deadline_seconds=$guard_deadline_seconds" ;;
 	guard) cmd_guard ;;
 	*) die 'usage: myron-main-os status|recover [--reason WORD] [--unless-committed]|resume|commit|reboot-normal [--reason WORD]' ;;
 esac

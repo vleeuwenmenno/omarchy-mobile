@@ -45,10 +45,39 @@ qualify_profile() {
         die 'IPA guard is not active'
       /usr/local/sbin/myron-ipa-guard check >/dev/null 2>&1 ||
         die 'IPA guard is not clean'
-      ! systemctl --quiet is-active myron-reference-audio-foundation.service ||
-        die 'cellular profile unexpectedly started AudioReach'
-      ! systemctl --quiet is-active myron-speaker-bridge.service ||
-        die 'cellular profile unexpectedly started speaker bridge'
+      if [ -f /etc/omamobile/myron-main-audio ] &&
+          [ ! -L /etc/omamobile/myron-main-audio ] &&
+          [ "$(cat /etc/omamobile/myron-main-audio)" = cellular-audio ]; then
+        systemctl --quiet is-active myron-cellular-audio.service ||
+          die 'persistent cellular-audio service is not active'
+        ! systemctl --quiet is-active myron-reference-audio-foundation.service ||
+          die 'persistent cellular-audio profile used the modem-incompatible legacy foundation'
+        boot_id=$(cat /proc/sys/kernel/random/boot_id)
+        [ "$(cat /run/myron-host/var/lib/omarchy-mobile/audio-stage.state 2>/dev/null || true)" = "done:speaker-dsp:$boot_id" ] ||
+          die 'persistent cellular-audio profile did not complete modem-safe AudioReach staging'
+        systemctl --quiet is-active myron-speaker-bridge.service ||
+          die 'persistent cellular-audio profile did not start speaker bridge'
+        [ -s /run/myron-cellular-audio-ready ] ||
+          die 'persistent cellular-audio readiness marker is missing'
+        [ -s /run/myron-audio/bridge-ready ] ||
+          die 'persistent speaker bridge readiness marker is missing'
+        grep -q canoe-mtp-snd-card /proc/asound/cards ||
+          die 'persistent cellular-audio ALSA card is missing'
+        tfa=$(amixer -c 0 cget 'name=TFA Profile' 2>/dev/null |
+          sed -n 's/^  : values=//p' | tail -n 1)
+        [ "$tfa" = 6 ] || die 'persistent speaker bridge did not remain idle in TFA Powerdown'
+        audio_state=' audio=AudioReach speaker=OEM-MIPLAY gain_db=-12'
+      else
+        [ ! -e /etc/omamobile/myron-main-audio ] && [ ! -L /etc/omamobile/myron-main-audio ] ||
+          die 'persistent cellular-audio marker is malformed'
+        ! systemctl --quiet is-active myron-cellular-audio.service ||
+          die 'cellular-only profile unexpectedly started cellular audio'
+        ! systemctl --quiet is-active myron-reference-audio-foundation.service ||
+          die 'cellular profile unexpectedly started AudioReach'
+        ! systemctl --quiet is-active myron-speaker-bridge.service ||
+          die 'cellular profile unexpectedly started speaker bridge'
+        audio_state=' audio=inactive'
+      fi
       [ ! -e /sys/class/bluetooth/hci0 ] ||
         die 'cellular profile unexpectedly created a Bluetooth controller'
       ! pgrep -x btattach >/dev/null 2>&1 ||
@@ -72,7 +101,7 @@ qualify_profile() {
         die 'cellular modem does not advertise raw GPS'
       printf '%s\n' "$location" | grep -Fq ': gps-nmea' ||
         die 'cellular modem does not advertise NMEA GPS'
-      say "profile=cellular modem=published location=raw+nmea discovery_seconds=$elapsed state=qualified"
+      say "profile=cellular modem=published location=raw+nmea discovery_seconds=$elapsed$audio_state state=qualified"
       ;;
     *) die 'unknown or missing Myron hardware-test profile' ;;
   esac

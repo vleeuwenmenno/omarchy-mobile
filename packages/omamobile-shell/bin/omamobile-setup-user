@@ -15,6 +15,7 @@ omarchy-done mark welcome-keybindings-not-applicable
 
 # Phone shell plugins: link them, so package updates reach the user
 mkdir -p "$config/plugins"
+ln -sfn "$share/plugins/PocketStatus.qml" "$config/plugins/PocketStatus.qml"
 for plugin in "$share"/plugins/omamobile.*; do
   ln -sfn "$plugin" "$config/plugins/$(basename "$plugin")"
 done
@@ -262,6 +263,9 @@ fi
 if omarchy-done ensure omamobile-call-plugin; then
   add_plugin omamobile.call
 fi
+if omarchy-done ensure omamobile-pocket-plugin; then
+  add_plugin omamobile.pocket
+fi
 if omarchy-done ensure omamobile-menu-update; then
   extension=~/.config/omarchy/extensions/omarchy-menu.jsonc
   mkdir -p "$(dirname "$extension")"
@@ -276,4 +280,42 @@ fi
 if omarchy-done ensure omamobile-lock-after-screensaver; then
   mkdir -p ~/.local/state/omarchy/toggles
   touch ~/.local/state/omarchy/toggles/lock-after-screensaver
+fi
+
+if omarchy-done ensure omamobile-rotation-plugin; then
+  add_plugin omamobile.rotation
+fi
+
+# Settings app (omamobile.settings): General, Keyboard and Quick Settings, also
+# an app in the drawer (applications/omamobile-settings.desktop).
+if omarchy-done ensure omamobile-settings-plugin; then
+  add_plugin omamobile.settings
+fi
+
+# On-screen keyboard theme: Squeekboard's keys drawn as Omarchy's square,
+# bordered controls from the current theme, through a generated file that gtk.css
+# imports (omamobile-settings keyboard-theme; an existing gtk.css is backed up
+# and kept, only the import is added at its top). Theme changes rewrite the file
+# through Omarchy's theme-set hook. Once; `omamobile-settings keyboard-theme
+# remove` and deleting the hook link undo it, and neither is redone.
+if omarchy-done ensure omamobile-keyboard-theme; then
+  hooks=~/.config/omarchy/hooks/theme-set.d
+  mkdir -p "$hooks"
+  [[ -e $hooks/50-omamobile-keyboard || -L $hooks/50-omamobile-keyboard ]] ||
+    ln -s "$share/hooks/omamobile-keyboard-theme" "$hooks/50-omamobile-keyboard"
+  omamobile-settings keyboard-theme install >/dev/null || true
+fi
+# Every login, keep the generated file in step with the package and the theme,
+# but only where it is already installed (never re-adding what was removed).
+if [[ -f ${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/omamobile-squeekboard.css ]]; then
+  omamobile-settings keyboard-theme generate >/dev/null || true
+fi
+
+# Chromium's own Wayland IME is off unless asked for: without it a focused
+# page field never reaches Hyprland's text-input-v3, so the on-screen keyboard
+# stays down (Chromium 155 has --enable-wayland-ime; text-input-v3 is its
+# default version). Added once to the user's flags file.
+if omarchy-done ensure omamobile-chromium-wayland-ime; then
+  grep -qx -- --enable-wayland-ime ~/.config/chromium-flags.conf 2>/dev/null ||
+    echo --enable-wayland-ime >>~/.config/chromium-flags.conf
 fi

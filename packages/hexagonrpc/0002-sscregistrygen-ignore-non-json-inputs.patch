@@ -1,0 +1,25 @@
+From: Omarchy Mobile contributors
+Subject: [PATCH] sscregistrygen: ignore inputs that are not JSON
+
+Vendor sensor configuration directories also contain list and calibration
+image files. json_object_from_fd returns NULL for those files, after which the
+generator dereferences it. Ignore files that cannot be parsed as JSON.
+---
+ tools/sscregistrygen.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tools/sscregistrygen.c b/tools/sscregistrygen.c
+index 6ffdfb5..e9b7aa1 100644
+--- a/tools/sscregistrygen.c
++++ b/tools/sscregistrygen.c
+@@ -220,6 +220,8 @@ void apply_sensor_configuration(struct config_filter *filter,
+ 	in = json_object_from_fd(fd);
+ 
+ 	close(fd);
++	if (in == NULL)
++		return;
+ 
+ 	config = json_object_object_get(in, "config");
+ 	if (config != NULL) {
+-- 
+2.51.0

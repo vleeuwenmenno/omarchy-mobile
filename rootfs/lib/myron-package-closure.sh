@@ -11,7 +11,8 @@ check_myron_package_closure() { # ROOT
                      qrtr rmtfs tqftpserv tinyalsa audioreach-graphservices
                      audioreach-conf audioreach-graphmgr fastrpc)
   local -a forbidden=(omamobile-apps omacam neard libcamera libcamera-ipa pipewire-libcamera
-                      gst-plugin-libcamera libfprint vulkan-panfrost)
+                      gst-plugin-libcamera libfprint vulkan-panfrost
+                      nautilus nautilus-python xdg-desktop-portal-gnome)
   local -a absent=() present=()
   local -A installed=()
 

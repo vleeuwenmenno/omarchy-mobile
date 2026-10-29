@@ -40,6 +40,15 @@
     },
     {
       "id": "omamobile.call"
+    },
+    {
+      "id": "omamobile.pocket"
+    },
+    {
+      "id": "omamobile.rotation"
+    },
+    {
+      "id": "omamobile.settings"
     }
   ]
 }

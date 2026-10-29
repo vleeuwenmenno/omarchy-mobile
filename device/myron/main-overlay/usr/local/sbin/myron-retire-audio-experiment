@@ -1,0 +1,38 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Retire an unused audio experiment without restarting the registered modem.
+set -eu
+case ${1:-} in --check|--apply) action=$1 ;; *) echo 'usage: myron-retire-audio-experiment --check|--apply' >&2; exit 2 ;; esac
+fail() { echo "ERROR: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'root required'
+grep -qx 'ID=omarchy' /etc/os-release || fail 'Omarchy required'
+[ "$(cat /etc/omamobile/myron-test-profile)" = cellular ] || fail 'cellular base profile required'
+marker=/etc/omamobile/myron-cellular-audio-experiment
+request=/run/myron-main/cellular-audio-experiment.request
+backup=/var/lib/myron-retired-audio-experiment
+[ -f "$marker" ] && [ ! -L "$marker" ] || fail 'regular audio experiment marker required'
+[ "$(cat "$marker")" = audio-cellular-bridge ] || fail 'unexpected experiment'
+[ ! -e "$backup" ] || fail 'backup already exists; inspect previous transition'
+for unit in myron-cellular-audio-experiment myron-audio-experiment myron-speaker-bridge myron-microphone-bridge; do
+ state=$(systemctl show "$unit.service" -p ActiveState --value)
+ [ "$state" = inactive ] || fail "$unit is not inactive"
+done
+for path in /run/myron-main/cellular-audio-experiment.consumed /run/myron-cellular-stage/mutation /run/myron-audio; do
+ [ ! -e "$path" ] && [ ! -L "$path" ] || fail "prior mutation: $path"
+done
+systemctl is-active --quiet myron-cellular.service ModemManager.service myron-ipa-guard.service myron-hardware-watchdog.service || fail 'required service inactive'
+/usr/local/sbin/myron-ipa-guard check pristine
+[ "$action" = --apply ] || { echo 'status=checked'; exit 0; }
+mkdir -m700 "$backup"
+cp -a "$marker" "$backup/marker"
+if [ -e "$request" ]; then
+ [ -f "$request" ] && [ ! -L "$request" ] || fail 'unsafe request'
+ cp -a "$request" "$backup/request"
+ rm "$request"
+fi
+systemctl is-enabled myron-cellular-publish.service >"$backup/publish-before" 2>/dev/null || true
+rm "$marker"
+# The cellular composer profile enables this read-only status publisher.
+systemctl enable myron-cellular-publish.service
+systemctl start myron-cellular-publish.service
+echo "status=retired backup=$backup modem=unchanged qualification=unchanged"

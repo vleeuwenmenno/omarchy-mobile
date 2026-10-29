@@ -9,7 +9,7 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 bash -n PKGBUILD install || fail "scripts parse"
 grep -Eq '^provides=\(omamobile-apps\)$' PKGBUILD || fail "provider is missing"
 grep -Eq '^conflicts=\(omamobile-apps\)$' PKGBUILD || fail "generic app profile is not excluded"
-grep -Eq '^depends=\(gnome-maps geoclue\)$' PKGBUILD || fail "safe app dependencies differ"
+grep -Eq '^depends=\(gnome-maps geoclue strata xdg-desktop-portal-gtk\)$' PKGBUILD || fail "safe app dependencies differ"
 if grep -Eq '^[[:space:]]*(omacam|neard|libcamera|libcamera-ipa|pipewire-libcamera)([[:space:])]|$)' PKGBUILD; then
   fail "unqualified camera or NFC dependency present"
 fi
@@ -17,9 +17,17 @@ pass "provider selects Maps and GeoClue without camera or NFC"
 
 ./install "$tmp/root"
 printf '%s\n' \
+  etc/xdg/mimeapps.list \
+  etc/xdg/xdg-desktop-portal/hyprland-portals.conf \
+  usr/local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service \
   usr/share/doc/omamobile-apps-myron/README.md \
   usr/share/licenses/omamobile-apps-myron/LICENSE \
   usr/share/omamobile/apps-myron/version > "$tmp/expected"
 (cd "$tmp/root" && find . -type f -print | sed 's#^\./##' | sort) > "$tmp/actual"
 cmp -s "$tmp/expected" "$tmp/actual" || fail "package stages unexpected files"
-pass "package stages inert metadata only"
+grep -qx 'inode/directory=io.github.lgse.Strata.desktop;' "$tmp/root/etc/xdg/mimeapps.list" || fail "folder default is not Strata"
+grep -qx 'Name=org.freedesktop.FileManager1' "$tmp/root/usr/local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service" || fail "FileManager1 name wrong"
+grep -qx 'Exec=/usr/bin/strata --gapplication-service' "$tmp/root/usr/local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service" || fail "FileManager1 exec wrong"
+grep -qx 'org.freedesktop.impl.portal.FileChooser=strata;gtk' "$tmp/root/etc/xdg/xdg-desktop-portal/hyprland-portals.conf" || fail "file chooser is not Strata"
+grep -qx 'org.freedesktop.impl.portal.Access=omamobile;gtk' "$tmp/root/etc/xdg/xdg-desktop-portal/hyprland-portals.conf" || fail "Access choice lost"
+pass "package stages metadata and the Strata folder/FileManager1 defaults"

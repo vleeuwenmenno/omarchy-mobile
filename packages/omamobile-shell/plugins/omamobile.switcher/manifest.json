@@ -5,7 +5,7 @@
   "version": "0.2.0",
   "author": "Omarchy Mobile",
   "license": "MIT",
-  "description": "Android-style recent apps: swipe up from the dock to see open windows as cards. Tap one to switch to it, flick it up to close it, hold it to show it with another app or move it back to its own screen, or go home.",
+  "description": "Recent apps and iOS-style bottom-edge gestures: swipe up from the bottom edge to go home, swipe up and pause to see open windows as cards, swipe sideways to switch apps, hold to go home. Tap a card to switch to it, flick it up to close it, hold it to show it with another app or move it back to its own screen.",
   "kinds": [
     "panel"
   ],

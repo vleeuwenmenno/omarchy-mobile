@@ -107,15 +107,14 @@ for line in "powerprofiles autodetect power-saver" "idle allow-idle" "sit data o
 done
 pass "tile-action.sh drives battery saver, stay awake, mobile data and hotspot"
 
-# Myron never falls through to Pixel SIT. Initial activation still asks only
-# its proven helper. Off/On on an active bearer start/stop the packet gate,
-# never disconnect IPA. Airplane remains unavailable.
+# Myron never falls through to Pixel SIT. Tile state is the helper's answer
+# verbatim and tile actions delegate on/off to the helper, which owns the
+# packet-gate policy; airplane remains unavailable.
 stub myron-mobile-data '
 [ ! -e '"$tmp"'/state/myron-helper-fail ] || exit 1
 case $1 in
   state) cat '"$tmp"'/state/myron-status ;;
-  on) echo "myron-data on" >>'"$log"' ;;
-  off) echo "myron-data off-refused" >>'"$log"'; exit 1 ;;
+  on|off) echo "myron-data $1" >>'"$log"' ;;
   *) exit 2 ;;
 esac'
 printf "data=off\ndata_status=Off ·5G\ndata_enable=1\ndata_busy=0\n" >"$tmp/state/myron-status"
@@ -123,6 +122,16 @@ out=$(run "$dir/tile-state.sh")
 grep -cx 'airplane=none' <<<"$out" >/dev/null || fail "Myron airplane mode is not unavailable"
 for line in data=off 'data_status=Off ·5G' data_enable=1 data_busy=0; do
   grep -cxF "$line" <<<"$out" >/dev/null || fail "Myron tile state lacks: $line"
+done
+printf "data=on\ndata_status=On ·5G\ndata_enable=1\ndata_busy=0\n" >"$tmp/state/myron-status"
+out=$(run "$dir/tile-state.sh")
+for line in data=on 'data_status=On ·5G' data_enable=1 data_busy=0; do
+  grep -cxF "$line" <<<"$out" >/dev/null || fail "tile-state.sh altered the helper's live answer: $line"
+done
+printf "data=off\ndata_status=Switching\ndata_enable=0\ndata_busy=1\n" >"$tmp/state/myron-status"
+out=$(run "$dir/tile-state.sh")
+for line in data=off data_status=Switching data_enable=0 data_busy=1; do
+  grep -cxF "$line" <<<"$out" >/dev/null || fail "tile-state.sh hid the helper's busy answer: $line"
 done
 touch "$tmp/state/myron-helper-fail"
 out=$(run "$dir/tile-state.sh")
@@ -132,30 +141,14 @@ done
 rm -f "$tmp/state/myron-helper-fail"
 : >"$log"
 run "$dir/tile-action.sh" mobile-data on
-grep -cxF 'myron-data on' "$log" >/dev/null || fail "Myron mobile-data start did not use its helper"
-! grep -q '^sit ' "$log" || fail "Myron mobile data fell through to Pixel SIT"
-printf "data=on\ndata_status=On ·5G\ndata_enable=0\ndata_busy=1\n" >"$tmp/state/myron-status"
-out=$(run "$dir/tile-state.sh")
-for line in data=on 'data_status=On ·5G' data_enable=1 data_busy=0; do
-  grep -cxF "$line" <<<"$out" >/dev/null || fail "active Myron bearer is not toggleable: $line"
-done
 run "$dir/tile-action.sh" mobile-data off
-grep -cxF 'systemctl start myron-mobile-data-block.service' "$log" >/dev/null ||
-  fail "Myron mobile-data off did not start the packet gate"
-out=$(run "$dir/tile-state.sh")
-for line in data=off 'data_status=Off ·5G' data_enable=1 data_busy=0; do
-  grep -cxF "$line" <<<"$out" >/dev/null || fail "blocked Myron bearer is not honestly off: $line"
-done
-run "$dir/tile-action.sh" mobile-data on
-grep -cxF 'systemctl stop myron-mobile-data-block.service' "$log" >/dev/null ||
-  fail "Myron mobile-data on did not remove the packet gate"
-[[ ! -e $tmp/state/data-block ]] || fail "Myron packet gate stayed active"
-[[ $(grep -c '^myron-data on$' "$log") == 1 ]] || fail "unblocking tried a second cellular activation"
+[[ $(cat "$log") == $'myron-data on\nmyron-data off' ]] || fail "Myron mobile data did not delegate on/off to its helper (got: $(tr '\n' '|' <"$log"))"
+! grep -q 'systemctl\|^sit ' "$log" || fail "Myron tile action duplicated policy or fell through to Pixel SIT"
 before=$(cat "$tmp/state/rfkill")
 if run "$dir/tile-action.sh" airplane on 2>/dev/null; then fail "Myron airplane mode was accepted"; fi
 [[ $(cat "$tmp/state/rfkill") == "$before" ]] || fail "Myron airplane refusal changed rfkill state"
 ! grep -q '^sit ' "$log" || fail "Myron refusal fell through to Pixel SIT"
-pass "Myron tile keeps one-shot activation, gates packets for off/on, reports failures, and refuses airplane"
+pass "Myron tile delegates mobile-data on/off and state to its helper, and refuses airplane"
 
 stub omamobile-microphone 'echo "microphone $*" >>'"$log"'; if [ "$1" = status ]; then echo off; fi; exit 0'
 grep -cx 'mic_bridge=off' <<<"$(run "$dir/tile-state.sh")" >/dev/null ||

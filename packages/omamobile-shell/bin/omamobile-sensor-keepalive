@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Keep one opted-in SensorProxy claim alive, without polling measurements."""
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+NAME = 'net.hadess.SensorProxy'
+OBJECT = '/net/hadess/SensorProxy'
+SENSORS = {'Light': ('', 'HasAmbientLight'), 'Proximity': ('', 'HasProximity'),
+           'Compass': ('/Compass', 'HasCompass')}
+
+
+def main():
+    import gi
+    gi.require_version('Gio', '2.0')
+    from gi.repository import Gio, GLib
+    sensor = sys.argv[1]
+    suffix, capability = SENSORS[sensor]
+    if sensor == 'Light':
+        # Myron's first ALS claim times out while the panel is dark. Wait for
+        # the owner's normal power wake instead of repeatedly opening it.
+        # Once claimed, keep it across screen-off like the other sensors.
+        config = Path('/etc/omamobile/display.json')
+        if config.exists():
+            name = json.loads(config.read_text()).get('backlight', '')
+            if name and '/' not in name and name not in ('.', '..'):
+                power = Path('/sys/class/backlight') / name / 'bl_power'
+                while power.exists() and power.read_text().strip() != '0':
+                    time.sleep(1)
+    interface = NAME + ('.Compass' if suffix else '')
+    path = OBJECT + suffix
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    loop = GLib.MainLoop()
+    runtime = Path(os.environ['XDG_RUNTIME_DIR'])
+    status = runtime / ('omamobile-sensor-' + sensor + '.json')
+    owner = ''
+    changed = False
+    claimed = False
+    unavailable = False
+    since = time.monotonic()
+
+    def call(iface, method, args=None, timeout=1500):
+        return bus.call_sync(NAME, path, iface, method, args, None,
+                             Gio.DBusCallFlags.NO_AUTO_START, timeout, None)
+
+    def owner_changed(connection, sender, object_path, iface, name, params):
+        nonlocal changed
+        changed = True
+        loop.quit()
+
+    def properties_changed(connection, sender, object_path, iface, name, params):
+        nonlocal unavailable
+        prop_iface, values, invalidated = params.unpack()
+        if prop_iface == interface and (values.get(capability) is False or capability in invalidated):
+            unavailable = True
+            loop.quit()
+
+    def heartbeat():
+        temp = status.with_suffix('.tmp')
+        temp.write_text(json.dumps(dict(owner=owner, since=since, at=time.monotonic())) + '\n')
+        temp.replace(status)
+        return GLib.SOURCE_CONTINUE
+
+    def stop(*_):
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+
+    subscription = bus.signal_subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus',
+        'NameOwnerChanged', '/org/freedesktop/DBus', NAME, Gio.DBusSignalFlags.NONE, owner_changed)
+    property_subscription = bus.signal_subscribe(NAME, 'org.freedesktop.DBus.Properties',
+        'PropertiesChanged', path, None, Gio.DBusSignalFlags.NONE, properties_changed)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, stop)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, stop)
+    try:
+        owner = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+            'org.freedesktop.DBus', 'GetNameOwner', GLib.Variant('(s)', (NAME,)), None,
+            Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+        props = call('org.freedesktop.DBus.Properties', 'GetAll',
+                     GLib.Variant('(s)', (interface,))).unpack()[0]
+        if not props.get(capability):
+            raise RuntimeError(sensor + ' unavailable')
+        claimed = True  # Release even when Claim times out server-side.
+        call(interface, 'Claim' + sensor, timeout=5000)
+        # Process a restart that happened during the synchronous claim first.
+        context = GLib.MainContext.default()
+        while context.pending():
+            context.iteration(False)
+        if changed or unavailable:
+            raise RuntimeError('SensorProxy restarted during claim')
+        since = time.monotonic()
+        heartbeat()
+        GLib.timeout_add_seconds(2, heartbeat)
+        print(sensor + ': continuous claim active', flush=True)
+        loop.run()
+        return 1 if changed or unavailable else 0
+    finally:
+        status.unlink(missing_ok=True)
+        if claimed and not changed:
+            try:
+                call(interface, 'Release' + sensor, timeout=500)
+            except GLib.Error:
+                pass
+        bus.signal_unsubscribe(subscription)
+        bus.signal_unsubscribe(property_subscription)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print('sensor keepalive: ' + str(error), file=sys.stderr)
+        sys.exit(1)

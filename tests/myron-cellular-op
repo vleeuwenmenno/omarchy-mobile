@@ -83,7 +83,11 @@ if grep -niE 'imei|imsi|iccid|msisdn|own-numbers|equipment-identifier|hw-addr|ma
 fi
 # Helper: only ModemManager listing and keys, and the one start.
 grep -E 'mmcli' "$helper_src" | grep -vE 'mmcli -L|mmcli -m "\$\(printf|^[[:space:]]*#' && fail 'helper runs an mmcli command other than list and keys'
-grep -c 'systemctl' "$helper_src" | grep -qx 1 || fail 'helper uses systemctl more than once'
+# Only: read the owned gate unit, start/stop that gate, start the enable unit.
+if grep -E 'systemctl' "$helper_src" | grep -vE '^[[:space:]]*#' |
+  grep -vE 'systemctl show -p LoadState -p ActiveState "\$block_unit"|exec systemctl (stop|start) "\$block_unit"|exec systemctl start --no-block "\$enable_unit"'; then
+  fail 'helper runs a systemctl command other than the gate read, gate start/stop and enable start'
+fi
 grep -Fq 'exec systemctl start --no-block "$enable_unit"' "$helper_src" || fail 'helper does not start exactly the enable unit'
 if grep -nE 'nmcli|rfkill|connection (up|down)|device (disconnect|set)' "$helper_src"; then fail 'helper touches NetworkManager or rfkill'; fi
 pass 'supervisor and helpers: POSIX syntax, bounded plain reboot, forbidden actions, no latch, no identity'

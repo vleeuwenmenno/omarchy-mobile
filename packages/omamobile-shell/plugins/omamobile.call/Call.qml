@@ -4,6 +4,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
+import ".." as Phone
 import qs.Commons as Commons
 import "CallModel.js" as CallModel
 
@@ -21,6 +22,7 @@ import "CallModel.js" as CallModel
 // Phone app opens only on an unlocked phone, and the lock stays put.
 Item {
   id: root
+  Phone.PocketStatus { id: pocketGuard }
 
   // Injected by the host.
   property var shell: null
@@ -143,7 +145,7 @@ Item {
 
   PanelWindow {
     id: fullWindow
-    visible: root.mode === "incoming" || root.mode === "in-call" || root.showEmergency
+    visible: !pocketGuard.active && (root.mode === "incoming" || root.mode === "in-call" || root.showEmergency)
     anchors { top: true; bottom: true; left: true; right: true }
     exclusionMode: ExclusionMode.Ignore
     color: "transparent"
@@ -178,7 +180,7 @@ Item {
 
   PanelWindow {
     id: topWindow
-    visible: root.mode === "heads-up" || root.mode === "in-call-mini"
+    visible: !pocketGuard.active && (root.mode === "heads-up" || root.mode === "in-call-mini")
     anchors { top: true; left: true; right: true }
     implicitHeight: headsUp.implicitHeight
     exclusionMode: ExclusionMode.Ignore

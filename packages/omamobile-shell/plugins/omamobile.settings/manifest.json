@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "omamobile.settings",
+  "name": "Settings",
+  "version": "0.1.0",
+  "author": "Omarchy Mobile",
+  "license": "MIT",
+  "description": "The phone's Settings app: General, Keyboard and Quick Settings.",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "Settings.qml"
+  }
+}

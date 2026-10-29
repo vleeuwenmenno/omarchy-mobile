@@ -255,7 +255,7 @@ def scan_reports_each_folder():
         assert any("not valid JSON" in e for e in by["t.json"]["errors"])
         assert any("outside" in e for e in by["t.link"]["errors"])
         assert any("links outside" in e for e in by["t.leak"]["errors"])
-        assert [e["id"] for e in data["examples"]] == ["countdown", "disk-space"]
+        assert [e["id"] for e in data["examples"]] == ["countdown", "disk-space", "sensors"]
         assert all(e["status"] == "ok" for e in data["examples"]), data["examples"]
         # The contract is linked from the widgets folder.
         assert os.path.islink(os.path.join(s.widgets, "WIDGETS.md"))

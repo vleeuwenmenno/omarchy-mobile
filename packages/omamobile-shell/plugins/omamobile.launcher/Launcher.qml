@@ -8,8 +8,11 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import qs.services as OmarchyServices
+import ".." as Phone
+import "../omamobile.gestures" as Gestures
 import "DeviceProfile.js" as DeviceProfile
 import "LauncherModel.js" as LauncherModel
+import "SettingsGeometry.js" as SettingsGeometry
 
 // The phone's home surface, after Omalauncher: one bar at the bottom of the
 // screen that is app search, app grid and coding-agent prompt at once.
@@ -46,6 +49,9 @@ Item {
     onLoadFailed: root.deviceDescriptor = ""
   }
 
+  // Pocket protection: the bottom-edge gestures stand down while it is up.
+  Phone.PocketStatus { id: pocketGuard }
+
   readonly property string pluginId: (manifest && manifest.id) || "omamobile.launcher"
   readonly property var appLibrary: shell && shell.appLibrary ? shell.appLibrary : localLibrary.item
 
@@ -63,6 +69,22 @@ Item {
 
   // `opened` is the drawer; the dock is always on screen.
   property bool opened: false
+  // Home is an empty workspace; an app keeps only the system gesture strip.
+  readonly property bool homeVisible: !!Hyprland.focusedWorkspace
+    && Hyprland.focusedWorkspace.toplevels.values.length === 0
+  // The strip kept under the drawer and the on-screen keyboard for the bottom
+  // gestures: Settings > Keyboard > Bottom gap (24 by default, which is what
+  // it always was). Read-only here; bin/omamobile-settings writes the file.
+  property var geometry: SettingsGeometry.parse("")
+  readonly property int navigationHeight: Style.space(SettingsGeometry.bottomGap(geometry))
+  FileView {
+    path: Quickshell.env("HOME") + "/.config/omamobile/settings.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.geometry = SettingsGeometry.parse(text())
+    onLoadFailed: root.geometry = SettingsGeometry.parse("")
+  }
   property string query: ""
   property var apps: []
   property int appsRevision: 0
@@ -187,6 +209,61 @@ Item {
     opened = true
   }
 
+  // ---------------------------------------------------------------- focus
+
+  // A drawer summoned over IPC (or by a swipe) is mapped without any touch
+  // on it, and Hyprland gives such a layer no keyboard focus, so the input
+  // never gets one and squeekboard stays hidden. Hand the focus over on
+  // purpose: a HyprlandFocusGrab on the drawer for a moment, then drop the
+  // grab (it would swallow the keyboard's touches, like Exclusive focus) and
+  // show the keyboard. Only for a committed open, never for a drag preview.
+  property bool keyboardShown: false
+
+  function setKeyboard(show) {
+    Quickshell.execDetached(["busctl", "--user", "call", "sm.puri.OSK0", "/sm/puri/OSK0",
+                             "sm.puri.OSK0", "SetVisible", "b", show ? "true" : "false"])
+    keyboardShown = show
+  }
+
+  function cancelFocus() {
+    focusStart.stop()
+    focusEnd.stop()
+    focusGrab.active = false
+    if (keyboardShown) setKeyboard(false)
+  }
+
+  onOpenedChanged: {
+    if (opened) focusStart.restart()
+    else cancelFocus()
+  }
+
+  Timer {
+    id: focusStart
+    interval: 120
+    onTriggered: {
+      if (!root.opened) return
+      focusGrab.active = true
+      input.forceActiveFocus()
+      focusEnd.restart()
+    }
+  }
+
+  Timer {
+    id: focusEnd
+    interval: 450
+    onTriggered: {
+      focusGrab.active = false
+      if (!root.opened) return
+      input.forceActiveFocus()
+      root.setKeyboard(true)
+    }
+  }
+
+  HyprlandFocusGrab {
+    id: focusGrab
+    windows: [drawer]
+  }
+
   // Host-initiated close (`shell hide`).
   function close() {
     opened = false
@@ -239,9 +316,84 @@ Item {
   readonly property int touch: Math.max(44, Style.space(44))
   readonly property int inputHeight: Math.max(48, Style.space(48))
   readonly property int dockHeight: inputHeight + Style.spacing.xxl * 2
+  // Same side padding as the status bar, so the search bar lines up with the
+  // rounded corners.
+  readonly property int searchInset: Style.spacing.huge + sideInset
+  // The strip above the dock's search pill that holds the drag handle.
+  readonly property int handleHeight: Math.max(22, Style.space(22))
+  readonly property int dockBottomInset: Style.space(8)
 
-  property real reveal: opened ? 1 : 0
+  // Dragging the dock handle up: the drawer follows the finger before it is
+  // opened. `previewing` keeps it mapped and fully shown meanwhile.
+  property bool previewing: false
+  property real handleVelocity: 0
+  readonly property real screenHeight: drawer.screen ? drawer.screen.height : Math.max(drawerSheetHeight, 1)
+
+  function previewMove(up, velocity) {
+    if (opened) return
+    if (!previewing) {
+      previewing = true
+      pullSettle = false
+      previewEnd.stop()
+    }
+    handleVelocity = velocity
+    var h = Math.max(drawerSheetHeight, screenHeight)
+    dragY = Math.max(0, h - Math.max(0, up))
+  }
+
+  function previewRelease() {
+    if (!previewing) return
+    var h = Math.max(drawerSheetHeight, screenHeight)
+    var up = h - dragY
+    pullSettle = true
+    if (up > h * 0.25 || (handleVelocity < -1.0 && up > Style.space(24))) {
+      dragY = 0
+      expand()
+    } else {
+      dragY = h
+    }
+    previewEnd.restart()
+  }
+
+  // Settles the preview once the open has landed or the cancel slide is done.
+  Timer {
+    id: previewEnd
+    interval: 260
+    onTriggered: {
+      root.previewing = false
+      if (!root.opened) {
+        root.pullSettle = false
+        root.dragY = 0
+        root.pullSettle = true
+      }
+    }
+  }
+
+  property real reveal: (opened || previewing) ? 1 : 0
   Behavior on reveal { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+
+  // Pull the open drawer down to close it, as QuickSettings is pushed up: the
+  // sheet follows the finger and, on release, settles back or slides off.
+  // `dragY` is how far down the finger has pulled it.
+  property real dragY: 0
+  property bool pullSettle: true
+  property bool pullMoved: false
+  Behavior on dragY { enabled: root.pullSettle; NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+  // A pull that ends over an app cell must not also count as a tap on it.
+  Timer { id: pullGuard; interval: 150; onTriggered: root.pullMoved = false }
+
+  function pullRelease(velocity) {
+    var past = dragY > Style.space(120) || (velocity > 1.0 && dragY > Style.space(24))
+    pullSettle = true
+    pullGuard.restart()
+    if (past) {
+      dragY = drawerSheetHeight
+      dismiss()
+    } else {
+      dragY = 0
+    }
+  }
+  property real drawerSheetHeight: 0
 
   // ---------------------------------------------------------------- dock
 
@@ -252,11 +404,11 @@ Item {
       required property var modelData
       screen: modelData
 
-      // Hidden while the drawer is open, so the on-screen keyboard takes the
-      // bottom edge and the drawer's input sits right above it.
-      visible: !root.opened
+      // Keep the navigation strip reserved while typing so the keyboard
+      // sits above it; only Home shows the search pill and drawer handle.
+      visible: true
       anchors { bottom: true; left: true; right: true }
-      implicitHeight: root.dockHeight
+      implicitHeight: (root.homeVisible && !root.opened) ? root.dockHeight + root.handleHeight + root.dockBottomInset : root.navigationHeight
       exclusionMode: ExclusionMode.Auto
       color: Commons.Color.bar.background
       WlrLayershell.namespace: "omamobile-dock"
@@ -265,31 +417,156 @@ Item {
       // drawn over a fullscreen window when it re-mapped after the drawer.
       WlrLayershell.layer: WlrLayer.Bottom
 
-      // Swipe up on the dock for recent apps (omamobile.switcher), as on
-      // Android; a tap still opens the drawer.
+      // System gestures along the bottom edge (omamobile.switcher), as on
+      // Android: up for recent apps, sideways to switch apps, hold for home.
+      // A tap on the pill still opens the drawer. The strip covers only the
+      // margin under the pill, so the drawer handle above has its own drag.
       Item {
         anchors.fill: parent
 
-        DragHandler {
-          target: null
-          xAxis.enabled: false
-          property real swipeY: 0
-          onActiveTranslationChanged: swipeY = activeTranslation.y
-          onActiveChanged: {
-            if (active) swipeY = 0
-            // Through the CLI, like Omarchy's background does: a plugin may
-            // only summon panels it owns, and the switcher is its own plugin.
-            else if (swipeY < -24)
-              Quickshell.execDetached(["omarchy-shell", "shell", "summon", "omamobile.switcher", "{}"])
+        // The handle: drag up and the drawer follows the finger; on release it
+        // settles open (keyboard follows) or back.
+        Item {
+          id: handleZone
+          visible: root.homeVisible && !root.opened
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: root.handleHeight + Style.spacing.xxl
+
+          Rectangle {
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
+            anchors.topMargin: Style.spacing.md
+            width: Math.max(36, Style.space(40))
+            height: Math.max(4, Style.space(4))
+            radius: height / 2
+            color: Qt.darker(root.foreground, 1.6)
+          }
+
+          DragHandler {
+            target: null
+            xAxis.enabled: false
+            property real lastY: 0
+            property real lastT: 0
+            property real velocity: 0
+            onActiveChanged: {
+              if (active) { lastY = 0; lastT = Date.now(); velocity = 0 }
+              else root.previewRelease()
+            }
+            onActiveTranslationChanged: {
+              if (!active) return
+              var y = activeTranslation.y
+              var now = Date.now()
+              if (now > lastT) velocity = 0.6 * velocity + 0.4 * ((y - lastY) / (now - lastT))
+              lastY = y; lastT = now
+              root.previewMove(-y, velocity)
+            }
+          }
+        }
+
+        // The system navigation strip along the bottom edge. The finger goes
+        // to Gestures.NavState, where the switcher follows it: sideways
+        // switches apps, up opens recents, a hold goes home. A small handle
+        // shows while it is touched and fades a moment later; the strip
+        // itself always takes gestures.
+        Item {
+          id: recentsStrip
+          anchors.bottom: parent.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: root.navigationHeight
+          enabled: !pocketGuard.active
+
+          property bool handleShown: false
+          readonly property bool touched: navDrag.active || navTap.pressed
+
+          onTouchedChanged: {
+            if (touched) {
+              handleHide.stop()
+              handleShown = true
+            } else {
+              handleHide.restart()
+            }
+          }
+
+          Timer {
+            id: handleHide
+            interval: 1600
+            onTriggered: recentsStrip.handleShown = false
+          }
+
+          Rectangle {
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.verticalCenter: parent.verticalCenter
+            // Leans after the finger, like the handle on Android and iOS.
+            anchors.horizontalCenterOffset: navDrag.active
+              ? Math.max(-Style.space(40), Math.min(Style.space(40), Gestures.NavState.dx * 0.2)) : 0
+            anchors.verticalCenterOffset: navDrag.active
+              ? Math.max(-Style.space(10), Math.min(0, Gestures.NavState.dy * 0.08)) : 0
+            width: Math.max(72, Style.space(96))
+            height: Math.max(4, Style.space(5))
+            radius: height / 2
+            color: root.foreground
+            opacity: recentsStrip.handleShown ? 0.75 : 0
+            Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+            Behavior on anchors.horizontalCenterOffset { enabled: !navDrag.active; NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+            Behavior on anchors.verticalCenterOffset { enabled: !navDrag.active; NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+          }
+
+          TapHandler {
+            id: navTap
+            gesturePolicy: TapHandler.DragThreshold
+            longPressThreshold: 0.45
+            onPressedChanged: {
+              if (pressed) Gestures.NavState.press()
+              else Gestures.NavState.release()
+            }
+            onLongPressed: {
+              if (Gestures.NavState.attached) Gestures.NavState.hold()
+            }
+          }
+
+          DragHandler {
+            id: navDrag
+            target: null
+            property bool canceled: false
+            onActiveChanged: {
+              if (active) {
+                canceled = false
+                Gestures.NavState.begin()
+                return
+              }
+              // Later, so a cancel (lost grab) has been seen whichever order
+              // Qt reports it in.
+              Qt.callLater(function() {
+                var dy = Gestures.NavState.dy
+                var lost = navDrag.canceled || pocketGuard.active
+                Gestures.NavState.finish(lost)
+                // No switcher listening: the plain swipe up for recents.
+                // Through the CLI, like Omarchy's background does: a plugin
+                // may only summon panels it owns, and the switcher is its own.
+                if (!Gestures.NavState.attached && !lost && dy < -24)
+                  Quickshell.execDetached(["omarchy-shell", "shell", "summon", "omamobile.switcher", "{}"])
+              })
+            }
+            onCanceled: canceled = true
+            onActiveTranslationChanged: {
+              if (!active) return
+              var velocity = centroid.velocity
+              Gestures.NavState.update(activeTranslation.x, activeTranslation.y,
+                                       velocity.x / 1000, velocity.y / 1000)
+            }
           }
         }
 
         SearchPill {
+          visible: root.homeVisible && !root.opened
           anchors.fill: parent
-          anchors.topMargin: Style.spacing.xxl
-          anchors.bottomMargin: Style.spacing.xxl
-          anchors.leftMargin: Style.spacing.xxl + root.sideInset
-          anchors.rightMargin: Style.spacing.xxl + root.sideInset
+          anchors.topMargin: root.handleHeight + Style.spacing.xxl
+          anchors.bottomMargin: Style.spacing.xxl + root.dockBottomInset
+          anchors.leftMargin: root.searchInset
+          anchors.rightMargin: root.searchInset
           placeholder: (root.hasAgent ? "Search apps or ask " + root.agentName + "…" : "Search apps…")
           onTapped: root.expand()
         }
@@ -302,7 +579,7 @@ Item {
   PanelWindow {
     id: drawer
 
-    visible: root.opened || root.reveal > 0
+    visible: root.opened || root.reveal > 0 || root.previewing
     anchors { top: true; bottom: true; left: true; right: true }
     // Normal: fit between the bar and the on-screen keyboard, like Android's
     // adjustResize.
@@ -314,15 +591,73 @@ Item {
     // one holds exclusive focus, and that includes the on-screen keyboard.
     WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None
 
-    onVisibleChanged: if (visible) Qt.callLater(function() { input.forceActiveFocus() })
+    onVisibleChanged: {
+      if (visible) {
+        if (root.opened) Qt.callLater(function() { input.forceActiveFocus() })
+      } else {
+        root.pullSettle = false
+        root.dragY = 0
+        root.pullSettle = true
+      }
+    }
 
     Rectangle {
       id: sheet
       width: parent.width
       height: parent.height
-      y: Math.round((1 - root.reveal) * Style.space(80))
-      opacity: root.reveal
+      y: Math.round((1 - root.reveal) * Style.space(80)) + root.dragY
+      opacity: root.reveal * (1 - Math.min(1, root.dragY / Math.max(1, height)) * 0.6)
       color: Commons.Color.menu.background
+      onHeightChanged: root.drawerSheetHeight = height
+
+      // Pull down from the header, or from the grid while it is scrolled to
+      // its top, to close. A passive PointHandler: it takes no grab, so the
+      // grid still scrolls and the cells still get their taps; at the top a
+      // downward drag cannot scroll the grid anyway, so it is free to move
+      // the sheet instead.
+      PointHandler {
+        id: pull
+        property real minY: 0
+        property real lastY: 0
+        property real lastT: 0
+        property real velocity: 0
+        property bool pulling: false
+        readonly property bool inGrid: point.position.y >= grid.y && point.position.y <= grid.y + grid.height
+        readonly property bool inDragZone: point.position.y <= grid.y + grid.height
+        readonly property bool atTop: !inGrid || (root.hasQuery ? grid.atYEnd : grid.atYBeginning)
+
+        onActiveChanged: {
+          if (active) {
+            minY = point.scenePosition.y
+            lastY = minY; lastT = Date.now(); velocity = 0
+            pulling = false
+          } else if (pulling) {
+            pulling = false
+            root.pullRelease(velocity)
+          }
+        }
+        onPointChanged: {
+          if (!active) return
+          var y = point.scenePosition.y
+          var x = point.scenePosition.x - point.scenePressPosition.x
+          var now = Date.now()
+          if (now > lastT) velocity = 0.6 * velocity + 0.4 * ((y - lastY) / (now - lastT))
+          lastY = y; lastT = now
+          if (!inDragZone && !pulling) return
+          // Moving up, or off the top of the grid, restarts the pull.
+          if (!atTop && !pulling) { minY = y; return }
+          if (y < minY) minY = y
+          var dy = y - minY
+          if (!pulling) {
+            if (dy < Style.space(10) || dy < Math.abs(x) * 1.5) return
+            pulling = true
+            root.pullMoved = true
+            pullGuard.stop()
+            root.pullSettle = false
+          }
+          root.dragY = Math.max(0, dy - Style.space(10))
+        }
+      }
 
       // ---------- Header: count and a collapse control
       Item {
@@ -384,8 +719,8 @@ Item {
           height: grid.cellHeight
           entry: modelData
           highlighted: index === 0 && root.hasQuery && !root.promptMode
-          onTapped: root.launchApp(modelData)
-          onHeld: root.addToHome(modelData)
+          onTapped: if (!root.pullMoved) root.launchApp(modelData)
+          onHeld: if (!root.pullMoved) root.addToHome(modelData)
         }
       }
 
@@ -406,8 +741,8 @@ Item {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: inputRow.top
-        anchors.leftMargin: Style.spacing.xxl
-        anchors.rightMargin: Style.spacing.xxl
+        anchors.leftMargin: root.searchInset
+        anchors.rightMargin: root.searchInset
         anchors.bottomMargin: Style.spacing.lg
         height: Math.max(root.touch, Style.space(52))
         radius: Style.cornerRadius
@@ -507,7 +842,10 @@ Item {
         TextField {
           id: input
           anchors.fill: parent
-          anchors.margins: Style.spacing.xxl
+          anchors.topMargin: Style.spacing.xxl
+          anchors.bottomMargin: Style.spacing.xxl + root.dockBottomInset
+          anchors.leftMargin: root.searchInset
+          anchors.rightMargin: root.searchInset
           verticalAlignment: TextInput.AlignVCenter
           font.pixelSize: Style.font.title
           leftPadding: Style.spacing.controlPaddingX + Style.font.iconLarge + Style.spacing.xl

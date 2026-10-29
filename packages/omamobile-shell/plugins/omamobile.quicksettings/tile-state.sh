@@ -93,18 +93,7 @@ if have myron-mobile-data; then
   # missing or stale answer is never read as the Pixel's SIT state.
   out=$(timeout 6 myron-mobile-data state 2>/dev/null) || out=
   if [ -n "$out" ]; then
-    data=$(printf '%s\n' "$out" | awk -F= '$1 == "data" { print substr($0, 6); exit }')
-    status=$(printf '%s\n' "$out" | awk 'index($0, "data_status=") == 1 { print substr($0, 13); exit }')
-    if [ "$data" = on ]; then
-      if systemctl is-active --quiet myron-mobile-data-block.service 2>/dev/null; then
-        case $status in On*) status="Off${status#On}" ;; *) status=Off ;; esac
-        printf 'data=off\ndata_status=%s\ndata_enable=1\ndata_busy=0\n' "$status"
-      else
-        printf 'data=on\ndata_status=%s\ndata_enable=1\ndata_busy=0\n' "${status:-On}"
-      fi
-    else
-      printf '%s\n' "$out"
-    fi
+    printf '%s\n' "$out"
   else
     printf 'data=none\ndata_status=Status unavailable\ndata_enable=0\ndata_busy=1\n'
   fi

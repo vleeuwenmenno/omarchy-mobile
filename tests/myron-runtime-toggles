@@ -130,3 +130,20 @@ grep -Fq 'action.lookup("verb") == "start"' "$gnss_polkit" || fail 'location pol
 ! grep -q '^\[Install\]' "$gnss_unit" || fail 'location permission unit is enableable'
 ! grep -q '^\[Install\]' "$gnss_prepare" || fail 'assisted GNSS prepare unit is enableable'
 pass 'location off gates GeoClue; on permits app-driven GNSS; polkit admits only exact on/off units'
+
+# Run the actual rule in a small polkit harness, without modem operations.
+node - "$main/etc/polkit-1/rules.d/49-myron-modem-access.rules" <<'JS'
+const fs = require("fs"), vm = require("vm"), assert = require("assert");
+let rule;
+vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8"), {
+  polkit: {addRule: callback => {rule = callback}, Result: {NO: "no"}}
+});
+for (const id of ["org.freedesktop.ModemManager1.Location", "org.freedesktop.ModemManager1.Device.Control"]) {
+  for (const user of ["menno", "another-owner", "nobody"])
+    assert.strictEqual(rule({id}, {user, local: true, active: true}), "no");
+  for (const user of ["root", "geoclue"])
+    assert.strictEqual(rule({id}, {user}), undefined);
+}
+assert.strictEqual(rule({id: "org.freedesktop.systemd1.manage-units"}, {user: "menno"}), undefined);
+JS
+pass 'direct modem access is denied to apps without changing trusted-service or bounded-unit grants'

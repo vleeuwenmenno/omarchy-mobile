@@ -1,0 +1,116 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Attended, one-attempt sensor foundation for the guarded Omarchy v60 boot.
+# Run under a bounded systemd service; never enable this helper at boot.
+set -eu
+export SYSTEMD_PAGER=cat
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+modules=/usr/local/lib/myron-audio/modules
+mapper=/sys/bus/auxiliary/drivers/qcom_pd_mapper.qcom-pdm-mapper
+runtime=/run/omamobile-myron
+bound() {
+  for entry in "$mapper"/rproc_qcom_common.pd-mapper.*; do
+    [ ! -L "$entry" ] || return 0
+  done
+  return 1
+}
+temperatures() {
+  hottest=0 pmic=0
+  for dir in /sys/class/thermal/thermal_zone*; do
+    type=$(timeout -k 1 2 cat "$dir/type") || fail 'thermal type unavailable'
+    case "$type" in *-trip-*) continue ;; esac
+    value=$(timeout -k 1 2 cat "$dir/temp" 2>/dev/null) || continue
+    case "$value" in ''|*[!0-9]*) continue ;; esac
+    [ "$value" -gt 0 ] && [ "$value" -lt 200000 ] || continue
+    [ "$value" -le "$hottest" ] || hottest=$value
+    [ "$type" != pmih010x_lite_tz ] || pmic=$value
+  done
+  [ "$hottest" -gt 0 ] && [ "$hottest" -lt 95000 ] || fail 'thermal ceiling reached or unavailable'
+  [ "$pmic" -gt 0 ] && [ "$pmic" -le 65000 ] || fail 'PMIC ceiling reached or unavailable'
+  say "hottest_mc=$hottest pmic_mc=$pmic"
+}
+
+[ "${1:-}" = --start ] && [ "$#" = 1 ] || fail 'usage: myron-sensor-foundation --start'
+[ "$(id -u)" = 0 ] || fail 'root required'
+grep -qx 'ID=omarchy' /etc/os-release || fail 'acceptance requires Omarchy'
+[ "$(uname -r)" = 6.12.23-android16-5-g5a0e85dd9db0-dirty-4k ] || fail 'unexpected kernel'
+[ -r /run/myron-main/boot-id ] || fail 'guarded main boot required'
+[ "$(cat /run/myron-main/boot-id)" = "$(cat /proc/sys/kernel/random/boot_id)" ] || fail 'boot identity mismatch'
+[ ! -e /run/myron-host/var/lib/omarchy-mobile/main/latch ] || fail 'recovery is pending'
+[ "$(systemctl show myron-hardware-watchdog.service -p SubState --value)" = running ] || fail 'live recovery guard required'
+guard_pid=$(systemctl show myron-hardware-watchdog.service -p MainPID --value)
+case "$guard_pid" in ''|0|1|*[!0-9]*) fail 'invalid guard PID' ;; esac
+kill -0 "$guard_pid" || fail 'guard process absent'
+if [ "$(cat /run/myron-main/guard-deadline-seconds 2>/dev/null || true)" != 0 ]; then
+  [ "$(cut -d. -f1 /proc/uptime)" -lt 900 ] || fail 'less than five minutes remain in guard window'
+fi
+systemctl is-active --quiet myron-reference-radio.service || fail 'firmware foundation not active'
+for unit in myron-cellular-audio-experiment myron-cellular-audio myron-reference-audio-foundation myron-speaker-bridge; do
+  state=$(systemctl show "$unit.service" -p ActiveState --value)
+  [ "$state" = inactive ] || fail "audio unit is not inactive: $unit"
+done
+for module in fastrpc frpc_adsprpc gpr_dlkm audio_pkt_dlkm machine_dlkm tfa98xx_dlkm; do
+  [ ! -d "/sys/module/$module" ] || fail "unexpected existing module: $module"
+done
+for module in qcom_scm mem_buf_dev pdr_interface qcom_glink qti_qmi_sensor_v2; do
+  [ -d "/sys/module/$module" ] || fail "dependency absent: $module"
+done
+[ "$(cat /sys/module/firmware_class/parameters/path)" = /run/myron-wireless/firmware/ ] || fail 'unexpected firmware view'
+for file in adsp.mdt adsp_dtb.mdt; do
+  [ -s "/run/myron-wireless/firmware/$file" ] || fail "firmware absent: $file"
+done
+printf '%s  %s\n' \
+  3d74f0f4d69478e7df89977b89d39811fe95702339174f8c24a23c69f78b43d3 "$modules/qcom_pd_mapper-canoe.ko" \
+  b203840bde826ffd0069b23fb8c742ec25b165a4d016a15a96d30a483eb2dd8a "$modules/frpc-adsprpc.ko" | sha256sum -c -
+adsp=
+for dir in /sys/class/remoteproc/remoteproc*; do
+  case "$(cat "$dir/name")" in *remoteproc-adsp) adsp=$dir ;; esac
+done
+[ -n "$adsp" ] && [ "$(cat "$adsp/state")" = offline ] || fail 'ADSP must be offline'
+if [ -d /sys/module/qcom_pd_mapper ] && ! bound; then
+  [ "$(awk '$1 == "qcom_pd_mapper" {print $3}' /proc/modules)" = 0 ] || fail 'unbound mapper is referenced'
+  for driver in /sys/module/qcom_pd_mapper/drivers/*; do
+    for entry in "$driver"/*; do
+      case "$(readlink -f "$entry")" in /sys/devices/*) fail 'mapper has another device binding' ;; esac
+    done
+  done
+fi
+# The kernel's early auto-probe prints "powering up" before failing to find
+# adsp.mdt (-ENOENT), before the firmware view exists. That is not a DSP boot.
+# Reject evidence that firmware was actually loaded or the DSP reached UP.
+if dmesg | grep -Eq 'Booting fw image adsp|remote processor 3000000.remoteproc-adsp is now up'; then
+  fail 'ADSP has already started during this boot'
+fi
+temperatures
+install -d -m0755 "$runtime"
+mkdir "$runtime/sensor-foundation-attempt" || fail 'one attempt per boot; inspect previous failure'
+say 'stage=mapper'
+if ! bound; then
+  if [ -d /sys/module/qcom_pd_mapper ]; then rmmod qcom_pd_mapper; fi
+  insmod "$modules/qcom_pd_mapper-canoe.ko"
+fi
+bound || fail 'Canoe mapper did not bind'
+say 'stage=fastrpc'
+insmod "$modules/frpc-adsprpc.ko"
+say 'stage=adsp'
+printf start > "$adsp/state"
+count=0
+while [ "$count" -lt 15 ]; do
+  if [ "$(cat "$adsp/state")" = running ] && [ -r /sys/class/misc/fastrpc-adsp-secure/dev ]; then break; fi
+  sleep 1
+  count=$((count + 1))
+done
+[ "$(cat "$adsp/state")" = running ] || fail 'ADSP did not start'
+numbers=$(cat /sys/class/misc/fastrpc-adsp-secure/dev) || fail 'secure FastRPC did not register'
+case "$numbers" in ''|*[!0-9:]*|:*|*:|*:*:*) fail 'invalid device numbers' ;; esac
+case "$numbers" in *:*) ;; *) fail 'missing device minor' ;; esac
+[ ! -L /dev/fastrpc-adsp-secure ] || fail 'FastRPC path is linked'
+if [ ! -e /dev/fastrpc-adsp-secure ]; then
+  mknod /dev/fastrpc-adsp-secure c "${numbers%:*}" "${numbers#*:}"
+  chmod 0600 /dev/fastrpc-adsp-secure
+fi
+[ -c /dev/fastrpc-adsp-secure ] || fail 'secure FastRPC node is not a character device'
+[ "$(stat -c '%t:%T' /dev/fastrpc-adsp-secure)" = "$(printf '%x:%x' "${numbers%:*}" "${numbers#*:}")" ] || fail 'FastRPC device numbers differ'
+temperatures
+say 'result=foundation-ready environment=omarchy audio=not-started'

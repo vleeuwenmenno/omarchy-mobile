@@ -1,0 +1,67 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Tests for omamobile-location-usage: the lifecycle model alone, the daemon on a
+# private D-Bus daemon against a fake GeoClue (never the machine's own bus),
+# then the staged layout and units.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+export PYTHONDONTWRITEBYTECODE=1
+
+bash -n install || fail "install parses"
+for f in bin/* lib/*.py test/*.py; do
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" || fail "$f parses"
+done
+pass "scripts parse"
+
+python3 -W ignore test/test_model.py 2>&1 | tail -15 | grep -qx OK || { python3 -W ignore test/test_model.py 2>&1 | tail -30; fail "lifecycle model"; }
+pass "lifecycle model"
+
+if command -v dbus-daemon >/dev/null && python3 -c 'import gi; gi.require_version("Gio", "2.0")' 2>/dev/null; then
+  out=$(python3 -W ignore test/test_service.py 2>&1) || { printf '%s\n' "$out" | tail -40; fail "daemon on a private bus"; }
+  pass "daemon on a private bus against a fake GeoClue"
+else
+  pass "daemon on a private bus # SKIP no dbus-daemon or PyGObject"
+fi
+
+# The monitor rules name the Client Start call, GeoClue's own method returns
+# (read by header only, see usage_daemon.py), and the Client and Manager
+# property signals; nothing of the Location objects or Stop.
+python3 -W ignore - <<'PY' || fail "monitor rules"
+import sys
+sys.path.insert(0, "lib")
+import usage_daemon
+rules = " ".join(usage_daemon.MONITOR_RULES)
+assert "Location" not in rules, rules
+assert "Stop" not in rules, rules
+assert all(("arg0=" in r) or "member='Start'" in r or r == "type='method_return',sender='org.freedesktop.GeoClue2'"
+           for r in usage_daemon.MONITOR_RULES), rules
+PY
+pass "monitor rules exclude the Location objects and Stop"
+
+stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
+./install "$stage"
+for f in usr/bin/omamobile-location usr/lib/omamobile-location-usage/omamobile-location-usaged \
+         usr/lib/omamobile-location-usage/model.py usr/lib/omamobile-location-usage/usage_daemon.py \
+         usr/lib/systemd/system/omamobile-location-usage.service \
+         usr/share/dbus-1/system.d/org.omamobile.LocationUsage1.conf \
+         usr/share/licenses/omamobile-location-usage/LICENSE; do
+  [[ -e $stage/$f ]] || fail "staged $f"
+done
+[[ -z $(find "$stage" -path '*.wants/*' -print -quit) ]] || fail "nothing is enabled by the package"
+[[ -z $(find "$stage" -path '*dbus-1/system-services*' -print -quit) ]] || fail "no D-Bus activation file"
+[[ -z $(find "$stage" -path '*polkit*' -print -quit) ]] || fail "no polkit grant"
+python3 -W ignore "$stage/usr/lib/omamobile-location-usage/omamobile-location-usaged" --help >/dev/null || fail "the staged daemon imports its library"
+# Ordered before GeoClue without pulling it in.
+grep -qx 'Before=geoclue.service' systemd/omamobile-location-usage.service || fail "the unit starts before GeoClue"
+grep -E '^(Requires|Wants|BindsTo|Requisite)=.*geoclue' systemd/omamobile-location-usage.service && fail "the unit pulls GeoClue in"
+grep -qx 'CapabilityBoundingSet=' systemd/omamobile-location-usage.service || fail "no capabilities"
+if command -v systemd-analyze >/dev/null; then
+  systemd-analyze verify --man=no "$stage/usr/lib/systemd/system/omamobile-location-usage.service" 2>&1 |
+    grep -v -e 'not executable' -e 'No such file' -e '^$' && fail "unit verify" || true
+fi
+if command -v xmllint >/dev/null; then
+  xmllint --noout dbus/org.omamobile.LocationUsage1.conf || fail "bus policy is well-formed XML"
+fi
+pass "staged layout, unit and bus policy"

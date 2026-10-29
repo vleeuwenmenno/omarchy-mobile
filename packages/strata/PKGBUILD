@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+# Repackages LGSE's official Strata release archive, pinned by SHA-256. The
+# archive is fetched at build time; no binary is committed. Bump pkgver, the
+# checksum and _source_commit together, after verifying the new release
+# (README.md of this package).
+pkgname=strata
+pkgver=1.1.1
+pkgrel=1
+pkgdesc="Strata: Miller-column GTK4 file manager (official aarch64 release binary)"
+arch=(aarch64)
+url="https://github.com/lgse/strata"
+license=(MIT LicenseRef-UnRAR)
+# libraries from the binary's DT_NEEDED list; glibc 2.39 and GTK 4.12 are
+# upstream's stated minimums
+depends=('glibc>=2.39' 'gtk4>=4.12' gtksourceview5 poppler-glib fontconfig glib2 pango cairo
+         gdk-pixbuf2 graphene gstreamer gst-plugins-base-libs gcc-libs
+         bubblewrap gvfs)
+optdepends=('ffmpeg: video preview and properties'
+            'ffmpegthumbnailer: video thumbnails'
+            'gst-libav: more audio and video codecs'
+            'gst-plugins-good: more audio and video formats'
+            'gvfs-smb: network shares')
+options=(!strip !debug !lto)
+_source_commit=fb0315529cecbe5019963b7adcbf5d3be1e75a78
+_dir=strata-$pkgver-aarch64-unknown-linux-gnu
+source=("$url/releases/download/v$pkgver/$_dir.tar.gz")
+sha256sums=('d6d8e41e1e00df7702e9a1a2624c3b8ee11b638a3a6db48f5ae2ef4db1188d4a')
+
+check() {
+  # the archive's own provenance record must name the pinned commit
+  [[ $(<"$srcdir/$_dir/SOURCE_COMMIT") == "$_source_commit" ]] || { echo "SOURCE_COMMIT differs from the pin" >&2; return 1; }
+}
+
+package() {
+  cd "$srcdir/$_dir"
+  install -Dm755 strata "$pkgdir/usr/bin/strata"
+  install -Dm644 io.github.lgse.Strata.desktop "$pkgdir/usr/share/applications/io.github.lgse.Strata.desktop"
+  install -Dm644 io.github.lgse.Strata.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.lgse.Strata.svg"
+  # Optional file-chooser portal backend. Present but unselected: the phone's
+  # portal config (omamobile-shell) still prefers the gnome backend.
+  install -Dm644 portal/strata.portal "$pkgdir/usr/share/xdg-desktop-portal/portals/strata.portal"
+  sed 's|@STRATA_EXECUTABLE@|/usr/bin/strata|' portal/org.freedesktop.impl.portal.desktop.strata.service.in \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.strata.service"
+  install -Dm644 portal/portals.conf "$pkgdir/usr/share/doc/strata/portals.conf.example"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/strata/README.md"
+  install -Dm644 docs/portal-file-chooser.md "$pkgdir/usr/share/doc/strata/portal-file-chooser.md"
+  install -Dm644 SOURCE_COMMIT "$pkgdir/usr/share/doc/strata/SOURCE_COMMIT"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/strata/LICENSE"
+  install -Dm644 UnRAR.txt "$pkgdir/usr/share/licenses/strata/UnRAR.txt"
+  install -Dm644 THIRD_PARTY_LICENSES.md "$pkgdir/usr/share/licenses/strata/THIRD_PARTY_LICENSES.md"
+}

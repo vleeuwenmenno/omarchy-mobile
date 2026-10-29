@@ -12,9 +12,9 @@ depends=(omarchy omamobile-apps omamobile-omarchy omamobile-owl-widgets bash squ
          inotify-tools qt6-declarative
          # Both are in Omarchy's base package list, which root images install.
          foot xdg-terminal-exec  # guard for hand-built/partial installations
-         xdg-desktop-portal-gnome)  # the file chooser (portal/hyprland-portals.conf)
+         xdg-desktop-portal xdg-desktop-portal-gtk)  # portal frontend and the file chooser fallback; the app profile picks the chooser
 optdepends=('fprintd: fingerprint setup and unlock (with omamobile-fingerprint)')
-backup=(etc/xdg/xdg-desktop-portal/hyprland-portals.conf)
+backup=(etc/xdg-desktop-portal/hyprland-portals.conf)
 install=omamobile-shell.install
 
 package() {

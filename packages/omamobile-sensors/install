@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 # Stage omamobile-sensors into DESTDIR. Enables the sensor proxy at boot; the
-# auto-rotate user service is turned on from the rotation lock tile.
+# auto-rotate user service is enabled separately after device qualification.
 #   ./install DESTDIR
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"

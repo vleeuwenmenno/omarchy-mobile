@@ -7,11 +7,19 @@
 #   state   key=value lines for tile-state.sh: data=on|off|none, data_status,
 #           data_enable=0|1 (a tap may start the operation), data_busy=0|1
 #           (a tap does nothing now)
-#   on      starts the one user-initiated operation unit. Root re-checks the
-#           attended evidence, the supervisor and every gate; nothing here is
-#           trusted. Allowed only when state says data_enable=1.
-#   off     refused: there is no supported way to stop or reconnect cellular
-#           data in a boot yet. Restart the phone.
+#   on      gate active: stops the packet-gate unit (removes the block). Bearer
+#           live and ungated: no-op. Otherwise starts the one user-initiated
+#           operation unit; root re-checks the attended evidence, the
+#           supervisor and every gate. Allowed only when state says
+#           data_enable=1 or a live bearer has the gate to remove.
+#   off     live bearer: starts myron-mobile-data-block.service, which drops
+#           packets on the already-active qmapmux netdev. It never disconnects,
+#           reconnects or reconfigures the modem, IPA, NetworkManager or radio.
+#           Already blocked or no bearer: no-op. Any unknown, stale or
+#           in-transition state refuses.
+#
+# data_enable=1 means a tap can act now; data_busy=1 means a transition or an
+# unknown state, where a tap does nothing.
 #
 # The modem is read only through ModemManager keys (state, registration,
 # access technology): no identity field is read or printed. The operation's
@@ -23,6 +31,7 @@ set -u
 public_file=/run/myron-cellular/state
 boot_id_file=/proc/sys/kernel/random/boot_id
 enable_unit=myron-cellular-enable.service
+block_unit=myron-mobile-data-block.service
 audio_experiment=/etc/omamobile/myron-audio-experiment
 cellular_audio_experiment=/etc/omamobile/myron-cellular-audio-experiment
 modem_prefix=/org/freedesktop/ModemManager1/Modem/
@@ -64,9 +73,25 @@ read_public() {
 	case $(pub evidence) in valid) evidence=valid ;; invalid) evidence=invalid ;; *) evidence=absent ;; esac
 }
 
+# Sets: gate (active|inactive|activating|deactivating|failed|unknown), the
+# owned packet-gate service's own state; anything unexpected reads as unknown.
+read_gate() {
+	gate=unknown
+	out=$(t systemctl show -p LoadState -p ActiveState "$block_unit") || return 0
+	[ "$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p')" = loaded ] || return 0
+	case $(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p') in
+	active) gate=active ;;
+	inactive) gate=inactive ;;
+	activating) gate=activating ;;
+	deactivating) gate=deactivating ;;
+	failed) gate=failed ;;
+	esac
+}
+
 compute() {
 	read_modem
 	read_public
+	read_gate
 	data=off enable=0 busy=0 note=
 	if [ "$modems" = 0 ]; then
 		data=none note='No modem'
@@ -78,19 +103,36 @@ compute() {
 	fi
 	label=${tech:+ $tech}
 	case $op in
-	unknown) busy=1 note='Status unavailable' ;;
-	starting) busy=1 note='Starting' ;;
-	restart) busy=1 note='Restart to retry' ;;
-	on) data=on busy=1 note="On${label:+ ·$label}" ;;
-	idle)
-		if [ "$evidence" != valid ]; then
-			note='Needs attended setup'
-		elif [ "$registered" != yes ]; then
-			note='Not registered'
-		else
-			enable=1 note="Off${label:+ ·$label}"
-		fi ;;
+	unknown) busy=1 note='Status unavailable'; return 0 ;;
+	starting) busy=1 note='Starting'; return 0 ;;
+	restart) busy=1 note='Restart to retry'; return 0 ;;
 	esac
+	# The supervisor's own failures above always win over the gate. From here
+	# the bearer is live (on) or absent (idle).
+	case $gate in
+	activating | deactivating) busy=1 note='Switching'; return 0 ;;
+	failed | unknown) busy=1 note='Packet gate unavailable'; return 0 ;;
+	esac
+	if [ "$op" = on ]; then
+		if [ "$gate" = active ]; then
+			note="Off${label:+ ·$label}"
+		else
+			data=on note="On${label:+ ·$label}"
+		fi
+		enable=1
+		return 0
+	fi
+	# idle: a gate left on a bearer that is gone is stale; only a restart or
+	# the operator clears it.
+	if [ "$gate" = active ]; then
+		busy=1 note='Packet gate stale'
+	elif [ "$evidence" != valid ]; then
+		note='Needs attended setup'
+	elif [ "$registered" != yes ]; then
+		note='Not registered'
+	else
+		enable=1 note="Off${label:+ ·$label}"
+	fi
 }
 
 cmd_state() {
@@ -98,28 +140,49 @@ cmd_state() {
 	printf 'data=%s\ndata_status=%s\ndata_enable=%s\ndata_busy=%s\n' "$data" "$note" "$enable" "$busy"
 }
 
+audio_blocked() {
+	[ -e "$audio_experiment" ] || [ -L "$audio_experiment" ] ||
+		[ -e "$cellular_audio_experiment" ] || [ -L "$cellular_audio_experiment" ]
+}
+
+refuse_audio() {
+	printf '%s\n' 'Mobile data is blocked by the one-shot audio experiment.' >&2
+	exit 1
+}
+
 case "${1:-}" in
 state)
-	if [ -e "$audio_experiment" ] || [ -L "$audio_experiment" ] ||
-	   [ -e "$cellular_audio_experiment" ] || [ -L "$cellular_audio_experiment" ]; then
+	if audio_blocked; then
 		printf '%s\n' 'data=none' 'data_status=Blocked by audio experiment' 'data_enable=0' 'data_busy=1'
 	else
 		cmd_state
 	fi
 	;;
 on)
-	[ ! -e "$audio_experiment" ] && [ ! -L "$audio_experiment" ] &&
-		[ ! -e "$cellular_audio_experiment" ] && [ ! -L "$cellular_audio_experiment" ] || {
-		printf '%s\n' 'Mobile data is blocked by the one-shot audio experiment.' >&2
-		exit 1
-	}
+	audio_blocked && refuse_audio
 	compute
+	if [ "$busy" = 1 ] || [ "$modems" != 1 ]; then
+		printf 'Mobile data cannot be started now: %s\n' "${note:-unavailable}" >&2
+		exit 1
+	fi
+	if [ "$op" = on ]; then
+		[ "$gate" = active ] || exit 0
+		exec systemctl stop "$block_unit"
+	fi
 	[ "$enable" = 1 ] || { printf 'Mobile data cannot be started now: %s\n' "${note:-unavailable}" >&2; exit 1; }
 	exec systemctl start --no-block "$enable_unit"
 	;;
 off)
-	printf '%s\n' 'Mobile data cannot be turned off yet: restart the phone to stop it.' >&2
-	exit 1
+	audio_blocked && refuse_audio
+	compute
+	if [ "$busy" = 1 ] || [ "$modems" != 1 ]; then
+		printf 'Mobile data cannot be stopped now: %s\n' "${note:-unavailable}" >&2
+		exit 1
+	fi
+	# No live bearer: nothing carries data, so data is already off.
+	[ "$op" = on ] || exit 0
+	[ "$gate" != active ] || exit 0
+	exec systemctl start "$block_unit"
 	;;
 *)
 	printf 'usage: %s state|on|off\n' "${0##*/}" >&2

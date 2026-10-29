@@ -1,0 +1,15 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+
+bash -n PKGBUILD || fail 'PKGBUILD parses'
+grep -Fq 'pkgver=0.5.0' PKGBUILD || fail 'version is not pinned'
+grep -Fq 'hfs_mkdir("odm", 1,' 0001-hexagonfs-map-sensor-config-under-odm.patch ||
+  fail 'ODM sensor-config alias patch is missing'
+grep -Fq 'if (in == NULL)' 0002-sscregistrygen-ignore-non-json-inputs.patch ||
+  fail 'registry parser guard is missing'
+grep -Fq 'u fastrpc ' hexagonrpc.sysusers || fail 'service account is missing'
+printf '%s\n' 'ok - HexagonRPC package carries Myron sensor compatibility'

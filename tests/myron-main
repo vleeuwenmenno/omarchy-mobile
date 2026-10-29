@@ -29,7 +29,7 @@ work=$(mktemp -d /tmp/myron-main.XXXXXX)
 trap 'chmod -R u+rwx "$work" 2>/dev/null || true; rm -rf -- "$work"' EXIT
 
 # ---- static ----------------------------------------------------------------
-for f in "$init_dir"/*.sh "$control"; do
+for f in "$init_dir"/*.sh "$control" "$overlay/usr/local/libexec/myron-main-guard-policy"; do
   sh -n "$f" || fail "$f parses as POSIX sh"
   bash -n "$f" || fail "$f parses as bash"
   if [[ -n $shellcheck_bin ]]; then "$shellcheck_bin" -s sh -e SC2154,SC2034,SC2086,SC2317,SC2100,SC2209,SC2329,SC1091,SC2093,SC2015 "$f" || fail "shellcheck $f"; fi
@@ -53,6 +53,8 @@ if grep -nE 'ttyGS0|acm\.usb|setsid|sh -i' "$init_dir/stage.sh" "$init_dir/fail-
   fail 'main init creates a console shell'
 fi
 grep -Fq 'ncm.usb0' "$init_dir/stage.sh" || fail 'main init lacks the NCM rescue gadget'
+grep -Fq 'myron-cellular-audio myron-omarchy-qualify' "$init_dir/stage.sh" ||
+  fail 'main init shadow guard does not cover persistent cellular audio'
 grep -Fq 'reboot_grace_seconds' "$control" && grep -Fq 'reboot -f' "$control" || fail 'control lacks the bounded plain reboot fallback'
 pass 'no partition write, no bootloader reboot outside the dead end, no console shell'
 
@@ -390,6 +392,51 @@ reset omarchy 30; pend; ctl commit >/dev/null
 ctl guard >/dev/null 2>&1 || fail 'guard exit after commit'
 pass 'guard: deadline latch + normal reboot, commit wins, no reboot after commit, a durable latch on an uncommitted boot is supervised to a normal then forced reboot with the reason kept'
 
+# The owner may remove the deadline for one development image, without
+# committing it or losing recovery. Advance the fake clock past 1200 seconds.
+dev_policy() { printf '%s\n' "${1:-$uuid_hex}" >"$m/development-no-timeout"; chmod 600 "$m/development-no-timeout"; }
+reset omarchy 1200; pend; dev_policy
+printf 'echo "5000.00 0" >%s/uptime\n' "$fix" >"$fix/hook-sleep-1"
+printf 'printf "reason=late-failure\\n" >%s/latch\n' "$m" >"$fix/hook-sleep-3"
+ctl guard >"$work/o" 2>&1 || fail 'development guard'
+grep -Fxq 0 "$fix/run/guard-deadline-seconds" || fail 'development deadline not disabled'
+grep -Fxq 'reason=late-failure' "$m/latch" || fail 'development guard timed out or rewrote failure'
+grep -Fxq 'reboot -f' "$fix/calls" || fail 'development guard lost failure recovery'
+reset; pend; dev_policy; ctl commit >/dev/null
+ctl guard >/dev/null || fail 'development guard after commit'
+grep -Fq reboot "$fix/calls" && fail 'development guard rebooted committed boot'
+reset; pend; dev_policy 00000000000000000000000000000000
+ctl guard >/dev/null || fail 'different-image policy'
+grep -Fxq 'reason=guard-timeout' "$m/latch" || fail 'policy leaked into another image'
+reset; pend; dev_policy; chmod 644 "$m/development-no-timeout"
+ctl guard >/dev/null 2>&1 && fail 'unsafe policy accepted'
+reset; pend; printf 'bad\n' >"$m/development-no-timeout"
+ctl guard >/dev/null 2>&1 && fail 'malformed policy accepted'
+reset; pend; dev_policy; mv "$m/development-no-timeout" "$m/policy-target"; ln -s policy-target "$m/development-no-timeout"
+ctl guard >/dev/null 2>&1 && fail 'linked policy accepted'
+pass 'development policy: image-bound, no time expiry, late failure recovery retained; unsafe policy refused'
+
+# Exercise the old-initramfs compatibility loader without touching /run or /usr.
+loader=$work/guard-policy-loader
+mkdir -p "$fix/usr/local/sbin"
+sh_patch "$overlay/usr/local/libexec/myron-main-guard-policy" "$loader" \
+  "runtime=$fix/run" "main=$m" "control=$control_copy" "system_prefix=$fix/usr" "root_uid=$uid" "root_gid=$gid"
+load_policy() { PATH=$bin:$PATH sh "$loader"; }
+reset; pend; printf 'original\n' >"$fix/run/myron-main-os"
+load_policy || fail 'loader without policy'
+grep -Fxq original "$fix/run/myron-main-os" || fail 'loader without policy changed control'
+dev_policy
+load_policy || fail 'loader with current image policy'
+cmp -s "$control_copy" "$fix/run/myron-main-os" || fail 'loader did not select updated control'
+grep -Fxq original "$fix/run/myron-main-os.embedded" || fail 'loader lost original'
+load_policy || fail 'loader repeat is not idempotent'
+reset; pend; dev_policy; printf 'original\n' >"$fix/run/myron-main-os"
+chmod o+w "$control_copy"
+load_policy >/dev/null 2>&1 && fail 'loader accepted writable control'
+chmod o-w "$control_copy"
+grep -Fxq original "$fix/run/myron-main-os" || fail 'failed loader replaced original'
+pass 'compatibility loader: explicit opt-in, atomic selection, original preserved, idempotent; writable control refused'
+
 # a held lock blocks another mutation, which then changes nothing
 reset; pend
 ( exec 8>"$fix/lock"; flock -n 8; ctl commit >"$work/o" 2>&1 ) && fail 'commit ran while the lock was held'
@@ -541,6 +588,25 @@ cmp -s "$R/cellular-audio-request.expect" "$R/run/myron-main/cellular-audio-expe
     fail 'cellular-audio stage request is not exact mode/boot/image/kernel proof'; }
 pass 'combined stage admits only the three exact reviewed legacy-audio masks'
 
+# The audible bridge experiment keeps the same cellular-first request boundary,
+# but leaves the exact known-good speaker bridge unmasked for explicit admission.
+make_stage cellular-bridge
+printf '%s\n' audio-cellular-bridge >"$R/newroot/etc/omamobile/myron-cellular-audio-experiment"
+cp device/myron/main-overlay/usr/local/sbin/myron-audio-experiment "$R/newroot/usr/local/sbin/"
+chmod 0755 "$R/newroot/usr/local/sbin/myron-audio-experiment"
+mkdir -p "$R/newroot/etc/systemd/system/multi-user.target.wants"
+ln -s /usr/lib/systemd/system/myron-cellular.service \
+  "$R/newroot/etc/systemd/system/multi-user.target.wants/myron-cellular.service"
+for unit in myron-reference-audio-foundation myron-microphone-bridge; do
+  ln -s /dev/null "$R/newroot/etc/systemd/system/$unit.service"
+done
+run_stage cellular-bridge || { cat "$R/out" "$R/markers"; fail 'cellular-bridge stage fixture does not reach switch_root'; }
+printf 'mode=audio-cellular-bridge\nboot_id=11111111-2222-3333-4444-555555555555\nimage_id=%s\nkernel=6.12.23-audio-test\n' \
+  "$uuid_hex" >"$R/cellular-bridge-request.expect"
+cmp -s "$R/cellular-bridge-request.expect" "$R/run/myron-main/cellular-audio-experiment.request" ||
+  fail 'cellular-bridge stage request is not exact mode/boot/image/kernel proof'
+pass 'audible cellular bridge stage keeps only foundation and microphone masks'
+
 # fault -> reason (the fault is a wrapper failure; "-trunc" makes a copy succeed but leave an empty file)
 stage_fault() { # NAME FAULT_LINE REASON [PREP...]
   local name=$1 line=$2 reason=$3; shift 3
@@ -596,9 +662,9 @@ pass 'real stage under fault injection: arm open/rename/sync, guard/control/Busy
 out=$(tools/myron-dev-image-compose --boot-policy bogus 2>&1) && fail 'composer accepted a bogus policy'
 grep -Fq 'unsupported boot policy' <<<"$out" || fail 'composer bogus policy message'
 out=$(tools/myron-dev-image-compose --boot-policy main 2>&1) && fail 'composer accepted main with the coexistence profile'
-grep -Fq 'supports only --profile cellular|audio-speaker|audio-microphone' <<<"$out" || fail 'composer main profile message'
+grep -Fq 'supports only --profile cellular|cellular-audio|audio-speaker|audio-microphone|audio-cellular-speaker|audio-cellular-bridge' <<<"$out" || fail 'composer main profile message'
 grep -Fq 'boot_policy=temporary' tools/myron-dev-image-compose || fail 'composer default policy must stay temporary'
-pass 'composer: default temporary, main only with cellular or explicit audio experiments, unknown policy refused'
+pass 'composer: default temporary, main only with cellular, cellular-audio or explicit audio experiments, unknown policy refused'
 
 B=tools/myron-build-main-init-boot
 out=$($B 2>&1) && fail 'builder with no arguments'; grep -Fq -- '--base-init-boot is required' <<<"$out" || fail 'builder base message'

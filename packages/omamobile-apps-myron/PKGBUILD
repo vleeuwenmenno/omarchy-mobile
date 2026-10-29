@@ -3,13 +3,14 @@
 pkgname=omamobile-apps-myron
 pkgver=$(cat "${startdir:-.}/version")
 pkgrel=1
-pkgdesc="Myron-safe mobile app dependency profile without unqualified camera or NFC"
+pkgdesc="Myron-safe mobile app profile: Maps, GeoClue and Strata as the default file manager and file chooser"
 arch=(any)
 url="https://github.com/derekross/omarchy-mobile"
 license=(MIT)
 provides=(omamobile-apps)
 conflicts=(omamobile-apps)
-depends=(gnome-maps geoclue)
+depends=(gnome-maps geoclue strata xdg-desktop-portal-gtk)
+backup=(etc/xdg/mimeapps.list etc/xdg/xdg-desktop-portal/hyprland-portals.conf)
 
 check() {
   "$startdir/test/all"

@@ -11,7 +11,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 Usage: tools/myron-dev-image-compose \
-  [--profile coexistence|cellular|audio-speaker|audio-microphone|audio-cellular-speaker] \
+  [--profile coexistence|cellular|cellular-audio|audio-speaker|audio-microphone|audio-cellular-speaker|audio-cellular-bridge] \
   [--boot-policy temporary|main] \
   --base-image ABSOLUTE_RAW_EXT4 \
   --module-stage ABSOLUTE_DIR \
@@ -20,6 +20,7 @@ Usage: tools/myron-dev-image-compose \
   --runtime-manifest ABSOLUTE_FILE \
   --bluetooth-probe ABSOLUTE_FILE \
   --speaker-reference-repo ABSOLUTE_DIR \
+  [--sensor-runtime-archive ABSOLUTE_FILE] \
   --firstboot-conf ABSOLUTE_FILE \
   --ssh-key ABSOLUTE_PUBLIC_KEY \
   --out ABSOLUTE_RAW_EXT4
@@ -33,8 +34,9 @@ and audio activation remain disabled until an attended, separately gated test.
 --boot-policy defaults to temporary (the 900 s rollback test). `main` composes
 the persistent Omarchy main root: it adds the main-only overlay (guard unit,
 recovery units, control) on top of the temporary overlay. Cellular remains
-the effective init profile. Audio experiment profiles require `main`, carry
-one probe each and always recover to postmarketOS. The explicit
+the effective init profile. `cellular-audio` starts the registered modem first,
+then the already qualified protected speaker bridge. Audio experiment profiles
+require `main`, carry one probe each and always recover to postmarketOS. The explicit
 `audio-cellular-speaker` profile admits the normal registered modem first but
 keeps data, GNSS and Bluetooth blocked; its audio service is attended-only.
 EOF
@@ -42,7 +44,7 @@ EOF
 
 profile=coexistence
 boot_policy=temporary
-base= modules= module_assets= runtime= runtime_manifest= bluetooth_probe= speaker_reference= firstboot= ssh_key= out=
+base= modules= module_assets= runtime= runtime_manifest= bluetooth_probe= speaker_reference= sensor_runtime= firstboot= ssh_key= out=
 while (($#)); do
   case $1 in
     --profile) profile=${2:?}; shift 2 ;;
@@ -54,6 +56,7 @@ while (($#)); do
     --runtime-manifest) runtime_manifest=${2:?}; shift 2 ;;
     --bluetooth-probe) bluetooth_probe=${2:?}; shift 2 ;;
     --speaker-reference-repo) speaker_reference=${2:?}; shift 2 ;;
+    --sensor-runtime-archive) sensor_runtime=${2:?}; shift 2 ;;
     --firstboot-conf) firstboot=${2:?}; shift 2 ;;
     --ssh-key) ssh_key=${2:?}; shift 2 ;;
     --out) out=${2:?}; shift 2 ;;
@@ -62,17 +65,17 @@ while (($#)); do
   esac
 done
 case $profile in
-  coexistence|cellular|audio-speaker|audio-microphone|audio-cellular-speaker) ;;
+  coexistence|cellular|cellular-audio|audio-speaker|audio-microphone|audio-cellular-speaker|audio-cellular-bridge) ;;
   *) die "unsupported hardware-test profile: $profile" ;;
 esac
 case $boot_policy in
   temporary)
-    [[ $profile != audio-speaker && $profile != audio-microphone && $profile != audio-cellular-speaker ]] ||
+    [[ $profile != audio-speaker && $profile != audio-microphone && $profile != audio-cellular-speaker && $profile != audio-cellular-bridge ]] ||
       die 'audio experiment profiles require --boot-policy main'
     ;;
   main)
-    [[ $profile == cellular || $profile == audio-speaker || $profile == audio-microphone || $profile == audio-cellular-speaker ]] ||
-      die 'boot policy main supports only --profile cellular|audio-speaker|audio-microphone|audio-cellular-speaker'
+    [[ $profile == cellular || $profile == cellular-audio || $profile == audio-speaker || $profile == audio-microphone || $profile == audio-cellular-speaker || $profile == audio-cellular-bridge ]] ||
+      die 'boot policy main supports only --profile cellular|cellular-audio|audio-speaker|audio-microphone|audio-cellular-speaker|audio-cellular-bridge'
     ;;
   *) die "unsupported boot policy: $boot_policy" ;;
 esac
@@ -88,6 +91,15 @@ done
   die 'base image, module archive, runtime manifest, Bluetooth probe, firstboot config and SSH key must be regular files'
 [[ -d $modules && -d $runtime && -d $speaker_reference ]] ||
   die 'module, runtime and speaker-reference inputs must be directories'
+if [[ -n $sensor_runtime ]]; then
+  [[ $sensor_runtime == /* && $sensor_runtime != *'/../'* && $sensor_runtime != */.. && $sensor_runtime != *'/./'* ]] ||
+    die "sensor runtime must be a canonical absolute path: $sensor_runtime"
+  [[ -f $sensor_runtime && ! -L $sensor_runtime ]] ||
+    die 'sensor runtime must be a regular, non-linked file'
+  [[ $(sha256sum <"$sensor_runtime" | cut -d' ' -f1) == \
+    01717daeb556d672c8bb2a04dcbd27834784ad48b61a2ff909121eff22ff4265 ]] ||
+    die 'sensor runtime is not the hardware-qualified private v3 archive'
+fi
 [[ $out == /* && $out != / && $out != *'/../'* && $out != */.. && $out != *'/./'* ]] ||
   die '--out must be a canonical absolute path'
 [[ ! -e $out && ! -L $out ]] || die "refusing to replace $out"
@@ -139,6 +151,19 @@ debugfs -R 'cat /var/lib/omamobile/repo/aarch64/.omamobile-dev-unsigned' "$base"
   grep -Fxq 'development-only: unsigned package repository' ||
   die 'base image is not the unsigned development payload'
 
+# Strata replaces a package dependency, not just shell files. An old base
+# would silently restore Nautilus and the GNOME chooser after reimaging.
+for path in /usr/bin/strata /usr/share/applications/io.github.lgse.Strata.desktop; do
+  debugfs -R "stat $path" "$base" 2>&1 | grep -q 'Inode:' ||
+    die "base lacks Strata; rebuild the Myron rootfs with current packages"
+done
+for path in /usr/bin/nautilus /usr/lib/xdg-desktop-portal-gnome; do
+  ! debugfs -R "stat $path" "$base" 2>&1 | grep -q 'Inode:' ||
+    die "base still contains Nautilus/GNOME chooser; rebuild the Myron rootfs"
+done
+[[ $(debugfs -R 'cat /etc/xdg/xdg-desktop-portal/hyprland-portals.conf' "$base" 2>/dev/null | sha256sum) == "$(sha256sum < packages/omamobile-apps-myron/portal/hyprland-portals.conf)" ]] ||
+  die "base chooser policy differs from the current Myron app profile"
+
 # Copy to a new inode before the privileged container sees it. The source is
 # never mounted and a failed composition leaves only the explicitly named OUT.
 cp --reflink=auto --sparse=always -- "$base" "$out"
@@ -150,27 +175,40 @@ effective_profile=$profile
 audio_experiment=
 cellular_audio_experiment=
 case $profile in
+  cellular-audio) effective_profile=cellular ;;
   audio-speaker|audio-microphone) effective_profile=cellular; audio_experiment=$profile ;;
-  audio-cellular-speaker) effective_profile=cellular; cellular_audio_experiment=$profile ;;
+  audio-cellular-speaker|audio-cellular-bridge) effective_profile=cellular; cellular_audio_experiment=$profile ;;
 esac
+sensor_present=0
+sensor_mount=()
+if [[ -n $sensor_runtime ]]; then
+  sensor_present=1
+  sensor_mount=(-v "$sensor_runtime:/sensor-runtime.tar.gz:ro")
+fi
 docker run --rm --privileged --platform linux/arm64 \
   -e MYRON_TEST_PROFILE="$effective_profile" \
   -e MYRON_COMPOSE_PROFILE="$profile" \
   -e MYRON_AUDIO_EXPERIMENT="$audio_experiment" \
   -e MYRON_CELLULAR_AUDIO_EXPERIMENT="$cellular_audio_experiment" \
   -e MYRON_BOOT_POLICY="$boot_policy" \
+  -e MYRON_SENSOR_RUNTIME="$sensor_present" \
   -v "$out:/payload.img" \
   -v "$modules:/module-stage:ro" \
   -v "$runtime:/runtime-stage:ro" \
   -v "$bluetooth_probe:/bluetooth-probe.py:ro" \
   -v "$speaker_reference:/speaker-reference:ro" \
   -v "$ROOT/packages/omamobile-shell:/shell-source:ro" \
+  -v "$ROOT/packages/omamobile-omarchy:/omarchy-phone-source:ro" \
+  -v "$ROOT/packages/omamobile-location-usage:/location-usage-source:ro" \
+  -v "$ROOT/packages/omamobile-sensors/bin/omamobile-rotation:/rotation-control:ro" \
+  -v "$ROOT/packages/omamobile-sensors/lib/autorotate.py:/autorotate.py:ro" \
   -v "$ROOT/tools/myron-networkmanager-keyfile-audit:/keyfile-audit:ro" \
   -v "$ROOT/device/myron/hardware-test-overlay:/test-overlay:ro" \
   -v "$ROOT/device/myron/main-overlay:/main-overlay:ro" \
   -v "$ROOT/device/myron/audio-experiment:/audio-experiment-source:ro" \
   -v "$firstboot:/firstboot.conf:ro" \
   -v "$ssh_key:/owner.pub:ro" \
+  "${sensor_mount[@]}" \
   "$image" bash -euo pipefail -c '
     mkdir -p /mnt/payload
     loop=
@@ -189,6 +227,35 @@ docker run --rm --privileged --platform linux/arm64 \
     cp -a /runtime-stage/. "$root/"
     tar -C /test-overlay -cf - . | tar --no-same-owner -C "$root" -xf -
     install -d -m0755 "$root/etc/omamobile"
+    install -Dm0755 /autorotate.py \
+      "$root/usr/local/libexec/myron-sensors/autorotate.py"
+    rm -f "$root/etc/omamobile/myron-sensors-enable"
+    if test "$MYRON_SENSOR_RUNTIME" = 1; then
+      sensor_asset_root="$root/usr/share/qcom/sm8850/Xiaomi/myron"
+      install -d -m0755 "$sensor_asset_root"
+      tar --extract --gzip --file=/sensor-runtime.tar.gz \
+        --directory="$sensor_asset_root" --strip-components=2 \
+        --no-same-owner --no-same-permissions --wildcards \
+        "myron-sensor-runtime-v3-20261027/root/*"
+      test -f "$sensor_asset_root/sensors/sns_reg.conf"
+      test -d "$sensor_asset_root/sensors/registry"
+      chown -R 0:0 "$sensor_asset_root"
+      find "$sensor_asset_root" -type d -exec chmod 0755 {} +
+      find "$sensor_asset_root" -type f -exec chmod 0644 {} +
+      printf "%s\n" private-v3 >"$root/etc/omamobile/myron-sensors-available"
+      chown 0:0 "$root/etc/omamobile/myron-sensors-available"
+      chmod 0644 "$root/etc/omamobile/myron-sensors-available"
+      # With the private assets present, stage the sensors at boot (bounded
+      # FastRPC wait, tunnel and sample) and run the rotation controller in
+      # the session. Without the archive both stay absent and inert.
+      install -m0644 /dev/null "$root/etc/omamobile/myron-sensors-enable"
+      install -d "$root/etc/systemd/system/multi-user.target.wants" \
+        "$root/etc/systemd/user/graphical-session.target.wants"
+      ln -sfn /usr/lib/systemd/system/myron-sensor-stage.service \
+        "$root/etc/systemd/system/multi-user.target.wants/myron-sensor-stage.service"
+      ln -sfn /usr/lib/systemd/user/omamobile-autorotate.service \
+        "$root/etc/systemd/user/graphical-session.target.wants/omamobile-autorotate.service"
+    fi
     # The empty in-tree-rmnet selection marker must arrive as a regular file.
     test -f "$root/etc/myron/use-in-tree-rmnet" -a ! -L "$root/etc/myron/use-in-tree-rmnet" -a \
       ! -s "$root/etc/myron/use-in-tree-rmnet"
@@ -211,6 +278,7 @@ docker run --rm --privileged --platform linux/arm64 \
         "$root/usr/local/sbin/myron-mobile-data-policy" \
         "$root/usr/local/sbin/myron-audio-experiment" \
         "$root/usr/local/sbin/myron-audio-microphone-probe" \
+        "$root/usr/local/libexec/myron-audio-experiment/write-bridge-tones.py" \
         "$root/usr/local/bin/myron-mobile-data"
       chmod 0644 "$root/usr/lib/systemd/system/myron-hardware-watchdog.service" \
         "$root/usr/lib/systemd/system/myron-main-recover.service" \
@@ -229,13 +297,20 @@ docker run --rm --privileged --platform linux/arm64 \
         "$root/usr/lib/systemd/system/myron-cellular-audio-experiment.service" \
         "$root/etc/polkit-1/rules.d/50-myron-cellular-enable.rules" \
         "$root/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules" \
+        "$root/etc/polkit-1/rules.d/49-myron-modem-access.rules" \
         "$root/etc/polkit-1/rules.d/50-myron-location.rules"
     fi
     printf "%s\n" "$MYRON_TEST_PROFILE" >"$root/etc/omamobile/myron-test-profile"
     chown 0:0 "$root/etc/omamobile/myron-test-profile"
     chmod 0644 "$root/etc/omamobile/myron-test-profile"
     rm -f "$root/etc/omamobile/myron-audio-experiment" \
-      "$root/etc/omamobile/myron-cellular-audio-experiment"
+      "$root/etc/omamobile/myron-cellular-audio-experiment" \
+      "$root/etc/omamobile/myron-main-audio"
+    if test "$MYRON_COMPOSE_PROFILE" = cellular-audio; then
+      printf "%s\n" cellular-audio >"$root/etc/omamobile/myron-main-audio"
+      chown 0:0 "$root/etc/omamobile/myron-main-audio"
+      chmod 0644 "$root/etc/omamobile/myron-main-audio"
+    fi
     if test -n "$MYRON_AUDIO_EXPERIMENT"; then
       printf "%s\n" "$MYRON_AUDIO_EXPERIMENT" >"$root/etc/omamobile/myron-audio-experiment"
       chown 0:0 "$root/etc/omamobile/myron-audio-experiment"
@@ -294,6 +369,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-bluetooth-qca-probe"
     install -Dm0755 /speaker-reference/experiments/speaker-pipewire-bridge/bridge.py \
       "$root/usr/local/libexec/myron-speaker/bridge.py"
+    chmod 0755 "$root/usr/local/libexec/myron-speaker/bridge-session.py"
     install -Dm0755 /speaker-reference/experiments/speaker-oem-miplay-graph/probe.py \
       "$root/usr/local/libexec/myron-speaker/probe.py"
     install -Dm0755 /speaker-reference/scripts/attempt78-tfa-hostless.py \
@@ -308,6 +384,62 @@ docker run --rm --privileged --platform linux/arm64 \
       install -Dm0755 /audio-experiment-source/attempt78-live-audio-speaker-probe.sh \
         "$root/usr/local/libexec/myron-audio-experiment/speaker-probe.sh"
     fi
+    # Opt-in Myron display policy, including the matching Omarchy hook.
+    # This does not start the sensor foundation; absent light data uses a dim
+    # wake fallback. Apply the patch through its normal recorded mechanism.
+    install -Dm0755 /shell-source/bin/omamobile-sensor-keepalive "$root/usr/bin/omamobile-sensor-keepalive"
+    install -Dm0644 /shell-source/systemd/user/omamobile-sensor-keepalive@.service "$root/usr/lib/systemd/user/omamobile-sensor-keepalive@.service"
+    install -d "$root/etc/omamobile" "$root/etc/systemd/user/graphical-session.target.wants"
+    touch "$root/etc/omamobile/sensors-keepalive"
+    for sensor in Light Proximity Compass; do
+      ln -sfn /usr/lib/systemd/user/omamobile-sensor-keepalive@.service "$root/etc/systemd/user/graphical-session.target.wants/omamobile-sensor-keepalive@$sensor.service"
+    done
+    install -Dm0755 /shell-source/bin/omamobile-haptics "$root/usr/bin/omamobile-haptics"
+    install -Dm0755 /shell-source/bin/omamobile-display "$root/usr/bin/omamobile-display"
+    install -Dm0755 /shell-source/bin/omamobile-keys "$root/usr/bin/omamobile-keys"
+    install -Dm0644 /shell-source/hypr/phone.lua "$root/usr/share/omamobile/shell/hypr/phone.lua"
+    install -Dm0644 /shell-source/systemd/user/omamobile-display.service \
+      "$root/usr/lib/systemd/user/omamobile-display.service"
+    install -Dm0644 /omarchy-phone-source/patches/0016-display-bounded-wake-and-touch-policy.patch \
+      "$root/usr/share/omamobile/omarchy/patches/0016-display-bounded-wake-and-touch-policy.patch"
+    install -Dm0755 /rotation-control "$root/usr/bin/omamobile-rotation"
+    for file in /shell-source/plugins/omamobile.gestures/*; do
+      install -Dm0644 "$file" "$root/usr/share/omamobile/shell/plugins/omamobile.gestures/${file##*/}"
+    done
+    for file in /shell-source/plugins/omamobile.rotation/*; do
+      install -Dm0644 "$file" "$root/usr/share/omamobile/shell/plugins/omamobile.rotation/${file##*/}"
+    done
+    # Settings app: helper, plugin, the launcher-side shared geometry model,
+    # the drawer entry and the keyboard theme hook (linked by setup-user).
+    install -Dm0755 /shell-source/bin/omamobile-settings "$root/usr/bin/omamobile-settings"
+    for file in /shell-source/plugins/omamobile.settings/*; do
+      install -Dm0644 "$file" "$root/usr/share/omamobile/shell/plugins/omamobile.settings/${file##*/}"
+    done
+    install -Dm0644 /shell-source/plugins/omamobile.launcher/SettingsGeometry.js \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.launcher/SettingsGeometry.js"
+    install -Dm0644 /shell-source/applications/omamobile-settings.desktop \
+      "$root/usr/share/applications/omamobile-settings.desktop"
+    install -Dm0755 /shell-source/hooks/omamobile-keyboard-theme \
+      "$root/usr/share/omamobile/shell/hooks/omamobile-keyboard-theme"
+    install -Dm0755 /shell-source/bin/omamobile-pocket "$root/usr/bin/omamobile-pocket"
+    install -Dm0644 /shell-source/systemd/user/omamobile-pocket@.service "$root/usr/lib/systemd/user/omamobile-pocket@.service"
+    for unit in omamobile-pocket-expire@.timer omamobile-pocket-expire@.service; do
+      install -Dm0644 "/shell-source/systemd/user/$unit" "$root/usr/lib/systemd/user/$unit"
+    done
+    install -Dm0644 /shell-source/plugins/PocketStatus.qml "$root/usr/share/omamobile/shell/plugins/PocketStatus.qml"
+    for file in /shell-source/plugins/omamobile.pocket/*; do
+      install -Dm0644 "$file" "$root/usr/share/omamobile/shell/plugins/omamobile.pocket/${file##*/}"
+    done
+    for plugin in omamobile.call/Call.qml omamobile.keyboard/Keyboard.qml omamobile.quicksettings/TilesModel.js; do
+      install -Dm0644 "/shell-source/plugins/$plugin" "$root/usr/share/omamobile/shell/plugins/$plugin"
+    done
+    install -Dm0644 /shell-source/profile/shell.json "$root/usr/share/omamobile/shell/profile/shell.json"
+    install -Dm0755 /shell-source/bin/omamobile-setup-user "$root/usr/bin/omamobile-setup-user"
+    install -Dm0644 /omarchy-phone-source/patches/0017-pocket-wake-guard.patch "$root/usr/share/omamobile/omarchy/patches/0017-pocket-wake-guard.patch"
+    python3 /omarchy-phone-source/bin/omamobile-omarchy-patches apply --root "$root"
+    install -d "$root/etc/systemd/user/graphical-session.target.wants"
+    ln -sfn /usr/lib/systemd/user/omamobile-display.service \
+      "$root/etc/systemd/user/graphical-session.target.wants/omamobile-display.service"
     # Carry the live-qualified temporary shell fixes into this test payload.
     # The Myron geometry files are a matched set: Bar and Launcher import the
     # shared device profile, and the installed version must describe them.
@@ -322,8 +454,14 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml"
     install -Dm0644 /shell-source/plugins/omamobile.launcher/Launcher.qml \
       "$root/usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml"
+    install -Dm0644 /shell-source/plugins/omamobile.home/Home.qml \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.home/Home.qml"
+    install -Dm0644 /shell-source/plugins/omamobile.home/HomeModel.js \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.home/HomeModel.js"
     install -Dm0644 /shell-source/version \
       "$root/usr/share/omamobile/shell/version"
+    install -Dm0644 /shell-source/plugins/omamobile.quicksettings/SliderRow.qml \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/SliderRow.qml"
     install -Dm0644 /shell-source/plugins/omamobile.quicksettings/QuickSettings.qml \
       "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml"
     install -Dm0755 /shell-source/plugins/omamobile.quicksettings/tile-action.sh \
@@ -332,6 +470,30 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/tile-state.sh"
     install -Dm0644 /shell-source/plugins/omamobile.switcher/Switcher.qml \
       "$root/usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml"
+    install -Dm0644 /shell-source/plugins/omamobile.switcher/manifest.json \
+      "$root/usr/share/omamobile/shell/plugins/omamobile.switcher/manifest.json"
+    # Location panel behind the Location tile (new files in the quick-settings
+    # plugin; the Quick Settings file itself is installed above).
+    for file in LocationPanel.qml LocationModel.js; do
+      install -Dm0644 "/shell-source/plugins/omamobile.quicksettings/$file" \
+        "$root/usr/share/omamobile/shell/plugins/omamobile.quicksettings/$file"
+    done
+    # Location-use history: metadata-only system observer, watching from boot
+    # and ordered before GeoClue. It never starts GeoClue or the receiver.
+    install -Dm0755 /location-usage-source/bin/omamobile-location "$root/usr/bin/omamobile-location"
+    install -Dm0755 /location-usage-source/bin/omamobile-location-usaged \
+      "$root/usr/lib/omamobile-location-usage/omamobile-location-usaged"
+    for file in model.py usage_daemon.py; do
+      install -Dm0644 "/location-usage-source/lib/$file" "$root/usr/lib/omamobile-location-usage/$file"
+    done
+    install -Dm0644 /location-usage-source/systemd/omamobile-location-usage.service \
+      "$root/usr/lib/systemd/system/omamobile-location-usage.service"
+    install -Dm0644 /location-usage-source/dbus/org.omamobile.LocationUsage1.conf \
+      "$root/usr/share/dbus-1/system.d/org.omamobile.LocationUsage1.conf"
+    install -d "$root/etc/systemd/system/multi-user.target.wants"
+    ln -sfn /usr/lib/systemd/system/omamobile-location-usage.service \
+      "$root/etc/systemd/system/multi-user.target.wants/omamobile-location-usage.service"
+    chown -R 0:0 "$root/usr/lib/omamobile-location-usage"
     chown -R 0:0 "$root/usr/local/sbin/myron-attempt79-module-dir"
     chmod 0755 "$root/usr/local/sbin/myron-attempt79-module-dir"
     install -Dm0600 /firstboot.conf "$root/etc/omamobile/firstboot.conf"
@@ -343,10 +505,12 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/bin/myron-speaker-sink" \
       "$root/usr/local/bin/myron-microphone-source" \
       "$root/usr/local/bin/omamobile-microphone" \
+      "$root/usr/local/bin/omamobile-autorotate" \
       "$root/usr/local/libexec/myron-shell-bin/quickshell" \
       "$root/usr/local/sbin/myron-reference-radio-start" \
       "$root/usr/local/sbin/myron-reference-wifi-import" \
       "$root/usr/local/sbin/myron-cellular-start" \
+      "$root/usr/local/sbin/myron-cellular-audio-start" \
       "$root/usr/local/sbin/myron-cellular-stage" \
       "$root/usr/local/sbin/myron-ipa-guard" \
       "$root/usr/local/sbin/myron-modemmanager-start" \
@@ -363,6 +527,7 @@ docker run --rm --privileged --platform linux/arm64 \
       "$root/usr/local/sbin/myron-batterysecret-start" \
       "$root/usr/local/sbin/myron-battery-stage" \
       "$root/usr/local/sbin/myron-peripheral-audit" \
+      "$root/usr/local/sbin/myron-sensor-stage" \
       "$root/usr/local/sbin/myron-audio-devnodes" \
       "$root/usr/local/sbin/myron-omarchy-prepare" \
       "$root/usr/local/sbin/myron-omarchy-qualify"
@@ -387,7 +552,8 @@ docker run --rm --privileged --platform linux/arm64 \
     # Omarchy Mobile has its own non-interactive first-boot service.  Arch
     # stock prompt otherwise blocks sysinit.target behind Plymouth forever.
     systemctl --root="$root" mask systemd-firstboot.service >/dev/null
-    if test "$MYRON_BOOT_POLICY" = main && test "$MYRON_COMPOSE_PROFILE" = cellular; then
+    if test "$MYRON_BOOT_POLICY" = main &&
+       { test "$MYRON_COMPOSE_PROFILE" = cellular || test "$MYRON_COMPOSE_PROFILE" = cellular-audio; }; then
       # Status only: the operation units stay unenabled and start only on an
       # explicit request, once per boot.
       systemctl --root="$root" enable myron-cellular-publish.service >/dev/null
@@ -402,6 +568,15 @@ docker run --rm --privileged --platform linux/arm64 \
         systemctl --root="$root" unmask ModemManager.service >/dev/null
         systemctl --root="$root" disable ModemManager.service >/dev/null 2>&1 || true
         systemctl --root="$root" enable myron-cellular.service >/dev/null
+        ;;
+      cellular-audio)
+        systemctl --root="$root" disable myron-coexistence.service >/dev/null 2>&1 || true
+        systemctl --root="$root" unmask ModemManager.service myron-speaker-bridge.service >/dev/null
+        systemctl --root="$root" disable ModemManager.service >/dev/null 2>&1 || true
+        systemctl --root="$root" mask myron-reference-audio-foundation.service \
+          myron-microphone-bridge.service >/dev/null
+        systemctl --root="$root" enable myron-cellular.service \
+          myron-cellular-audio.service >/dev/null
         ;;
       audio-speaker|audio-microphone)
         # Nothing except the experiment starts from multi-user.target. The
@@ -434,6 +609,22 @@ docker run --rm --privileged --platform linux/arm64 \
           myron-speaker-bridge.service myron-microphone-bridge.service >/dev/null
         rm -f "$root/usr/local/libexec/myron-speaker/probe.py"
         ;;
+      audio-cellular-bridge)
+        # Same attended modem-first experiment boundary, but reuse the exact
+        # user-confirmed -12 dB OEM MIPLAY bridge after AudioReach staging.
+        systemctl --root="$root" disable myron-batterysecret.service \
+          myron-omarchy-qualify.service myron-coexistence.service \
+          myron-audio-experiment.service >/dev/null 2>&1 || true
+        systemctl --root="$root" unmask ModemManager.service \
+          myron-speaker-bridge.service >/dev/null
+        systemctl --root="$root" disable ModemManager.service >/dev/null 2>&1 || true
+        systemctl --root="$root" enable myron-reference-wifi-import.service \
+          myron-omarchy-prepare.service myron-cellular.service >/dev/null
+        systemctl --root="$root" disable myron-cellular-publish.service >/dev/null 2>&1 || true
+        systemctl --root="$root" mask myron-reference-audio-foundation.service \
+          myron-microphone-bridge.service >/dev/null
+        rm -f "$root/usr/local/libexec/myron-audio-experiment/speaker-probe.sh"
+        ;;
     esac
     sync
     umount /mnt/payload
@@ -443,6 +634,46 @@ docker run --rm --privileged --platform linux/arm64 \
   '
 
 e2fsck -fn "$out" >/dev/null
+[[ $(debugfs -R 'cat /usr/local/libexec/myron-speaker/bridge-session.py' "$out" 2>/dev/null | sha256sum) == \
+  "$(sha256sum <device/myron/hardware-test-overlay/usr/local/libexec/myron-speaker/bridge-session.py)" ]] ||
+  die 'speaker PCM-start handshake differs from the repository'
+# Sensor programs always match the repository. Private assets are optional at
+# compose time; with them, staging and rotation are enabled, without them both
+# stay absent.
+for spec in \
+  '/usr/local/sbin/myron-sensor-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-sensor-stage' \
+  '/usr/lib/systemd/system/myron-sensor-stage.service|device/myron/hardware-test-overlay/usr/lib/systemd/system/myron-sensor-stage.service' \
+  '/usr/local/bin/omamobile-autorotate|device/myron/hardware-test-overlay/usr/local/bin/omamobile-autorotate' \
+  '/usr/lib/systemd/user/omamobile-autorotate.service|device/myron/hardware-test-overlay/usr/lib/systemd/user/omamobile-autorotate.service' \
+  '/usr/local/libexec/myron-sensors/autorotate.py|packages/omamobile-sensors/lib/autorotate.py'; do
+  image_path=${spec%%|*}
+  repository_path=${spec#*|}
+  [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$repository_path")" ]] ||
+    die "sensor program differs from the repository: $image_path"
+done
+for path in /etc/omamobile/myron-sensors-enable \
+  /etc/systemd/system/multi-user.target.wants/myron-sensor-stage.service \
+  /etc/systemd/user/graphical-session.target.wants/omamobile-autorotate.service; do
+  if [[ $sensor_present == 1 ]]; then
+    debugfs -R "stat $path" "$out" 2>&1 | grep -Fq 'File not found' &&
+      die "sensor activation is missing: $path"
+  else
+    debugfs -R "stat $path" "$out" 2>&1 | grep -Fq 'File not found' ||
+      die "sensor activation enabled without private assets: $path"
+  fi
+done
+debugfs -R 'stat /home/menno/.config/systemd/user/graphical-session.target.wants/omamobile-autorotate.service' "$out" 2>&1 |
+  grep -Fq 'File not found' || die 'rotation is enabled per user instead of by the image'
+if [[ $sensor_present == 1 ]]; then
+  debugfs -R 'cat /etc/omamobile/myron-sensors-available' "$out" 2>/dev/null |
+    grep -Fxq private-v3 || die 'sensor availability marker is missing'
+  debugfs -R 'stat /usr/share/qcom/sm8850/Xiaomi/myron/sensors/sns_reg.conf' "$out" 2>/dev/null |
+    grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
+    die 'private sensor registry is missing or not root-owned'
+else
+  debugfs -R 'stat /etc/omamobile/myron-sensors-available' "$out" 2>&1 |
+    grep -Fq 'File not found' || die 'sensor availability marker exists without private assets'
+fi
 if [[ $boot_policy == main ]]; then
   for path in /usr/local/sbin/myron-main-os /usr/lib/systemd/system/myron-hardware-watchdog.service \
     /usr/local/sbin/myron-cellular-op /usr/local/sbin/myron-cellular-reboot-failsafe /usr/local/bin/myron-mobile-data \
@@ -455,10 +686,13 @@ if [[ $boot_policy == main ]]; then
     /usr/lib/systemd/system/omamobile-gnss-location@.service \
     /usr/lib/systemd/system/omamobile-gnss-prepare.service \
     /usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf \
+    /etc/polkit-1/rules.d/49-myron-modem-access.rules \
     /etc/polkit-1/rules.d/50-myron-location.rules \
     /usr/lib/systemd/system/myron-main-recover.service \
     /usr/local/sbin/myron-audio-experiment /usr/lib/systemd/system/myron-audio-experiment.service \
+    /usr/local/libexec/myron-audio-experiment/write-bridge-tones.py \
     /usr/lib/systemd/system/myron-cellular-audio-experiment.service \
+    /usr/local/sbin/myron-cellular-audio-start /usr/lib/systemd/system/myron-cellular-audio.service \
     /usr/lib/systemd/system/myron-omarchy-qualify.service.d/90-myron-main.conf; do
     debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
       die "root ownership missing: $path"
@@ -479,7 +713,10 @@ if [[ $boot_policy == main ]]; then
     '/usr/local/bin/omamobile-gnss|device/myron/hardware-test-overlay/usr/local/bin/omamobile-gnss' \
     '/usr/local/sbin/myron-cellular-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-stage' \
     '/usr/local/sbin/myron-audio-stage|device/myron/hardware-test-overlay/usr/local/sbin/myron-audio-stage' \
+    '/usr/local/sbin/myron-cellular-audio-start|device/myron/hardware-test-overlay/usr/local/sbin/myron-cellular-audio-start' \
+    '/usr/lib/systemd/system/myron-cellular-audio.service|device/myron/hardware-test-overlay/usr/lib/systemd/system/myron-cellular-audio.service' \
     '/usr/local/sbin/myron-audio-experiment|device/myron/main-overlay/usr/local/sbin/myron-audio-experiment' \
+    '/usr/local/libexec/myron-audio-experiment/write-bridge-tones.py|device/myron/main-overlay/usr/local/libexec/myron-audio-experiment/write-bridge-tones.py' \
     '/usr/lib/systemd/system/myron-audio-experiment.service|device/myron/main-overlay/usr/lib/systemd/system/myron-audio-experiment.service' \
     '/usr/lib/systemd/system/myron-cellular-audio-experiment.service|device/myron/main-overlay/usr/lib/systemd/system/myron-cellular-audio-experiment.service'; do
     image_path=${spec%%|*}
@@ -507,6 +744,7 @@ if [[ $boot_policy == main ]]; then
     '/usr/lib/systemd/system/omamobile-gnss-prepare.service|device/myron/main-overlay/usr/lib/systemd/system/omamobile-gnss-prepare.service' \
     '/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf|device/myron/main-overlay/usr/lib/systemd/system/geoclue.service.d/50-omamobile-location.conf' \
     '/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules|device/myron/main-overlay/etc/polkit-1/rules.d/50-myron-mobile-data-block.rules' \
+    '/etc/polkit-1/rules.d/49-myron-modem-access.rules|device/myron/main-overlay/etc/polkit-1/rules.d/49-myron-modem-access.rules' \
     '/etc/polkit-1/rules.d/50-myron-location.rules|device/myron/main-overlay/etc/polkit-1/rules.d/50-myron-location.rules'; do
     image_path=${spec%%|*}
     repository_path=${spec#*|}
@@ -519,7 +757,7 @@ if [[ $boot_policy == main ]]; then
   for unit in myron-cellular-op.timer myron-cellular-attended.service myron-cellular-enable.service myron-cellular-watch.service; do
     ! in_image "/etc/systemd/system/multi-user.target.wants/$unit" || die "operation unit is enabled: $unit"
   done
-  if [[ $profile == cellular ]]; then
+  if [[ $profile == cellular || $profile == cellular-audio ]]; then
     in_image /etc/systemd/system/multi-user.target.wants/myron-cellular-publish.service ||
       die 'the cellular status publisher is not enabled'
   else
@@ -528,7 +766,7 @@ if [[ $boot_policy == main ]]; then
   fi
   # No higher-priority location may shadow a critical main unit, and the only
   # drop-ins in /usr/lib are the provided main ones, byte for byte.
-  for unit in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-cellular-audio-experiment myron-omarchy-qualify myron-omarchy-prepare \
+  for unit in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-cellular-audio-experiment myron-cellular-audio myron-omarchy-qualify myron-omarchy-prepare \
     myron-cellular myron-batterysecret; do
     for dir in /etc/systemd/system /etc/systemd/system.control /usr/local/lib/systemd/system; do
       for path in "$dir/$unit.service" "$dir/$unit.service.d"; do
@@ -555,19 +793,64 @@ for spec in \
   '/usr/share/omamobile/shell/plugins/omamobile.launcher/DeviceProfile.js|packages/omamobile-shell/plugins/omamobile.launcher/DeviceProfile.js' \
   '/usr/share/omamobile/shell/plugins/omamobile.bar/Bar.qml|packages/omamobile-shell/plugins/omamobile.bar/Bar.qml' \
   '/usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml|packages/omamobile-shell/plugins/omamobile.launcher/Launcher.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.home/Home.qml|packages/omamobile-shell/plugins/omamobile.home/Home.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.home/HomeModel.js|packages/omamobile-shell/plugins/omamobile.home/HomeModel.js' \
   '/usr/share/omamobile/shell/version|packages/omamobile-shell/version' \
   '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml|packages/omamobile-shell/plugins/omamobile.quicksettings/QuickSettings.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/SliderRow.qml|packages/omamobile-shell/plugins/omamobile.quicksettings/SliderRow.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.rotation/Rotation.qml|packages/omamobile-shell/plugins/omamobile.rotation/Rotation.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.rotation/SwitchRow.qml|packages/omamobile-shell/plugins/omamobile.rotation/SwitchRow.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.rotation/manifest.json|packages/omamobile-shell/plugins/omamobile.rotation/manifest.json' \
   '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/tile-action.sh|packages/omamobile-shell/plugins/omamobile.quicksettings/tile-action.sh' \
   '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/tile-state.sh|packages/omamobile-shell/plugins/omamobile.quicksettings/tile-state.sh' \
-  '/usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml|packages/omamobile-shell/plugins/omamobile.switcher/Switcher.qml'; do
+  '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/LocationPanel.qml|packages/omamobile-shell/plugins/omamobile.quicksettings/LocationPanel.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/LocationModel.js|packages/omamobile-shell/plugins/omamobile.quicksettings/LocationModel.js' \
+  '/usr/bin/omamobile-location|packages/omamobile-location-usage/bin/omamobile-location' \
+  '/usr/lib/omamobile-location-usage/omamobile-location-usaged|packages/omamobile-location-usage/bin/omamobile-location-usaged' \
+  '/usr/lib/omamobile-location-usage/model.py|packages/omamobile-location-usage/lib/model.py' \
+  '/usr/lib/omamobile-location-usage/usage_daemon.py|packages/omamobile-location-usage/lib/usage_daemon.py' \
+  '/usr/lib/systemd/system/omamobile-location-usage.service|packages/omamobile-location-usage/systemd/omamobile-location-usage.service' \
+  '/usr/share/dbus-1/system.d/org.omamobile.LocationUsage1.conf|packages/omamobile-location-usage/dbus/org.omamobile.LocationUsage1.conf' \
+  '/usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml|packages/omamobile-shell/plugins/omamobile.switcher/Switcher.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.switcher/manifest.json|packages/omamobile-shell/plugins/omamobile.switcher/manifest.json' \
+  '/usr/share/omamobile/shell/plugins/omamobile.gestures/qmldir|packages/omamobile-shell/plugins/omamobile.gestures/qmldir' \
+  '/usr/share/omamobile/shell/plugins/omamobile.gestures/NavState.qml|packages/omamobile-shell/plugins/omamobile.gestures/NavState.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.gestures/NavGesture.js|packages/omamobile-shell/plugins/omamobile.gestures/NavGesture.js' \
+  '/usr/share/omamobile/shell/plugins/omamobile.launcher/SettingsGeometry.js|packages/omamobile-shell/plugins/omamobile.launcher/SettingsGeometry.js' \
+  '/usr/share/omamobile/shell/plugins/omamobile.settings/manifest.json|packages/omamobile-shell/plugins/omamobile.settings/manifest.json' \
+  '/usr/share/omamobile/shell/plugins/omamobile.settings/Settings.qml|packages/omamobile-shell/plugins/omamobile.settings/Settings.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.settings/NavRow.qml|packages/omamobile-shell/plugins/omamobile.settings/NavRow.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.settings/InfoRow.qml|packages/omamobile-shell/plugins/omamobile.settings/InfoRow.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.settings/StepperRow.qml|packages/omamobile-shell/plugins/omamobile.settings/StepperRow.qml' \
+  '/usr/share/omamobile/shell/plugins/omamobile.quicksettings/TilesModel.js|packages/omamobile-shell/plugins/omamobile.quicksettings/TilesModel.js' \
+  '/usr/share/omamobile/shell/plugins/omamobile.keyboard/Keyboard.qml|packages/omamobile-shell/plugins/omamobile.keyboard/Keyboard.qml' \
+  '/usr/share/omamobile/shell/profile/shell.json|packages/omamobile-shell/profile/shell.json' \
+  '/usr/share/omamobile/shell/hooks/omamobile-keyboard-theme|packages/omamobile-shell/hooks/omamobile-keyboard-theme' \
+  '/usr/share/applications/omamobile-settings.desktop|packages/omamobile-shell/applications/omamobile-settings.desktop' \
+  '/usr/bin/omamobile-settings|packages/omamobile-shell/bin/omamobile-settings' \
+  '/usr/bin/omamobile-setup-user|packages/omamobile-shell/bin/omamobile-setup-user' \
+  '/usr/share/omamobile/shell/hypr/phone.lua|packages/omamobile-shell/hypr/phone.lua'; do
   image_path=${spec%%|*}
   repository_path=${spec#*|}
   [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum) == "$(sha256sum <"$repository_path")" ]] ||
     die "shell override differs from the repository: $image_path"
 done
+# The observer is enabled from boot and neither shadowed nor given a drop-in;
+# the package ships no activation file and no polkit rule.
+in_image_path() { ! debugfs -R "stat $1" "$out" 2>&1 | grep -Fq 'File not found'; }
+in_image_path /etc/systemd/system/multi-user.target.wants/omamobile-location-usage.service ||
+  die 'the location-use observer is not enabled'
+for path in /etc/systemd/system/omamobile-location-usage.service /etc/systemd/system/omamobile-location-usage.service.d \
+  /usr/lib/systemd/system/omamobile-location-usage.service.d /usr/local/lib/systemd/system/omamobile-location-usage.service \
+  /usr/share/dbus-1/system-services/org.omamobile.LocationUsage1.service; do
+  ! in_image_path "$path" || die "location-use observer is shadowed or activatable: $path"
+done
 for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot.conf \
   /usr/local/bin/myron-omarchy-setup-user /usr/local/libexec/myron-shell-bin/quickshell \
+  /usr/local/bin/omamobile-autorotate /usr/local/libexec/myron-sensors/autorotate.py \
+  /usr/lib/systemd/user/omamobile-autorotate.service \
   /usr/local/sbin/myron-omarchy-prepare /etc/myron/use-in-tree-rmnet \
+  /usr/local/sbin/myron-sensor-stage /usr/lib/systemd/system/myron-sensor-stage.service \
   /usr/local/sbin/myron-ipa-guard /usr/lib/systemd/system/myron-ipa-guard.service \
   /usr/local/sbin/myron-modemmanager-start /etc/NetworkManager/conf.d/20-myron-cellular-unmanaged.conf \
   /etc/systemd/system/ModemManager.service.d/20-myron-radio.conf \
@@ -576,7 +859,9 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/local/lib/myron-charging/bin/batterysecret \
   /usr/local/sbin/myron-batterysecret-start /etc/acdbdata/acdb_cal.acdb \
   /usr/local/sbin/myron-bluetooth-qca-probe \
-  /usr/local/libexec/myron-speaker/bridge.py /usr/local/bin/myron-speaker-sink \
+  /usr/local/sbin/myron-cellular-audio-start /usr/lib/systemd/system/myron-cellular-audio.service \
+  /usr/local/libexec/myron-speaker/bridge.py /usr/local/libexec/myron-speaker/bridge-session.py \
+  /usr/local/bin/myron-speaker-sink \
   /usr/local/bin/myron-microphone-source /usr/local/sbin/myron-microphone-bridge \
   /usr/share/omamobile/shell/plugins/DeviceProfile.js \
   /usr/share/omamobile/shell/plugins/omamobile.bar/DeviceProfile.js \
@@ -585,7 +870,17 @@ for path in / /usr /usr/local /etc/shadow /usr/bin/sudo /etc/omamobile/firstboot
   /usr/share/omamobile/shell/plugins/omamobile.launcher/Launcher.qml \
   /usr/share/omamobile/shell/version \
   /usr/share/omamobile/shell/plugins/omamobile.quicksettings/QuickSettings.qml \
+  /usr/share/omamobile/shell/plugins/omamobile.quicksettings/LocationPanel.qml \
+  /usr/share/omamobile/shell/plugins/omamobile.quicksettings/LocationModel.js \
+  /usr/bin/omamobile-location /usr/lib/omamobile-location-usage \
+  /usr/lib/omamobile-location-usage/omamobile-location-usaged \
+  /usr/lib/omamobile-location-usage/model.py /usr/lib/omamobile-location-usage/usage_daemon.py \
+  /usr/lib/systemd/system/omamobile-location-usage.service \
+  /usr/share/dbus-1/system.d/org.omamobile.LocationUsage1.conf \
   /usr/share/omamobile/shell/plugins/omamobile.switcher/Switcher.qml \
+  /usr/bin/omamobile-settings /usr/share/omamobile/shell/plugins/omamobile.settings/Settings.qml \
+  /usr/share/omamobile/shell/plugins/omamobile.launcher/SettingsGeometry.js \
+  /usr/share/omamobile/shell/hooks/omamobile-keyboard-theme /usr/share/applications/omamobile-settings.desktop \
   /etc/backend_conf.xml /etc/card-defs.xml; do
   debugfs -R "stat $path" "$out" 2>/dev/null | grep -q '^User:[[:space:]]*0[[:space:]]*Group:[[:space:]]*0' ||
     die "root ownership missing: $path"
@@ -612,6 +907,32 @@ case $profile in
       "$out" 2>&1 | grep -Fq 'File not found' || die 'ModemManager is enabled outside the guarded cellular transaction'
     debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/myron-ipa-guard.service' \
       "$out" 2>&1 | grep -Fq 'File not found' || die 'IPA guard is enabled outside the guarded cellular transaction'
+    ;;
+  cellular-audio)
+    [[ $(debugfs -R 'cat /etc/omamobile/myron-test-profile' "$out" 2>/dev/null) == cellular ]] ||
+      die 'cellular-audio image changed the effective main-init profile'
+    [[ $(debugfs -R 'cat /etc/omamobile/myron-main-audio' "$out" 2>/dev/null) == cellular-audio ]] ||
+      die 'cellular-audio image lacks its exact persistent marker'
+    for unit in myron-cellular myron-cellular-audio myron-cellular-publish myron-omarchy-qualify; do
+      debugfs -R "stat /etc/systemd/system/multi-user.target.wants/$unit.service" \
+        "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die "$unit is not enabled in the cellular-audio image"
+    done
+    for unit in myron-reference-audio-foundation myron-microphone-bridge; do
+      debugfs -R "stat /etc/systemd/system/$unit.service" "$out" 2>/dev/null |
+        grep -Fq 'Fast link dest: "/dev/null"' || die "$unit is not masked in the cellular-audio image"
+    done
+    for unit in myron-speaker-bridge ModemManager; do
+      debugfs -R "stat /etc/systemd/system/$unit.service" "$out" 2>&1 |
+        grep -Fq 'Fast link dest: "/dev/null"' && die "$unit is masked in the cellular-audio image"
+    done
+    debugfs -R 'stat /usr/local/libexec/myron-speaker/probe.py' "$out" 2>&1 |
+      grep -Fq 'File not found' && die 'cellular-audio image lacks the known-good OEM MIPLAY graph'
+    debugfs -R 'stat /usr/local/libexec/myron-speaker/bridge.py' "$out" 2>&1 |
+      grep -Fq 'File not found' && die 'cellular-audio image lacks the known-good speaker bridge'
+    debugfs -R 'stat /etc/omamobile/myron-audio-experiment' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'cellular-audio image contains an isolated-audio marker'
+    debugfs -R 'stat /etc/omamobile/myron-cellular-audio-experiment' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'cellular-audio image contains the one-shot cellular-audio marker'
     ;;
   audio-speaker|audio-microphone)
     [[ $(debugfs -R 'cat /etc/omamobile/myron-test-profile' "$out" 2>/dev/null) == cellular ]] ||
@@ -679,6 +1000,48 @@ case $profile in
     debugfs -R 'stat /usr/local/sbin/myron-audio-microphone-probe' "$out" 2>&1 |
       grep -Fq 'File not found' || die 'cellular-audio image contains the microphone experiment probe'
     ;;
+  audio-cellular-bridge)
+    [[ $(debugfs -R 'cat /etc/omamobile/myron-test-profile' "$out" 2>/dev/null) == cellular ]] ||
+      die 'cellular-bridge image changed the effective main-init profile'
+    [[ $(debugfs -R 'cat /etc/omamobile/myron-cellular-audio-experiment' "$out" 2>/dev/null) == "$profile" ]] ||
+      die 'cellular-bridge image lacks its exact experiment mode'
+    for spec in \
+      'multi-user.target.wants/myron-cellular.service|myron-cellular' \
+      'NetworkManager.service.requires/myron-reference-wifi-import.service|myron-reference-wifi-import' \
+      'multi-user.target.wants/myron-omarchy-prepare.service|myron-omarchy-prepare'; do
+      unit_path=${spec%%|*}
+      unit_name=${spec#*|}
+      debugfs -R "stat /etc/systemd/system/$unit_path" \
+        "$out" 2>/dev/null | grep -Fq 'Fast link dest:' || die "$unit_name is not enabled in the cellular-bridge image"
+    done
+    for unit in myron-audio-experiment myron-cellular-audio-experiment myron-omarchy-qualify myron-coexistence myron-batterysecret myron-cellular-publish; do
+      debugfs -R "stat /etc/systemd/system/multi-user.target.wants/$unit.service" \
+        "$out" 2>&1 | grep -Fq 'File not found' || die "$unit is enabled in the attended cellular-bridge image"
+    done
+    debugfs -R 'stat /etc/systemd/system/ModemManager.service' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'ModemManager is masked in the cellular-bridge image'
+    for unit in myron-reference-audio-foundation myron-microphone-bridge; do
+      debugfs -R "stat /etc/systemd/system/$unit.service" "$out" 2>/dev/null |
+        grep -Fq 'Fast link dest: "/dev/null"' || die "$unit is not masked in the cellular-bridge image"
+    done
+    debugfs -R 'stat /etc/systemd/system/myron-speaker-bridge.service' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'known-good speaker bridge is masked in the cellular-bridge image'
+    for spec in \
+      "/usr/local/libexec/myron-speaker/bridge.py|$speaker_reference/experiments/speaker-pipewire-bridge/bridge.py" \
+      "/usr/local/libexec/myron-speaker/probe.py|$speaker_reference/experiments/speaker-oem-miplay-graph/probe.py" \
+      "/usr/local/libexec/myron-speaker/watchdog.py|$speaker_reference/scripts/myron-speaker-watchdog.py" \
+      '/usr/local/libexec/myron-speaker/bridge-session.py|device/myron/hardware-test-overlay/usr/local/libexec/myron-speaker/bridge-session.py' \
+      '/usr/lib/systemd/system/myron-speaker-bridge.service|device/myron/hardware-test-overlay/usr/lib/systemd/system/myron-speaker-bridge.service'; do
+      image_path=${spec%%|*}
+      source_path=${spec#*|}
+      [[ $(debugfs -R "cat $image_path" "$out" 2>/dev/null | sha256sum | cut -d' ' -f1) == "$(sha256sum <"$source_path" | cut -d' ' -f1)" ]] ||
+        die "known-good cellular-bridge asset differs: $image_path"
+    done
+    debugfs -R 'cat /usr/lib/systemd/system/myron-speaker-bridge.service' "$out" 2>/dev/null |
+      grep -Fxq 'Environment=MYRON_SPEAKER_GAIN_DB=-12' || die 'cellular-bridge image changed the proven speaker gain'
+    debugfs -R 'stat /usr/local/libexec/myron-audio-experiment/speaker-probe.sh' "$out" 2>&1 |
+      grep -Fq 'File not found' || die 'cellular-bridge image contains the inaudible raw speaker probe'
+    ;;
 esac
 hash=$(sha256sum <"$out" | cut -d" " -f1)
 printf '%s  %s\n' "$hash" "$(basename -- "$out")" >"$out.sha256"
@@ -687,7 +1050,7 @@ activation=temporary-hardware-test
 [[ $boot_policy != main ]] || activation=persistent-main
 case $profile in
   audio-speaker|audio-microphone) activation=persistent-main-audio-experiment ;;
-  audio-cellular-speaker) activation=persistent-main-cellular-audio-experiment ;;
+  audio-cellular-speaker|audio-cellular-bridge) activation=persistent-main-cellular-audio-experiment ;;
 esac
 printf 'status=composed\nimage=%s\nsha256=%s\nprofile=%s\neffective_profile=%s\nactivation=%s\ndeployment_authorized=false\nboot_policy=%s\n' \
   "$out" "$hash" "$profile" "$effective_profile" "$activation" "$boot_policy"

@@ -58,8 +58,8 @@ done
 
 # Default order: dependencies of our own packages first (check() of a later
 # package can then install an earlier one from the repository being built).
-ORDER=(omamobile-keyring qrtr libqmi modemmanager rmtfs tqftpserv audioreach-kernel-headers tinyalsa audioreach-graphservices audioreach-conf audioreach-graphmgr fastrpc libfprint neard omacam omamobile-apps omamobile-apps-myron omamobile-device-cheetah omamobile-device-felix omamobile-myron-kernel-contract omamobile-device-myron omamobile-audio
-       omamobile-sensors omamobile-gnss omamobile-fingerprint omamobile-mirror omamobile-omarchy omamobile-owl-widgets omamobile-shell
+ORDER=(omamobile-keyring qrtr libqmi modemmanager rmtfs tqftpserv hexagonrpc audioreach-kernel-headers tinyalsa audioreach-graphservices audioreach-conf audioreach-graphmgr fastrpc libfprint neard omacam omamobile-apps strata omamobile-apps-myron omamobile-device-cheetah omamobile-device-felix omamobile-myron-kernel-contract omamobile-device-myron omamobile-audio
+       omamobile-sensors omamobile-gnss omamobile-location-usage omamobile-fingerprint omamobile-mirror omamobile-omarchy omamobile-owl-widgets omamobile-shell
        omamobile-modem omamobile-modem-sit omamobile-mmd omamobile-speaker-tuning omamobile-waydroid
        omamobile-firstboot mesa mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland libcamera)
 if ((${#dirs[@]} == 0)) && ((${#imports[@]} == 0)); then

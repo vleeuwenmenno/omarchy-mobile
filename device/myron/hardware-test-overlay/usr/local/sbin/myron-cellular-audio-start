@@ -1,0 +1,94 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Start the already hardware-qualified speaker bridge only after the guarded
+# cellular transaction has admitted one registered ModemManager instance.
+set -eu
+umask 077
+
+marker=/etc/omamobile/myron-main-audio
+runtime=/run/omamobile-myron
+cellular_ready=/run/myron-cellular-ready
+audio_ready=/run/myron-cellular-audio-ready
+desktop_ready=/run/myron-coexistence-ready
+admission=$runtime/modem-manager-admission
+audio_stage=/usr/local/sbin/myron-audio-stage
+data_runtime=/run/myron-cellular-stage
+ipa_guard=/usr/local/sbin/myron-ipa-guard
+maximum_pmic_temperature_mc=70000
+
+fail() {
+	printf 'ERROR: Myron cellular audio bring-up: %s\n' "$*" >&2
+	exit 1
+}
+
+pmic_temperature() {
+	for type_file in /sys/class/thermal/thermal_zone*/type; do
+		[ -r "$type_file" ] || continue
+		[ "$(cat "$type_file" 2>/dev/null || true)" = pmih010x_lite_tz ] || continue
+		value=$(cat "${type_file%/type}/temp" 2>/dev/null || true)
+		case $value in ''|*[!0-9]*) return 1 ;; esac
+		printf '%s\n' "$value"
+		return 0
+	done
+	return 1
+}
+
+[ "$(id -u)" = 0 ] || fail 'must run as root'
+[ -f "$marker" ] && [ ! -L "$marker" ] &&
+	[ "$(cat "$marker")" = cellular-audio ] ||
+	fail 'persistent cellular-audio marker is missing or invalid'
+[ -f /run/myron-host/var/lib/omarchy-mobile/hardware-test.armed ] ||
+	fail 'persistent main arm is absent'
+systemctl --quiet is-active myron-hardware-watchdog.service ||
+	fail 'independent rollback guard is not active'
+systemctl --quiet is-active myron-cellular.service ||
+	fail 'guarded cellular transaction is not active'
+[ -s "$cellular_ready" ] || fail 'cellular readiness marker is missing'
+systemctl --quiet is-active ModemManager.service || fail 'ModemManager is not active'
+modem_pid=$(pgrep -xo ModemManager 2>/dev/null || true)
+case $modem_pid in ''|*[!0-9]*) fail 'one ModemManager process is not present' ;; esac
+[ "$modem_pid" -gt 1 ] && kill -0 "$modem_pid" 2>/dev/null ||
+	fail 'ModemManager process is not live'
+[ -d "$admission" ] && [ ! -L "$admission" ] ||
+	fail 'ModemManager admission marker is missing or unsafe'
+[ "$(cat "$admission/boot-id" 2>/dev/null || true)" = "$(cat /proc/sys/kernel/random/boot_id)" ] ||
+	fail 'ModemManager admission marker is not current'
+timeout 10 mmcli -L 2>/dev/null | grep -Fq '/Modem/' ||
+	fail 'ModemManager did not publish a modem before audio start'
+systemctl --quiet is-active myron-ipa-guard.service || fail 'IPA guard is not active'
+"$ipa_guard" check pristine >/dev/null 2>&1 || fail 'IPA guard is not pristine'
+[ ! -e "$data_runtime/mutation" ] && [ ! -L "$data_runtime/mutation" ] ||
+	fail 'mobile-data mutation exists before audio start'
+[ ! -e "$data_runtime/data.state" ] && [ ! -L "$data_runtime/data.state" ] ||
+	fail 'mobile-data state exists before audio start'
+[ ! -e /sys/class/net/qmapmux0.0 ] && [ ! -L /sys/class/net/qmapmux0.0 ] ||
+	fail 'packet-data qmap link exists before audio start'
+[ ! -e /run/omamobile-myron/gnss-admission ] && [ ! -L /run/omamobile-myron/gnss-admission ] ||
+	fail 'GNSS admission exists before audio start'
+[ ! -e /sys/class/bluetooth/hci0 ] || fail 'Bluetooth controller exists before audio start'
+! pgrep -x btattach >/dev/null 2>&1 || fail 'Bluetooth transport is active before audio start'
+
+temperature=$(pmic_temperature) || fail 'PMIC safety temperature is unavailable'
+[ "$temperature" -lt "$maximum_pmic_temperature_mc" ] ||
+	fail "PMIC temperature safety limit reached: $temperature mC"
+[ ! -e "$audio_ready" ] && [ ! -L "$audio_ready" ] || exit 0
+
+for stage in arm mapper transport adsp codecs devnodes fastrpc speaker-dsp; do
+	MYRON_AUDIO_EXPECT_CELLULAR=1 "$audio_stage" "$stage" ||
+		fail "modem-safe AudioReach stage failed: $stage"
+done
+grep -q canoe-mtp-snd-card /proc/asound/cards || fail 'AudioReach ALSA card is absent'
+systemctl start myron-speaker-bridge.service
+systemctl --quiet is-active myron-speaker-bridge.service ||
+	fail 'known-good speaker bridge did not remain active'
+[ -s /run/myron-audio/bridge-ready ] || fail 'speaker bridge readiness marker is missing'
+tfa=$(amixer -c 0 cget 'name=TFA Profile' 2>/dev/null |
+	sed -n 's/^  : values=//p' | tail -n 1)
+[ "$tfa" = 6 ] || fail "speaker bridge did not idle in TFA Powerdown: ${tfa:-missing}"
+
+printf 'radio=ready\nmodem-manager=active\naudio=AudioReach\nspeaker=protected-idle\nbluetooth=absent\n' >"$desktop_ready"
+chmod 0600 "$desktop_ready"
+printf 'boot_id=%s\nmodem_pid=%s\nroute=OEM-MIPLAY\ngain_db=-12\ntfa=Powerdown\n' \
+	"$(cat /proc/sys/kernel/random/boot_id)" "$modem_pid" >"$audio_ready"
+chmod 0600 "$audio_ready"
+printf 'result=ready modem_pid=%s audio=AudioReach speaker=OEM-MIPLAY gain_db=-12 tfa=Powerdown\n' "$modem_pid"

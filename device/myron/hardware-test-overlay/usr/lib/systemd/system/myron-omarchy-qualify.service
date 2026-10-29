@@ -2,7 +2,7 @@
 [Unit]
 Description=Qualify native Hyprland and disarm Myron rollback watchdog
 Requires=myron-omarchy-prepare.service
-After=myron-omarchy-prepare.service myron-coexistence.service myron-cellular.service myron-reference-radio.service ModemManager.service display-manager.service sshd.service
+After=myron-omarchy-prepare.service myron-coexistence.service myron-cellular.service myron-cellular-audio.service myron-reference-radio.service ModemManager.service display-manager.service sshd.service
 ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
 
 [Service]

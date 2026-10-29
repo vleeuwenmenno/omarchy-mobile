@@ -91,16 +91,9 @@ case $tile in
     ;;
   mobile-data)
     if command -v myron-mobile-data >/dev/null 2>&1; then
-      # Never disconnect Myron's unsafe IPA path. Off starts a packet-only
-      # qmapmux gate; on removes that gate or asks the proven one-shot helper
-      # to activate a bearer when none exists.
-      if [ "$want" = off ]; then
-        exec systemctl start myron-mobile-data-block.service
-      fi
-      if systemctl is-active --quiet myron-mobile-data-block.service 2>/dev/null; then
-        exec systemctl stop myron-mobile-data-block.service
-      fi
-      exec myron-mobile-data on
+      # The helper owns the policy: off gates packets, on removes the gate
+      # or starts the one-shot activation. Nothing here disconnects IPA.
+      exec myron-mobile-data "$want"
     fi
     exec omamobile-sit data "$want"
     ;;

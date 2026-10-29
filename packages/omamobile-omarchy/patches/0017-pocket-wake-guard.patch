@@ -1,0 +1,100 @@
+# Tokenized pocket guard before enabling touch; explicit PIN authentication gate.
+--- a/bin/omarchy-brightness-display
++++ b/bin/omarchy-brightness-display
+@@ -83,10 +83,14 @@
+   fi
+   hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1
+   panel_power 4
++  command -v omamobile-pocket >/dev/null && omamobile-pocket cancel
+   exit 0
+ elif [[ $step == "on" ]]; then
+   if command -v omamobile-display >/dev/null; then
+     timeout -k 0.2 2 omamobile-display prepare-wake || omamobile-display wake-fallback || exit 1
++  fi
++  if command -v omamobile-pocket >/dev/null; then
++    omamobile-pocket begin || exit 1
+   fi
+   # Before the check below: Hyprland can show a lit display whose panel is off.
+   panel_power 0
+--- a/shell/plugins/lock/Service.qml
++++ b/shell/plugins/lock/Service.qml
+@@ -17,6 +17,21 @@
+   readonly property string userName: Quickshell.env("USER") || Quickshell.env("LOGNAME")
+   readonly property string currentBackgroundLink: stateHome + "/omarchy/current/background"
+ 
++  property string pocketToken: "loading"
++  FileView {
++    id: pocketState
++    path: Quickshell.env("XDG_RUNTIME_DIR") + "/omamobile-pocket.json"
++    watchChanges: true
++    onFileChanged: reload()
++    onLoaded: {
++      try {
++        var value = JSON.parse(text())
++        root.pocketToken = value.active === true ? value.token : ""
++        if (root.pocketToken) root.resetAuthenticationState()
++      } catch (error) {}
++    }
++    onLoadFailed: { if (root.pocketToken === "loading") root.pocketToken = "" }
++  }
+   property bool lockRequested: false
+   property bool pendingSessionLock: false
+   property bool authenticatingPassword: false
+@@ -159,7 +174,7 @@
+   }
+ 
+   function finishUnlock() {
+-    if (!root.currentlyLocked()) return
++    if (pocketToken || !root.currentlyLocked()) return
+ 
+     lockRequested = false
+     pendingSessionLock = false
+@@ -188,7 +203,7 @@
+ 
+   function submitPassword(value) {
+     var password = String(value || "")
+-    if (!lockRequested || authenticatingPassword || password.length === 0) return
++    if (pocketToken || !lockRequested || authenticatingPassword || password.length === 0) return
+ 
+     runWake()
+     pendingPassword = password
+@@ -220,7 +235,7 @@
+   }
+ 
+   function startFingerprint() {
+-    if (!lockRequested || !sessionLock.secure || !fingerprintConfigured) return
++    if (pocketToken || !lockRequested || !sessionLock.secure || !fingerprintConfigured) return
+     if (fingerprintPam.active || fingerprintAuthenticating) return
+ 
+     fingerprintAuthenticating = true
+@@ -288,13 +303,13 @@
+         authenticatingPassword: root.authenticatingPassword
+         failureMessage: root.failureMessage
+         failedAttempts: root.failedAttempts
+-        inputEnabled: root.lockRequested
++        inputEnabled: root.lockRequested && !root.pocketToken
+         loadBackground: root.locked
+         passwordText: root.enteredPassword
+-        onPasswordTextEdited: function(password) { root.enteredPassword = password }
++        onPasswordTextEdited: function(password) { if (!root.pocketToken) root.enteredPassword = password }
+         onSubmitPassword: function(password) { root.submitPassword(password) }
+         onClearFailureRequested: root.failureMessage = ""
+-        onWakeRequested: root.runWake()
++        onWakeRequested: { if (!root.pocketToken) root.runWake() }
+       }
+ 
+     }
+@@ -552,6 +567,13 @@
+       return "ok"
+     }
+ 
++    function pocket(token: string): string {
++      root.pocketToken = token
++      if (token) root.resetAuthenticationState()
++      else if (root.currentlyLocked()) root.startFingerprint()
++      return "ok"
++    }
++
+     function isLocked(): string {
+       return root.currentlyLocked() ? "true" : "false"
+     }

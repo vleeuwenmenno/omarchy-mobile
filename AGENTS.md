@@ -5,6 +5,78 @@ Omarchy Mobile runs native Omarchy (Arch Linux ARM, Hyprland, Omarchy's packages
 
 **The repositories are public.** Anything you commit, push, or write into a plan, a log excerpt or a screenshot is published.
 
+## Myron owner workflow rules (2026-10-28)
+
+Start Myron work with [the current status and boundaries](docs/myron/STATUS.md).
+Historical device notes are evidence, not an instruction to repeat old probes.
+
+**Omarchy is the required acceptance environment for Myron work.** Test fixes
+and hardware features in the installed Omarchy system. postmarketOS results
+are reference or recovery evidence only; they do not validate Omarchy drivers,
+packages, configuration, service ordering or application behavior. Always
+identify the running OS before a hardware test and label the environment in
+the result. Do not substitute a pmOS test when Omarchy is unavailable.
+
+These owner-requested rules govern ongoing Myron work. They qualify the generic
+per-step approval, offline-only workflow and one-change-per-boot guidance below;
+they do not authorize unrelated destructive work or weaken hardware safeguards.
+
+1. **Minimize reboots.** Reuse the current boot when its state is known and the
+   next operation can safely run there. Reboot only for a concrete dependency,
+   required recovery, a known unsafe same-boot retry, or a specific persistence
+   acceptance test. State the reason before rebooting. A failed check alone is
+   not a reason to reboot and repeat an unchanged experiment. Do not disable a
+   required recovery watchdog to avoid its reboot; select the appropriate test
+   profile before starting instead.
+   **Owner exception (2026-10-28):** remove the automatic 20-minute deadline
+   for the explicitly selected Myron development image. Keep the guard process,
+   manual recovery, failure latch supervision, pending-boot fallback and all
+   thermal safeguards. Do not reinstate a timed reboot for ordinary UI/sensor
+   development without a concrete need and an owner decision.
+2. **Minimize reapplication and deployment.** Inspect installed versions,
+   relevant file hashes and runtime state first. Skip changes already present.
+   Prefer a backed-up, targeted file/package update over rebuilding and
+   transferring the entire rootfs when that preserves the required guarantees.
+   Reapply only when evidence shows drift, a missing change, or failed staging.
+3. **Honor existing authorization.** Continue routine SSH/sudo, diagnostics,
+   reversible fixes and tests within the owner's approved scope without asking
+   repeatedly. Announcing a screen change is not an approval request. Ask only
+   for a genuinely new destructive/irreversible action, a material scope or risk
+   expansion, or a missing user decision. Do not treat this rule as blanket
+   authorization for flashing, partition writes, calibration changes or pushes.
+   Respect any scope and expiry on earlier approvals.
+4. **Test only what informs the next decision.** Before a test, identify the
+   current failure or changed behavior it checks and how its result affects the
+   next action. Use the smallest relevant check, then practical hardware
+   evidence. Do not run broad suites, repeated reviews, long polling loops or
+   full-image rehashes merely for reassurance. Reuse still-valid evidence;
+   repeat expensive integrity checks when transfer, mutation or the deployment
+   contract requires them. Give long necessary checks a concrete reason and
+   bound. Documentation-only updates need no hardware or software test suite.
+5. **Investigate failures instead of repeating them.** Capture the precise
+   failing stage and relevant measurements before retrying. Retry only after a
+   meaningful change or evidence that a transient condition cleared. Preserve
+   known-working implementations and user-confirmed results. Keep thermal,
+   amplifier, storage and recovery safeguards intact; a mock or exit-zero
+   result never substitutes for the required physical observation.
+
+**Feature completion and repository parity (owner, 2026-10-29):** For every
+feature, put all intended device changes in repository sources and the package
+installer/image composer before calling it complete. Include units, enablement,
+configuration, dependencies and user migrations, not only application code.
+After a targeted deployment, run `tools/myron-drift-check` and investigate
+changed files or user overrides. Identify private inputs and unchecked paths
+explicitly; zero compared-file drift does not prove those paths or boot
+behavior. Record practical Omarchy evidence, rollback paths and outstanding
+boot acceptance in the status report. Do not leave phone-only fixes or rebuild,
+reboot, commit or push merely to satisfy this rule.
+
+**Myron wake policy (owner, 2026-10-28):** only the power-button path may wake
+an off display for now. Keep touch/pointer and ordinary software wake blocked.
+Do not add double-tap wake yet; pocket-safe double-tap research is deferred
+until broader hardware support is further along. See
+[display policy and evidence](docs/myron/DISPLAY-POWER.md).
+
 ## 1. Safety rules (non-negotiable)
 
 - **Ask the human before every reboot, flash, `push`, overlay boot or irreversible write.** That includes RPMB writes, a first `storageproxyd` run, `devinfo` and anything under `/dev/sd*`. The phone is real hardware with calibration data that can't be replaced, and a human has to be ready to recover it.

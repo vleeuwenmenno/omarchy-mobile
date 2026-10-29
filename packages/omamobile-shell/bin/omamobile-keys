@@ -57,6 +57,12 @@ screensaver_up() {
 # Light the locked display like a touch on the lock screen would, so its
 # blank timer runs again (patches/omarchy/0009); plain "on" otherwise.
 wake_locked() {
+  if command -v omamobile-display >/dev/null && omamobile-display configured; then
+    # Authorize only the physical power-key path. Wake directly before asking
+    # the lock to re-arm: an unrelated rejected wake may still be finishing.
+    omamobile-display authorize-wake || return
+    omarchy-brightness-display on || return
+  fi
   [[ $(omarchy-shell lock wake 2>/dev/null) == "ok" ]] || omarchy-brightness-display on
 }
 
@@ -83,12 +89,13 @@ chord() {
   rm -f "$state/power"
   # A moment for the fingers to leave the keys, then Omarchy's screenshot:
   # saved, copied, and a notification with a thumbnail to edit.
-  (sleep 0.4; omarchy-capture-screenshot fullscreen) >/dev/null 2>&1 &
+  (sleep 0.4; omamobile-pocket active 2>/dev/null || omarchy-capture-screenshot fullscreen) >/dev/null 2>&1 &
 }
 
 long_press() {
+  omamobile-pocket active 2>/dev/null && return
   touch "$state/long"
-  if locked; then
+  if screen_off || locked; then
     wake_locked
   else
     omarchy-menu toggle system
@@ -96,8 +103,15 @@ long_press() {
 }
 
 short_press() {
+  if [[ -e $state/pocket-consumed ]]; then
+    rm -f "$state/pocket-consumed"
+    return
+  fi
   if screensaver_up; then
     omarchy-system-lock
+    wake_locked
+  elif screen_off; then
+    wake_locked
   elif locked; then
     if screen_off; then
       wake_locked
@@ -109,9 +123,11 @@ short_press() {
     # waits for a working screen ("screen-stabilizing"), so powering the panel
     # off first made the lock light it again for a moment. Lock behind the dark
     # panel, then power it off and put the brightness back for the next wake.
-    local device level=
+    local device level= managed_blackout=0
     device=$(omarchy-hw-display 2>/dev/null)
-    if [[ -n $device ]]; then
+    if command -v omamobile-display >/dev/null && omamobile-display blackout; then
+      managed_blackout=1
+    elif [[ -n $device ]]; then
       level=$(brightnessctl -d "$device" get 2>/dev/null)
       brightnessctl -q -d "$device" set 0
     fi
@@ -121,13 +137,19 @@ short_press() {
       sleep 0.1
     done
     omarchy-brightness-display off
-    [[ -n $level ]] && brightnessctl -q -d "$device" set "$level"
+    if (( managed_blackout )); then
+      # Keep the panel dark. The coordinated wake precheck supplies its next
+      # level; a delayed restore here could overwrite a concurrent wake.
+      omamobile-display end-blackout
+    else
+      [[ -n $level ]] && brightnessctl -q -d "$device" set "$level"
+    fi
   fi
 }
 
 case "${1:-}" in
   power-down)
-    rm -f "$state/chord" "$state/long"
+    rm -f "$state/chord" "$state/long" "$state/pocket-consumed"
     press=$(now)
     echo "$press" >"$state/power"
     if recent volume-down; then
@@ -171,7 +193,7 @@ case "${1:-}" in
     else
       (
         sleep "$volume_wait"
-        [[ -f $state/power ]] || in_chord || omarchy-audio-output-volume lower
+        [[ -f $state/power ]] || in_chord || omamobile-pocket active 2>/dev/null || omarchy-audio-output-volume lower
       ) >/dev/null 2>&1 &
     fi
     ;;

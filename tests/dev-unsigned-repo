@@ -636,18 +636,18 @@ pass "an unmarked, linked or unreadable development repository is refused and le
 
 # --- the documented command -------------------------------------------------
 doc=docs/myron/DEV-UNSIGNED.md
-want="omamobile-keyring qrtr libqmi modemmanager rmtfs tqftpserv audioreach-kernel-headers tinyalsa audioreach-graphservices audioreach-conf audioreach-graphmgr fastrpc omamobile-firstboot omamobile-omarchy omamobile-apps-myron omamobile-owl-widgets omamobile-shell omamobile-mirror omamobile-myron-kernel-contract omamobile-device-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland"
+want="omamobile-keyring qrtr libqmi modemmanager rmtfs tqftpserv audioreach-kernel-headers tinyalsa audioreach-graphservices audioreach-conf audioreach-graphmgr fastrpc omamobile-firstboot omamobile-omarchy strata omamobile-apps-myron omamobile-owl-widgets omamobile-shell omamobile-mirror omamobile-myron-kernel-contract omamobile-device-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland"
 got=$(sed -n '/^tools\/build-packages --dev-unsigned/,/^env DEVICE=myron/p' "$doc" | grep -o 'packages/[a-z0-9-]*' | sed 's|packages/||' | tr '\n' ' ')
-[[ ${got% } == "$want" ]] || fail "the documented build list is not the exact twenty-three Myron directories: $got"
+[[ ${got% } == "$want" ]] || fail "the documented build list is not the exact twenty-four Myron directories: $got"
 for dir in $want; do [[ -f packages/$dir/PKGBUILD ]] || fail "$dir has no PKGBUILD"; done
 grep -q '^env DEVICE=myron tools/build-rootfs --dev-unsigned --stage-only --version <version>$' "$doc" || fail "the documented stage command is wrong"
 grep -q '^pkgname=(hyprland hyprpm)' packages/hyprland/PKGBUILD || fail "hyprland no longer emits hyprland and hyprpm"
 grep -q 'hyprland. and .hyprpm' "$doc" && grep -qi 'not a release' "$doc" || fail "the document lacks the hyprpm note or the non-release statement"
-[[ $(printf '%s\n' $want | sort -u | wc -l) == 23 ]] || fail "the list has duplicates"
+[[ $(printf '%s\n' $want | sort -u | wc -l) == 24 ]] || fail "the list has duplicates"
 for dir in $want; do
   grep -qx "${dir#omamobile-}" <(sed -e 's/#.*//' -e 's/[[:space:]]//g' \
     rootfs/packages.base.myron rootfs/packages.omamobile.myron | grep -v '^$' | sed 's/^omamobile-//') ||
     [[ $dir == omamobile-owl-widgets || $dir == omamobile-myron-kernel-contract || $dir == omamobile-device-myron || $dir == audioreach-kernel-headers ]] ||
     fail "$dir is in the documented list but is neither in the Myron rootfs profile nor a known dependency"
 done
-pass "the documented command names exactly the twenty-three Myron build directories and states its non-release status"
+pass "the documented command names exactly the twenty-four Myron build directories and states its non-release status"

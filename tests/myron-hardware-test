@@ -34,6 +34,7 @@ tests/myron-wifi-import || fail 'Wi-Fi profile import checks failed'
 tests/myron-watchdog || fail 'rollback watchdog checks failed'
 tests/myron-modemmanager-admission || fail 'ModemManager admission checks failed'
 tests/myron-runtime-toggles || fail 'runtime toggle checks failed'
+tests/myron-sensors || fail 'sensor integration checks failed'
 for fragment in "$initramfs/fail-boot.sh" "$initramfs/systemd-stage.sh" "$initramfs/watchdog.sh"; do
   sh -n "$fragment" || fail "$fragment parses"
 done
@@ -43,9 +44,11 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$overlay/usr/local/bin/myron-microphone-source" \
   "$overlay/usr/local/bin/omamobile-microphone" \
   "$overlay/usr/local/bin/omamobile-gnss" \
+  "$overlay/usr/local/bin/omamobile-autorotate" \
   "$overlay/usr/local/libexec/myron-shell-bin/quickshell" \
   "$overlay/usr/local/sbin/myron-reference-radio-start" \
   "$overlay/usr/local/sbin/myron-cellular-start" \
+  "$overlay/usr/local/sbin/myron-cellular-audio-start" \
   "$overlay/usr/local/sbin/myron-cellular-stage" \
   "$overlay/usr/local/sbin/myron-ipa-guard" \
   "$overlay/usr/local/sbin/myron-modemmanager-start" \
@@ -61,6 +64,7 @@ for script in "$overlay/usr/local/bin/myron-start-omarchy" \
   "$battery_start" \
   "$battery_stage" \
   "$peripheral_audit" \
+  "$overlay/usr/local/sbin/myron-sensor-stage" \
   "$overlay/usr/local/sbin/myron-audio-devnodes" \
   "$overlay/usr/local/sbin/myron-omarchy-prepare" \
   "$overlay/usr/local/sbin/myron-omarchy-qualify"; do
@@ -238,6 +242,11 @@ grep -Fq 'disable ModemManager.service' "$compose" ||
   fail 'cellular profile does not keep ModemManager behind its guarded transaction'
 grep -Fq 'enable myron-cellular.service' "$compose" ||
   fail 'cellular profile does not enable its guarded transaction'
+grep -Fq 'cellular-audio|audio-speaker' "$compose" ||
+  fail 'composer does not admit the persistent cellular-audio profile'
+grep -Fq 'enable myron-cellular.service \' "$compose" &&
+  grep -Fq 'myron-cellular-audio.service' "$compose" ||
+  fail 'persistent cellular-audio profile does not enable both guarded transactions'
 grep -Fq 'Session=myron-omarchy.desktop' "$overlay/etc/sddm.conf.d/zz-myron-test.conf" ||
   fail 'late SDDM override does not select the isolated Myron session'
 grep -Fq 'TimeoutStartSec=3min' \
@@ -326,6 +335,8 @@ coexist=$overlay/usr/local/sbin/myron-coexistence-start
 coexist_unit=$overlay/usr/lib/systemd/system/myron-coexistence.service
 cellular=$overlay/usr/local/sbin/myron-cellular-start
 cellular_unit=$overlay/usr/lib/systemd/system/myron-cellular.service
+cellular_audio=$overlay/usr/local/sbin/myron-cellular-audio-start
+cellular_audio_unit=$overlay/usr/lib/systemd/system/myron-cellular-audio.service
 previous=0
 for required in \
   'systemctl start myron-reference-radio.service' \
@@ -371,6 +382,38 @@ grep -Fq 'Before=NetworkManager.service display-manager.service myron-omarchy-qu
   fail 'cellular service is not ordered before networking, graphics, and qualification'
 grep -Fxq 'Conflicts=myron-coexistence.service' "$cellular_unit" ||
   fail 'cellular and coexistence profiles are not mutually exclusive'
+previous=0
+for required in \
+  'systemctl --quiet is-active myron-cellular.service' \
+  'systemctl --quiet is-active ModemManager.service' \
+  'timeout 10 mmcli -L' \
+  '"$ipa_guard" check pristine' \
+  'for stage in arm mapper transport adsp codecs devnodes fastrpc speaker-dsp' \
+  'systemctl start myron-speaker-bridge.service'; do
+  line=$(grep -nF "$required" "$cellular_audio" | head -n1 | cut -d: -f1)
+  [[ -n $line && $line -gt $previous ]] ||
+    fail "persistent cellular-audio order is missing or invalid at: $required"
+  previous=$line
+done
+for required in \
+  'persistent cellular-audio marker is missing or invalid' \
+  'independent rollback guard is not active' \
+  'ModemManager admission marker is not current' \
+  'mobile-data mutation exists before audio start' \
+  'GNSS admission exists before audio start' \
+  'PMIC temperature safety limit reached' \
+  'speaker bridge did not idle in TFA Powerdown'; do
+  grep -Fq "$required" "$cellular_audio" ||
+    fail "persistent cellular-audio gate is missing: $required"
+done
+grep -Fxq 'Requires=myron-cellular.service myron-hardware-watchdog.service' "$cellular_audio_unit" ||
+  fail 'persistent cellular-audio service does not require cellular and rollback guard'
+grep -Fxq 'After=myron-cellular.service myron-hardware-watchdog.service' "$cellular_audio_unit" ||
+  fail 'persistent cellular-audio service is not ordered after cellular admission'
+grep -Fxq 'Before=display-manager.service myron-omarchy-qualify.service' "$cellular_audio_unit" ||
+  fail 'persistent cellular-audio service is not ordered before graphics and qualification'
+grep -Fxq 'ConditionPathExists=/etc/omamobile/myron-main-audio' "$cellular_audio_unit" ||
+  fail 'persistent cellular-audio service lacks its exact opt-in marker'
 grep -Fxq 'Requires=myron-omarchy-prepare.service' \
   "$overlay/usr/lib/systemd/system/myron-omarchy-qualify.service" ||
   fail 'graphical qualification does not require hardware preparation'
@@ -387,7 +430,12 @@ for required in \
   'rmnet_core must remain absent' \
   'systemctl --quiet is-active myron-ipa-guard.service' \
   '/usr/local/sbin/myron-ipa-guard check' \
-  'IPA guard is not clean'; do
+  'IPA guard is not clean' \
+  'persistent cellular-audio service is not active' \
+  'persistent cellular-audio profile did not complete modem-safe AudioReach staging' \
+  'persistent cellular-audio profile did not start speaker bridge' \
+  'persistent speaker bridge readiness marker is missing' \
+  'persistent speaker bridge did not remain idle in TFA Powerdown'; do
   grep -Fq "$required" "$qualify" ||
     fail "profile qualification lacks: $required"
 done
@@ -779,6 +827,7 @@ pass 'Bluetooth bring-up is exact, one-shot, bounded, private and independently 
 
 speaker_sink=$overlay/usr/local/bin/myron-speaker-sink
 speaker_service=$overlay/usr/lib/systemd/system/myron-speaker-bridge.service
+speaker_session=$overlay/usr/local/libexec/myron-speaker/bridge-session.py
 speaker_user_service=$overlay/usr/lib/systemd/user/myron-speaker-sink.service
 speaker_powerdown=$overlay/usr/local/sbin/myron-speaker-powerdown
 for required in \
@@ -794,6 +843,11 @@ grep -Fxq 'Environment=MYRON_SPEAKER_GAIN_DB=-12' "$speaker_service" ||
   fail 'speaker bridge lacks its independent -12 dBFS hard cap'
 grep -Fxq 'Environment=MYRON_SPEAKER_WAIT_SECONDS=0' "$speaker_service" ||
   fail 'speaker bridge cannot remain safely idle'
+grep -Fxq 'ExecStart=/usr/bin/python3 /usr/local/libexec/myron-speaker/bridge-session.py' "$speaker_service" ||
+  fail 'speaker bridge does not use the OEM PCM-start handshake'
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+  "$speaker_session" || fail 'speaker PCM-start handshake does not parse'
+[[ -x $speaker_session ]] || fail 'speaker PCM-start handshake is not executable'
 grep -Fxq 'ExecStopPost=/usr/local/sbin/myron-speaker-powerdown' "$speaker_service" ||
   fail 'speaker bridge lacks independent exit Powerdown cleanup'
 for required in "name=TFA Stop" "name=TFA Profile" 'Powerdown' '"$profile" = 6'; do

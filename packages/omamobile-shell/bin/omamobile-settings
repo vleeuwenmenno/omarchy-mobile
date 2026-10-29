@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""omamobile-settings: the helper behind the phone's Settings app.
+
+  omamobile-settings status                     JSON: every setting's live value and its limits
+  omamobile-settings general                    JSON: theme name and version lines for General > About
+  omamobile-settings set KEY VALUE              validate and save one setting, print status
+  omamobile-settings keyboard-auto reconcile    at login: undo a screensaver's own "keyboard off"
+  omamobile-settings keyboard-theme generate    write the generated Squeekboard CSS
+  omamobile-settings keyboard-theme install     generate, and import it from gtk.css (backup, idempotent)
+  omamobile-settings keyboard-theme remove      take the import and the generated file away again
+  omamobile-settings keyboard-theme status      JSON: what is installed
+
+Where each setting lives (one place each, nothing mirrored):
+
+  keyboard.portrait_scale   GSettings sm.puri.Squeekboard scale-in-vertical-screen-orientation
+  keyboard.landscape_scale  GSettings sm.puri.Squeekboard scale-in-horizontal-screen-orientation
+  keyboard.stretch          GSettings sm.puri.Squeekboard layout-shape-changes-to-fit-panel
+  keyboard.auto_show        GSettings org.gnome.desktop.a11y.applications screen-keyboard-enabled
+  keyboard.bottom_gap       ~/.config/omamobile/settings.json (the launcher's dock reads it)
+
+Caveat: Squeekboard 1.43.1 binds keyboard.auto_show's key to a property that
+nothing in its source reads, so on that version the key alone may not stop the
+keyboard from opening on text focus; the setting is stored faithfully and is
+what patches/omarchy/0006 and any patched Squeekboard consult.
+
+Existing GSettings values are never reset: a setting the user has not touched
+is whatever the system holds. Only `set` writes, and only the one key given.
+The file is replaced atomically (temporary file, fsync, rename) under a lock.
+Squeekboard is never restarted: its size and shape are read when it next
+shows, and the generated CSS is read when it starts.
+
+Environment, for tests: OMAMOBILE_SETTINGS_FILE, OMAMOBILE_GSETTINGS (command),
+OMAMOBILE_THEME_DIR, OMAMOBILE_GTK_DIR, OMAMOBILE_RUNTIME_DIR.
+"""
+import fcntl
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SCALE_MIN, SCALE_MAX = 0.5, 2.0
+GAP_MIN, GAP_MAX, GAP_DEFAULT = 24, 64, 24
+SETTINGS_VERSION = 1
+
+SQUEEK = "sm.puri.Squeekboard"
+A11Y = "org.gnome.desktop.a11y.applications"
+# key -> (schema, gsettings key, kind)
+GSETTINGS_KEYS = {
+    "keyboard.portrait_scale": (SQUEEK, "scale-in-vertical-screen-orientation", "scale"),
+    "keyboard.landscape_scale": (SQUEEK, "scale-in-horizontal-screen-orientation", "scale"),
+    "keyboard.stretch": (SQUEEK, "layout-shape-changes-to-fit-panel", "bool"),
+    "keyboard.auto_show": (A11Y, "screen-keyboard-enabled", "bool"),
+}
+FILE_KEYS = {"keyboard.bottom_gap": "gap"}
+
+OSK_MARKER = "omarchy-screensaver-osk-off"
+CSS_NAME = "omamobile-squeekboard.css"
+BLOCK_BEGIN = "/* >>> omamobile-squeekboard (managed by omamobile-settings; undo with: omamobile-settings keyboard-theme remove) >>> */"
+BLOCK_END = "/* <<< omamobile-squeekboard <<< */"
+BLOCK = BLOCK_BEGIN + '\n@import url("' + CSS_NAME + '");\n' + BLOCK_END + "\n"
+
+
+class SettingsError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- files
+
+def home():
+    return Path(os.environ.get("HOME") or Path.home())
+
+
+def settings_path():
+    override = os.environ.get("OMAMOBILE_SETTINGS_FILE")
+    return Path(override) if override else home() / ".config/omamobile/settings.json"
+
+
+def runtime_dir():
+    return Path(os.environ.get("OMAMOBILE_RUNTIME_DIR") or os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+
+
+def atomic_write(path, data, mode=0o644):
+    """Replace `path` (through a symlink, if it is one) with `data`, all or nothing."""
+    target = Path(os.path.realpath(path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="." + target.name + ".", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data.encode() if isinstance(data, str) else data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    directory = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+class Locked:
+    def __init__(self, path):
+        self.lock_path = str(path) + ".lock"
+
+    def __enter__(self):
+        Path(self.lock_path).parent.mkdir(parents=True, exist_ok=True)
+        self.handle = open(self.lock_path, "a")
+        fcntl.flock(self.handle, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.handle, fcntl.LOCK_UN)
+        self.handle.close()
+
+
+# ---------------------------------------------------------------- validation
+
+def clamp_gap(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return GAP_DEFAULT
+    if not math.isfinite(number):
+        return GAP_DEFAULT
+    return int(max(GAP_MIN, min(GAP_MAX, round(number))))
+
+
+def parse_gap(text):
+    """Strict: a whole number inside the limits, or an error."""
+    if not re.fullmatch(r"[0-9]{1,3}", str(text).strip()):
+        raise SettingsError("bottom_gap must be a whole number from %d to %d" % (GAP_MIN, GAP_MAX))
+    value = int(text)
+    if not GAP_MIN <= value <= GAP_MAX:
+        raise SettingsError("bottom_gap must be from %d to %d" % (GAP_MIN, GAP_MAX))
+    return value
+
+
+def parse_scale(text):
+    try:
+        value = float(str(text).strip())
+    except ValueError:
+        raise SettingsError("a size is a number from %s to %s" % (SCALE_MIN, SCALE_MAX))
+    if not math.isfinite(value) or not SCALE_MIN <= value <= SCALE_MAX:
+        raise SettingsError("a size is a number from %s to %s" % (SCALE_MIN, SCALE_MAX))
+    return round(value, 2)
+
+
+def parse_bool(text):
+    value = str(text).strip().lower()
+    if value in ("true", "on", "1", "yes"):
+        return True
+    if value in ("false", "off", "0", "no"):
+        return False
+    raise SettingsError("expected true or false")
+
+
+def sanitize(data):
+    """The file's contents as the shell reads them: known keys only, in range."""
+    keyboard = data.get("keyboard") if isinstance(data, dict) else None
+    gap = keyboard.get("bottom_gap") if isinstance(keyboard, dict) else None
+    return {"version": SETTINGS_VERSION, "keyboard": {"bottom_gap": clamp_gap(gap) if gap is not None else GAP_DEFAULT}}
+
+
+def read_file_settings():
+    try:
+        data = json.loads(settings_path().read_text())
+    except (OSError, ValueError):
+        data = None
+    return sanitize(data), data
+
+
+def write_gap(value):
+    path = settings_path()
+    with Locked(path):
+        _, raw = read_file_settings()
+        data = raw if isinstance(raw, dict) else {}
+        if raw is None and path.exists():
+            # Unreadable: keep it for the owner, start a valid file.
+            path.replace(path.with_name(path.name + ".invalid-" + time.strftime("%Y%m%d-%H%M%S")))
+        keyboard = data.get("keyboard") if isinstance(data.get("keyboard"), dict) else {}
+        keyboard["bottom_gap"] = value
+        data["keyboard"] = keyboard
+        data["version"] = SETTINGS_VERSION
+        atomic_write(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+# ---------------------------------------------------------------- GSettings
+
+def gsettings(*args):
+    command = os.environ.get("OMAMOBILE_GSETTINGS", "gsettings")
+    try:
+        result = subprocess.run([command, *args], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def gs_read(key):
+    schema, name, kind = GSETTINGS_KEYS[key]
+    text = gsettings("get", schema, name)
+    if text is None:
+        return None
+    if kind == "bool":
+        return True if text == "true" else False if text == "false" else None
+    try:
+        return round(float(text.split()[-1]), 2)
+    except ValueError:
+        return None
+
+
+def gs_write(key, value):
+    schema, name, kind = GSETTINGS_KEYS[key]
+    if gs_read(key) is None:
+        raise SettingsError("%s is not available on this system" % schema)
+    text = ("true" if value else "false") if kind == "bool" else repr(float(value))
+    if gsettings("set", schema, name, text) is None:
+        raise SettingsError("could not save %s" % key)
+    if gs_read(key) != value:
+        raise SettingsError("%s did not keep the new value" % key)
+
+
+def osk_marker():
+    return runtime_dir() / OSK_MARKER
+
+
+def screensaver_running():
+    try:
+        return subprocess.run(["pgrep", "-f", "[o]rg.omarchy.screensaver"], capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ---------------------------------------------------------------- commands
+
+def status():
+    file_settings, _ = read_file_settings()
+    keyboard = {
+        "portrait_scale": gs_read("keyboard.portrait_scale"),
+        "landscape_scale": gs_read("keyboard.landscape_scale"),
+        "stretch": gs_read("keyboard.stretch"),
+        "auto_show": gs_read("keyboard.auto_show"),
+        "bottom_gap": file_settings["keyboard"]["bottom_gap"],
+    }
+    return {
+        "version": SETTINGS_VERSION,
+        "path": str(settings_path()),
+        "keyboard": keyboard,
+        "available": {
+            "size": keyboard["portrait_scale"] is not None and keyboard["landscape_scale"] is not None,
+            "stretch": keyboard["stretch"] is not None,
+            "auto_show": keyboard["auto_show"] is not None,
+        },
+        "limits": {"scale": [SCALE_MIN, SCALE_MAX], "gap": [GAP_MIN, GAP_MAX], "gap_default": GAP_DEFAULT},
+    }
+
+
+def command_set(key, value):
+    if key in FILE_KEYS:
+        write_gap(parse_gap(value))
+    elif key in GSETTINGS_KEYS:
+        kind = GSETTINGS_KEYS[key][2]
+        parsed = parse_scale(value) if kind == "scale" else parse_bool(value)
+        gs_write(key, parsed)
+        if key == "keyboard.auto_show":
+            # An explicit choice outranks a screensaver's pending restore.
+            try:
+                osk_marker().unlink()
+            except FileNotFoundError:
+                pass
+    else:
+        raise SettingsError("unknown setting: " + key)
+    return status()
+
+
+def keyboard_auto_reconcile():
+    """Login-time repair, only for what the screensaver itself switched off.
+
+    patches/omarchy/0006 turns the keyboard's automatic showing off while the
+    screensaver runs and leaves a marker; if the session ended before the
+    screensaver could turn it back on, the marker is still there and nothing
+    runs. Without the marker the value is the user's choice and stays.
+    """
+    marker = osk_marker()
+    if not marker.exists():
+        return {"action": "none", "reason": "no screensaver marker"}
+    if screensaver_running():
+        return {"action": "none", "reason": "screensaver running"}
+    current = gs_read("keyboard.auto_show")
+    if current is False:
+        gs_write("keyboard.auto_show", True)
+    marker.unlink()
+    return {"action": "restored" if current is False else "cleared", "reason": "screensaver ended without restoring"}
+
+
+def command_general():
+    def run(*argv):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def first_line(path):
+        try:
+            return Path(path).read_text().splitlines()[0].strip()
+        except (OSError, IndexError):
+            return ""
+
+    return {
+        "theme": run("omarchy-theme-current") or "Unknown",
+        "omarchy": run("omarchy-version"),
+        "shell": first_line("/usr/share/omamobile/shell/version"),
+        "kernel": os.uname().release,
+    }
+
+
+# ---------------------------------------------------------------- keyboard theme
+
+FALLBACK = {
+    "background": "#1a1b26", "foreground": "#a9b1d6", "accent": "#7aa2f7",
+    "bright_foreground": "#c0caf5",
+}
+HEX = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def theme_dir():
+    override = os.environ.get("OMAMOBILE_THEME_DIR")
+    return Path(override) if override else home() / ".local/state/omarchy/current/theme"
+
+
+def read_toml(path):
+    import tomllib
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def to_rgb(color):
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def to_hex(rgb):
+    return "#%02x%02x%02x" % tuple(int(round(max(0, min(255, c)))) for c in rgb)
+
+
+def blend(base, over, alpha):
+    a, b = to_rgb(base), to_rgb(over)
+    return to_hex(tuple(a[i] + (b[i] - a[i]) * alpha for i in range(3)))
+
+
+def luminance(color):
+    def channel(c):
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (channel(c) for c in to_rgb(color))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a, b):
+    la, lb = sorted((luminance(a), luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def readable_on(fill, *preferred):
+    """The first preferred text color that reads on `fill`, else the best of black and white."""
+    for color in preferred:
+        if contrast(fill, color) >= 4.5:
+            return color
+    return max((*preferred, "#000000", "#ffffff"), key=lambda c: contrast(fill, c))
+
+
+def number(table, key, default, low, high):
+    value = table.get(key) if isinstance(table, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return default
+    return max(low, min(high, float(value)))
+
+
+def color_of(*candidates):
+    for value in candidates:
+        if isinstance(value, str) and HEX.fullmatch(value):
+            return value.lower()
+    return None
+
+
+def palette():
+    colors = read_toml(theme_dir() / "colors.toml")
+    shell = read_toml(theme_dir() / "shell.toml")
+    bar = shell.get("bar") if isinstance(shell.get("bar"), dict) else {}
+    controls = shell.get("controls") if isinstance(shell.get("controls"), dict) else {}
+    background = color_of(bar.get("background"), colors.get("background"), FALLBACK["background"])
+    foreground = color_of(bar.get("text"), colors.get("foreground"), FALLBACK["foreground"])
+    accent = color_of(colors.get("accent"), FALLBACK["accent"])
+    bright = color_of(colors.get("bright_foreground"), foreground)
+    return {
+        "background": background, "foreground": foreground, "accent": accent, "bright": bright,
+        "fill_alpha": number(controls, "normal-fill-alpha", 0.04, 0, 1),
+        "border_alpha": number(controls, "normal-border-alpha", 0.4, 0, 1),
+        "border_width": int(number(controls, "normal-border-width", 1, 1, 3)),
+        "pressed_alpha": number(controls, "pressed-fill-alpha", 0.22, 0, 1),
+        "selected_alpha": number(controls, "selected-fill-alpha", 0.18, 0, 1),
+    }
+
+
+SPECIAL = ["altline", "special", "special-2", "special-3", "wide", "change-view", "change-view-2",
+           "change-view-3", "emoji-group", "character-group", "subtle-highlight", "subtle-highlight-2"]
+
+
+def keyboard_css(p=None):
+    """Squeekboard's sq_view and sq_button, as Omarchy's square, bordered controls.
+
+    Only sq_* selectors: loaded from the user's GTK 3 CSS (priority 800), which
+    outranks Squeekboard's own sheet (600) by priority, not specificity, and
+    reaches no other application. Margins stay Squeekboard's: they place the
+    keys, not style them.
+    """
+    p = p or palette()
+    bg, fg, accent = p["background"], p["foreground"], p["accent"]
+    border = blend(bg, fg, max(p["border_alpha"], 0.25))
+    key = blend(bg, fg, max(p["fill_alpha"], 0.06))
+    key_special = blend(bg, fg, max(p["fill_alpha"], 0.06) + 0.08)
+    pressed = blend(bg, accent, max(p["pressed_alpha"], 0.30))
+    latched = blend(bg, accent, max(p["selected_alpha"], 0.18) + 0.12)
+    on_pressed = readable_on(pressed, fg, p["bright"], bg)
+    on_latched = readable_on(latched, fg, p["bright"], bg)
+    on_accent = readable_on(accent, bg, fg, p["bright"])
+    w = p["border_width"]
+    special = ",\n".join("sq_button." + name for name in SPECIAL)
+    return """/* Generated by omamobile-settings keyboard-theme from the current Omarchy theme.
+   Do not edit: it is rewritten whenever the theme changes. Only Squeekboard's
+   own sq_view and sq_button are styled. */
+sq_view {
+    background-color: %(bg)s;
+    background-image: none;
+    box-shadow: inset 0 %(w)dpx 0 0 %(border)s;
+}
+
+sq_button {
+    background-color: %(key)s;
+    background-image: none;
+    color: %(fg)s;
+    border: %(w)dpx solid %(border)s;
+    border-radius: 0;
+    box-shadow: none;
+    text-shadow: none;
+}
+
+%(special)s {
+    background-color: %(key_special)s;
+}
+
+sq_button.placeholder,
+sq_button.placeholder-2 {
+    background-color: %(bg)s;
+    border-color: %(bg)s;
+}
+
+sq_button:active {
+    background-color: %(pressed)s;
+    border-color: %(accent)s;
+    color: %(on_pressed)s;
+}
+
+sq_button.latched {
+    background-color: %(latched)s;
+    border-color: %(accent)s;
+    color: %(on_latched)s;
+}
+
+sq_button.locked {
+    background-color: %(accent)s;
+    border-color: %(accent)s;
+    color: %(on_accent)s;
+}
+
+#Return {
+    background-color: %(accent)s;
+    border-color: %(accent)s;
+    color: %(on_accent)s;
+}
+
+#Return:active {
+    background-color: %(pressed)s;
+    border-color: %(accent)s;
+    color: %(on_pressed)s;
+}
+""" % dict(bg=bg, fg=fg, accent=accent, border=border, key=key, key_special=key_special, pressed=pressed,
+           latched=latched, on_pressed=on_pressed, on_latched=on_latched, on_accent=on_accent, w=w,
+           special=special)
+
+
+def gtk_dir():
+    override = os.environ.get("OMAMOBILE_GTK_DIR")
+    if override:
+        return Path(override)
+    return Path(os.environ.get("XDG_CONFIG_HOME") or home() / ".config") / "gtk-3.0"
+
+
+def split_block(text):
+    """(text without our block, whether it was there, whether it opened the file)."""
+    start = text.find(BLOCK_BEGIN)
+    if start < 0:
+        return text, False, False
+    end = text.find(BLOCK_END, start)
+    if end < 0:
+        # A damaged block (no end marker): treat the rest of the line as ours.
+        stop = text.find("\n", start)
+        stop = len(text) if stop < 0 else stop + 1
+    else:
+        stop = end + len(BLOCK_END)
+        if text[stop:stop + 1] == "\n":
+            stop += 1
+    return text[:start] + text[stop:], True, start == 0
+
+
+def backup_file(path):
+    target = Path(os.path.realpath(path))
+    destination = target.with_name(target.name + ".omamobile-backup-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()))
+    n = 1
+    while destination.exists():
+        n += 1
+        destination = target.with_name("%s.omamobile-backup-%s-%d" % (target.name, time.strftime("%Y%m%d-%H%M%S", time.gmtime()), n))
+    atomic_write(destination, target.read_bytes(), mode=target.stat().st_mode & 0o777)
+    return str(destination)
+
+
+def write_if_changed(path, text):
+    try:
+        if Path(path).read_text() == text:
+            return False
+    except OSError:
+        pass
+    atomic_write(path, text)
+    return True
+
+
+def keyboard_theme(action):
+    directory = gtk_dir()
+    css_path = directory / CSS_NAME
+    gtk_css = directory / "gtk.css"
+    result = {"css": str(css_path), "gtk_css": str(gtk_css)}
+    existing = gtk_css.read_text() if gtk_css.exists() else None
+    rest, present, at_top = split_block(existing) if existing is not None else ("", False, False)
+
+    if action == "status":
+        result.update(generated=css_path.exists(), imported=present and at_top)
+        return result
+
+    if action == "remove":
+        result["backup"] = None
+        if present:
+            result["backup"] = backup_file(gtk_css) if existing.strip() else None
+            atomic_write(gtk_css, rest)
+        result["import"] = "removed" if present else "absent"
+        try:
+            css_path.unlink()
+            result["generated"] = "removed"
+        except FileNotFoundError:
+            result["generated"] = "absent"
+        return result
+
+    result["generated"] = "written" if write_if_changed(css_path, keyboard_css()) else "unchanged"
+    if action == "generate":
+        return result
+
+    result["backup"] = None
+    if present and at_top and existing.startswith(BLOCK):
+        result["import"] = "unchanged"
+    else:
+        if existing and existing.strip():
+            result["backup"] = backup_file(gtk_css)
+        # @import has to come before any rule, so it goes first.
+        atomic_write(gtk_css, BLOCK + rest.lstrip("\n") if rest.strip() else BLOCK)
+        result["import"] = "moved" if present else "added"
+    return result
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    try:
+        if len(argv) >= 2 and argv[1] == "status":
+            out = status()
+        elif len(argv) >= 2 and argv[1] == "general":
+            out = command_general()
+        elif len(argv) == 4 and argv[1] == "set":
+            out = command_set(argv[2], argv[3])
+        elif len(argv) == 3 and argv[1] == "keyboard-auto" and argv[2] == "reconcile":
+            out = keyboard_auto_reconcile()
+        elif len(argv) == 3 and argv[1] == "keyboard-theme" and argv[2] in ("generate", "install", "remove", "status"):
+            out = keyboard_theme(argv[2])
+        else:
+            print(__doc__.strip().split("\n\n")[0], file=sys.stderr)
+            return 2
+    except SettingsError as error:
+        print(json.dumps({"error": str(error)}))
+        return 1
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

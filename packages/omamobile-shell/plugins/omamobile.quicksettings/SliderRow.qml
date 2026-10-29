@@ -12,9 +12,18 @@ Item {
 
   property string icon: ""
   property real value: 0
+  readonly property bool dragging: slider.dragging
+  // Opt-in high-value zone; volume and torch retain their normal colors.
+  property real warningThreshold: -1
+  property color warningColor: "#ef4444"
+  readonly property bool warningEnabled: warningThreshold >= 0 && warningThreshold < 1
+  readonly property bool warningActive: warningEnabled && slider.liveValue > warningThreshold
   property bool available: true
   property string unavailableText: ""
   property color foreground: Commons.Color.popups.text
+  // Draw the glyph as a selected toggle (brightness's Auto mode).
+  property bool iconSelected: false
+  property bool iconEnabled: available
 
   signal moved(real value)
   signal released(real value)
@@ -32,17 +41,19 @@ Item {
     anchors.left: parent.left
     anchors.verticalCenter: parent.verticalCenter
 
-    Rectangle {
+    BorderSurface {
       anchors.fill: parent
       radius: Style.cornerRadius
-      color: iconTouch.pressed ? Style.pressedFillFor(root.foreground, Commons.Color.accent) : "transparent"
+      color: iconTouch.pressed ? Style.pressedFillFor(root.foreground, Commons.Color.accent)
+        : root.iconSelected ? Util.alpha(Commons.Color.accent, Style.selectedFillAlpha) : "transparent"
+      borderSpec: root.iconSelected ? Border.controlSpec("selected", root.foreground, Commons.Color.accent) : Border.none()
     }
 
     Text {
       anchors.centerIn: parent
       textFormat: Text.PlainText
       text: root.icon
-      color: root.foreground
+      color: root.iconSelected ? Commons.Color.accent : root.foreground
       font.family: Style.font.family
       font.pixelSize: Style.font.display
     }
@@ -50,8 +61,45 @@ Item {
     MouseArea {
       id: iconTouch
       anchors.fill: parent
-      enabled: root.available
+      enabled: root.iconEnabled
       onClicked: root.iconClicked()
+    }
+  }
+
+  // Draw the segmented track behind PanelSlider, leaving its thumb and
+  // pointer handling above it. Only the portion beyond the threshold is red.
+  Item {
+    visible: root.available && root.warningEnabled
+    x: slider.x
+    y: slider.y + (slider.height - slider.trackHeight) / 2
+    width: slider.width
+    height: slider.trackHeight
+
+    Rectangle {
+      anchors.fill: parent
+      radius: height / 2
+      color: Style.selectedFillFor(root.foreground, Commons.Color.accent)
+    }
+    Rectangle {
+      x: parent.width * root.warningThreshold
+      width: parent.width * (1 - root.warningThreshold)
+      height: parent.height
+      radius: height / 2
+      color: root.warningColor
+      opacity: 0.35
+    }
+    Rectangle {
+      width: parent.width * Math.min(slider.progress, root.warningThreshold)
+      height: parent.height
+      radius: height / 2
+      color: Commons.Color.accent
+    }
+    Rectangle {
+      x: parent.width * root.warningThreshold
+      width: parent.width * Math.max(0, slider.progress - root.warningThreshold)
+      height: parent.height
+      radius: height / 2
+      color: root.warningColor
     }
   }
 
@@ -70,9 +118,9 @@ Item {
     step: 0.05
     trackHeight: Math.max(6, Style.space(6))
     knobSize: Math.max(22, Style.space(22))
-    trackColor: Style.selectedFillFor(root.foreground, Commons.Color.accent)
-    fillColor: Commons.Color.accent
-    knobColor: root.foreground
+    trackColor: root.warningEnabled ? "transparent" : Style.selectedFillFor(root.foreground, Commons.Color.accent)
+    fillColor: root.warningEnabled ? "transparent" : Commons.Color.accent
+    knobColor: root.warningActive ? root.warningColor : root.foreground
     tickColor: Commons.Color.popups.background
     onMoved: function(value) { root.moved(value) }
     onReleased: function(value) { root.released(value) }
@@ -98,7 +146,7 @@ Item {
     horizontalAlignment: Text.AlignRight
     textFormat: Text.PlainText
     text: root.available ? Math.round(slider.liveValue * 100) + "%" : ""
-    color: root.foreground
+    color: root.warningActive ? root.warningColor : root.foreground
     font.family: Style.font.family
     font.pixelSize: Style.font.body
   }

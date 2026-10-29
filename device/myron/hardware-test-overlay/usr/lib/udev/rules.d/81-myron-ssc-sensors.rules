@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Myron's SSC registry exposes accelerometer and proximity through secure ADSP
+# FastRPC. iio-sensor-proxy 3.9's default rule advertises only light and compass.
+# This overlay is Myron-only; do not add a second probe on nonsecure ADSP nodes.
+# Physical portrait testing found the sensor's X/Y frame rotated 180 degrees
+# relative to the panel. Keep that board correction out of generic consumers.
+ACTION!="remove", SUBSYSTEM=="misc", KERNEL=="fastrpc-adsp-secure", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-accel ssc-proximity", ENV{ACCEL_MOUNT_MATRIX}="-1, 0, 0; 0, -1, 0; 0, 0, 1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="iio-sensor-proxy.service"

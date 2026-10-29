@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Report Myron files that a fresh composed image would not reproduce.
+
+Read-only. Over SSH, hashes the phone's Omarchy Mobile shell, our programs
+and units, the Myron overlays' paths and the sensor controller, and compares
+each file with the repository source the composer installs. Also lists
+user-level overrides: plugin directories that are copies instead of package
+symlinks, and regular unit files in ~/.config/systemd/user.
+
+Exit status 0 when every mapped file matches and no override exists, 1 on any
+drift. Files without a repository source (private assets, Omarchy patch
+results, per-device keys) are not checked here.
+
+Usage: tools/myron-drift-check [--host USER@HOST] [--known-hosts FILE]
+"""
+import argparse
+import hashlib
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+OVERLAYS = [ROOT / 'device/myron/main-overlay', ROOT / 'device/myron/hardware-test-overlay']
+SHELL = ROOT / 'packages/omamobile-shell'
+
+REMOTE = r'''
+set -u
+for d in /usr/share/omamobile/shell /usr/local/bin /usr/local/sbin /usr/local/libexec/myron-sensors \
+  /usr/local/libexec/myron-speaker /etc/omamobile /usr/lib/omamobile-location-usage; do
+  test -d "$d" && find "$d" -type f -print0 | xargs -0r sha256sum
+done
+for f in /usr/share/applications/omamobile-settings.desktop /etc/xdg/xdg-desktop-portal/hyprland-portals.conf /etc/xdg-desktop-portal/hyprland-portals.conf /etc/xdg/mimeapps.list /usr/local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service /usr/bin/omamobile-* /usr/lib/systemd/system/myron-* /usr/lib/systemd/user/omamobile-* \
+  /usr/lib/systemd/system/omamobile-location-usage.service \
+  /usr/share/dbus-1/system.d/org.omamobile.LocationUsage1.conf \
+  /usr/lib/udev/rules.d/*myron* /etc/polkit-1/rules.d/*myron*; do
+  test -f "$f" && sha256sum "$f"
+done
+echo '@@overrides'
+for p in "$HOME"/.config/omarchy/plugins/*; do
+  test -e "$p" || continue
+  test -L "$p" || echo "plugin-copy $p"
+done
+for u in "$HOME"/.config/systemd/user/*.service "$HOME"/.config/systemd/user/*.timer; do
+  test -f "$u" && ! test -L "$u" && echo "user-unit $u"
+done
+true
+'''
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_for(phone_path):
+    """The repository file the composer installs at phone_path, if any."""
+    if phone_path == '/usr/share/applications/omamobile-settings.desktop':
+        return SHELL / 'applications/omamobile-settings.desktop'
+    if phone_path == '/etc/xdg-desktop-portal/hyprland-portals.conf':
+        return SHELL / 'portal/hyprland-portals.conf'
+    strata_defaults = {
+        '/etc/xdg/xdg-desktop-portal/hyprland-portals.conf': 'portal/hyprland-portals.conf',
+        '/etc/xdg/mimeapps.list': 'etc-mimeapps.list',
+        '/usr/local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service': 'io.github.lgse.Strata.FileManager1.service',
+    }
+    if phone_path in strata_defaults:
+        return ROOT / 'packages/omamobile-apps-myron' / strata_defaults[phone_path]
+    p = Path(phone_path)
+    rel = p.relative_to('/')
+    for overlay in OVERLAYS:
+        if (overlay / rel).is_file():
+            return overlay / rel
+    if phone_path == '/usr/local/libexec/myron-sensors/autorotate.py':
+        return ROOT / 'packages/omamobile-sensors/lib/autorotate.py'
+    if phone_path == '/usr/bin/omamobile-rotation':
+        return ROOT / 'packages/omamobile-sensors/bin/omamobile-rotation'
+    if phone_path.startswith('/usr/share/omamobile/shell/'):
+        candidate = SHELL / phone_path[len('/usr/share/omamobile/shell/'):]
+        if candidate.is_file():
+            return candidate
+        # The widget docs, template and examples install under the shell tree.
+        rest = phone_path[len('/usr/share/omamobile/shell/'):]
+        for prefix, repo in (('widget-examples/', 'widgets/examples/'), ('widget-template/', 'widgets/template/'), ('', 'widgets/')):
+            if rest.startswith(prefix):
+                candidate = SHELL / repo / rest[len(prefix):]
+                if candidate.is_file():
+                    return candidate
+        return None
+    usage = ROOT / 'packages/omamobile-location-usage'
+    if phone_path.startswith('/usr/lib/omamobile-location-usage/'):
+        name = p.name
+        candidate = usage / ('bin' if name == 'omamobile-location-usaged' else 'lib') / name
+        return candidate if candidate.is_file() else None
+    if phone_path == '/usr/lib/systemd/system/omamobile-location-usage.service':
+        return usage / 'systemd/omamobile-location-usage.service'
+    if phone_path == '/usr/share/dbus-1/system.d/org.omamobile.LocationUsage1.conf':
+        return usage / 'dbus/org.omamobile.LocationUsage1.conf'
+    if phone_path.startswith('/usr/bin/omamobile-'):
+        hits = sorted(ROOT.glob(f'packages/*/bin/{p.name}'))
+        return hits[0] if len(hits) == 1 else None
+    if phone_path.startswith('/usr/lib/systemd/user/'):
+        hits = sorted(ROOT.glob(f'packages/*/systemd/user/{p.name}'))
+        return hits[0] if len(hits) == 1 else None
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--host', default='menno@172.16.42.1')
+    ap.add_argument('--known-hosts', default=str(ROOT / 'out/private/myron-main-v60-known-hosts'))
+    a = ap.parse_args()
+    ssh = ['ssh', '-o', 'ControlPath=none', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+           '-o', 'HostKeyAlias=myron', '-o', f'UserKnownHostsFile={a.known_hosts}',
+           '-o', 'StrictHostKeyChecking=yes', a.host, 'sh -c ' + shlex.quote(REMOTE)]
+    out = subprocess.run(ssh, capture_output=True, text=True, timeout=120, check=True).stdout
+    hashes, _, overrides = out.partition('@@overrides\n')
+    drift = 0
+    unmapped = 0
+    for line in hashes.splitlines():
+        digest, _, path = line.partition('  ')
+        src = source_for(path)
+        if src is None:
+            unmapped += 1
+            continue
+        if sha(src) != digest:
+            drift += 1
+            print(f'differs  {path}  (repo: {src.relative_to(ROOT)})')
+    for line in overrides.splitlines():
+        drift += 1
+        print(f'override {line}')
+    print(f'{drift} drifted, {unmapped} without a repository source (not checked)')
+    return 1 if drift else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

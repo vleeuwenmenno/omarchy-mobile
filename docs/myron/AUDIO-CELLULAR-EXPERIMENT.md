@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Myron cellular + speaker coexistence experiment
 
-Status: hardware-tested on 2026-10-27. Registered LTE/5G and the guarded
-speaker path coexisted through one complete probe and automatic pmOS recovery.
-Subjective audibility still requires the attended listener's confirmation.
+Status: radio/audio graph coexistence tested on 2026-10-27, but speaker output
+failed the attended acceptance check. Registered LTE/5G survived the complete
+`-45 dBFS` raw probe and automatic pmOS recovery; the listener heard nothing.
+That run is not evidence of working speaker output.
 
 `audio-cellular-speaker` is an attended persistent-MAIN experiment for the
 smallest useful radio/audio boundary: one normally admitted ModemManager,
@@ -11,11 +12,22 @@ exactly one home-registered LTE/5G modem, no packet-data bearer, no GNSS, no
 Bluetooth, then one fixed 250 ms speaker probe. It does not test mobile data,
 calls, microphone capture, Bluetooth audio, or GNSS.
 
+`audio-cellular-bridge` is the corrective attended mode. It keeps the same
+modem-first, data/GNSS/Bluetooth exclusions and automatic pmOS recovery, but
+uses the previously user-confirmed PipeWire FIFO -> OEM MIPLAY -> three-TFA
+bridge at its proven `-12 dB` software cap. It plays one bounded 1.5-second
+left tone, 0.75 seconds of silence and one 1.5-second right tone. An exit-zero
+result is insufficient: the listener must confirm audible output from the top
+and bottom speakers.
+
 The profile uses its own marker,
 `/etc/omamobile/myron-cellular-audio-experiment`. The isolated-audio marker is
 absent, so `myron-cellular.service` and the one-start ModemManager admission
 path can run unchanged. Packet-data operations and both GeoClue and GNSS
-mutations refuse the combined marker. The legacy audio services remain masked.
+mutations refuse the combined marker. The legacy foundation and microphone
+services remain masked. In corrective bridge mode only the exact
+checksum-pinned speaker bridge is available; the runner admits it after
+modem-safe AudioReach staging and stops it before recovery.
 
 ## Boot and start contract
 
@@ -98,6 +110,69 @@ FastRPC and speaker-DSP readiness. Cleanup stopped streams, restored controls
 and powered TFA down. Recovery completed normally into pmOS boot
 `002580a8-1c82-4729-8e8e-1958d94a4885` with latch reason
 `audio-cellular-speaker-complete`. There was no fastboot entry or hard reset.
+The listener then reported no sound. Therefore the software boundary passed,
+but the acoustic acceptance result failed.
+
+The first corrective `audio-cellular-bridge` boot used rootfs SHA-256
+`8e50b66abf2bfa5eef548844088c1e80ad3ead4d1f51ead9dcfe9f896cb93051`
+and boot ID `c381b09d-d8de-4cab-ae2c-c5b9ac8384fd`. Live inspection again proved
+home registration on LTE plus 5G NR, active USB and Wi-Fi rescue, no packet-data
+mutation, GNSS or Bluetooth, PMIC 38.709 C and hottest valid non-trip sensor
+73.3 C. AudioReach reached `speaker-dsp`, the exact bridge became ready and the
+durable boundary reached `probe-started`, but the FIFO producer hit its
+10-second cap before completing the 3.75-second waveform. The run failed
+closed with `bounded left/right speaker bridge tones failed`, powered the TFA
+amplifiers down and recovered normally to pmOS with latch
+`audio-experiment-failed`; `boot_a` remained unchanged. This is not an acoustic
+pass. The corrective writer now precomputes the complete 720000-byte waveform
+before opening the FIFO and gives the already-bounded OEM graph 30 seconds to
+consume it.
+
+The second corrective v59 run used that precomputed writer and a 30-second
+FIFO limit. It again reached `probe-started` with the registered modem stable,
+but the producer still did not complete before the bound. The durable record
+was boot ID `73a88eca-9e39-4fef-b1bc-f2c0d67182f0`, modem PID 4456, mode
+`audio-cellular-bridge`, 3750 ms, `-12 dB`, left+right. Automatic recovery
+returned to pmOS; the current pmOS boot ID is
+`ac4ee6db-3c5a-49ac-9f6c-ab290d46719a`. No audible acceptance test occurred.
+Therefore v59 also fails and must not be described as restored speaker support.
+
+The v59 failure exposed a protocol bug in the corrective probe, not proof that
+the OEM graph itself failed. The bridge reads one 15,360-byte PCM period, then
+opens and starts the MIPLAY graph. The producer wrote the remaining 704,640
+bytes immediately, so the FIFO could fill while that hardware transaction was
+still in progress. Extending the timeout or precomputing samples did not fix
+that ordering error.
+
+The next candidate carries an explicit two-phase handshake. It writes exactly
+one period, waits for a runtime-only `stream-ready` marker published at the
+bridge's post-`pcm_start` `stream_pcm` boundary, then writes the remainder. The
+marker is cleared before every service start and on normal, error and cleanup
+paths. The whole producer remains bounded to 60 seconds, with only 45 seconds
+available for PCM start. The pinned reference bridge remains byte-identical;
+an Omarchy wrapper adds the marker around it. The audio-specific behavioral
+fault matrix passes, but this candidate has not run on hardware and is not an
+acoustic pass.
+
+The offline v60 candidate was composed on 2026-10-28 from the fresh r7
+development rootfs with the radio profile, the two-phase speaker handshake and
+the inert private-v3 sensor runtime in one image:
+
+```text
+out/private/myron-omarchy-main-20261028-v60-audio-cellular-sensors.img
+SHA-256 3c4c62321d0cf8ea69bd44472594d59c0e178564064f58a2e42fd42623d4c3bd
+```
+
+Offline composition reported `profile=audio-cellular-bridge`,
+`effective_profile=cellular`,
+`activation=persistent-main-cellular-audio-experiment` and
+`deployment_authorized=false`. `e2fsck -fn` passed. The exact handshake files,
+packaged `hexagonrpc`/`ssccli`, private sensor registry and manual sensor tools
+are present. Sensor staging and autorotation are absent from every enable path.
+The image was subsequently deployed and booted. The speaker handshake was not
+reached before thermal/registration failures; audible output is still unproven.
+Speaker work is now parked by owner request. See [current status](STATUS.md)
+for the latest hardware evidence and work boundary.
 
 ## Offline composition
 
@@ -106,7 +181,7 @@ the profile and output path:
 
 ```fish
 tools/myron-dev-image-compose --boot-policy main \
-  --profile audio-cellular-speaker \
+  --profile audio-cellular-bridge \
   --base-image /abs/base.ext4 \
   --module-stage /abs/modules \
   --module-assets-archive /abs/systemd-vt-device-assets.tar.gz \
@@ -116,10 +191,10 @@ tools/myron-dev-image-compose --boot-policy main \
   --speaker-reference-repo /abs/ref \
   --firstboot-conf /abs/firstboot.conf \
   --ssh-key /abs/owner.pub \
-  --out /abs/myron-audio-cellular-speaker.ext4
+  --out /abs/myron-audio-cellular-bridge.ext4
 ```
 
-Expected result includes `profile=audio-cellular-speaker`,
+Expected result includes `profile=audio-cellular-bridge`,
 `effective_profile=cellular`,
 `activation=persistent-main-cellular-audio-experiment`, and
 `deployment_authorized=false`.
@@ -138,3 +213,24 @@ packet-data or GNSS evidence, dirty IPA guard, temperature refusal, timeout,
 unexpected reboot, fastboot entry, or cleanup failure. Do not retry in the
 same boot. If registration-only plus speaker passes, packet data plus audio is
 a separate later image and approval; it is not silently widened here.
+
+### Retiring the unused experiment for normal cellular use (2026-10-29)
+
+On an Omarchy cellular-base boot where the audio experiment never ran, use the
+repository-installed `myron-retire-audio-experiment --check` and then `--apply`.
+The helper refuses active audio, consumed experiments, data mutations or a dirty
+IPA guard, and backs up the marker/request before retiring them. It does not
+reset the modem, forge qualification or change the recovery policy. The backup
+is `/var/lib/myron-retired-audio-experiment`; the previous publisher enablement
+is saved there. Do not restore the audio marker/request while data/GNSS is in
+use: reverting to audio experimentation requires its original isolated startup
+preconditions, not merely copying the marker back.
+
+New images for this non-audio development phase use composer `--profile cellular`
+with the private sensor archive. Restore the ordinary charging-authentication
+and qualification units, let the existing qualifier pass, then use the existing
+attended cellular procedure if evidence is absent. That procedure requires held
+USB/Wi-Fi rescue sessions, fresh SSH proofs after activation, and a Wi-Fi-off
+ordinary DNS/HTTPS proof before evidence can be recorded. Do not substitute a
+bound-interface probe for that final proof. Successful execution and current
+limits are recorded in STATUS.md.

@@ -191,8 +191,12 @@ function portPlacements(raw) {
 
 // What a fresh home gets, before the user changes anything: a clock and the
 // first of these apps that are installed along the bottom row.
-var DEFAULT_APPS = ["chromium", "Alacritty", "org.gnome.Nautilus", "omarchy-menu", "org.omarchy.settings",
+var DEFAULT_APPS = ["chromium", "Alacritty", "io.github.lgse.Strata", "org.gnome.Nautilus", "omarchy-menu", "org.omarchy.settings",
                     "foot", "org.gnome.Calculator", "btop", "nvim", "localsend"]
+
+// A default app that stands in for another: when it is installed, the
+// stand-in is not also put in the dock.
+var SUPERSEDED_APPS = { "org.gnome.Nautilus": "io.github.lgse.Strata" }
 
 function clampInt(value, lo, hi, fallback) {
   var n = Math.round(Number(value))
@@ -355,6 +359,7 @@ function defaultLayout(availableApps, grid) {
   var x = 0
   for (var i = 0; i < DEFAULT_APPS.length && x < grid.columns; i++) {
     if (!have[DEFAULT_APPS[i]]) continue
+    if (SUPERSEDED_APPS[DEFAULT_APPS[i]] && have[SUPERSEDED_APPS[DEFAULT_APPS[i]]]) continue
     layout.pages[0].items.push({ id: takeId(layout, "a"), kind: "app", app: DEFAULT_APPS[i],
                                  x: x, y: grid.rows - 1, w: 1, h: 1 })
     x += 1

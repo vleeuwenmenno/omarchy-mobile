@@ -1,0 +1,2 @@
+singleton PullState 1.0 PullState.qml
+singleton NavState 1.0 NavState.qml

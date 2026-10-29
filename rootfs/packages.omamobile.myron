@@ -5,8 +5,10 @@
 omamobile-keyring
 omamobile-firstboot
 omamobile-omarchy
+strata
 omamobile-apps-myron
 omamobile-shell
+omamobile-location-usage
 omamobile-mirror
 mesa-myron-zink-turnip
 omamobile-myron-gpu-profile
@@ -21,3 +23,4 @@ audioreach-graphservices
 audioreach-conf
 audioreach-graphmgr
 fastrpc
+hexagonrpc

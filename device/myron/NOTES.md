@@ -1,6 +1,9 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Xiaomi myron notes
 
+Current handoff: [STATUS.md](../../docs/myron/STATUS.md). Older status paragraphs
+below describe their dated development phase, not the current deployment.
+
 Status (2026-10-24): reference userspace audited; native Hyprland passed on
 the downstream kernel; Arch rootfs integration is build-only. No Omarchy
 Mobile image has been built, booted, installed, or flashed.
@@ -8,6 +11,36 @@ Mobile image has been built, booted, installed, or flashed.
 Phase 2 now provides an activation-disabled, metadata-only kernel contract.
 It verifies externally supplied qualified VT artifacts and the private runtime
 asset manifest; it does not install or load any hardware payload.
+
+## 2026-10-28: Owner confirms torch and brightness controls
+
+The owner reports that the torch appeared to work when last tested and that
+both torch-intensity and display-brightness sliders worked. Record these as
+user-confirmed control behavior; the exact tested boot/image was not supplied.
+Display-brightness slider quality-of-life work is explicitly deferred.
+Automatic brightness and reboot persistence are not established by this report.
+
+The owner subsequently confirmed that a USB dongle appeared to work in a
+previous test. Its type and tested functions were not specified. Further USB
+qualification is now the lowest-priority hardware follow-up, below fingerprint
+enrollment and cameras. This does not change the immediate sensors/rotation
+priority or the decision to park speaker output.
+
+## 2026-10-27: Qualcomm SSC sensors work with Myron's ODM registry
+
+On pmOS kernel `6.12.23-android16-5-g5a0e85dd9db0-dirty-4k`, boot ID
+`ac4ee6db-3c5a-49ac-9f6c-ab290d46719a`, a bounded HexagonRPC v3 experiment
+mapped this phone's read-only sensor config under both the vendor and ODM
+virtual paths. The first two layouts failed because firmware always reopened
+`/odm/etc/sensors/config/json.lst`; the ODM alias fixed that. Accelerometer,
+gyroscope, magnetometer/compass and proximity returned physical samples, while
+SensorProxy advertised accelerometer, ambient-light and proximity support.
+Ambient-light presence passed but no measurement arrived in the short window.
+
+The package, private archive hashes, method-31 limitation and manual-only
+Omarchy runbook are in [SENSORS.md](../../docs/myron/SENSORS.md). Nothing is
+enabled by default, and no display rotation, reboot, module load or DSP restart
+was performed.
 
 Kernel contract 0.2.0 adds `device/myron/stage-contract.json` (a byte-identical
 copy ships in the package) and `omamobile-myron-kernel-verify show-stage`,

@@ -1,0 +1,49 @@
+From: Omarchy Mobile contributors
+Subject: [PATCH] hexagonfs: map sensor config under ODM too
+
+Recent Qualcomm sensor firmware opens the board configuration through
+/odm/etc/sensors/config, while older firmware uses the vendor path. Both
+Android locations contain the same class of read-only board assets, so expose
+the configured sensor directory at both virtual paths.
+---
+ hexagonrpcd/rpcd_builder.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/hexagonrpcd/rpcd_builder.c b/hexagonrpcd/rpcd_builder.c
+index 8110ab4..75f61bc 100644
+--- a/hexagonrpcd/rpcd_builder.c
++++ b/hexagonrpcd/rpcd_builder.c
+@@ -113,7 +113,7 @@ struct hexagonfs_dirent *construct_root_dir(const char *prefix, const char *dsp)
+ {
+ 	char *acdbdata, *dsp_libs, *sns_cfg, *sns_reg, *sns_reg_config, *socinfo;
+ 	size_t n_prefix;
+-	struct hexagonfs_dirent *persist_dir, *vendor_dir;
++	struct hexagonfs_dirent *odm_dir, *persist_dir, *vendor_dir;
+ 
+ 	n_prefix = strlen(prefix);
+ 
+@@ -182,7 +182,21 @@ struct hexagonfs_dirent *construct_root_dir(const char *prefix, const char *dsp)
+ 				)
+ 			);
+ 
+-	return hfs_mkdir("/", 6,
++	/*
++	 * Newer Qualcomm sensor firmware reads the board JSON list from ODM,
++	 * while older releases use the equivalent vendor path. Expose both
++	 * virtual paths through the same read-only host directory.
++	 */
++	odm_dir = hfs_mkdir("odm", 1,
++			hfs_mkdir("etc", 1,
++				hfs_mkdir("sensors", 1,
++					hfs_map_or_empty("config", sns_cfg)
++				)
++			)
++		  );
++
++	return hfs_mkdir("/", 7,
++			odm_dir,
+ 			hfs_mkdir("mnt", 1,
+ 				hfs_mkdir("vendor", 1,
+ 					persist_dir
+-- 
+2.51.0

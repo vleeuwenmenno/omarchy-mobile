@@ -122,6 +122,9 @@ pacstrap -C /etc/pacman.conf -c -M "$T" "${base[@]}" >/var/log/pacstrap-base.log
 omarchy_list=$T/usr/share/omarchy/install/omarchy-base.packages
 [[ -f $omarchy_list ]] || die "no $omarchy_list in the omarchy package"
 mapfile -t skip < <(list /src/rootfs/packages.omarchy-skip)
+if [[ $ROOTFS_PACKAGE_PROFILE == myron ]]; then
+  mapfile -t -O "${#skip[@]}" skip < <(list /src/rootfs/packages.omarchy-skip.myron)
+fi
 want=() unavailable=()
 while read -r p; do
   [[ " ${skip[*]} " == *" $p "* ]] && continue
@@ -248,6 +251,10 @@ fi
 say "Services"
 systemctl --root="$T" enable NetworkManager.service systemd-networkd.service systemd-resolved.service \
   sshd.service sddm.service >/dev/null 2>&1
+# Location-use history: watching from boot, before GeoClue can first start.
+# It starts nothing itself (no GeoClue, no GNSS).
+[[ -e $T/usr/lib/systemd/system/omamobile-location-usage.service ]] &&
+  systemctl --root="$T" enable omamobile-location-usage.service >/dev/null 2>&1
 systemctl --root="$T" mask systemd-networkd-wait-online.service NetworkManager-wait-online.service >/dev/null 2>&1
 ln -sfn /run/systemd/resolve/stub-resolv.conf "$T/etc/resolv.conf"
 echo omamobile > "$T/etc/hostname"

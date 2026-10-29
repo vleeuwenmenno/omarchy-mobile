@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 import QtQuick
+import "../omamobile.gestures" as Gestures
 import Quickshell
 import Quickshell.Bluetooth
 import Quickshell.Io
@@ -360,13 +361,17 @@ Item {
         property bool pulled: false
         readonly property real pullThreshold: Style.space(14)
 
-        onPressed: function(mouse) { pressY = mouse.y; pulled = false }
+        onPressed: function(mouse) { pressY = mapToGlobal(mouse.x, mouse.y).y; pulled = false }
         onPositionChanged: function(mouse) {
-          if (!pulled && mouse.y - pressY > pullThreshold) {
+          var distance = mapToGlobal(mouse.x, mouse.y).y - pressY
+          if (!pulled && distance > 3) {
             pulled = true
+            Gestures.PullState.begin(distance)
             root.openQuickSettings()
-          }
+          } else if (pulled) Gestures.PullState.update(distance)
         }
+        onReleased: if (pulled) Gestures.PullState.finish()
+        onCanceled: Gestures.PullState.finish()
         onClicked: if (!pulled) root.toggleQuickSettings()
       }
     }

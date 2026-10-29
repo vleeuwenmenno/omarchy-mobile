@@ -18,6 +18,7 @@ logical at scale 3).
 | `omamobile.launcher` | `panel` (keepLoaded) | Home bar: app search, app grid and coding-agent prompt in one input |
 | `omamobile.home` | `panel` (keepLoaded) | Home screens: pages of apps and widgets on the wallpaper, with an edit mode |
 | `omamobile.fingerprint` | `panel` (keepLoaded) | Fingerprint target over the sensor during verification, desktop guard, and the enrollment screen |
+| `omamobile.settings` | `panel` (keepLoaded) | Settings: General, Keyboard and Quick Settings pages in a card over a scrim; never takes keyboard focus and never opens over the lock or from a pocket |
 | `omamobile.keyboard` | `panel` (keepLoaded) | A hide button right above the on-screen keyboard while it is up (also over the lock) |
 | `omamobile.update` | `panel` (keepLoaded) | The update sheet: Omarchy's update for a phone, in place of its terminal update |
 | `omamobile.access` | `panel` (keepLoaded) | The permission sheet: xdg-desktop-portal's "Allow Camera to use the camera?", in place of GTK's desktop dialog |
@@ -852,3 +853,27 @@ What upstream needs instead, smallest first:
   `omarchy.notifications` only to full bars. Quick settings calls the
   `notifications` IPC target on its own shell instance (`qs ipc -p
   Quickshell.shellDir`) instead.
+
+## omamobile.settings
+
+`omarchy-shell shell summon omamobile.settings '{}'` opens the list;
+`'{"page":"general"}'`, `'{"page":"keyboard"}'` or `'{"page":"quicksettings"}'`
+open a page. Reachable from the app drawer ("Settings"), the Quick Settings
+gear and the optional Settings tile, and the Keyboard tile's chevron or long
+press (Keyboard page). Nothing keeps a second copy of a setting
+(`bin/omamobile-settings` header lists where each lives):
+
+| Setting | Stored in | Applies |
+| --- | --- | --- |
+| Automatically show when typing | GSettings `org.gnome.desktop.a11y.applications screen-keyboard-enabled` | **Unverified on the phone's Squeekboard 1.43.1:** its source binds this key to a property nothing reads, so flipping it may change nothing until Squeekboard is patched to honour it (`src/server-context-service.c` `enabled`). Intended meaning: Off keeps the keyboard down on text focus until the Keyboard tile or the drawer search asks for it |
+| Portrait / landscape size, 0.5 to 2.0 | GSettings `sm.puri.Squeekboard scale-in-vertical-screen-orientation` / `scale-in-horizontal-screen-orientation` | The next time Squeekboard shows or its output changes; never restarted |
+| Stretch keys to fit | GSettings `sm.puri.Squeekboard layout-shape-changes-to-fit-panel` | Same |
+| Bottom gap, 24 to 64 (default 24) | `~/.config/omamobile/settings.json` `keyboard.bottom_gap`, written atomically by the helper | At once: the launcher's dock height, which also lifts the keyboard |
+
+The Keyboard tile is the manual show/hide (Hidden / Shown) and works with
+automatic showing off. It closes the sheet first and asks Squeekboard to show
+about 0.4 s later, because Squeekboard drops a forced show when the focused
+text input changes. The login step `omamobile-settings keyboard-auto reconcile`
+turns automatic showing back on only when the screensaver's own marker
+(`$XDG_RUNTIME_DIR/omarchy-screensaver-osk-off`) is left behind with no
+screensaver running; with no marker the value is the user's.

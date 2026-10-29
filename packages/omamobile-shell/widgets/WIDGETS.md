@@ -6,6 +6,11 @@ screens, by hand or with a coding agent. It is installed as
 `/usr/share/omamobile/shell/WIDGETS.md` and linked from
 `~/.config/omamobile/widgets/WIDGETS.md`.
 
+The `sensors` example provides a device-independent diagnostic panel for
+SensorProxy orientation, ambient light, proximity and compass heading. It
+includes a rotating compass dial and an explicit 60-second live-test mode.
+See its README for sampling limits and unsupported-sensor behavior.
+
 A widget is a folder with a `manifest.json` and a QML file, like an Omarchy
 shell plugin. It draws inside a card on the home screen, takes its colours
 and fonts from the current Omarchy theme, and can be placed, resized and
@@ -130,6 +135,7 @@ Declare these properties. The home screen sets them before
 | --- | --- |
 | `host.foreground`, `host.dimForeground` | Text colours that read on the card |
 | `host.timeFormat` | The system's clock format (`"HH:mm"` or `"h:mm AP"`), from the status bar's 12/24-hour setting |
+| `host.active` | This placement is on the current home page, not covered by an application, with the panel on and no layout editor/sheet. Use it to stop sampling; it is not an authorization or lock-state check. |
 | `host.widgetId`, `host.instanceId`, `host.dir` | The manifest id, this placement's id, the widget's folder |
 | `host.saveSettings({ key: value })` | Store settings for this placement (the user's settings sheet does the same) |
 | `host.openSettings()` | Open this placement's settings sheet |

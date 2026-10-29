@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# Enabled by the composer when the image carries the sensor runtime. The
+# controller only claims the accelerometer while the panel is lit and the
+# session unlocked; stopping it restores the upright transform.
+[Unit]
+Description=Rotate Myron display and touch input with the phone
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/omamobile-autorotate --monitor DSI-1
+ExecStopPost=/usr/bin/python3 -c 'import sys; sys.path.insert(0, "/usr/local/libexec/myron-sensors"); import autorotate; autorotate.apply(0, "DSI-1")'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

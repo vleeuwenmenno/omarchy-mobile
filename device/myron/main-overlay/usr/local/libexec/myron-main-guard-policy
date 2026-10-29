@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Compatibility for an already-installed initramfs carrying the old guard.
+# Only an explicit, image-bound owner policy selects the updated control.
+# Keep the independent initramfs BusyBox and preserve its original control.
+set -eu
+umask 077
+runtime=/run/myron-main
+main=/run/myron-host/var/lib/omarchy-mobile/main
+control=/usr/local/sbin/myron-main-os
+system_prefix=/usr
+root_uid=0
+root_gid=0
+die() { printf 'guard policy loader: %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" = "$root_uid" ] || die 'root required'
+[ -e "$main/development-no-timeout" ] || [ -L "$main/development-no-timeout" ] || exit 0
+for path in "$system_prefix" "$system_prefix/local" "$system_prefix/local/sbin" "$runtime"; do
+	[ -d "$path" ] && [ ! -L "$path" ] || die 'unsafe control directory'
+	info=$(stat -c '%u:%g:%a' "$path")
+	[ "${info%:*}" = "$root_uid:$root_gid" ] && [ $((0${info##*:} & 022)) -eq 0 ] || die 'writable control directory'
+done
+[ -f "$control" ] && [ ! -L "$control" ] && [ -x "$control" ] || die 'control missing'
+info=$(stat -c '%u:%g:%a:%h' "$control")
+case $info in "$root_uid:$root_gid":*:1) ;; *) die 'unsafe control ownership or links' ;; esac
+mode=${info#*:*:}
+[ $((0${mode%%:*} & 022)) -eq 0 ] || die 'writable control'
+sh -n "$control"
+policy=$(sh "$control" guard-policy)
+[ "$policy" = guard_deadline_seconds=0 ] || exit 0
+if [ -e "$runtime/myron-main-os.embedded" ]; then
+	cmp -s "$control" "$runtime/myron-main-os" || die 'different control already selected this boot'
+	exit 0
+fi
+cp -p "$runtime/myron-main-os" "$runtime/myron-main-os.embedded"
+cp "$control" "$runtime/myron-main-os.new"
+chmod 0755 "$runtime/myron-main-os.new"
+cmp "$control" "$runtime/myron-main-os.new"
+sh -n "$runtime/myron-main-os.new"
+mv -f "$runtime/myron-main-os.new" "$runtime/myron-main-os"
+printf '%s\n' 'guard policy: owner-selected development image, no wall-clock timeout; recovery remains active'

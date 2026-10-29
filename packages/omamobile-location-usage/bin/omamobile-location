@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""omamobile-location: your own location-use status and history, as JSON.
+
+  omamobile-location status    now: coverage, active uses, GeoClue-wide in-use
+  omamobile-location history   status plus recent uses (7 days, 50 at most)
+  omamobile-location clear     forget your finished history entries
+
+Talks to the root observer omamobile-location-usage over the system bus. The
+observer decides what you may see from your own user ID, so this command has
+no option to name another user or a file. Exit status 0, or 1 with
+{"available": false, ...} when the observer does not answer."""
+import json
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+METHODS = {"status": ("GetStatus", "(s)"), "history": ("GetHistory", "(s)"), "clear": ("ClearHistory", "(u)")}
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in METHODS:
+        print(__doc__, file=sys.stderr)
+        return 2
+    method, reply = METHODS[argv[1]]
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        result = bus.call_sync("org.omamobile.LocationUsage1", "/org/omamobile/LocationUsage1",
+                               "org.omamobile.LocationUsage1", method, None, GLib.VariantType(reply),
+                               Gio.DBusCallFlags.NO_AUTO_START, 3000, None).unpack()[0]
+    except GLib.Error as error:
+        print(json.dumps({"available": False, "error": error.message.split(":")[-1].strip()[:120]}))
+        return 1
+    if argv[1] == "clear":
+        print(json.dumps({"available": True, "cleared": result}))
+    else:
+        data = json.loads(result)
+        data["available"] = True
+        print(json.dumps(data))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

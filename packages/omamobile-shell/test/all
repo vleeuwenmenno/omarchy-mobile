@@ -12,6 +12,12 @@ for manifest in plugins/*/manifest.json; do
 done
 pass "plugin manifests are valid"
 
+python3 -B test/haptics.py || fail "haptic policy"
+python3 -B test/display.py || fail "display policy"
+python3 -B test/pocket.py || fail "pocket guard"
+python3 -B test/settings.py || fail "settings helper"
+bash test/settings-wiring.sh || fail "settings wiring"
+
 python3 -c 'import json; json.load(open("profile/shell.json"))' || fail "profile/shell.json is valid JSON"
 pass "phone profile is valid"
 
@@ -42,6 +48,9 @@ if command -v node >/dev/null; then
   node test/bluetooth-model.js || fail "Bluetooth model"
   node test/sensor-model.js || fail "fingerprint sensor model"
   node test/tiles-model.js || fail "quick-settings tile layout"
+  node test/settings-model.js >/dev/null || fail "settings geometry model"
+  node test/nav-gesture.js >/dev/null || fail "bottom-edge swipe up: home, pause for recents, spring back"
+  node test/location-model.js || fail "location tile status and panel text"
   node test/home-model.js || fail "home screen model"
   node test/device-profile.js || fail "device safe-area profile"
   # Our OWL runtime's core: probes against the reference runtime's recorded
@@ -205,6 +214,35 @@ grep -c '"omamobile-launch", "show-with"' plugins/omamobile.switcher/Switcher.qm
 grep -c '"omamobile-launch", "own-screen"' plugins/omamobile.switcher/Switcher.qml >/dev/null || fail "the switcher moves apps to their own screen"
 grep -Fq 'live: false' plugins/omamobile.switcher/Switcher.qml \
   || fail "the switcher continuously captures recents previews"
+# Bottom-edge gestures: their picture layer must never take touches (the
+# keyboard and the finger's own surface keep them), they act only after the
+# lock check, and the feedback goes through the bounded haptic helper.
+grep -Fq 'mask: Region {}' plugins/omamobile.switcher/Switcher.qml \
+  || fail "the gesture layer is not click-through"
+grep -Fq '"omarchy-shell", "lock", "isLocked"' plugins/omamobile.switcher/Switcher.qml \
+  || fail "bottom-edge gestures act without checking the lock"
+grep -Fq '"timeout", "2", "omamobile-haptics", "pulse"' plugins/omamobile.switcher/Switcher.qml \
+  || fail "bottom-edge gesture feedback bypasses omamobile-haptics"
+grep -Fq 'singleton NavState 1.0 NavState.qml' plugins/omamobile.gestures/qmldir \
+  || fail "the gesture state singleton is not registered"
+grep -Fq 'namespace = "^omamobile-nav$" }, no_anim = true' hypr/phone.lua \
+  || fail "the gesture layer animates when it maps"
+if grep -nE 'omamobile-nav.*above_lock' hypr/phone.lua; then
+  fail "bottom-edge gestures show above the lock"
+fi
+# Home from a gesture or recents closes the drawer and the keyboard, and
+# recents with no app open go home instead of standing empty.
+grep -Fq '"omarchy-shell", "shell", "hide", "omamobile.launcher"' plugins/omamobile.switcher/Switcher.qml \
+  || fail "going home leaves the app drawer open"
+grep -Fq '"sm.puri.OSK0", "SetVisible", "b", "false"' plugins/omamobile.switcher/Switcher.qml \
+  || fail "going home leaves the keyboard up"
+grep -Fq 'if (windows.length === 0) Qt.callLater(goHome)' plugins/omamobile.switcher/Switcher.qml \
+  || fail "recents open empty instead of going home"
+grep -Fq 'onWindowsChanged: if (opened && windows.length === 0) Qt.callLater(goHome)' plugins/omamobile.switcher/Switcher.qml \
+  || fail "recents stay up after the last app closes"
+if grep -nE 'omamobile-switcher.*above_lock' hypr/phone.lua; then
+  fail "recents show above the lock"
+fi
 if command -v node >/dev/null; then
   node -e '
 const L = require("./plugins/omamobile.launcher/LauncherModel.js")
@@ -310,6 +348,11 @@ python3 -c 'import json; assert {"id": "omamobile.access"} in json.load(open("pr
   || fail "the phone profile enables the permission sheet"
 grep -c 'add_plugin omamobile.access' bin/omamobile-setup-user >/dev/null || fail "existing users get the permission sheet"
 grep -cx 'org.freedesktop.impl.portal.Access=omamobile;gtk' portal/hyprland-portals.conf >/dev/null || fail "Hyprland's portals.conf picks the sheet for Access only"
+! grep -q 'FileChooser' portal/hyprland-portals.conf || fail "the shell leaves the file chooser to the app profile"
+! grep -q 'xdg-desktop-portal-gnome' PKGBUILD || fail "the shell no longer depends on the GNOME portal"
+grep -q 'xdg-desktop-portal-gtk' PKGBUILD || fail "the shell keeps the gtk chooser fallback"
+grep -Fq 'o.bind("SUPER + SHIFT + F", "File manager", "uwsm-app -- xdg-open' hypr/phone.lua || fail "the file manager shortcut opens the default handler"
+! grep -v '^ *--' hypr/phone.lua | grep -q 'nautilus"' || fail "no shortcut names Nautilus"
 ! grep -c '^default' portal/hyprland-portals.conf >/dev/null || fail "the override leaves the default portals alone"
 grep -cx 'DBusName=org.freedesktop.impl.portal.desktop.omamobile' portal/omamobile.portal >/dev/null || fail "omamobile.portal names the service"
 grep -cx 'BusName=org.freedesktop.impl.portal.desktop.omamobile' systemd/user/omamobile-portal-access.service >/dev/null || fail "the unit owns the bus name"
@@ -340,7 +383,7 @@ grep -c "omarchy-done ensure $marker\$\|omarchy-done ensure $marker;" bin/omamob
 grep -cx 'ExecStart=/usr/bin/omamobile-setup-user' systemd/user/omamobile-setup-user.service >/dev/null || fail "the unit runs setup-user"
 [[ -x $tmp/root/usr/bin/omamobile-setup-user ]] || fail "setup-user is installed where the unit runs it"
 [[ -x $tmp/root/usr/bin/omamobile-portal-access && -f $tmp/root/usr/share/xdg-desktop-portal/portals/omamobile.portal \
-   && -f $tmp/root/etc/xdg/xdg-desktop-portal/hyprland-portals.conf \
+   && -f $tmp/root/etc/xdg-desktop-portal/hyprland-portals.conf \
    && -f $tmp/root/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.omamobile.service \
    && -f $tmp/root/usr/lib/systemd/user/omamobile-portal-access.service \
    && -f $tmp/root/usr/share/omamobile/shell/plugins/omamobile.access/AccessSheet.qml ]] \

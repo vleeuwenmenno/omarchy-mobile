@@ -1,0 +1,133 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Executes the unprivileged myron-mobile-data helper against fake mmcli and
+# systemctl: the packet-gate-aware state, off/on/idempotency, and the refusals
+# for stale, other-boot, unknown, audio-experiment and in-transition states.
+# Nothing touches a phone, a network or a unit.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+# shellcheck source=/dev/null
+source tests/lib/myron-sh-harness.sh
+
+helper_src=device/myron/main-overlay/usr/local/bin/myron-mobile-data
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+fake=$work/bin; calls=$work/calls; mkdir -p "$fake"
+boot=$work/boot_id; echo boot-A >"$boot"
+sh_patch "$helper_src" "$work/helper" "public_file=$work/state" "boot_id_file=$boot" \
+  "audio_experiment=$work/audio" "cellular_audio_experiment=$work/cell-audio"
+
+cat >"$fake/mmcli" <<'M'
+#!/bin/sh
+[ "$1" = -L ] && {
+	[ "${MODEMS:-1}" = 0 ] || echo "/org/freedesktop/ModemManager1/Modem/0 [Qualcomm] modem"
+	[ "${MODEMS:-1}" != 2 ] || echo "/org/freedesktop/ModemManager1/Modem/1 [Qualcomm] modem"
+	exit 0; }
+printf 'modem.3gpp.registration-state : %s\nmodem.generic.access-technologies.value[1] : lte\n' "${REG:-home}"
+M
+# systemctl: show reports $GATE_STATE (or an unloaded unit); start/stop log
+# and flip the gate state like the real oneshot unit would.
+cat >"$fake/systemctl" <<M
+#!/bin/sh
+case "\$1" in
+show) [ "\${GATE_STATE:-inactive}" = missing ] && { echo LoadState=not-found; echo ActiveState=inactive; exit 0; }
+      [ "\${GATE_STATE:-inactive}" = broken ] && exit 1
+      echo LoadState=loaded; echo ActiveState=\${GATE_STATE:-inactive} ;;
+start|stop) echo "systemctl \$*" >>$calls
+      [ "\${GATE_FAIL:-0}" = 0 ] || exit 1 ;;
+*) exit 1 ;;
+esac
+M
+chmod +x "$fake"/*
+
+setup() { # op evidence [boot]
+  printf 'boot_id=%s\nstate=%s\nevidence=%s\n' "${3:-boot-A}" "$1" "$2" >"$work/state"
+  rm -f "$work/audio" "$work/cell-audio"; : >"$calls"
+}
+# h [VAR=value...] verb
+h() { local a=("$@"); local verb=${a[-1]}; unset 'a[-1]'; env -i PATH="$fake:/usr/bin:/bin" "${a[@]}" sh "$work/helper" "$verb"; }
+val() { sed -n "s/^$2=//p" <<<"$1"; }
+expect_state() { # out data status enable busy label
+  [[ $(val "$1" data) == "$2" && $(val "$1" data_status) == "$3" && $(val "$1" data_enable) == "$4" && $(val "$1" data_busy) == "$5" ]] ||
+    fail "$6: got $(tr '\n' '|' <<<"$1")"
+}
+calls_are() { [[ $(cat "$calls") == "$1" ]] || fail "$2: calls were [$(cat "$calls")]"; }
+
+# state: live ungated bearer is on and toggleable; gated reads off.
+setup on valid
+expect_state "$(h GATE_STATE=inactive state)" on 'On · LTE' 1 0 'live bearer'
+expect_state "$(h GATE_STATE=active state)" off 'Off · LTE' 1 0 'gated bearer'
+expect_state "$(h GATE_STATE=activating state)" off 'Switching' 0 1 'gate activating'
+expect_state "$(h GATE_STATE=deactivating state)" off 'Switching' 0 1 'gate deactivating'
+expect_state "$(h GATE_STATE=failed state)" off 'Packet gate unavailable' 0 1 'gate failed'
+expect_state "$(h GATE_STATE=broken state)" off 'Packet gate unavailable' 0 1 'gate unknown'
+expect_state "$(h GATE_STATE=missing state)" off 'Packet gate unavailable' 0 1 'gate unit missing'
+setup idle valid
+expect_state "$(h state)" off 'Off · LTE' 1 0 'idle can start'
+expect_state "$(h GATE_STATE=active state)" off 'Packet gate stale' 0 1 'stale gate on idle'
+expect_state "$(h REG=searching state)" off 'Not registered' 0 0 'unregistered'
+setup idle invalid
+expect_state "$(h state)" off 'Needs attended setup' 0 0 'no evidence'
+# Supervisor failures are not hidden by an active gate.
+for op in restart unknown starting; do
+  setup $op valid
+  [[ $(val "$(h GATE_STATE=active state)" data_busy) == 1 ]] || fail "$op with gate is not busy"
+done
+setup restart valid
+[[ $(val "$(h GATE_STATE=active state)" data_status) == 'Restart to retry' ]] || fail 'gate hid a supervisor restart failure'
+setup on valid boot-B
+[[ $(val "$(h GATE_STATE=active state)" data_status) == 'Status unavailable' ]] || fail 'other-boot evidence read as live'
+setup on valid
+expect_state "$(h MODEMS=0 state)" none 'No modem' 0 0 'no modem'
+pass 'state: gate-aware on/off, transition and failed gates busy, supervisor failures kept'
+
+# off: live bearer starts the gate once; already gated is a no-op.
+setup on valid
+h GATE_STATE=inactive off; calls_are 'systemctl start myron-mobile-data-block.service' 'off starts gate'
+setup on valid
+h GATE_STATE=active off; calls_are '' 'off when already gated'
+setup idle valid
+h off; calls_are '' 'off with no bearer is already off'
+pass 'off: gates a live bearer once and is idempotent'
+
+# on: gate active stops it; live ungated is a no-op; idle starts the enable unit.
+setup on valid
+h GATE_STATE=active on; calls_are 'systemctl stop myron-mobile-data-block.service' 'on removes gate'
+setup on valid
+h GATE_STATE=inactive on; calls_are '' 'on when already on'
+setup idle valid
+h on; calls_are 'systemctl start --no-block myron-cellular-enable.service' 'on activates once'
+pass 'on: removes the gate, no-ops when on, otherwise one-shot activation'
+
+# Refusals never touch a unit.
+refuse() { # label env...
+  local label=$1; shift
+  for verb in on off; do
+    : >"$calls"
+    if h "$@" $verb 2>/dev/null; then fail "$label: $verb was accepted"; fi
+    calls_are '' "$label: $verb touched a unit"
+  done
+}
+setup on valid;  refuse 'gate activating' GATE_STATE=activating
+setup on valid;  refuse 'gate deactivating' GATE_STATE=deactivating
+setup on valid;  refuse 'gate failed' GATE_STATE=failed
+setup on valid;  refuse 'gate unknown' GATE_STATE=broken
+setup on valid;  refuse 'gate unit missing' GATE_STATE=missing
+setup on valid boot-B; refuse 'stale evidence' GATE_STATE=active
+setup restart valid;   refuse 'supervisor restart' GATE_STATE=active
+setup unknown valid;   refuse 'supervisor unknown' GATE_STATE=inactive
+setup starting valid;  refuse 'starting' GATE_STATE=inactive
+setup on valid;  refuse 'modem status unknown' MODEMS=2
+for f in audio cell-audio; do
+  setup on valid; : >"$work/$f"
+  refuse "audio experiment ($f)" GATE_STATE=active
+  [[ $(val "$(h state)" data_status) == 'Blocked by audio experiment' ]] || fail "audio state ($f)"
+done
+setup idle invalid
+if h on 2>/dev/null; then fail 'on without evidence was accepted'; fi
+calls_are '' 'on without evidence touched a unit'
+setup on valid
+if h GATE_STATE=inactive GATE_FAIL=1 off 2>/dev/null; then fail 'gate start failure was hidden'; fi
+pass 'refusals: transition, failed, unknown, stale, supervisor, audio and failures touch nothing'

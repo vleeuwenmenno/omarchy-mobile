@@ -1,0 +1,35 @@
+# Phone display policy: suppress blanked touch input and sample ambient light
+# before waking. Optional helper; desktops without it keep existing behavior.
+# Against Omarchy 4.0.6 after patch 0008.
+--- a/bin/omarchy-brightness-display
++++ b/bin/omarchy-brightness-display
+@@ -70,13 +70,29 @@
+ 
+ step="$1"
+ 
++# Serialize the whole transition, including the bounded ambient precheck.
++# A newer off must not finish while an older wake is still preparing.
++if [[ $step == off || $step == on ]]; then
++  exec {transition_fd}>"${XDG_RUNTIME_DIR:-/tmp}/omamobile-display-transition.lock"
++  flock "$transition_fd" || exit 1
++fi
++
+ if [[ $step == "off" ]]; then
++  if command -v omamobile-display >/dev/null; then
++    omamobile-display off || echo "Could not suppress touchscreen input" >&2
++  fi
+   hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1
+   panel_power 4
+   exit 0
+ elif [[ $step == "on" ]]; then
++  if command -v omamobile-display >/dev/null; then
++    timeout -k 0.2 2 omamobile-display prepare-wake || omamobile-display wake-fallback || exit 1
++  fi
+   # Before the check below: Hyprland can show a lit display whose panel is off.
+   panel_power 0
++  if command -v omamobile-display >/dev/null; then
++    omamobile-display touch-on || echo "Could not restore touchscreen input" >&2
++  fi
+   # Skip the dispatch when every active display is already lit: a redundant
+   # DPMS enable right after system resume forces another modeset, which blanks
+   # the panel for a beat (visible flash at the unlock screen).

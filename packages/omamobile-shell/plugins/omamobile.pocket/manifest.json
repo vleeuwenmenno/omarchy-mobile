@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "omamobile.pocket",
+  "name": "Pocket protection",
+  "version": "0.1.0",
+  "author": "Omarchy Mobile",
+  "license": "MIT",
+  "description": "Bounded proximity guard for power-button wakes; never unlocks the session.",
+  "kinds": [
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "Pocket.qml"
+  }
+}

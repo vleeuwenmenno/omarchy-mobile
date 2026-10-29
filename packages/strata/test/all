@@ -1,0 +1,21 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+bash -n PKGBUILD || fail "PKGBUILD parses"
+(
+  source ./PKGBUILD
+  [[ $pkgname == strata && ${arch[*]} == aarch64 ]] || exit 1
+  [[ $pkgver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
+  [[ ${#sha256sums[@]} == 1 && ${sha256sums[0]} =~ ^[0-9a-f]{64}$ ]] || exit 3
+  [[ ${source[0]} == https://github.com/lgse/strata/releases/download/v$pkgver/* ]] || exit 4
+  [[ $_source_commit =~ ^[0-9a-f]{40}$ ]] || exit 5
+  [[ " ${options[*]} " == *" !strip "* ]] || exit 6
+) || fail "PKGBUILD metadata (exit $?)"
+grep -q 'glibc>=2.39' PKGBUILD || fail "glibc minimum missing"
+grep -q "d6d8e41e1e00df7702e9a1a2624c3b8ee11b638a3a6db48f5ae2ef4db1188d4a" README.md || fail "README pin differs from PKGBUILD"
+grep -q "$(sed -n 's/^sha256sums=(.\(.*\).)$/\1/p' PKGBUILD)" README.md || fail "README digest differs"
+pass "pinned Strata release metadata"

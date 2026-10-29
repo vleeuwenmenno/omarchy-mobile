@@ -24,6 +24,8 @@ QtObject {
   readonly property color dimForeground: home ? home.dimForeground : "white"
   readonly property string timeFormat: home ? home.systemTimeFormat : "HH:mm"
   readonly property bool canRunCommands: capabilities.indexOf("commands") >= 0
+  // Opt-in lifecycle hint for sampling widgets; not a permission boundary.
+  readonly property bool active: !!home && home.userWidgetActive(instanceId)
 
   // ---------- settings and cache
 

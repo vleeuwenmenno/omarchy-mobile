@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Guarded Myron registered-cellular and protected-speaker bring-up
+Requires=myron-cellular.service myron-hardware-watchdog.service
+After=myron-cellular.service myron-hardware-watchdog.service
+Before=display-manager.service myron-omarchy-qualify.service
+Conflicts=myron-coexistence.service myron-audio-experiment.service myron-cellular-audio-experiment.service
+ConditionPathExists=/etc/omamobile/myron-main-audio
+ConditionPathExists=/run/myron-host/var/lib/omarchy-mobile/hardware-test.armed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myron-cellular-audio-start
+RemainAfterExit=yes
+TimeoutStartSec=4min
+
+[Install]
+WantedBy=multi-user.target

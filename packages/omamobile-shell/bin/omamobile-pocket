@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Bounded, tokenized pocket wake guard. Never unlocks the session."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import uuid
+
+loader = importlib.machinery.SourceFileLoader('display_policy', str(Path(__file__).with_name('omamobile-display')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+display = importlib.util.module_from_spec(spec)
+loader.exec_module(display)
+RUNTIME = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/' + str(os.getuid())))
+STATE = RUNTIME / 'omamobile-pocket.json'
+SETTING = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'omamobile/pocket.json'
+
+
+def read(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save(value):
+    tmp = STATE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(value) + '\n')
+    tmp.replace(STATE)
+
+
+def enabled():
+    return bool(display.configuration()) and read(SETTING).get('enabled', True)
+
+
+def run(argv, timeout=1):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'command failed: ' + argv[0])
+    return result.stdout.strip()
+
+
+def shell(*args):
+    return run(['omarchy-shell', *args])
+
+
+def hypr(code):
+    result = run(['hyprctl', 'eval', code])
+    if 'error' in result.lower():
+        raise RuntimeError(result)
+
+
+def proximity():
+    """Read the reported value after a bounded claim; never use pre-claim cache.
+
+    SensorProxy has no sample timestamp. The settling read is best-effort,
+    not proof of a new hardware measurement; expose this in diagnostics.
+    """
+    import gi
+    gi.require_version('Gio', '2.0')
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    deadline = time.monotonic() + .9
+    claimed = False
+    def call(interface, method, args=None):
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            raise TimeoutError('proximity deadline')
+        return bus.call_sync(display.NAME, display.OBJECT, interface, method, args, None,
+                             Gio.DBusCallFlags.NO_AUTO_START, remaining, None)
+    def props():
+        return call('org.freedesktop.DBus.Properties', 'GetAll',
+                    GLib.Variant('(s)', (display.NAME,))).unpack()[0]
+    try:
+        if props().get('HasProximity') is not True:
+            return None
+        claimed = True
+        call(display.NAME, 'ClaimProximity')
+        if not display.sensor_kept_alive(bus, 'Proximity'):
+            if deadline - time.monotonic() < .35:
+                return None
+            time.sleep(.3)
+        values = props()
+        near = values.get('ProximityNear')
+        return near if values.get('HasProximity') is True and isinstance(near, bool) else None
+    finally:
+        if claimed:
+            try:
+                bus.call_sync(display.NAME, display.OBJECT, display.NAME, 'ReleaseProximity',
+                              None, None, Gio.DBusCallFlags.NO_AUTO_START, 150, None)
+            except GLib.Error:
+                pass
+
+
+def panel():
+    return display.Panel(display.configuration())
+
+
+def matching(token, state=None):
+    value = read(STATE) if state is None else state
+    return value.get('active') is True and value.get('token') == token
+
+
+def ready(token):
+    data = json.loads(shell('shell', 'call', 'omamobile.pocket', 'state', ''))
+    monitors = json.loads(run(['hyprctl', 'monitors', '-j']))
+    expected = {m['name'] for m in monitors if not m.get('disabled')}
+    layers = json.loads(run(['hyprctl', 'layers', '-j']))
+    covered = {name for name, monitor in layers.items()
+               if any(x.get('namespace') == 'omamobile-pocket'
+                      for rows in monitor.get('levels', {}).values() for x in rows)}
+    return (run(['hyprctl', 'submap']) == 'omamobile-pocket'
+            and data.get('token') == token and data.get('active') and expected
+            and expected <= set(data.get('screens', [])) and expected <= covered)
+
+
+def attempt_all(actions):
+    errors = []
+    for action in actions:
+        try:
+            action()
+        except Exception as error:
+            errors.append(str(error))
+    if errors:
+        raise RuntimeError('; '.join(errors))
+
+
+def clear_locked(p, reason):
+    # Attempt every recovery step even if one IPC endpoint is unavailable.
+    state = read(STATE)
+    state.update(active=False, phase='idle', reason=reason)
+    token = state.get('token', '')
+    def keys():
+        for name in ('power', 'long', 'chord'):
+            (RUNTIME / 'omamobile-keys' / name).unlink(missing_ok=True)
+    def brightness():
+        with p.locked():
+            current = p.state()
+            current.update(mode='waiting' if p.lit() else 'off', manual=False, last_raw=p.raw())
+            p.save(current)
+    actions = [lambda: save(state), keys,
+               lambda: hypr('hl.dispatch(hl.dsp.submap("reset"))'),
+               lambda: shell('lock', 'pocket', ''), brightness]
+    if token:
+        actions.append(lambda: run(['systemctl', '--user', 'stop',
+                                    'omamobile-pocket-expire@' + token + '.timer']))
+    attempt_all(actions)
+
+
+def off_locked(p, reason):
+    # No recursive brightness-display call: caller owns transition lock.
+    def state_off():
+        with p.locked():
+            current = p.state()
+            current.update(mode='off', manual=False, wake_until=0, lux=None)
+            p.save(current)
+    try:
+        attempt_all([lambda: display.touch(False),
+                     lambda: hypr('hl.dispatch(hl.dsp.dpms({ action = "disable" }))'),
+                     lambda: (p.path / 'bl_power').write_text('4'), state_off])
+    finally:
+        clear_locked(p, reason)
+
+
+def begin():
+    # Called after ambient preparation, while brightness-display holds the
+    # transition lock and the panel is still dark.
+    p = panel()
+    if p.lit() or not enabled():
+        return
+    if read(STATE).get('active'):
+        raise RuntimeError('previous pocket wake still pending')
+    try:
+        near = proximity()
+    except Exception as error:
+        print('Proximity unavailable: ' + str(error), file=sys.stderr)
+        near = None
+    if near is False:
+        save(dict(active=False, phase='idle', near=False, source='reported-after-claim', checked_at=time.time()))
+        print('pocket=far source=reported-after-claim', flush=True)
+        return
+    token = uuid.uuid4().hex
+    save(dict(active=True, token=token, phase='preparing', near=near, deadline=0))
+    try:
+        # Lock's own handlers must reject input even if compositor keyboard
+        # focus moves back below our layer surface.
+        if shell('lock', 'pocket', token) != 'ok':
+            raise RuntimeError('PIN input gate unavailable')
+        hypr('hl.dispatch(hl.dsp.submap("omamobile-pocket"))')
+        run(['systemctl', '--user', '--no-block', 'start', 'omamobile-pocket@' + token + '.service'])
+        with p.locked():
+            p.write(p.c['min_percent'], p.state())
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if (ready(token) and run(['systemctl', '--user', 'is-active',
+                                      'omamobile-pocket@' + token + '.service']) == 'active'):
+                return
+            time.sleep(.08)
+        raise RuntimeError('pocket shield did not cover every display')
+    except Exception:
+        off_locked(p, 'prepare-failed')
+        raise
+
+
+def watch(token):
+    p = panel()
+    limit = time.monotonic() + 5
+    while matching(token) and not p.lit() and time.monotonic() < limit:
+        time.sleep(.05)
+    with p.transition():
+        if not matching(token):
+            return
+        if not p.lit() or not ready(token):
+            off_locked(p, 'wake-failed')
+            return
+        run(['systemctl', '--user', 'start', 'omamobile-pocket-expire@' + token + '.timer'])
+        state = read(STATE)
+        state.update(phase='blocked', deadline=time.monotonic() + 5,
+                     deadline_wall=time.time() + 5)
+        save(state)
+    while matching(token):
+        state = read(STATE)
+        if time.monotonic() >= state['deadline']:
+            break
+        if not ready(token):
+            break
+        # An input method cannot appear above the guard.
+        subprocess.run(['busctl', '--user', '--timeout=.2', 'call', 'sm.puri.OSK0',
+                        '/sm/puri/OSK0', 'sm.puri.OSK0', 'SetVisible', 'b', 'false'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=.3)
+        time.sleep(.1)
+    expire(token)
+
+
+def expire(token):
+    p = panel()
+    with p.transition():
+        if matching(token):
+            off_locked(p, 'timeout-or-shield-loss')
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else 'status'
+    if command == 'status':
+        print(json.dumps(dict(read(STATE), available=bool(display.configuration()), enabled=enabled())))
+    elif command == 'active':
+        return 0 if read(STATE).get('active') else 1
+    elif command == 'begin':
+        if display.configuration():
+            begin()
+    elif command == 'cancel':
+        # brightness-display has already disabled touch and blanked the panel.
+        if read(STATE).get('active'):
+            clear_locked(panel(), 'screen-off')
+    elif command in ('watch', 'expire'):
+        token = sys.argv[2]
+        if len(token) != 32 or any(c not in '0123456789abcdef' for c in token):
+            raise ValueError('invalid wake token')
+        (watch if command == 'watch' else expire)(token)
+    elif command == 'dismiss':
+        p = panel()
+        with p.transition():
+            state = read(STATE)
+            if (matching(sys.argv[2], state) and state.get('phase') == 'blocked'
+                    and time.monotonic() < state.get('deadline', 0) and p.lit()):
+                clear_locked(p, 'swipe')
+    elif command == 'power-off':
+        # Consume the release after restoring the normal submap too.
+        directory = RUNTIME / 'omamobile-keys'
+        directory.mkdir(exist_ok=True)
+        (directory / 'pocket-consumed').touch()
+        p = panel()
+        with p.transition():
+            if read(STATE).get('active'):
+                off_locked(p, 'power-button')
+            else:
+                clear_locked(p, 'recover-input')
+    elif command in ('on', 'off'):
+        p = panel()
+        with p.transition():
+            if read(STATE).get('active'):
+                raise RuntimeError('dismiss the guard before changing its setting')
+            SETTING.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SETTING.with_suffix('.tmp')
+            tmp.write_text(json.dumps({'enabled': command == 'on'}) + '\n')
+            tmp.replace(SETTING)
+    else:
+        raise ValueError('unknown command')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print('omamobile-pocket: ' + str(error), file=sys.stderr)
+        sys.exit(1)

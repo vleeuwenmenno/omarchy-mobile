@@ -75,6 +75,26 @@ if printf '%s\n' "$bus_names" | awk '$1 == "org.freedesktop.ModemManager1" { fou
   fi
 fi
 
+sensor_proxy_owner=no
+sensor_accelerometer=no
+sensor_ambient_light=no
+sensor_proximity=no
+if printf '%s\n' "$bus_names" |
+    awk '$1 == "net.hadess.SensorProxy" { found=1 } END { exit !found }'; then
+  sensor_proxy_owner=yes
+  for property in HasAccelerometer HasAmbientLight HasProximity; do
+    value=$(timeout 5 busctl --system get-property \
+      net.hadess.SensorProxy /net/hadess/SensorProxy \
+      net.hadess.SensorProxy "$property" 2>/dev/null || true)
+    [ "$value" = 'b true' ] || continue
+    case $property in
+      HasAccelerometer) sensor_accelerometer=yes ;;
+      HasAmbientLight) sensor_ambient_light=yes ;;
+      HasProximity) sensor_proximity=yes ;;
+    esac
+  done
+fi
+
 [ -d "$persist_dir" ] && [ ! -L "$persist_dir" ] || die 'persistent log directory is invalid'
 [ ! -L "$persist_log" ] || die 'persistent peripheral log is linked'
 temporary=$(mktemp "$persist_dir/.myron-peripheral-audit.XXXXXX")
@@ -86,11 +106,14 @@ printf '%s\n' \
   "haptic_inputs=$haptic_count force_feedback=$haptic_ff" \
   "camera_module=$(module_state camera) mmrm_module=$(module_state msm_mmrm) video_nodes=$video_count media_nodes=$media_count v4l_subdev_nodes=$v4l_subdev_count" \
   "fingerprint_module=$(module_state mi_fp) fingerprint_nodes=$fingerprint_node_count" \
+  "sensor_proxy=$sensor_proxy_owner accelerometer=$sensor_accelerometer ambient_light=$sensor_ambient_light proximity=$sensor_proximity" \
   "telephony_owner=$telephony_owner modem_objects=$modem_object_count voice_interface=$voice_interface messaging_interface=$messaging_interface" \
   >"$temporary"
 mv -f "$temporary" "$persist_log"
 trap - EXIT HUP INT TERM
-printf 'result=complete iio=%s motion_iio=%s haptics=%s ff=%s camera_nodes=%s/%s/%s fingerprint_nodes=%s telephony=%s voice=%s messaging=%s writes=none identifiers=not-collected\n' \
-  "$iio_count" "$motion_iio_count" "$haptic_count" "$haptic_ff" \
+printf 'result=complete iio=%s motion_iio=%s sensors=%s/%s/%s/%s haptics=%s ff=%s camera_nodes=%s/%s/%s fingerprint_nodes=%s telephony=%s voice=%s messaging=%s writes=none identifiers=not-collected\n' \
+  "$iio_count" "$motion_iio_count" \
+  "$sensor_proxy_owner" "$sensor_accelerometer" "$sensor_ambient_light" "$sensor_proximity" \
+  "$haptic_count" "$haptic_ff" \
   "$video_count" "$media_count" "$v4l_subdev_count" "$fingerprint_node_count" \
   "$telephony_owner" "$voice_interface" "$messaging_interface"

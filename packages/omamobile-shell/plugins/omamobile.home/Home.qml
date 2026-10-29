@@ -538,9 +538,12 @@ Item {
   // no change events, so it is read every 2 s, a cheap file read.
   property bool owlPanelOff: false
   property string owlBacklight: ""
+  readonly property bool hasUserWidgets: layout.pages.some(function(page) {
+    return page.items.some(function(item) { return HomeModel.isUserType(item.type) })
+  })
   Process {
     command: ["omarchy-hw-display"]
-    running: root.owlEnabled
+    running: root.owlEnabled || root.hasUserWidgets
     stdout: StdioCollector { id: displayName; waitForEnd: true; onStreamFinished: root.owlBacklight = String(displayName.text || "").trim().split("\n")[0] }
   }
   FileView {
@@ -552,7 +555,7 @@ Item {
   Timer {
     interval: 2000
     repeat: true
-    running: root.owlEnabled && root.owlBacklight !== ""
+    running: (root.owlEnabled || root.hasUserWidgets) && root.owlBacklight !== ""
     onTriggered: blPower.reload()
   }
 
@@ -562,6 +565,10 @@ Item {
   function owlActive(entryId) {
     const found = HomeModel.findItem(layout, entryId)
     return !!found && Math.abs(found.page - currentPage) <= 1 && !owlPaused
+  }
+  function userWidgetActive(entryId) {
+    const found = HomeModel.findItem(layout, entryId)
+    return !!found && found.page === currentPage && !owlPaused && !editing && sheet === ""
   }
 
   // The palette OWL names resolve to: the Omarchy theme, with the names that
@@ -1132,6 +1139,33 @@ Item {
           gesturePolicy: TapHandler.DragThreshold
           longPressThreshold: 0.5
           onLongPressed: root.requestEdit()
+        }
+      }
+
+      // ---------- swipe down on home background: search
+      // Opens the launcher drawer with its input focused (and so the
+      // keyboard), like the dock's search pill. Passive, like the long-press
+      // above: the pager still swipes sideways and widgets keep their touch. It
+      // starts over widgets too; a sideways drag is the pager's, not ours.
+      Item {
+        anchors.fill: pager
+        z: 50
+        PointHandler {
+          id: searchSwipe
+          property bool fired: false
+          enabled: !root.editing && root.sheet === ""
+          onActiveChanged: {
+            if (active) fired = false
+            else if (fired && !root.editing && root.sheet === "") {
+              Quickshell.execDetached(["omarchy-shell", "shell", "summon", "omamobile.launcher", "{}"])
+            }
+          }
+          onPointChanged: {
+            if (!active || pager.dragging || pager.moving) return
+            var dy = point.scenePosition.y - point.scenePressPosition.y
+            var dx = point.scenePosition.x - point.scenePressPosition.x
+            fired = dy >= Style.space(64) && dy >= Math.abs(dx) * 2
+          }
         }
       }
 

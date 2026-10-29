@@ -17,6 +17,7 @@ OnFailure=myron-main-recover.service
 Type=simple
 RemainAfterExit=yes
 Environment=PATH=/run/myron-main/bin:/usr/bin
+ExecStartPre=/run/myron-main/bin/busybox sh /usr/local/libexec/myron-main-guard-policy
 ExecStartPre=/run/myron-main/bin/busybox sh /run/myron-main/myron-main-os guard-preflight
 ExecStart=/run/myron-main/bin/busybox sh /run/myron-main/myron-main-os guard
 Restart=no

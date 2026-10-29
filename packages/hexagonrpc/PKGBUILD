@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Omarchy Mobile contributors
+pkgname=hexagonrpc
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Free FastRPC reverse-tunnel daemon for Qualcomm DSPs"
+arch=(aarch64)
+url="https://github.com/linux-msm/hexagonrpc"
+license=(GPL-3.0-or-later)
+depends=(glibc json-c)
+makedepends=(meson)
+source=(
+  "$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+  0001-hexagonfs-map-sensor-config-under-odm.patch
+  0002-sscregistrygen-ignore-non-json-inputs.patch
+  hexagonrpc.sysusers
+)
+sha256sums=(
+  '2173985932ab68d8ac593f9954357123bdbbbe9ba5f1b17a098d9cbcec22c5d5'
+  'e296c9cbe2be8c7d517cc210f47cf87550e80331c290f92a1ab5c65c1527a1c7'
+  '4b888986999114c93c44a9553974f077b1ca0d6871577d119f1ba339221c4eee'
+  '1d35656f73292c0b93afa4f90b4666ef253620f96b5c3a0fb989c2382f1fc3e3'
+)
+
+prepare() {
+  cd "$srcdir/hexagonrpc-$pkgver"
+  patch -Np1 <"$srcdir/0001-hexagonfs-map-sensor-config-under-odm.patch"
+  patch -Np1 <"$srcdir/0002-sscregistrygen-ignore-non-json-inputs.patch"
+}
+
+build() {
+  arch-meson "$srcdir/hexagonrpc-$pkgver" build
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 "$srcdir/hexagonrpc.sysusers" \
+    "$pkgdir/usr/lib/sysusers.d/hexagonrpc.conf"
+}

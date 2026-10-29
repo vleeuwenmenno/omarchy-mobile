@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+# Started at boot when the image carries the private assets and the composer
+# wrote the enable marker. Bounded: the ADSP FastRPC wait, the registry
+# tunnel and the accelerometer sample all have their own limits.
+[Unit]
+Description=Stage Myron SSC sensors from private read-only assets
+ConditionPathExists=/etc/omamobile/myron-sensors-enable
+ConditionPathExists=/usr/share/qcom/sm8850/Xiaomi/myron/sensors/sns_reg.conf
+# The stage synchronously starts/restarts SensorProxy after registry loading.
+# Do not order this unit after that service: its restart must not wait on us.
+
+[Service]
+Type=oneshot
+# ADSP brings up the secure FastRPC node during boot; wait at most 60 s.
+ExecStartPre=/bin/sh -c 'i=0; while [ ! -c /dev/fastrpc-adsp-secure ]; do i=$$((i+1)); [ "$$i" -le 60 ] || exit 1; sleep 1; done'
+ExecStart=/usr/local/sbin/myron-sensor-stage
+TimeoutStartSec=105
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

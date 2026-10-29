@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: MIT
+// Applications use GeoClue for location and the bounded Myron units for data.
+// Direct modem control can bypass Location Off or reopen the unsafe IPA link.
+// NetworkManager and the bounded helpers run as root; GeoClue has its own
+// vendor grant. Leave those identities to their existing authorization rules.
+polkit.addRule(function(action, subject) {
+  if (action.id != "org.freedesktop.ModemManager1.Location" &&
+      action.id != "org.freedesktop.ModemManager1.Device.Control")
+    return;
+  if (subject.user == "root" || subject.user == "geoclue")
+    return;
+  return polkit.Result.NO;
+});

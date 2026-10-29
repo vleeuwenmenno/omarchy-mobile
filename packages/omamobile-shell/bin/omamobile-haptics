@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Bounded, opt-out UI feedback for the qualified Myron evdev driver."""
+import fcntl
+import glob
+import json
+import os
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import time
+
+STATE = Path(os.environ.get('XDG_STATE_HOME', str(Path.home()/'.local/state'))) / 'omamobile'
+RUNTIME = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/'+str(os.getuid())))
+
+def device():
+    for path in glob.glob('/sys/class/input/event*/device/name'):
+        if Path(path).read_text().strip() == 'qcom-hv-haptics':
+            return '/dev/input/'+Path(path).parent.parent.name
+    return None
+
+def enabled():
+    return not (STATE/'haptics-disabled').exists()
+
+def safe():
+    try:
+        pocket=RUNTIME/'omamobile-pocket.json'
+        if pocket.exists() and json.loads(pocket.read_text()).get('active'):
+            return False
+        panels=list(Path('/sys/class/backlight').glob('*/bl_power'))
+        if not panels or any(p.read_text().strip() != '0' for p in panels):
+            return False
+        p=subprocess.run(['omarchy-shell','lock','isLocked'],capture_output=True,text=True,timeout=1)
+        return p.returncode == 0 and p.stdout.strip() == 'false'
+    except (OSError,ValueError,subprocess.TimeoutExpired):
+        return False
+
+def pulse():
+    if not enabled() or not safe():
+        return
+    path=device()
+    if not path or struct.calcsize('P') != 8:
+        return
+    with (RUNTIME/'omamobile-haptics.lock').open('a+') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: return
+        lock.seek(0)
+        try: previous=json.loads(lock.read() or '[]')
+        except ValueError: previous=[]
+        now=time.monotonic()
+        previous=[t for t in previous if 0 <= now-t < 10]
+        if len(previous)>=6 or (previous and now-previous[-1]<0.3):
+            return
+        lock.seek(0);lock.truncate();lock.write(json.dumps(previous+[now]));lock.flush()
+        fd=os.open(path,os.O_RDWR|os.O_CLOEXEC|os.O_NOFOLLOW)
+        effect_id=None
+        try:
+            name=bytearray(128)
+            fcntl.ioctl(fd,0x80804506,name,True)
+            if name.split(b'\0')[0] != b'qcom-hv-haptics':
+                return
+            # Linux 64-bit ff_effect ABI: union begins at byte 16, size 48.
+            effect=bytearray(48)
+            struct.pack_into('HhHHHHH',effect,0,0x52,-1,0,0,0,35,0)
+            struct.pack_into('h',effect,16,4096)
+            fcntl.ioctl(fd,0x40304580,effect,True)
+            effect_id=struct.unpack_from('h',effect,2)[0]
+            event=lambda value: struct.pack('llHHi',0,0,0x15,effect_id,value)
+            os.write(fd,event(1))
+            time.sleep(.07)
+        finally:
+            try:
+                if effect_id is not None:
+                    os.write(fd,struct.pack('llHHi',0,0,0x15,effect_id,0))
+                    fcntl.ioctl(fd,0x40044581,effect_id)
+            finally: os.close(fd)
+
+def main():
+    command=sys.argv[1] if len(sys.argv)>1 else 'status'
+    if command == 'status':
+        path=device()
+        print(json.dumps(dict(available=bool(path and os.access(path,os.W_OK)),enabled=enabled())))
+    elif command in ('on','off'):
+        STATE.mkdir(parents=True,exist_ok=True)
+        if command == 'off': (STATE/'haptics-disabled').touch()
+        else: (STATE/'haptics-disabled').unlink(missing_ok=True)
+    elif command == 'pulse': pulse()
+    else: raise ValueError('expected status, on, off or pulse')
+
+if __name__=='__main__':
+    try: main()
+    except (OSError,ValueError) as error:
+        print('omamobile-haptics: '+str(error),file=sys.stderr)
+        sys.exit(1)

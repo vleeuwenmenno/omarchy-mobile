@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "power_key_only": true,
+  "backlight": "panel0-backlight",
+  "min_percent": 3,
+  "max_percent": 55,
+  "wake_max_percent": 15,
+  "rise_per_second": 2,
+  "fall_per_second": 1.5,
+  "fast_rise_per_second": 5,
+  "fast_fall_per_second": 5
+}

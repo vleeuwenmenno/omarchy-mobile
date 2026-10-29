@@ -1,0 +1,78 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Run as root on the existing Omarchy boot. Inspect owner stock slot-B files;
+# never execute a HAL, open a fingerprint node, or access calibration storage.
+# Pinned to the single-extent vendor_b/odm_b layout verified on 2026-10-29.
+set -eu
+umask 077
+work=/var/tmp/myron-fingerprint-stock-20261029-r4
+vendor_loop=
+odm_loop=
+fail() { echo "ERROR: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'root required for read-only loop mounts'
+grep -qx 'ID=omarchy' /etc/os-release || fail 'Omarchy required'
+grep -qx 'PARTNAME=super' /sys/class/block/sda33/uevent || fail 'super identity differs'
+[ "$(cat /sys/class/block/sda33/dev)" = '259:41' ] || fail 'super device differs'
+[ -b /dev/sda33 ] && [ "$(stat -c '%t:%T' /dev/sda33)" = '103:29' ] || fail 'super node differs'
+[ ! -e "$work" ] || fail 'inventory already exists; preserve it'
+for cmd in losetup mount umount mountpoint findmnt tar sha256sum readelf find awk cp blkid; do command -v "$cmd" >/dev/null || fail "missing $cmd"; done
+loader=/run/myron-host/lib/ld-musl-aarch64.so.1
+dumper=/run/myron-host/usr/bin/lpdump
+[ -x "$loader" ] && [ -x "$dumper" ] || fail 'read-only metadata tool unavailable'
+metadata=$("$loader" --library-path /run/myron-host/lib:/run/myron-host/usr/lib "$dumper" -s 1 /dev/sda33)
+check_extent() {
+  printf '%s\n' "$metadata" | awk -v name="$1" -v extent="$2" '
+    $1 == "Name:" { selected=($2 == name) }
+    selected && $1 == "Attributes:" { ro=($2 == "readonly") }
+    selected && $4 == "linear" { count++; line=$1 " " $2 " " $3 " " $4 " " $5 " " $6 }
+    END { exit !(ro && count == 1 && line == extent) }' || fail "unexpected $1 layout"
+}
+check_extent vendor_b '0 .. 2261591 linear super 7239680'
+check_extent odm_b '0 .. 8940999 linear super 9754624'
+mkdir -m700 "$work"
+mkdir "$work/vendor" "$work/odm" "$work/files"
+cleanup() {
+  for path in "$work/odm" "$work/vendor"; do
+    if mountpoint -q "$path"; then umount "$path" || return 1; fi
+  done
+  [ -z "$odm_loop" ] || losetup -d "$odm_loop"
+  [ -z "$vendor_loop" ] || losetup -d "$vendor_loop"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+printf '%s\n' "$metadata" > "$work/logical-partitions.txt"
+vendor_loop=$(losetup --find --show --read-only --offset $((7239680 * 512)) --sizelimit $((2261592 * 512)) /dev/sda33)
+odm_loop=$(losetup --find --show --read-only --offset $((9754624 * 512)) --sizelimit $((8941000 * 512)) /dev/sda33)
+mount_stock() {
+  kind=$(blkid -p -s TYPE -o value "$1")
+  case "$kind" in
+    ext4) mount -t ext4 -o ro,noload,nosuid,nodev,noexec "$1" "$2" ;;
+    erofs) mount -t erofs -o ro,nosuid,nodev,noexec "$1" "$2" ;;
+    *) fail "unsupported stock filesystem: $kind" ;;
+  esac
+}
+mount_stock "$vendor_loop" "$work/vendor"
+mount_stock "$odm_loop" "$work/odm"
+for path in "$work/vendor" "$work/odm"; do
+  findmnt -rn -M "$path" -o OPTIONS | grep -q '^ro,' || fail 'mount is not read-only'
+done
+find "$work/vendor" "$work/odm" -maxdepth 4 -type f   \( -iname '*finger*' -o -iname '*mfp*' -o -iname '*goodix*' -o -name 'libgf*' \) -print > "$work/candidate-paths.txt"
+: > "$work/hashes.txt"
+: > "$work/elf-needed.txt"
+for relative in vendor/bin/hw/android.hardware.biometrics.fingerprint-service.xiaomi odm/lib64/hw/fingerprint.goodix_us2.default.so odm/lib64/libgf_hal.so vendor/etc/init/android.hardware.biometrics.fingerprint-service.xiaomi.rc vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint-service.xiaomi.xml odm/etc/vintf/manifest/fod-aidl.xml vendor/lib64/libQSEEComAPI.so; do
+  src=$work/$relative
+  if [ ! -f "$src" ] || [ -L "$src" ]; then printf "missing=%s\n" "$relative" >> "$work/hashes.txt"; continue; fi
+  mkdir -p "$work/files/${relative%/*}"
+  cp "$src" "$work/files/$relative"
+  sha256sum "$src" >> "$work/hashes.txt"
+  case "$relative" in *.so|*/android.hardware.biometrics.fingerprint-service.xiaomi) printf "\nFILE %s\n" "$relative" >> "$work/elf-needed.txt"; readelf -Wd "$src" >> "$work/elf-needed.txt" ;; esac
+done
+find "$work/vendor/etc/vintf" "$work/odm/etc/vintf" -type f -iname '*finger*' -print > "$work/vintf-paths.txt"
+for p in "$work/vendor/etc/vintf" "$work/odm/etc/vintf"; do
+  grep -R -n -i -E 'fingerprint|goodix' "$p" >> "$work/vintf-references.txt" || true
+done
+# The archive is private owner material, never a repository/build input by default.
+tar -C "$work" -cf "$work/inspection.tar" files candidate-paths.txt logical-partitions.txt hashes.txt elf-needed.txt vintf-paths.txt vintf-references.txt
+chmod 0600 "$work/inspection.tar"
+case ${SUDO_UID:-} in ''|*[!0-9]*) ;; *) chown "$SUDO_UID" "$work/inspection.tar"; chmod 0711 "$work" ;; esac
+printf 'archive=%s/inspection.tar\n' "$work"

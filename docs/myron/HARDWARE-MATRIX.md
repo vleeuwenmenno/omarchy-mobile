@@ -1,7 +1,10 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Myron feature-preservation matrix
 
-Snapshot: 2026-10-24. Status describes the postmarketOS reference, not Arch.
+For current priorities, live-state caveats and test boundaries, read
+[STATUS.md](STATUS.md). The tables below retain historical reference evidence.
+
+Snapshot: 2026-10-27. Status describes the postmarketOS reference, not Arch.
 Every working row is a regression-protected requirement for the port.
 
 Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
@@ -17,7 +20,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | Buttons | VERIFIED_WORKING | Power and volume inputs present and used in the reference shell. |
 | Brightness | VERIFIED_WORKING | `panel0-backlight`, range 0-16383; Plasma control proven. |
 | DisplayPort | PRESENT_UNTESTED | card0-DP-1 exists and was disconnected during audit. |
-| Rotation / motion sensors | BROKEN | No accelerometer/gyro integration; only ADC IIO devices appeared live. |
+| Rotation / motion sensors | PARTIAL | Qualcomm SSC returned live accelerometer, gyro and compass samples after a bounded manual registry load. Omarchy autorotation and touch-transform alignment remain untested. |
 | Haptics | PRESENT_UNTESTED | `qcom-hv-haptics` input device exists; no attended vibration test recorded. |
 | Qualcomm DRM/KMS | VERIFIED_WORKING | card0 is msm_drm/qcom SDE; direct native Hyprland modeset passed. |
 | KGSL | VERIFIED_WORKING | `/dev/kgsl-3d0`, Adreno840v2; KWin/Hyprland and apps opened it. |
@@ -47,7 +50,7 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 
 | Feature | Status | Evidence and Arch acceptance |
 | --- | --- | --- |
-| Speaker output | VERIFIED_WORKING | Omarchy opened the physical three-channel TDM graph with the amplifiers off, then completed one 250 ms 440 Hz probe at -45 dBFS. All three TFA amplifiers reached ready state, returned to Powerdown, and stayed below 49 C. |
+| Speaker output | PARTIAL | Earlier attended runs confirmed the OEM MIPLAY/TFA bridge acoustically. The later radio-coexistence raw probe completed silently, and both corrective FIFO runs timed out before acoustic playback. A PCM-start handshake is prepared but not hardware-tested. |
 | Earpiece | UNKNOWN | No verified call/earpiece route. |
 | Microphones | PARTIAL | Omarchy AudioReach captured one second at 48 kHz with 41,615 nonzero samples, discarded the recording, and restored mixer state. PipeWire app path and quality remain open. |
 | Headphones / USB audio | PRESENT_UNTESTED | No attended route test recorded. |
@@ -77,10 +80,11 @@ Statuses: `VERIFIED_WORKING`, `PARTIAL`, `EXPERIMENTAL`, `PRESENT_UNTESTED`,
 | Cameras | PARTIAL | Qualcomm request manager/sync and 27 subdevices were proven earlier; current userspace exposes no video/media nodes and no frame capture. |
 | Flashlight / torch | VERIFIED_WORKING | Plasma toggle and intensity slider passed after reboot. |
 | Fingerprint | BROKEN | Not integrated. |
-| Accelerometer | BROKEN | Not integrated. |
-| Gyroscope | BROKEN | Not integrated. |
-| Proximity | BROKEN | Not integrated. |
-| Ambient light | BROKEN | Not integrated. |
+| Accelerometer | PARTIAL | LSM6DSV produced live three-axis samples through SSC; persistent Omarchy staging remains disabled. |
+| Gyroscope | PARTIAL | LSM6DSV produced live angular-velocity samples through SSC; no graphical rotation test yet. |
+| Magnetometer / compass | OWNER_ACCEPTED | Owner accepted the Omarchy compass on 2026-10-28 for the development baseline. Dial and turn direction work; measured +17° to +30° reference difference and +8° return difference remain documented. Accuracy refinement is parked. |
+| Proximity | PARTIAL | SSC returned a live `FAR` result and SensorProxy advertised proximity support. |
+| Ambient light | PRESENT_UNTESTED | STK6B9x configuration loaded and SensorProxy advertised ambient light, but no sample arrived in the unattended window. |
 | Storage | VERIFIED_WORKING | Persistent ext4 `pmos_root`; current public install path intentionally absent. |
 | RTC / time | PARTIAL | PMIC RTC counter exists; counter-offset bootstrap plus Chrony works, writable wall-clock RTC does not. |
 | Lock authentication | BROKEN | PIN submission currently waits indefinitely despite compositor stability. |
@@ -107,11 +111,34 @@ reference statuses above:
   ModemManager/GNSS caused an immediate hard reboot. A later separate clean
   boot passed the checkpointed mapper, ADSP, codec, microphone and speaker
   path; mixing those subsystem sequences remains forbidden.
-- **Present but unverified on Omarchy:** UPower UI and haptics. Only two ADC
-  IIO nodes exist, and no camera/media or fingerprint node is exposed.
+- **Present but unverified on Omarchy:** UPower UI and haptics. Motion sensors
+  do not appear as ordinary IIO nodes; a later bounded pmOS test proved they
+  work through Qualcomm SSC, but Omarchy staging and rotation are not yet run.
+  No camera/media or fingerprint node is exposed.
 - **Not integrated on Omarchy:** SMS, voice calls/call audio, fingerprint and
   camera capture. The current reference boot also exposes no camera/media or
   fingerprint character nodes, and only two ADC IIO devices.
+
+## Owner confirmation reported 2026-10-28
+
+The owner reports that the torch appeared to work in the last session they
+tested, and that both the torch-intensity slider and the display-brightness
+slider worked. Treat these controls as user-confirmed working for that tested
+session. The report does not identify a boot/image or establish repeated-boot
+persistence; it is not a fresh automated hardware test.
+
+Display-brightness slider quality-of-life improvements are deferred at the
+owner's request. Automatic brightness and the earlier zero
+`actual_brightness` readback issue remain separate, unverified items. The
+historical r5 observations above are retained as historical evidence.
+
+The owner also reports that a previously tested USB dongle appeared to work.
+The dongle type and exercised functions were not specified, so this records
+basic user-observed dongle functionality without qualifying all USB audio,
+storage, display, power-delivery or reconnect behavior. Further USB/dongle
+qualification moves to the bottom of the current hardware backlog, below
+fingerprint enrollment and camera bring-up. Sensors and rotation remain the
+immediate priority; speaker output remains parked.
 
 ## Evidence sources
 

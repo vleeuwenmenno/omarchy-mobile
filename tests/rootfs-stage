@@ -491,7 +491,7 @@ for p in modemmanager libqmi geoclue pipewire wireplumber rtkit chrony bluez blu
   mesa-utils vulkan-tools; do
   grep -qx "$p" rootfs/packages.base.myron || fail "Myron base profile misses $p"
 done
-for p in omamobile-apps-myron mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland \
+for p in omamobile-apps-myron strata mesa-myron-zink-turnip omamobile-myron-gpu-profile hyprland \
   qrtr rmtfs tqftpserv tinyalsa audioreach-graphservices audioreach-conf \
   audioreach-graphmgr fastrpc; do
   grep -qx "$p" rootfs/packages.omamobile.myron || fail "Myron mobile profile misses $p"

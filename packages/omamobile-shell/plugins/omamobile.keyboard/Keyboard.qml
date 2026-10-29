@@ -4,6 +4,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
+import ".." as Phone
 import qs.Commons as Commons
 
 // A "hide keyboard" button, as on Android: while squeekboard is unfolded, a
@@ -17,6 +18,7 @@ import qs.Commons as Commons
 // hypr/phone.lua lets it work over the lock screen too (above_lock 2).
 Item {
   id: root
+  Phone.PocketStatus { id: pocketGuard }
 
   // Injected by the host.
   property var shell: null
@@ -43,6 +45,7 @@ Item {
   function toggleKeyboard() { setVisible(!oskOpen); return oskOpen ? "hiding" : "showing" }
 
   function setVisible(visible) {
+    if (visible && pocketGuard.active) return
     Quickshell.execDetached(["busctl", "--user", "call", "sm.puri.OSK0", "/sm/puri/OSK0",
                              "sm.puri.OSK0", "SetVisible", "b", visible ? "true" : "false"])
   }
@@ -76,7 +79,7 @@ Item {
   PanelWindow {
     id: button
 
-    visible: root.oskOpen
+    visible: root.oskOpen && !pocketGuard.active
     anchors { bottom: true; right: true }
     margins { right: Style.space(8); bottom: Style.space(6) }
     implicitWidth: root.size + Style.space(8)

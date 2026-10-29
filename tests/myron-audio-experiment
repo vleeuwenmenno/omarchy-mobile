@@ -21,12 +21,24 @@ compose=tools/myron-dev-image-compose
 init_stage=device/myron/main-initramfs/stage.sh
 speaker=device/myron/audio-experiment/attempt78-live-audio-speaker-probe.sh
 provenance=device/myron/audio-experiment/README.md
+bridge_session=device/myron/hardware-test-overlay/usr/local/libexec/myron-speaker/bridge-session.py
+bridge_writer=device/myron/main-overlay/usr/local/libexec/myron-audio-experiment/write-bridge-tones.py
+speaker_service=device/myron/hardware-test-overlay/usr/lib/systemd/system/myron-speaker-bridge.service
+speaker_prepare=device/myron/hardware-test-overlay/usr/local/sbin/myron-speaker-prepare
 
 for file in "$runner" "$mic_probe" "$stage" "$bridge" "$init_stage"; do
   sh -n "$file" || fail "$file does not parse as POSIX sh"
   bash -n "$file" || fail "$file does not parse as bash"
 done
 bash -n "$compose" || fail 'composer does not parse'
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+  "$bridge_session" || fail 'speaker PCM-start handshake does not parse'
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+  "$bridge_writer" || fail 'speaker FIFO producer does not parse'
+grep -Fxq 'ExecStart=/usr/bin/python3 /usr/local/libexec/myron-speaker/bridge-session.py' "$speaker_service" ||
+  fail 'speaker service bypasses the PCM-start handshake'
+grep -Fq '/run/myron-audio/stream-ready' "$speaker_prepare" ||
+  fail 'speaker preparation does not clear stale PCM-start readiness'
 grep -Fq 'tests/myron-audio-experiment' tests/all || fail 'tests/all does not run this test'
 pass 'audio experiment scripts parse and tests/all runs this test'
 
@@ -50,7 +62,7 @@ grep -Fq "cat /usr/local/libexec/myron-audio-experiment/speaker-probe.sh" "$comp
   fail 'composer does not byte-verify the speaker probe in the image'
 pass 'speaker source is vendored, MIT-cited, pinned and image-byte-verified without sibling checkout dependency'
 
-grep -Fq '[--profile coexistence|cellular|audio-speaker|audio-microphone|audio-cellular-speaker]' "$compose" ||
+grep -Fq '[--profile coexistence|cellular|cellular-audio|audio-speaker|audio-microphone|audio-cellular-speaker|audio-cellular-bridge]' "$compose" ||
   fail 'composer does not expose isolated and combined audio modes'
 grep -Fq 'audio experiment profiles require --boot-policy main' "$compose" ||
   fail 'composer permits temporary audio experiment images'
@@ -117,6 +129,13 @@ if grep -Fq '[Install]' "$combined_unit"; then fail 'combined audio service can 
 if grep -F 'Conflicts=' "$combined_unit" | grep -Fq 'ModemManager'; then
   fail 'combined unit conflicts with the modem it must preserve'
 fi
+if grep -F 'Conflicts=' "$combined_unit" | grep -Fq 'myron-speaker-bridge.service'; then
+  fail 'combined unit conflicts with the known-good bridge it must admit'
+fi
+grep -Fq 'audio-cellular-bridge' "$runner" ||
+  fail 'combined runner does not admit the known-good bridge mode'
+grep -Fq 'MYRON_SPEAKER_GAIN_DB=-12' "$runner" ||
+  fail 'combined bridge probe does not require the proven -12 dB gain'
 grep -Fq 'audio_request_path=/run/myron-main/cellular-audio-experiment.request' "$init_stage" ||
   fail 'main init does not create the separate combined request'
 grep -Fq 'MYRON_AUDIO_EXPECT_CELLULAR' "$stage" ||
@@ -140,14 +159,85 @@ pass 'microphone path is one second, aggregate-only, runtime-only and restores c
 work=$(mktemp -d /tmp/myron-audio-experiment.XXXXXX)
 guard_one=''
 guard_two=''
+bridge_reader=''
 cleanup_test() {
   [[ -z $guard_one ]] || kill "$guard_one" >/dev/null 2>&1 || true
   [[ -z $guard_two ]] || kill "$guard_two" >/dev/null 2>&1 || true
+  [[ -z $bridge_reader ]] || kill "$bridge_reader" >/dev/null 2>&1 || true
   rm -rf -- "$work"
 }
 trap cleanup_test EXIT
 sleep 600 & guard_one=$!
 sleep 600 & guard_two=$!
+
+# The wrapper publishes readiness only while the pinned bridge is inside its
+# post-pcm_start stream boundary, then removes it on normal exit.
+session_case=$work/session
+mkdir -p "$session_case"
+cp "$bridge_session" "$session_case/bridge-session.py"
+cat >"$session_case/bridge.py" <<'PY'
+import os
+import pathlib
+
+def stream_pcm():
+    marker = pathlib.Path(os.environ["MYRON_SPEAKER_STREAM_READY"])
+    if not marker.is_file():
+        raise RuntimeError("stream marker missing")
+    pathlib.Path(os.environ["MYRON_SPEAKER_TEST_RESULT"]).write_text("observed\n")
+
+def main():
+    stream_pcm()
+PY
+MYRON_SPEAKER_STREAM_READY="$session_case/stream-ready" \
+MYRON_SPEAKER_TEST_RESULT="$session_case/result" \
+  python3 "$session_case/bridge-session.py" || fail 'PCM-start handshake wrapper failed'
+[[ $(cat "$session_case/result") == observed && ! -e $session_case/stream-ready ]] ||
+  fail 'PCM-start handshake marker was late or survived bridge exit'
+pass 'speaker wrapper marks only the active post-pcm_start stream boundary'
+
+# Exercise the real producer against a real FIFO. It must stop after one
+# period, leak no second-period byte before the marker, then deliver 720000
+# bytes total after PCM-start readiness.
+writer_case=$work/writer
+mkdir -p "$writer_case"
+mkfifo "$writer_case/speaker.pcm"
+python3 - "$writer_case/speaker.pcm" "$writer_case/stream-ready" "$writer_case/result" <<'PY' &
+import os
+import pathlib
+import select
+import sys
+
+fifo, marker, result = sys.argv[1:]
+period = 3840 * 2 * 2
+fd = os.open(fifo, os.O_RDONLY)
+try:
+    initial = bytearray()
+    while len(initial) < period:
+        chunk = os.read(fd, period - len(initial))
+        if not chunk:
+            raise RuntimeError("producer closed before initial period")
+        initial.extend(chunk)
+    if select.select([fd], [], [], 0.25)[0]:
+        raise RuntimeError("producer leaked payload before PCM-start marker")
+    pathlib.Path(marker).write_text("ready\n")
+    total = len(initial)
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        total += len(chunk)
+    pathlib.Path(result).write_text(f"{len(initial)} {total}\n")
+finally:
+    os.close(fd)
+PY
+bridge_reader=$!
+python3 "$bridge_writer" "$writer_case/speaker.pcm" "$writer_case/stream-ready" ||
+  fail 'real speaker FIFO producer failed its handshake fixture'
+wait "$bridge_reader" || fail 'speaker FIFO reader observed ordering failure'
+bridge_reader=''
+[[ $(cat "$writer_case/result") == '15360 720000' ]] ||
+  fail 'speaker FIFO producer changed the period or total payload bound'
+pass 'real FIFO producer waits after one period, then delivers exact bounded payload'
 
 boot_id=11111111-2222-3333-4444-555555555555
 other_boot=99999999-2222-3333-4444-555555555555
@@ -161,7 +251,8 @@ fixture() {
   local mode=${1:-audio-speaker}
   case_root=$work/case
   rm -rf -- "$case_root"
-  mkdir -p "$case_root/bin" "$case_root/main" "$case_root/host" "$case_root/runtime" "$case_root/etc" "$case_root/omamobile"
+  mkdir -p "$case_root/bin" "$case_root/main" "$case_root/host" "$case_root/runtime" "$case_root/etc" "$case_root/omamobile" \
+    "$case_root/bridge-assets" "$case_root/bridge-runtime"
   printf '%s\n' "$mode" >"$case_root/etc/mode"
   printf '%s\n' cellular >"$case_root/etc/profile"
   printf '%s\n' "$boot_id" >"$case_root/boot-id"
@@ -182,12 +273,18 @@ fixture() {
   printf '%s\n' "$guard_one" >"$case_root/guard-pid"
   printf '%s\n' "$guard_two" >"$case_root/guard-alt-pid"
   : >"$case_root/calls"
+  printf '%s\n' bridge >"$case_root/bridge-assets/bridge.py"
+  printf '%s\n' graph >"$case_root/bridge-assets/probe.py"
+  printf '%s\n' hostless >"$case_root/bridge-assets/attempt78-tfa-hostless.py"
+  printf '%s\n' calibration >"$case_root/bridge-assets/attempt78-tfa-calibration.py"
+  printf '%s\n' watchdog >"$case_root/bridge-assets/watchdog.py"
 
   cat >"$case_root/bin/systemctl" <<'SH'
 #!/bin/sh
 root=${CASE_ROOT:?}
 unit=${2:-}
 property=${4:-}
+mode=$(cat "$root/etc/mode")
 case ${1:-}:$unit:$property in
   show:myron-hardware-watchdog.service:ActiveState) cat "$root/guard-active" ;;
   show:myron-hardware-watchdog.service:SubState) cat "$root/guard-sub" ;;
@@ -200,12 +297,31 @@ case ${1:-}:$unit:$property in
   show:myron-cellular.service:ActiveState) test ! -e "$root/combined" && { cat "$root/cellular-active" 2>/dev/null || printf '%s\n' inactive; } || printf '%s\n' active ;;
   show:myron-ipa-guard.service:ActiveState) test ! -e "$root/combined" && printf '%s\n' inactive || printf '%s\n' active ;;
   show:myron-coexistence.service:ActiveState) cat "$root/coexistence-active" 2>/dev/null || printf '%s\n' inactive ;;
-  show:myron-reference-audio-foundation.service:LoadState|show:myron-speaker-bridge.service:LoadState|show:myron-microphone-bridge.service:LoadState) printf '%s\n' masked ;;
-  show:myron-reference-audio-foundation.service:ActiveState|show:myron-speaker-bridge.service:ActiveState|show:myron-microphone-bridge.service:ActiveState) cat "$root/legacy-audio-active" 2>/dev/null || printf '%s\n' inactive ;;
-  show:myron-reference-audio-foundation.service:InvocationID|show:myron-speaker-bridge.service:InvocationID|show:myron-microphone-bridge.service:InvocationID) cat "$root/legacy-audio-invocation" 2>/dev/null || true ;;
+  show:myron-reference-audio-foundation.service:LoadState|show:myron-microphone-bridge.service:LoadState) printf '%s\n' masked ;;
+  show:myron-reference-audio-foundation.service:ActiveState|show:myron-microphone-bridge.service:ActiveState) cat "$root/legacy-audio-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:myron-reference-audio-foundation.service:InvocationID|show:myron-microphone-bridge.service:InvocationID) cat "$root/legacy-audio-invocation" 2>/dev/null || true ;;
+  show:myron-speaker-bridge.service:LoadState) test "$mode" = audio-cellular-bridge && printf '%s\n' loaded || printf '%s\n' masked ;;
+  show:myron-speaker-bridge.service:ActiveState) cat "$root/bridge-active" 2>/dev/null || printf '%s\n' inactive ;;
+  show:myron-speaker-bridge.service:SubState) test "$(cat "$root/bridge-active" 2>/dev/null || true)" = active && printf '%s\n' running || printf '%s\n' dead ;;
+  show:myron-speaker-bridge.service:InvocationID) cat "$root/bridge-invocation" 2>/dev/null || true ;;
+  show:myron-speaker-bridge.service:Environment) printf '%s\n' 'CONFIRM_PIPEWIRE_SPEAKER=PIPEWIRE-PCM16-MAX3S-MINUS24DBFS-OEM-MIPLAY-LEVEL0 MYRON_SPEAKER_DAEMON=1 MYRON_SPEAKER_MAX_SECONDS=0 MYRON_SPEAKER_GAIN_DB=-12' ;;
   is-enabled:myron-cellular.service:) test ! -e "$root/combined" && printf '%s\n' disabled || printf '%s\n' enabled ;;
   is-enabled:myron-coexistence.service:) printf '%s\n' disabled ;;
-  start:*) printf 'systemctl %s\n' "$*" >>"$root/calls" ;;
+  start:myron-speaker-bridge.service:)
+    printf '%s\n' active >"$root/bridge-active"
+    printf '%s\n' bridge-invocation >"$root/bridge-invocation"
+    mkdir -p "$root/bridge-runtime"
+    test -p "$root/bridge-runtime/speaker.pcm" || mkfifo "$root/bridge-runtime/speaker.pcm"
+    printf '%s\n' ready >"$root/bridge-runtime/bridge-ready"
+    printf 'systemctl %s\n' "$*" >>"$root/calls"
+    ;;
+  stop:myron-speaker-bridge.service:)
+    printf '%s\n' inactive >"$root/bridge-active"
+    rm -f "$root/bridge-runtime/bridge-ready"
+    rm -f "$root/bridge-runtime/stream-ready"
+    printf 'systemctl %s\n' "$*" >>"$root/calls"
+    ;;
+  start:*|stop:*) printf 'systemctl %s\n' "$*" >>"$root/calls" ;;
   *) exit 1 ;;
 esac
 SH
@@ -246,6 +362,7 @@ root=${CASE_ROOT:?}
 probe=no
 for arg do
   case $arg in "$root/bin/speaker-probe"|"$root/bin/microphone-probe") probe=yes ;; esac
+  case $arg in python3) printf '%s\n' bridge-tones >>"$root/calls"; exit 0 ;; esac
 done
 if test "$probe" = yes && test -e "$root/timeout-probe"; then
   rm -f "$root/timeout-probe"
@@ -255,6 +372,15 @@ test "${1:-}" != -s || shift 2
 test "${1:-}" != -k || shift 2
 shift
 exec "$@"
+SH
+  cat >"$case_root/bin/journalctl" <<'SH'
+#!/bin/sh
+printf '%s\n' 'pipewire_pcm_bytes_written=720000 software_gain_db=-12'
+printf '%s\n' 'PASS: PipeWire FIFO reached protected OEM MIPLAY graph'
+SH
+  cat >"$case_root/bin/amixer" <<'SH'
+#!/bin/sh
+printf '%s\n' '  : values=6'
 SH
   printf '#!/bin/sh\nprintf "%%s\\n" speaker >>%s\nprintf "%%s\\n" "%s"\n' \
     "$case_root/probes" \
@@ -269,7 +395,7 @@ SH
 }
 
 combined_fixture() {
-  fixture audio-cellular-speaker
+  fixture "${1:-audio-cellular-speaker}"
   : >"$case_root/combined"
   mv "$case_root/runtime/audio-experiment.request" \
     "$case_root/runtime/cellular-audio-experiment.request"
@@ -307,7 +433,7 @@ SH
 }
 
 audio_command() {
-  local speaker_fake_sha request consumed expect_cellular
+  local speaker_fake_sha request consumed expect_cellular bridge_sha graph_sha hostless_sha calibration_sha watchdog_sha
   speaker_fake_sha=$(sha256sum <"$case_root/bin/speaker-probe" | cut -d' ' -f1)
   request=$case_root/runtime/audio-experiment.request
   consumed=$case_root/runtime/audio-experiment.consumed
@@ -317,6 +443,11 @@ audio_command() {
     consumed=$case_root/runtime/cellular-audio-experiment.consumed
     expect_cellular=1
   fi
+  bridge_sha=$(sha256sum <"$case_root/bridge-assets/bridge.py" | cut -d' ' -f1)
+  graph_sha=$(sha256sum <"$case_root/bridge-assets/probe.py" | cut -d' ' -f1)
+  hostless_sha=$(sha256sum <"$case_root/bridge-assets/attempt78-tfa-hostless.py" | cut -d' ' -f1)
+  calibration_sha=$(sha256sum <"$case_root/bridge-assets/attempt78-tfa-calibration.py" | cut -d' ' -f1)
+  watchdog_sha=$(sha256sum <"$case_root/bridge-assets/watchdog.py" | cut -d' ' -f1)
   env \
     CASE_ROOT="$case_root" \
     MYRON_AUDIO_TEST_ROOT="$case_root" \
@@ -335,12 +466,24 @@ audio_command() {
     MYRON_AUDIO_PGREP="$case_root/bin/pgrep" \
     MYRON_AUDIO_PKILL="$case_root/bin/pkill" \
     MYRON_AUDIO_TIMEOUT="$case_root/bin/timeout" \
+    MYRON_AUDIO_JOURNALCTL="$case_root/bin/journalctl" \
+    MYRON_AUDIO_AMIXER="$case_root/bin/amixer" \
     MYRON_AUDIO_STAGE="$case_root/bin/audio-stage" \
     MYRON_AUDIO_READINESS_HELPER="$case_root/bin/readiness" \
     MYRON_AUDIO_POWERDOWN="$case_root/bin/powerdown" \
     MYRON_AUDIO_MAIN_OS="$case_root/bin/main-os" \
     MYRON_AUDIO_SPEAKER_PROBE="$case_root/bin/speaker-probe" \
     MYRON_AUDIO_SPEAKER_SHA="$speaker_fake_sha" \
+    MYRON_AUDIO_SPEAKER_BRIDGE_DIR="$case_root/bridge-assets" \
+    MYRON_AUDIO_SPEAKER_BRIDGE_FIFO="$case_root/bridge-runtime/speaker.pcm" \
+    MYRON_AUDIO_SPEAKER_BRIDGE_READY="$case_root/bridge-runtime/bridge-ready" \
+    MYRON_AUDIO_SPEAKER_BRIDGE_STREAM_READY="$case_root/bridge-runtime/stream-ready" \
+    MYRON_AUDIO_SPEAKER_BRIDGE_WRITER="$bridge_writer" \
+    MYRON_AUDIO_SPEAKER_BRIDGE_SHA="$bridge_sha" \
+    MYRON_AUDIO_SPEAKER_GRAPH_SHA="$graph_sha" \
+    MYRON_AUDIO_SPEAKER_HOSTLESS_SHA="$hostless_sha" \
+    MYRON_AUDIO_SPEAKER_CALIBRATION_SHA="$calibration_sha" \
+    MYRON_AUDIO_SPEAKER_WATCHDOG_SHA="$watchdog_sha" \
     MYRON_AUDIO_MICROPHONE_PROBE="$case_root/bin/microphone-probe" \
     MYRON_AUDIO_OMAMOBILE_RUNTIME="$case_root/omamobile" \
     MYRON_AUDIO_WIRELESS_READY="$case_root/wireless-ready" \
@@ -430,6 +573,49 @@ grep -Fq 'data=blocked gnss=blocked bluetooth=absent' "$case_root/audio.log" ||
   fail 'combined durable log lacks the radio exclusion boundary'
 expect_recover audio-cellular-speaker-complete
 pass 'combined mode preserves registered radio, blocks data/GNSS/Bluetooth, probes once and recovers'
+
+# The corrected combined mode reuses the exact -12 dB OEM MIPLAY bridge and
+# emits one bounded left/right sequence. Software pass remains distinct from
+# the required attended audibility confirmation on hardware.
+grep -Fq '"$timeout_cmd" -s TERM -k 2 60 python3' "$runner" ||
+  fail 'combined bridge writer lacks a bounded PCM-start handshake window'
+grep -Fq '"$speaker_bridge_writer" "$speaker_bridge_fifo" "$speaker_bridge_stream_ready"' "$runner" ||
+  fail 'combined bridge runner does not pass both handshake endpoints to the writer'
+grep -Fq 'left_cycle = b"".join' "$bridge_writer" ||
+  fail 'combined bridge writer regenerates the waveform while the FIFO can back-pressure'
+grep -Fq 'left_cycle * cycles' "$bridge_writer" ||
+  fail 'combined bridge writer does not prepare the bounded waveform before opening the FIFO'
+grep -Fq 'write_all(fd, data[:PERIOD_BYTES])' "$bridge_writer" ||
+  fail 'combined bridge writer does not prime exactly one OEM period'
+grep -Fq 'while not stream_ready.is_file()' "$bridge_writer" ||
+  fail 'combined bridge writer can fill the FIFO before OEM PCM start'
+grep -Fq 'write_all(fd, data[PERIOD_BYTES:])' "$bridge_writer" ||
+  fail 'combined bridge writer does not resume after OEM PCM start'
+for required in \
+  'original_stream_pcm = bridge.stream_pcm' \
+  'STREAM_READY.write_text("ready\n")' \
+  'STREAM_READY.unlink(missing_ok=True)' \
+  'bridge.stream_pcm = stream_pcm'; do
+  grep -Fq "$required" "$bridge_session" ||
+    fail "speaker PCM-start handshake lacks: $required"
+done
+combined_fixture audio-cellular-bridge
+run_audio
+[[ $audio_rc == 0 ]] || { cat "$case_root/output"; fail 'combined cellular bridge fixture did not complete'; }
+grep -Fxq 'systemctl start myron-speaker-bridge.service' "$case_root/calls" ||
+  fail 'combined bridge mode did not admit the known-good bridge exactly once'
+grep -Fxq bridge-tones "$case_root/calls" ||
+  fail 'combined bridge mode did not write the bounded left/right tones'
+grep -Fxq 'systemctl stop myron-speaker-bridge.service' "$case_root/calls" ||
+  fail 'combined bridge mode did not stop the known-good bridge'
+[[ ! -e $case_root/probes ]] || fail 'combined bridge mode ran the inaudible raw speaker probe'
+grep -Fq 'kind=speaker-bridge duration_ms=3750 gain_db=-12 channels=left+right route=OEM-MIPLAY' "$case_root/audio.log" ||
+  fail 'combined bridge durable log lacks exact route/gain/channel proof'
+grep -Fq 'kind=speaker-bridge duration_ms=3750 gain_db=-12 channels=left+right route=OEM-MIPLAY tfa=Powerdown' \
+  "$case_root/main/cellular-audio-experiment.stage" ||
+  fail 'combined bridge boundary lacks exact route/gain/channel cleanup proof'
+expect_recover audio-cellular-bridge-complete
+pass 'combined bridge mode reuses -12 dB OEM MIPLAY, emits bounded left/right tones, powers down and recovers'
 
 combined_fixture
 printf '%s\n' 66000 >"$case_root/thermal/thermal_zone0/temp"

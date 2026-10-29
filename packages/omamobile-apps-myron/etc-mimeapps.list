@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Myron: Strata, not Nautilus, opens folders. $XDG_CONFIG_DIRS (/etc/xdg) is read
+# before the Omarchy defaults in /usr/share/applications/mimeapps.list; a
+# user's ~/.config/mimeapps.list still wins.
+[Default Applications]
+inode/directory=io.github.lgse.Strata.desktop;

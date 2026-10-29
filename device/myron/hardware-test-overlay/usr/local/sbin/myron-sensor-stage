@@ -1,0 +1,80 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Load Myron's private SSC registry into the already-running ADSP sensor PD.
+# Manual and bounded: this does not restart firmware, load modules, or rotate UI.
+set -eu
+
+asset_root=/usr/share/qcom/sm8850/Xiaomi/myron
+enable_marker=/etc/omamobile/myron-sensors-enable
+ready_dir=/run/omamobile-myron
+ready_marker=$ready_dir/sensors-ready
+rpc_log=$ready_dir/hexagonrpcd.log
+probe_log=$ready_dir/ssccli-accelerometer.log
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+sensor_property() {
+  timeout 5 busctl --system get-property \
+    net.hadess.SensorProxy /net/hadess/SensorProxy \
+    net.hadess.SensorProxy "$1" 2>/dev/null |
+    awk '$1 == "b" && $2 == "true" { found=1 } END { exit !found }'
+}
+
+[ "$(id -u)" = 0 ] || die 'must run as root'
+[ -f "$enable_marker" ] && [ ! -L "$enable_marker" ] ||
+  die 'manual enable marker is absent or linked'
+[ -x /usr/bin/hexagonrpcd ] || die 'hexagonrpcd is unavailable'
+[ -x /usr/bin/ssccli ] || die 'ssccli is unavailable'
+[ -c /dev/fastrpc-adsp-secure ] || die 'secure ADSP FastRPC device is unavailable'
+[ -f "$asset_root/sensors/sns_reg.conf" ] || die 'private sensor registry is unavailable'
+[ ! -L "$asset_root" ] || die 'private sensor asset root is linked'
+
+install -d -m0755 "$ready_dir"
+rm -f "$ready_marker" "$rpc_log" "$probe_log"
+
+# A prior stage in this boot may already have populated SSC. Do not run a
+# second reverse tunnel when SensorProxy already advertises the accelerometer.
+refresh_proxy=0
+if ! sensor_property HasAccelerometer; then
+  status=0
+  timeout --signal=TERM --kill-after=5 30 \
+    /usr/bin/hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s -R "$asset_root" \
+    >"$rpc_log" 2>&1 || status=$?
+  [ "$status" = 0 ] || die "hexagonrpcd failed or timed out (status $status)"
+  refresh_proxy=1
+fi
+
+# Hardware proof, not presence-only proof: require one real accelerometer
+# measurement after the registry tunnel has completed.
+status=0
+timeout --signal=TERM --kill-after=2 10 \
+  /usr/bin/ssccli --sensor accelerometer --timeout 5 >"$probe_log" 2>&1 || status=$?
+[ "$status" = 0 ] || die "accelerometer probe failed or timed out (status $status)"
+grep -Fq 'Accelerometer sensor measurement' "$probe_log" ||
+  die 'accelerometer probe returned no measurement'
+# Registry loading returns before every SSC sensor is ready for discovery.
+# Wait for the real sample above before refreshing the proxy. Restart also
+# starts an inactive proxy on systems without D-Bus service activation.
+if [ "$refresh_proxy" = 1 ]; then
+  systemctl restart iio-sensor-proxy.service ||
+    die 'SensorProxy failed to start after sensor readiness'
+fi
+# A running D-Bus service may still be discovering its SSC sensors. Allow that
+# asynchronous discovery to finish inside the existing 45-second unit bound.
+attempt=0
+until sensor_property HasAccelerometer; do
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 6 ] || die 'SensorProxy still lacks an accelerometer after discovery wait'
+  sleep 1
+done
+
+temporary=$(mktemp "$ready_dir/.sensors-ready.XXXXXX")
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+printf '%s\n' 'result=ready source=ssc hardware_sample=accelerometer identifiers=not-collected' >"$temporary"
+chmod 0644 "$temporary"
+mv -f "$temporary" "$ready_marker"
+trap - EXIT HUP INT TERM
+printf '%s\n' 'result=ready sensor=accelerometer source=ssc'

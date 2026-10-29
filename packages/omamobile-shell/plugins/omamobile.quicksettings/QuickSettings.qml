@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 import QtQuick
+import ".." as Phone
+import "../omamobile.gestures" as Gestures
 import Quickshell
 import Quickshell.Bluetooth
 import Quickshell.Io
@@ -10,6 +12,7 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
+import "LocationModel.js" as LocationModel
 import "TilesModel.js" as TilesModel
 
 // Pull-down quick settings for the phone. The sheet drops from the top edge
@@ -17,8 +20,9 @@ import "TilesModel.js" as TilesModel
 // four tiles and brightness. A pull down on the sheet or its handle (or a
 // tap on the handle) expands it to every tile, a page of eight at a time with a
 // sideways swipe between pages, and volume. Tap outside it, swipe it up, or
-// press Escape to put it away. The Wi-Fi and Bluetooth tiles' chevrons (or a
-// long-press) open the panels in WifiPanel.qml and BluetoothPanel.qml.
+// press Escape to put it away. The Wi-Fi, Bluetooth and Location tiles'
+// chevrons (or a long-press) open the panels in WifiPanel.qml,
+// BluetoothPanel.qml and LocationPanel.qml.
 //
 // The pencil under the expanded grid enters edit mode: tap a tile to remove
 // it, hold and drag one to move it, tap one under "Add tiles" to add it.
@@ -42,12 +46,12 @@ Item {
 
   // ---------------------------------------------------------------- lifecycle
 
-  // A payload of {"page": "wifi"} or {"page": "bluetooth"} opens that panel
+  // A payload of {"page": "wifi"}, "bluetooth" or "location" opens that panel
   // instead of the sheet.
   function open(payloadJson) {
     var payload = {}
     try { payload = JSON.parse(payloadJson || "{}") || {} } catch (error) {}
-    if (payload.page === "wifi" || payload.page === "bluetooth") {
+    if (payload.page === "wifi" || payload.page === "bluetooth" || payload.page === "location") {
       openPage(payload.page)
       // Let the host finish delivering this open before it hears a hide.
       Qt.callLater(root.dismiss)
@@ -55,6 +59,7 @@ Item {
     }
     wifiPicker.close()
     bluetoothPanelItem.close()
+    locationPanelItem.close()
     if (editing) finishEditing()
     expanded = payload.expanded === true
     if (payload.page === "edit") startEditing()
@@ -64,6 +69,7 @@ Item {
     brightness.refresh()
     torch.refresh()
     rotationLock.refresh()
+    pocketProtection.refresh()
     location.refresh()
     nfc.refresh()
     fingerprint.refresh()
@@ -74,6 +80,8 @@ Item {
   // Host-initiated close (`shell hide`).
   function close() {
     if (editing) finishEditing()
+    resizing=false; dragHeight=-1
+    Gestures.PullState.finish()
     opened = false
   }
 
@@ -94,10 +102,14 @@ Item {
       bluetooth: bluetooth.enabled,
       doNotDisturb: dnd.enabled,
       torch: torch.available ? torch.enabled : null,
+      pocketProtection: pocketProtection.enabled,
       brightness: brightness.available ? brightness.percent : null,
+      automaticBrightness: brightness.autoAvailable ? brightness.automatic : null,
       volume: audio.available ? Math.round(audio.volume * 100) : null,
       wifiPanel: wifiPicker.opened,
       bluetoothPanel: bluetoothPanelItem.opened,
+      locationPanel: locationPanelItem.opened,
+      location: location.status,
       barClearance: Math.round(topBarClearance),
       sheetY: Math.round(sheet.y),
       sheetHeight: Math.round(sheet.height),
@@ -116,6 +128,18 @@ Item {
 
   function bluetoothPanel() {
     return bluetoothPanelItem.snapshot()
+  }
+
+  // `shell call omamobile.quicksettings openLocation ''`: the same as the
+  // Location tile's chevron. `locationPanel ''` returns its state as JSON.
+  function openLocation() {
+    if (!location.available) return "unavailable"
+    openLocationPanel()
+    return locationPanelItem.snapshot()
+  }
+
+  function locationPanel() {
+    return locationPanelItem.snapshot()
   }
 
   // `shell call omamobile.quicksettings openWifi ''`: the same as the tile's
@@ -184,8 +208,37 @@ Item {
     "hotspot": hotspot, "dnd": dnd, "torch": torch, "rotation-lock": rotationLock,
     "location": location, "nfc": nfc, "battery-saver": batterySaver, "dark-theme": darkTheme,
     "night-light": nightLight, "stay-awake": stayAwake, "mic": mic, "screenshot": screenshot,
-    "screen-record": screenRecord, "fingerprint": fingerprint, "keyboard": keyboard
+    "touch-feedback": touchFeedback, "pocket-protection": pocketProtection, "screen-record": screenRecord, "fingerprint": fingerprint, "keyboard": keyboard, "settings": settingsTile
   })
+
+  property bool hapticsAvailable: false
+  property bool hapticsEnabled: true
+  function feedback() {
+    if (opened && hapticsAvailable && hapticsEnabled && !hapticPulse.running) hapticPulse.running=true
+  }
+  Process { id:hapticPulse; command:["timeout","2","omamobile-haptics","pulse"] }
+  Process {
+    id:hapticRead; running:true; command:["omamobile-haptics","status"]
+    stdout:StdioCollector { onStreamFinished: {
+      try { var value=JSON.parse(text); root.hapticsAvailable=value.available; root.hapticsEnabled=value.enabled }
+      catch(e) { root.hapticsAvailable=false }
+    } }
+  }
+  Process { id:hapticWrite; onExited: { if(!hapticRead.running) hapticRead.running=true } }
+
+  QtObject {
+    id: touchFeedback
+    readonly property bool available: root.hapticsAvailable
+    readonly property bool enabled: root.hapticsEnabled
+    readonly property bool busy: hapticWrite.running
+    readonly property string icon: "󰕿"
+    readonly property string status: !available ? "Unavailable" : enabled ? "On" : "Off"
+    function toggle() {
+      if (!available || busy) return
+      hapticWrite.command = ["omamobile-haptics", enabled ? "off" : "on"]
+      hapticWrite.running = true
+    }
+  }
 
   // ---------------------------------------------------------------- layout
 
@@ -456,6 +509,23 @@ Item {
 
   PwObjectTracker { objects: mic.source ? [mic.source] : [] }
 
+  // Settings: through the CLI, like the fingerprint tile: a plugin may only
+  // summon panels it owns. The sheet closes first.
+  function openSettings(page) {
+    root.dismiss()
+    Quickshell.execDetached(["omarchy-shell", "shell", "summon", "omamobile.settings",
+                             JSON.stringify(page ? { page: page } : {})])
+  }
+
+  QtObject {
+    id: settingsTile
+    readonly property bool available: true
+    readonly property bool enabled: false
+    readonly property string icon: "󰒓"
+    readonly property string status: "Open"
+    function toggle() { root.openSettings("") }
+  }
+
   // Screenshot: the sheet slides away first so it isn't in the picture.
   QtObject {
     id: screenshot
@@ -575,13 +645,31 @@ Item {
     root.dismiss()
   }
 
+  function openLocationPanel() {
+    openPage("location")
+    root.dismiss()
+  }
+
+  // The panel behind the Location tile's chevron or a long-press: what is
+  // using location now and recent app/process use, from omamobile-location.
+  LocationPanel {
+    id: locationPanelItem
+    tileStatus: location.status
+    twelveHour: root.twelveHour
+    onBackRequested: root.backToSheet(locationPanelItem)
+    onDataChanged: location.usage = data
+    onRefreshRequested: { if (!locationRead.running) locationRead.running = true }
+  }
+
   // One page at a time.
   function openPage(page) {
     if (page !== "wifi") wifiPicker.close()
     if (page !== "bluetooth") bluetoothPanelItem.close()
+    if (page !== "location") locationPanelItem.close()
     if (page !== "record") recordPanelItem.close()
     if (page === "wifi") wifiPicker.open()
     else if (page === "bluetooth") bluetoothPanelItem.open()
+    else if (page === "location") locationPanelItem.open()
     else if (page === "record") recordPanelItem.open()
   }
 
@@ -732,74 +820,107 @@ Item {
     onExited: { mobileData.myronStarting = false; root.refreshProbe() }
   }
 
-  // Rotation lock over omamobile-autorotate (omamobile-sensors): it rotates
-  // the screen while the sensor proxy has an accelerometer, unless
-  // ~/.local/state/omamobile/rotation-lock exists. Turning the lock off also
-  // enables the service, so auto-rotate stays on after a reboot.
   QtObject {
-    id: rotationLock
-
+    id: pocketProtection
     property bool available: false
     property bool enabled: false
-    readonly property string icon: "󰑵"
-    readonly property string status: !available ? "No sensor" : enabled ? "Locked" : "Auto-rotate"
-
-    function refresh() {
-      if (!rotationRead.running) rotationRead.running = true
-    }
-
+    readonly property string icon: "󰒃"
+    readonly property string status: !available ? "Unavailable" : enabled ? "On" : "Off"
+    function refresh() { if (!pocketRead.running) pocketRead.running = true }
     function toggle() {
-      if (!available || rotationWrite.running) return
-      rotationWrite.command = enabled
-        ? ["sh", "-c", "rm -f \"$HOME/.local/state/omamobile/rotation-lock\"; systemctl --user enable --now omamobile-autorotate.service"]
-        : ["sh", "-c", "mkdir -p \"$HOME/.local/state/omamobile\" && touch \"$HOME/.local/state/omamobile/rotation-lock\""]
-      rotationWrite.running = true
+      if (!available || pocketWrite.running) return
+      pocketWrite.command = ["omamobile-pocket", enabled ? "off" : "on"]
+      pocketWrite.running = true
     }
   }
-
   Process {
-    id: rotationRead
-    // none: no accelerometer; locked: the lock file, or the service is off
-    command: ["sh", "-c",
-      "busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy HasAccelerometer 2>/dev/null | grep -q true || { echo none; exit 0; }; "
-      + "[ -e \"$HOME/.local/state/omamobile/rotation-lock\" ] && { echo locked; exit 0; }; "
-      + "systemctl --user is-active --quiet omamobile-autorotate.service && echo auto || echo locked"]
+    id: pocketRead
+    command: ["omamobile-pocket", "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var value = String(text || "").trim()
-        rotationLock.available = value === "auto" || value === "locked"
-        rotationLock.enabled = value === "locked"
+        try {
+          var value = JSON.parse(text)
+          pocketProtection.available = value.available === true
+          pocketProtection.enabled = value.enabled === true
+        } catch (error) { pocketProtection.available = false }
       }
     }
   }
+  Process { id: pocketWrite; onExited: pocketProtection.refresh() }
 
-  Process {
-    id: rotationWrite
-    onExited: rotationLock.refresh()
+  // Lock freezes the current transform; hints can still observe orientation.
+  QtObject {
+    id: rotationLock
+    property bool available: false
+    property bool enabled: true
+    readonly property string icon: "󰑵"
+    readonly property string status: !available ? "Unavailable" : enabled ? "Current locked" : "Auto-rotate"
+    readonly property bool details: true
+    function openDetails() {
+      if (root.shell && typeof root.shell.summon === "function") root.shell.summon("omamobile.rotation", "{}")
+      root.dismiss()
+    }
+    function refresh() { if (!rotationRead.running) rotationRead.running=true }
+    function toggle() {
+      if (!available || rotationWrite.running) return
+      rotationWrite.command=["omamobile-rotation", enabled ? "unlock" : "lock"]
+      rotationWrite.running=true
+    }
   }
+  Process {
+    id: rotationRead
+    command:["omamobile-rotation","status"]
+    stdout:StdioCollector {
+      waitForEnd:true
+      onStreamFinished: {
+        try {
+          var value=JSON.parse(text)
+          rotationLock.available=value.available===true
+          rotationLock.enabled=value.locked===true
+        } catch(e) { rotationLock.available=false }
+      }
+    }
+  }
+  Process { id:rotationWrite; onExited:rotationLock.refresh() }
 
   // Location over omamobile-gnss: on grants GeoClue permission, while the
   // receiver runs only during an app request. Off removes permission, stops
   // GeoClue and disables Qualcomm GNSS. As the user, on/off go through an
   // exact systemd/polkit unit. "No GNSS" when the backend is missing.
+  //
+  // The status line separates permission from use: Off (no permission), On
+  // (allowed), In use (a client the omamobile-location observer saw start, or
+  // GeoClue's own InUse flag) and Receiver on (the receiver runs but the
+  // observer cannot vouch for a user, so it is never shown as In use). The
+  // chevron or a long-press opens LocationPanel.qml. A toggle waits for the
+  // real state: it never flips the tile first, and a failed one says Failed.
   QtObject {
     id: location
 
     property bool available: false
     property bool enabled: false
     property bool running: false
+    property bool failed: false
+    // `omamobile-location status` parsed, or null when the observer is not answering.
+    property var usage: null
+    readonly property bool busy: locationWrite.running
+    readonly property bool details: true
     readonly property string icon: enabled ? "󰍎" : "󰍐"
-    readonly property string status: !available ? "No GNSS" : !enabled ? "Off" : running ? "In use" : "On"
+    readonly property string status: LocationModel.tileStatus({
+      available: available, enabled: enabled, running: running, busy: busy, failed: failed, usage: usage })
+
+    function openDetails() { root.openLocationPanel() }
 
     function refresh() {
       if (!locationRead.running) locationRead.running = true
+      if (!usageRead.running) usageRead.running = true
     }
 
     function toggle() {
       if (!available || locationWrite.running) return
+      failed = false
       locationWrite.command = ["omamobile-gnss", enabled ? "off" : "on"]
-      enabled = !enabled
       locationWrite.running = true
     }
   }
@@ -821,8 +942,28 @@ Item {
   }
 
   Process {
+    id: usageRead
+    command: ["omamobile-location", "status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: location.usage = LocationModel.parse(text)
+    }
+    onExited: function(exitCode) { if (exitCode !== 0) location.usage = null }
+  }
+
+  Process {
     id: locationWrite
-    onExited: location.refresh()
+    onExited: function(exitCode) {
+      location.failed = exitCode !== 0
+      location.refresh()
+      if (location.failed) locationFailedReset.restart()
+    }
+  }
+
+  Timer {
+    id: locationFailedReset
+    interval: 4000
+    onTriggered: location.failed = false
   }
 
   // NFC through its rfkill switch, which the kernel's NFC core registers for
@@ -920,6 +1061,10 @@ Item {
     property bool enabled: false
     readonly property string icon: "󰌌"
     readonly property string status: !available ? "No keyboard" : enabled ? "Shown" : "Hidden"
+    // The chevron and a long press open Settings > Keyboard. The tile itself
+    // is the manual show/hide, independent of "Automatically show when typing".
+    readonly property bool details: true
+    function openDetails() { root.openSettings("keyboard") }
 
     function refresh() {
       if (!keyboardRead.running) keyboardRead.running = true
@@ -928,10 +1073,31 @@ Item {
     function toggle() {
       if (!available) return
       var show = !enabled
-      Quickshell.execDetached(["busctl", "--user", "call", "sm.puri.OSK0", "/sm/puri/OSK0",
-                               "sm.puri.OSK0", "SetVisible", "b", show ? "true" : "false"])
       enabled = show
-      if (show) root.dismiss()
+      if (!show) {
+        keyboardShowLater.stop()
+        Quickshell.execDetached(["busctl", "--user", "call", "sm.puri.OSK0", "/sm/puri/OSK0",
+                                 "sm.puri.OSK0", "SetVisible", "b", "false"])
+        return
+      }
+      // squeekboard drops a forced show when the text-input focus changes,
+      // which closing this sheet does: ask after the sheet is gone.
+      root.dismiss()
+      keyboardShowLater.restart()
+    }
+  }
+
+  Phone.PocketStatus { id: keyboardPocket }
+
+  Timer {
+    id: keyboardShowLater
+    interval: 400
+    onTriggered: {
+      // Not in a pocket, and never over a secure lock.
+      if (keyboardPocket.active) { keyboard.enabled = false; return }
+      Quickshell.execDetached(["sh", "-c",
+        "omarchy-shell lock status 2>/dev/null | grep -q '\"secure\":true' && exit 0; " +
+        "exec busctl --user call sm.puri.OSK0 /sm/puri/OSK0 sm.puri.OSK0 SetVisible b true"])
     }
   }
 
@@ -960,6 +1126,8 @@ Item {
     property bool enabled: false
     property string device: ""
     property int percent: 25
+    property bool autoAvailable: false
+    property bool automatic: false
     property int pendingPercent: -1
     readonly property string icon: "󰉄"
     readonly property string status: !available ? "No flash LED" : enabled ? "On" : "Off"
@@ -974,6 +1142,8 @@ Item {
     }
 
     function set(fraction) {
+      automatic = false
+      editSerial++
       percent = Math.max(1, Math.round(fraction * 100))
       pendingPercent = percent
       if (!torchWrite.running) flush()
@@ -1035,14 +1205,23 @@ Item {
     id: brightness
 
     property bool available: false
-    property int percent: 0
+    property real percent: 0
+    property bool autoAvailable: false
+    property bool automatic: false
     property int pendingPercent: -1
+    property int editSerial: 0
 
     function refresh() {
-      if (!brightnessRead.running) brightnessRead.running = true
+      if (brightnessSlider.dragging || brightnessWrite.running || pendingPercent >= 0) return
+      if (!brightnessRead.running) {
+        brightnessRead.editSerial = editSerial
+        brightnessRead.running = true
+      }
     }
 
     function set(fraction) {
+      automatic = false
+      editSerial++
       percent = Math.max(1, Math.round(fraction * 100))
       pendingPercent = percent
       if (!brightnessWrite.running) flush()
@@ -1050,23 +1229,55 @@ Item {
 
     function flush() {
       if (pendingPercent < 0) return
-      brightnessWrite.command = ["brightnessctl", "--class=backlight", "--quiet", "set", pendingPercent + "%"]
+      brightnessWrite.command = ["omamobile-display", "manual", String(pendingPercent)]
       pendingPercent = -1
       brightnessWrite.running = true
     }
   }
 
+  FileView {
+    path: Quickshell.env("XDG_RUNTIME_DIR") + "/omamobile-display.json"
+    watchChanges: true
+    onFileChanged: reload()
+    onLoaded: {
+      try { brightness.automatic = JSON.parse(text()).manual !== true }
+      catch(e) { brightness.automatic = false }
+    }
+  }
+  Process {
+    running: true
+    command: ["omamobile-display", "configured"]
+    onExited: function(code) { brightness.autoAvailable = code === 0 }
+  }
+  Process {
+    id: brightnessModeWrite
+    onExited: { brightness.refresh() }
+  }
+
+  // Follow automatic and hardware-key changes only while the sheet is visible.
+  Timer {
+    interval: 500
+    running: root.opened
+    repeat: true
+    onTriggered: brightness.refresh()
+  }
+
   Process {
     id: brightnessRead
+    property int editSerial: 0
     command: ["brightnessctl", "--class=backlight", "--machine-readable", "info"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         // device,class,current,percent%,max
         var parts = String(text || "").trim().split(",")
-        var value = parts.length >= 4 ? parseInt(parts[3], 10) : NaN
+        var raw = parts.length >= 5 ? Number(parts[2]) : NaN
+        var maximum = parts.length >= 5 ? Number(parts[4]) : NaN
+        var value = isFinite(raw) && isFinite(maximum) && maximum > 0 ? 100 * raw / maximum : NaN
+        // A read started before a drag must not overwrite its newer value.
+        if (brightnessRead.editSerial !== brightness.editSerial || brightnessSlider.dragging || brightnessWrite.running) return
         brightness.available = isFinite(value)
-        if (isFinite(value)) brightness.percent = value
+        if (isFinite(value)) brightness.percent = Math.max(0, Math.min(100, value))
       }
     }
     onExited: function(exitCode) { if (exitCode !== 0) brightness.available = false }
@@ -1074,7 +1285,10 @@ Item {
 
   Process {
     id: brightnessWrite
-    onExited: brightness.flush()
+    onExited: {
+      brightness.flush()
+      brightness.refresh()
+    }
   }
 
   // ---------------------------------------------------------------- volume
@@ -1123,8 +1337,8 @@ Item {
 
   // 0 = tucked above the screen, 1 = fully down. Driving the window's
   // visibility from this lets the sheet finish sliding up before it unmaps.
-  property real reveal: opened ? 1 : 0
-  Behavior on reveal { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+  property real reveal: opened ? (Gestures.PullState.active ? Math.min(1, Gestures.PullState.distance / Math.max(1, sheet.height + topBarClearance + Style.gapsOut * 2)) : 1) : 0
+  Behavior on reveal { enabled: !Gestures.PullState.active; NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
 
   readonly property color foreground: Commons.Color.popups.text
   readonly property int pad: Style.spacing.panelPadding
@@ -1132,7 +1346,52 @@ Item {
   readonly property int tileHeight: Math.max(64, Style.space(68))
   readonly property int editTileHeight: Math.max(56, Style.space(60))
   readonly property int editColumns: 3
-  readonly property real handlePullThreshold: Math.max(18, Style.space(24))
+  property real handleOffset: 0
+  Behavior on handleOffset { enabled: !root.resizing; NumberAnimation { duration:220; easing.type:Easing.OutCubic } }
+  property bool resizeTransition: false
+  readonly property real resizeBlend: !resizeTransition ? 1 : Math.min(1, Math.abs(sheet.height-resizeStartHeight)/Math.max(1,Math.abs(sheet.naturalHeight-resizeStartHeight)))
+  Timer { id:resizeFinish; interval:240; onTriggered:root.resizeTransition=false }
+  property bool resizing: false
+  property real dragHeight: -1
+  property real resizeStartY: 0
+  property real resizeStartHeight: 0
+  property real compactHeight: 0
+  property bool resizeStartedExpanded: false
+  property bool resizeMoved: false
+  function beginResize(y) {
+    resizeStartY=y; resizeStartHeight=sheet.height
+    resizeStartedExpanded=expanded; resizeMoved=false
+    if (!expanded) compactHeight=sheet.height
+    resizeFinish.stop()
+    previousContent.textureSize=Qt.size(Math.max(1,content.width),Math.max(1,content.height))
+    previousContent.sourceRect=Qt.rect(0,0,content.width,content.height)
+    previousContent.height=content.height
+    previousContent.scheduleUpdate()
+    resizeTransition=true
+    resizing=true; dragHeight=sheet.height; handleOffset=0
+  }
+  function updateResize(y) {
+    var delta=y-resizeStartY
+    if (Math.abs(delta)<3 && !resizeMoved) return
+    resizeMoved=true
+    var minimum=compactHeight || resizeStartHeight
+    // Below compact height, move the whole sheet up instead of clamping it.
+    handleOffset=Math.min(0,resizeStartHeight+delta-minimum)
+    if (delta>0 || resizeStartedExpanded) expanded=true
+    dragHeight=Math.max(minimum, resizeStartHeight+delta)
+  }
+  function endResize(y, canceled) {
+    if (!resizing) return
+    var delta=y-resizeStartY
+    var dismissSheet=!canceled && resizeMoved && delta<0
+        && (!resizeStartedExpanded || resizeStartHeight+delta<(compactHeight || resizeStartHeight)-24)
+    expanded=canceled ? resizeStartedExpanded : (resizeMoved ? delta>0 : !resizeStartedExpanded)
+    resizing=false
+    dragHeight=-1
+    handleOffset=0
+    resizeFinish.restart()
+    if (dismissSheet) dismiss()
+  }
   // Keep the sheet below a visible top bar. This follows the live bar API,
   // including device-specific heights such as Myron's camera-safe 88 px bar.
   readonly property real topBarClearance: shell && shell.bar && !shell.bar.barHidden && shell.bar.position === "top"
@@ -1172,8 +1431,11 @@ Item {
 
       x: Style.gapsOut
       width: parent.width - Style.gapsOut * 2
-      height: content.implicitHeight + sheet.contentTopInset + sheet.contentBottomInset
-      y: root.topBarClearance + Style.gapsOut - (height + root.topBarClearance + Style.gapsOut * 2) * (1 - root.reveal) + drag.offset
+      readonly property real naturalHeight: content.implicitHeight + sheet.contentTopInset + sheet.contentBottomInset + resizeHandle.height + root.pad
+      height: root.dragHeight >= 0 ? Math.min(root.dragHeight, naturalHeight) : naturalHeight
+      clip: true
+      Behavior on height { enabled: !root.resizing; NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+      y: root.topBarClearance + Style.gapsOut - (height + root.topBarClearance + Style.gapsOut * 2) * (1 - root.reveal) + drag.offset + root.handleOffset
       color: Commons.Color.popups.background
       borderSpec: Border.surfaceSpec("popups", "border", Commons.Color.popups.border, Math.max(1, Style.space(2)))
       radius: Style.cornerRadius
@@ -1189,10 +1451,10 @@ Item {
         anchors.fill: parent
         property real startY: 0
         property real offset: 0
-        onPressed: function(mouse) { startY = mouse.y; offset = 0 }
+        Behavior on offset { enabled: !drag.pressed; NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+        onPressed: function(mouse) { startY = mapToGlobal(mouse.x, mouse.y).y; offset = 0 }
         onPositionChanged: function(mouse) {
-          offset = Math.min(0, mouse.y - startY)
-          if (mouse.y - startY > Style.space(40) && !root.expanded) root.expanded = true
+          offset = Math.min(0, mapToGlobal(mouse.x, mouse.y).y - startY)
         }
         onReleased: {
           if (offset < -Style.space(60)) root.dismiss()
@@ -1203,10 +1465,11 @@ Item {
 
       Column {
         id: content
+        opacity: root.resizeBlend
         anchors.fill: parent
         anchors.topMargin: sheet.contentTopInset
         anchors.rightMargin: sheet.contentRightInset
-        anchors.bottomMargin: sheet.contentBottomInset
+        anchors.bottomMargin: sheet.contentBottomInset + resizeHandle.height + root.pad
         anchors.leftMargin: sheet.contentLeftInset
         spacing: root.pad
 
@@ -1383,6 +1646,15 @@ Item {
                 color: index === pager.currentIndex ? Commons.Color.accent : Util.alpha(root.foreground, 0.3)
               }
             }
+          }
+
+          GlyphButton {
+            id: settingsButton
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            glyph: "󰒓"
+            foreground: root.foreground
+            onTapped: root.openSettings("")
           }
 
           GlyphButton {
@@ -1570,12 +1842,37 @@ Item {
           spacing: Style.spacing.sm
 
           SliderRow {
+            id: brightnessSlider
             width: parent.width
-            icon: "󰃠"
+            // The glyph is the Auto/Manual toggle; dragging switches to Manual.
+            icon: brightness.autoAvailable && brightness.automatic ? "󰃡" : "󰃠"
+            iconSelected: brightness.autoAvailable && brightness.automatic
+            iconEnabled: brightness.autoAvailable && brightness.available && !brightnessModeWrite.running
+                         && !brightnessWrite.running && brightness.pendingPercent < 0 && !brightnessSlider.dragging
             value: brightness.percent / 100
-            available: brightness.available
+            warningThreshold: 0.8
+            available: brightness.available && !brightnessModeWrite.running
             unavailableText: "No backlight"
             onMoved: function(value) { brightness.set(value) }
+            onIconClicked: {
+              root.feedback()
+              brightness.automatic = !brightness.automatic
+              brightnessModeWrite.command = brightness.automatic
+                  ? ["omamobile-display", "auto"]
+                  : ["omamobile-display", "manual", String(Math.max(1, Math.round(brightness.percent)))]
+              brightnessModeWrite.running = true
+            }
+          }
+
+          Text {
+            width: parent.width
+            visible: brightness.available && brightnessSlider.warningActive
+            text: "Outdoor brightness · higher battery use"
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: brightnessSlider.warningColor
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
           }
 
           SliderRow {
@@ -1600,50 +1897,34 @@ Item {
           }
         }
 
-        // ---------- Handle: tap or pull it down to expand the collapsed sheet.
-        // This handler owns the handle's touch sequence, so the full-sheet
-        // swipe layer behind the content cannot steal it.
-        Item {
-          visible: !root.editing
-          width: parent.width
-          height: visible ? Math.max(28, Style.space(28)) : 0
-
-          Rectangle {
-            anchors.centerIn: parent
-            width: Style.space(48)
-            height: Math.max(4, Style.space(4))
-            radius: height / 2
-            color: Util.alpha(root.foreground, 0.35)
-          }
-
-          MouseArea {
-            id: handleGesture
-            anchors.horizontalCenter: parent.horizontalCenter
-            width: Math.max(96, Style.space(120))
-            height: parent.height
-            cursorShape: Qt.PointingHandCursor
-            preventStealing: true
-            property real pressY: 0
-            property bool expandedByPull: false
-
-            onPressed: function(mouse) {
-              pressY = mouse.y
-              expandedByPull = false
-            }
-            onPositionChanged: function(mouse) {
-              // Expanding moves this handle lower in the new layout. Handle
-              // only the first qualifying movement so that relayout cannot
-              // turn the same gesture back into a tap or a second action.
-              if (expandedByPull || root.expanded) return
-              if (mouse.y - pressY >= root.handlePullThreshold) {
-                expandedByPull = true
-                root.expanded = true
-              }
-            }
-            onClicked: {
-              if (!expandedByPull) root.expanded = !root.expanded
-            }
-          }
+      }
+      ShaderEffectSource {
+        id:previousContent
+        x:content.x; y:content.y; width:content.width
+        sourceItem:content; live:false; hideSource:false
+        visible:root.resizeTransition
+        opacity:1-root.resizeBlend
+        recursive:false
+      }
+      // Fixed to the moving sheet edge, outside the content being revealed.
+      Item {
+        id:resizeHandle
+        visible: !root.editing
+        anchors.left:parent.left; anchors.right:parent.right; anchors.bottom:parent.bottom
+        anchors.leftMargin:sheet.contentLeftInset; anchors.rightMargin:sheet.contentRightInset
+        anchors.bottomMargin:sheet.contentBottomInset
+        height:visible ? Math.max(28,Style.space(28)) : 0
+        Rectangle { anchors.fill:parent; color:Commons.Color.popups.background }
+        Rectangle {
+          anchors.centerIn:parent; width:Style.space(48); height:Math.max(4,Style.space(4))
+          radius:height/2; color:Util.alpha(root.foreground,0.35)
+        }
+        MouseArea {
+          anchors.fill:parent; preventStealing:true; cursorShape:Qt.PointingHandCursor
+          onPressed:function(mouse) { root.beginResize(mapToGlobal(mouse.x,mouse.y).y) }
+          onPositionChanged:function(mouse) { if(pressed) root.updateResize(mapToGlobal(mouse.x,mouse.y).y) }
+          onReleased:function(mouse) { root.endResize(mapToGlobal(mouse.x,mouse.y).y,false) }
+          onCanceled:root.endResize(root.resizeStartY,true)
         }
       }
     }
@@ -1664,7 +1945,7 @@ Item {
     busy: !!backend && backend.busy === true
     details: !!backend && backend.details === true
     longPress: !!backend && backend.longPress === true
-    onClicked: if (backend) backend.toggle()
+    onClicked: if (backend) { if (host) host.feedback(); backend.toggle() }
     onDetailsRequested: if (backend && typeof backend.openDetails === "function") backend.openDetails()
   }
 }

@@ -26,6 +26,12 @@ result_file=$audio_runtime/result
 recovery_requested=$audio_runtime/recovery-requested
 log=${MYRON_AUDIO_LOG:-/run/myron-host/var/log/myron-audio-experiment.log}
 speaker_probe=${MYRON_AUDIO_SPEAKER_PROBE:-/usr/local/libexec/myron-audio-experiment/speaker-probe.sh}
+speaker_bridge_dir=${MYRON_AUDIO_SPEAKER_BRIDGE_DIR:-/usr/local/libexec/myron-speaker}
+speaker_bridge_unit=${MYRON_AUDIO_SPEAKER_BRIDGE_UNIT:-myron-speaker-bridge.service}
+speaker_bridge_fifo=${MYRON_AUDIO_SPEAKER_BRIDGE_FIFO:-/run/myron-audio/speaker.pcm}
+speaker_bridge_ready=${MYRON_AUDIO_SPEAKER_BRIDGE_READY:-/run/myron-audio/bridge-ready}
+speaker_bridge_stream_ready=${MYRON_AUDIO_SPEAKER_BRIDGE_STREAM_READY:-/run/myron-audio/stream-ready}
+speaker_bridge_writer=${MYRON_AUDIO_SPEAKER_BRIDGE_WRITER:-/usr/local/libexec/myron-audio-experiment/write-bridge-tones.py}
 microphone_probe=${MYRON_AUDIO_MICROPHONE_PROBE:-/usr/local/sbin/myron-audio-microphone-probe}
 audio_stage=${MYRON_AUDIO_STAGE:-/usr/local/sbin/myron-audio-stage}
 powerdown=${MYRON_AUDIO_POWERDOWN:-/usr/local/sbin/myron-speaker-powerdown}
@@ -34,6 +40,8 @@ systemctl_cmd=${MYRON_AUDIO_SYSTEMCTL:-systemctl}
 pgrep_cmd=${MYRON_AUDIO_PGREP:-pgrep}
 pkill_cmd=${MYRON_AUDIO_PKILL:-pkill}
 timeout_cmd=${MYRON_AUDIO_TIMEOUT:-timeout}
+journalctl_cmd=${MYRON_AUDIO_JOURNALCTL:-journalctl}
+amixer_cmd=${MYRON_AUDIO_AMIXER:-amixer}
 readiness_helper=${MYRON_AUDIO_READINESS_HELPER:-}
 omamobile_runtime=${MYRON_AUDIO_OMAMOBILE_RUNTIME:-/run/omamobile-myron}
 wireless_ready=${MYRON_AUDIO_WIRELESS_READY:-/run/myron-wireless-ready}
@@ -63,6 +71,11 @@ guard_start_min_seconds=${MYRON_AUDIO_GUARD_START_MIN_SECONDS:-720}
 guard_arm_min_seconds=${MYRON_AUDIO_GUARD_ARM_MIN_SECONDS:-600}
 guard_stage_min_seconds=${MYRON_AUDIO_GUARD_STAGE_MIN_SECONDS:-120}
 speaker_sha=${MYRON_AUDIO_SPEAKER_SHA:-6f8fca8b0920ef9a3a949f099b16472646a472a2657bd32a03b36a2c68736095}
+speaker_bridge_sha=${MYRON_AUDIO_SPEAKER_BRIDGE_SHA:-9b788529fe4c0fd2b20d4f73fca24b4e532c9ab364fd67a10bd89b9577daafbc}
+speaker_graph_sha=${MYRON_AUDIO_SPEAKER_GRAPH_SHA:-e5b99216ae3f3a6a97d03cef599803e9e80e85ca5b0903b4986f0582ca5d5cd0}
+speaker_hostless_sha=${MYRON_AUDIO_SPEAKER_HOSTLESS_SHA:-440329d141cd2b51ac728dfd70861b55947f8865e219431113d277b63be62750}
+speaker_calibration_sha=${MYRON_AUDIO_SPEAKER_CALIBRATION_SHA:-61965d4902719f410e904d383cad492bd4b6d43d81e6a42663e0274f0ebc2e6e}
+speaker_watchdog_sha=${MYRON_AUDIO_SPEAKER_WATCHDOG_SHA:-1ca8692482522147802bde26d153cc307006a87dca91ac48eca63e93b4aeadcf}
 guard_unit=myron-hardware-watchdog.service
 guard_pid=
 modem_pid=
@@ -277,7 +290,7 @@ check_combined_cellular() {
 	[ "$(unit_property myron-coexistence.service ActiveState || true)" = inactive ] || fail 'coexistence service is active'
 	[ "$("$systemctl_cmd" is-enabled myron-coexistence.service 2>/dev/null || true)" = disabled ] ||
 		fail 'coexistence service is not disabled'
-	for legacy_audio_unit in myron-reference-audio-foundation.service myron-speaker-bridge.service myron-microphone-bridge.service; do
+	for legacy_audio_unit in myron-reference-audio-foundation.service myron-microphone-bridge.service; do
 		[ "$(unit_property "$legacy_audio_unit" LoadState || true)" = masked ] ||
 			fail "legacy audio service is not masked: $legacy_audio_unit"
 		[ "$(unit_property "$legacy_audio_unit" ActiveState || true)" = inactive ] ||
@@ -285,6 +298,31 @@ check_combined_cellular() {
 		[ -z "$(unit_property "$legacy_audio_unit" InvocationID || true)" ] ||
 			fail "legacy audio service was admitted: $legacy_audio_unit"
 	done
+	if [ "$mode" = audio-cellular-bridge ]; then
+		[ "$(unit_property "$speaker_bridge_unit" LoadState || true)" = loaded ] ||
+			fail 'known-good speaker bridge service is not loaded'
+		bridge_active=$(unit_property "$speaker_bridge_unit" ActiveState || true)
+		case $bridge_active in
+			inactive)
+				[ -e "$probe_started" ] ||
+					[ -z "$(unit_property "$speaker_bridge_unit" InvocationID || true)" ] ||
+					fail 'known-good speaker bridge was admitted before the probe'
+				;;
+			active)
+				[ -e "$probe_started" ] || fail 'known-good speaker bridge started before the probe'
+				[ "$(unit_property "$speaker_bridge_unit" SubState || true)" = running ] ||
+					fail 'known-good speaker bridge is not running'
+				;;
+			*) fail 'known-good speaker bridge state is invalid' ;;
+		esac
+	else
+		[ "$(unit_property "$speaker_bridge_unit" LoadState || true)" = masked ] ||
+			fail "legacy audio service is not masked: $speaker_bridge_unit"
+		[ "$(unit_property "$speaker_bridge_unit" ActiveState || true)" = inactive ] ||
+			fail "legacy audio service is active: $speaker_bridge_unit"
+		[ -z "$(unit_property "$speaker_bridge_unit" InvocationID || true)" ] ||
+			fail "legacy audio service was admitted: $speaker_bridge_unit"
+	fi
 	"$pgrep_cmd" -x ModemManager >/dev/null 2>&1 || fail 'ModemManager process is absent'
 	[ -d "$modem_admission" ] && [ ! -L "$modem_admission" ] || fail 'ModemManager admission marker is missing or unsafe'
 	[ "$(cat "$modem_admission/boot-id" 2>/dev/null || true)" = "$(cat "$boot_id_file")" ] ||
@@ -338,7 +376,7 @@ check_fresh_attempt() {
 	safe_input "$mode_file" || fail 'experiment mode is unsafe'
 	mode=$(cat "$mode_file" 2>/dev/null || true)
 	case $expect_cellular:$mode in
-		0:audio-speaker|0:audio-microphone|1:audio-cellular-speaker) ;;
+		0:audio-speaker|0:audio-microphone|1:audio-cellular-speaker|1:audio-cellular-bridge) ;;
 		*) fail 'experiment mode or cellular expectation is invalid' ;;
 	esac
 	safe_input "$profile_file" && [ "$(cat "$profile_file")" = cellular ] ||
@@ -442,7 +480,76 @@ check_readiness() {
 mark_probe_started() {
 	mkdir "$probe_started" 2>/dev/null || fail 'an audio probe already started this boot'
 	printf 'mode=%s\n' "$mode" >"$probe_started/mode"
-	[ "$expect_cellular" != 1 ] || write_boundary probe-started "modem_pid=$modem_pid kind=speaker duration_ms=250 level_dbfs=-45"
+	[ "$expect_cellular" != 1 ] || {
+		if [ "$mode" = audio-cellular-bridge ]; then
+			write_boundary probe-started "modem_pid=$modem_pid kind=speaker-bridge duration_ms=3750 gain_db=-12 channels=left+right"
+		else
+			write_boundary probe-started "modem_pid=$modem_pid kind=speaker duration_ms=250 level_dbfs=-45"
+		fi
+	}
+}
+
+check_bridge_asset() {
+	path=$1
+	expected=$2
+	[ -f "$path" ] && [ ! -L "$path" ] || fail "known-good speaker bridge asset is unavailable: $path"
+	[ "$(sha256sum "$path" | awk '{print $1}')" = "$expected" ] ||
+		fail "known-good speaker bridge asset checksum differs: $path"
+}
+
+write_bridge_tones() {
+	"$timeout_cmd" -s TERM -k 2 60 python3 \
+		"$speaker_bridge_writer" "$speaker_bridge_fifo" "$speaker_bridge_stream_ready"
+}
+
+run_speaker_bridge_probe() {
+	before_hardware
+	check_bridge_asset "$speaker_bridge_dir/bridge.py" "$speaker_bridge_sha"
+	check_bridge_asset "$speaker_bridge_dir/probe.py" "$speaker_graph_sha"
+	check_bridge_asset "$speaker_bridge_dir/attempt78-tfa-hostless.py" "$speaker_hostless_sha"
+	check_bridge_asset "$speaker_bridge_dir/attempt78-tfa-calibration.py" "$speaker_calibration_sha"
+	check_bridge_asset "$speaker_bridge_dir/watchdog.py" "$speaker_watchdog_sha"
+	bridge_environment=$(unit_property "$speaker_bridge_unit" Environment || true)
+	printf '%s\n' "$bridge_environment" | grep -Fq 'MYRON_SPEAKER_GAIN_DB=-12' ||
+		fail 'known-good speaker bridge is not pinned to -12 dB'
+	printf '%s\n' "$bridge_environment" | grep -Fq 'MYRON_SPEAKER_MAX_SECONDS=0' ||
+		fail 'known-good speaker bridge is not configured for daemon sessions'
+	"$systemctl_cmd" start "$speaker_bridge_unit" || fail 'known-good speaker bridge failed to start'
+	attempt=0
+	while [ "$attempt" -lt 50 ] && [ ! -s "$speaker_bridge_ready" ]; do
+		sleep 0.1
+		attempt=$((attempt + 1))
+	done
+	[ -s "$speaker_bridge_ready" ] || fail 'known-good speaker bridge readiness marker is missing'
+	[ -p "$speaker_bridge_fifo" ] || fail 'known-good speaker bridge FIFO is missing'
+	[ ! -e "$speaker_bridge_stream_ready" ] && [ ! -L "$speaker_bridge_stream_ready" ] ||
+		fail 'stale OEM PCM stream-ready marker exists before the probe'
+	before_hardware
+	write_bridge_tones || fail 'bounded left/right speaker bridge tones failed'
+	sleep 2
+	before_hardware
+	bridge_invocation=$(unit_property "$speaker_bridge_unit" InvocationID || true)
+	[ -n "$bridge_invocation" ] || fail 'known-good speaker bridge invocation is missing'
+	bridge_log=$audio_runtime/speaker-bridge.log
+	"$journalctl_cmd" _SYSTEMD_INVOCATION_ID="$bridge_invocation" --no-pager -o cat -n 120 >"$bridge_log" 2>&1 ||
+		fail 'known-good speaker bridge journal is unavailable'
+	grep -E '^(pipewire_fifo=ready|pipewire_pcm_bytes_written=|PASS: PipeWire FIFO|ERROR:)' "$bridge_log" |
+		tail -n 12 | while IFS= read -r line; do persist "stage=bridge-log $line"; done
+	grep -Fq 'PASS: PipeWire FIFO reached protected OEM MIPLAY graph' "$bridge_log" ||
+		fail 'known-good speaker bridge did not report the OEM MIPLAY pass'
+	grep -Fq 'software_gain_db=-12' "$bridge_log" ||
+		fail 'known-good speaker bridge did not report -12 dB gain'
+	"$systemctl_cmd" stop "$speaker_bridge_unit" || fail 'known-good speaker bridge failed to stop'
+	[ "$(unit_property "$speaker_bridge_unit" ActiveState || true)" = inactive ] ||
+		fail 'known-good speaker bridge remained active after the probe'
+	[ ! -e "$speaker_bridge_ready" ] && [ ! -L "$speaker_bridge_ready" ] ||
+		fail 'known-good speaker bridge readiness survived cleanup'
+	tfa=$("$amixer_cmd" -c 0 cget 'name=TFA Profile' 2>/dev/null |
+		sed -n 's/^  : values=//p' | tail -n 1)
+	[ "$tfa" = 6 ] || fail 'TFA amplifiers did not return to Powerdown after bridge probe'
+	before_hardware
+	persist 'stage=probe result=pass kind=speaker-bridge duration_ms=3750 frequency_hz=300 gain_db=-12 channels=left+right route=OEM-MIPLAY'
+	write_boundary probe-result "modem_pid=$modem_pid result=pass kind=speaker-bridge duration_ms=3750 gain_db=-12 channels=left+right route=OEM-MIPLAY tfa=Powerdown"
 }
 
 run_speaker_probe() {
@@ -490,6 +597,9 @@ run_microphone_probe() {
 
 cleanup_audio() {
 	cleanup_status=0
+	if [ "$(unit_property "$speaker_bridge_unit" ActiveState || true)" = active ]; then
+		"$systemctl_cmd" stop "$speaker_bridge_unit" >/dev/null 2>&1 || cleanup_status=1
+	fi
 	for process in agmplay agmcap; do
 		if "$pgrep_cmd" -x "$process" >/dev/null 2>&1; then
 			"$pkill_cmd" -TERM -x "$process" >/dev/null 2>&1 || cleanup_status=1
@@ -501,7 +611,8 @@ cleanup_audio() {
 	if [ -e "$audio_mutated" ] || [ -L "$audio_mutated" ]; then
 		"$timeout_cmd" -s TERM -k 1 8 "$powerdown" >/dev/null 2>&1 || cleanup_status=1
 	fi
-	rm -f "$audio_runtime/speaker-probe.log" "$audio_runtime/microphone-probe.log"
+	rm -f "$speaker_bridge_ready" "$speaker_bridge_stream_ready" "$audio_runtime/speaker-probe.log" \
+		"$audio_runtime/speaker-bridge.log" "$audio_runtime/microphone-probe.log"
 	[ "$cleanup_status" -eq 0 ] || return 1
 	persist 'stage=cleanup streams=stopped controls=restored tfa=Powerdown raw=discarded'
 }
@@ -564,12 +675,13 @@ run_experiment() {
 	stage arm
 	touch "$audio_mutated"
 	for name in mapper transport adsp codecs devnodes fastrpc; do stage "$name"; done
-	case $mode in audio-speaker|audio-cellular-speaker) stage speaker-dsp ;; esac
+	case $mode in audio-speaker|audio-cellular-speaker|audio-cellular-bridge) stage speaker-dsp ;; esac
 	check_readiness
 	before_hardware
 	mark_probe_started
 	case $mode in
 		audio-speaker|audio-cellular-speaker) run_speaker_probe ;;
+		audio-cellular-bridge) run_speaker_bridge_probe ;;
 		audio-microphone) run_microphone_probe ;;
 	esac
 	final_result=complete

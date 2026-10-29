@@ -1,0 +1,88 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Static safety gate for Myron's manually staged Qualcomm SSC sensors.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+overlay=device/myron/hardware-test-overlay
+stage=$overlay/usr/local/sbin/myron-sensor-stage
+unit=$overlay/usr/lib/systemd/system/myron-sensor-stage.service
+wrapper=$overlay/usr/local/bin/omamobile-autorotate
+user_unit=$overlay/usr/lib/systemd/user/omamobile-autorotate.service
+autorotate=packages/omamobile-sensors/lib/autorotate.py
+compose=tools/myron-dev-image-compose
+audit=$overlay/usr/local/sbin/myron-peripheral-audit
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+sh -n "$stage" "$wrapper" "$audit" || fail 'sensor shell programs parse'
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+  "$autorotate" || fail 'autorotate client parses'
+[[ -x $stage && -x $wrapper ]] || fail 'sensor entry points are not executable'
+pass 'sensor programs parse'
+
+for exact in \
+  'asset_root=/usr/share/qcom/sm8850/Xiaomi/myron' \
+  'enable_marker=/etc/omamobile/myron-sensors-enable' \
+  '/usr/bin/hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s -R "$asset_root"' \
+  '/usr/bin/ssccli --sensor accelerometer --timeout 5' \
+  "grep -Fq 'Accelerometer sensor measurement'"; do
+  grep -Fq "$exact" "$stage" || fail "sensor stage lacks: $exact"
+done
+grep -Fq 'timeout --signal=TERM --kill-after=5 30' "$stage" ||
+  fail 'hexagon reverse tunnel is not bounded'
+grep -Fq 'timeout --signal=TERM --kill-after=2 10' "$stage" ||
+  fail 'accelerometer sample is not bounded'
+if grep -Eq '(remoteproc|rmmod|modprobe|insmod|reboot|hyprctl|systemctl (stop|restart) .*display|/sys/class/drm)' "$stage"; then
+  fail 'sensor stage mutates firmware, modules, boot, or display'
+fi
+pass 'sensor stage requires one bounded hardware sample without display mutation'
+
+grep -Fxq 'ConditionPathExists=/etc/omamobile/myron-sensors-enable' "$unit" ||
+  fail 'sensor stage lacks its enable-marker condition'
+grep -Fxq 'TimeoutStartSec=105' "$unit" || fail 'sensor systemd stage is not bounded'
+grep -Fq 'fastrpc-adsp-secure ]; do i=$$((i+1)); [ "$$i" -le 60 ] || exit 1' "$unit" ||
+  fail 'sensor stage does not bound its FastRPC wait (systemd needs $$)'
+grep -Fxq 'WantedBy=multi-user.target' "$unit" || fail 'sensor stage is not installable at boot'
+grep -Fxq 'ExecStart=/usr/local/bin/omamobile-autorotate --monitor DSI-1' "$user_unit" ||
+  fail 'autorotate user unit has the wrong entry point'
+grep -Fq 'autorotate.apply(0, "DSI-1")' "$user_unit" ||
+  fail 'autorotate user unit does not restore upright on stop'
+grep -Fq '/usr/local/libexec/myron-sensors/autorotate.py' "$wrapper" ||
+  fail 'autorotate wrapper does not use shared source'
+# Activation is tied to the private assets: enabled only inside the
+# sensor-runtime branch, after the unconditional stale-marker removal.
+runtime_block=$(sed -n '/if test "$MYRON_SENSOR_RUNTIME" = 1; then/,/^    fi$/p' "$compose")
+for exact in \
+  'install -m0644 /dev/null "$root/etc/omamobile/myron-sensors-enable"' \
+  'multi-user.target.wants/myron-sensor-stage.service' \
+  'graphical-session.target.wants/omamobile-autorotate.service'; do
+  grep -Fq "$exact" <<<"$runtime_block" || fail "composer does not enable sensors with the assets: $exact"
+done
+grep -Fq 'sensor activation enabled without private assets' "$compose" ||
+  fail 'composer does not verify sensors stay off without the assets'
+pass 'sensor stage and rotation start at boot only with the private assets'
+
+grep -Fq '[--sensor-runtime-archive ABSOLUTE_FILE]' "$compose" ||
+  fail 'composer lacks optional private sensor archive'
+grep -Fq '01717daeb556d672c8bb2a04dcbd27834784ad48b61a2ff909121eff22ff4265' "$compose" ||
+  fail 'composer does not pin the qualified sensor archive'
+grep -Fq 'myron-sensor-runtime-v3-20261027/root/*' "$compose" ||
+  fail 'composer does not restrict extraction to the private asset subtree'
+grep -Fq '/usr/share/qcom/sm8850/Xiaomi/myron' "$compose" ||
+  fail 'composer installs assets outside the expected Qualcomm path'
+grep -Fq 'packages/omamobile-sensors/lib/autorotate.py:/autorotate.py:ro' "$compose" ||
+  fail 'composer does not reuse shared autorotate source'
+grep -Fq 'rm -f "$root/etc/omamobile/myron-sensors-enable"' "$compose" ||
+  fail 'composer does not clear stale sensor activation'
+pass 'composer admits only pinned private assets and keeps them inert'
+
+for property in HasAccelerometer HasAmbientLight HasProximity; do
+  grep -Fq "$property" "$audit" || fail "peripheral audit lacks $property"
+done
+grep -Fq 'identifiers=not-collected' "$audit" ||
+  fail 'peripheral audit does not retain its privacy contract'
+pass 'peripheral audit records aggregate SensorProxy capability only'
+
+packages/hexagonrpc/test/all || fail 'HexagonRPC package safety test failed'
+pass 'Myron sensor integration passes static safety gate'

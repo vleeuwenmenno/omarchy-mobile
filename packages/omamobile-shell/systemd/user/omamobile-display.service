@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Bounded ambient brightness for an opted-in phone display
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/etc/omamobile/display.json
+
+[Service]
+ExecStart=/usr/bin/omamobile-display daemon
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

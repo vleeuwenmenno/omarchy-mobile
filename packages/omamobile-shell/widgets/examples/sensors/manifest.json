@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "sensors",
+  "name": "Sensors",
+  "version": "1.1.1",
+  "author": "Omarchy Mobile",
+  "description": "Live orientation, light, proximity and compass readings through the standard SensorProxy interface.",
+  "kinds": ["home-widget"],
+  "entryPoints": { "homeWidget": "Widget.qml" },
+  "homeWidget": {
+    "icon": "󰋘",
+    "size": [4, 3],
+    "min": [3, 3],
+    "max": [6, 4],
+    "capabilities": ["commands"],
+    "defaults": {},
+    "schema": []
+  }
+}

@@ -20,7 +20,7 @@ stage_copied() {
 # location would shadow the guard, recovery or qualifier.
 stage_unit_shadowed() {
 	null_target=$(printf '/%s/%s' dev null)
-	for unit_name in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-cellular-audio-experiment myron-omarchy-qualify \
+	for unit_name in myron-hardware-watchdog myron-main-recover myron-audio-experiment myron-cellular-audio-experiment myron-cellular-audio myron-omarchy-qualify \
 		myron-omarchy-prepare myron-cellular myron-batterysecret; do
 		for unit_dir in /newroot/etc/systemd/system /newroot/etc/systemd/system.control \
 			/newroot/usr/local/lib/systemd/system /newroot/run/systemd/system \
@@ -131,7 +131,7 @@ case $isolated_experiment_mode:$cellular_audio_mode in
 		[ -L /newroot/etc/systemd/system/multi-user.target.wants/myron-audio-experiment.service ] ||
 			fail_boot omarchy-audio-experiment-not-enabled
 		;;
-	:audio-cellular-speaker)
+	:audio-cellular-speaker|:audio-cellular-bridge)
 		main_experiment_mode=$cellular_audio_mode
 		audio_request_path=/run/myron-main/cellular-audio-experiment.request
 		[ -x /newroot/usr/local/sbin/myron-audio-experiment ] ||

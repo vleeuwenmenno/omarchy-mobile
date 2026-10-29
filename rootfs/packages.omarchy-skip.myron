@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Also left out of the Myron profile (ROOTFS_PACKAGE_PROFILE=myron), on top of
+# packages.omarchy-skip. Strata is the file manager and the file chooser there
+# (omamobile-apps-myron), so Nautilus, its Python extension host and the GNOME
+# portal backend, which depends on Nautilus, stay out. check_myron_package_closure
+# fails the build if anything resolves them again.
+nautilus
+nautilus-python

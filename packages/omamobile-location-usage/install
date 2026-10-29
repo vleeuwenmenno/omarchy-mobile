@@ -1,0 +1,15 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stage omamobile-location-usage into DESTDIR. Enables nothing.
+#   ./install DESTDIR
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+d=${1:?Usage: ./install DESTDIR}
+[[ $d == /* && $d != "/" ]] || { echo "Use an absolute staging directory" >&2; exit 1; }
+install -Dm755 bin/omamobile-location "$d/usr/bin/omamobile-location"
+install -Dm755 bin/omamobile-location-usaged "$d/usr/lib/omamobile-location-usage/omamobile-location-usaged"
+for f in lib/*.py; do install -Dm644 "$f" "$d/usr/lib/omamobile-location-usage/${f#lib/}"; done
+install -Dm644 systemd/omamobile-location-usage.service "$d/usr/lib/systemd/system/omamobile-location-usage.service"
+install -Dm644 dbus/org.omamobile.LocationUsage1.conf "$d/usr/share/dbus-1/system.d/org.omamobile.LocationUsage1.conf"
+install -Dm644 LICENSE "$d/usr/share/licenses/omamobile-location-usage/LICENSE"
+install -Dm644 version "$d/usr/share/omamobile/location-usage/version"

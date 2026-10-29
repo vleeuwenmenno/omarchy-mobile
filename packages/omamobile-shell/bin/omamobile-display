@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Opt-in phone display policy. No sensor/firmware startup or privileged writes."""
+import contextlib
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG = Path('/etc/omamobile/display.json')
+NAME = 'net.hadess.SensorProxy'
+OBJECT = '/net/hadess/SensorProxy'
+RAMP_INTERVAL = .02  # At the fastest rate, each write is at most 0.1 percentage point.
+
+
+def target(lux, low, high):
+    # Conservative logarithmic response; sunlight never bypasses the ceiling.
+    return max(low, min(high, low + 12 * math.log10(1 + lux / 5)))
+
+
+def ramp(current, desired, elapsed, up, down):
+    return current + max(-down * elapsed, min(up * elapsed, desired - current))
+
+
+class AdaptiveBrightness:
+    """Filter in perceptual target space; keep fractional output across writes."""
+    def __init__(self, config, quantum=100 / 16383):
+        self.c = config
+        self.quantum = quantum
+        self.filtered = self.recent = self.output = None
+
+    def update(self, lux, current, elapsed):
+        c = self.c
+        raw = target(lux, c['min_percent'], c['max_percent'])
+        dt = max(0, min(.6, elapsed))
+        if self.output is None or abs(current - self.output) > self.quantum * .51:
+            # Reconcile a wake-preparation write, even if off/on occurred
+            # between daemon ticks. Normal sysfs rounding keeps the fraction.
+            self.output = current
+            self.filtered = self.recent = raw
+        # A recent large change stays urgent while the output catches up.
+        # Working after the log mapping prevents a flash dominating raw-lux
+        # averaging for tens of seconds after the room becomes dark.
+        trend = raw - self.recent
+        urgency = max(abs(raw - self.output), abs(trend))
+        strength = max(0, min(1, (urgency - .5) / 5.5))
+        strength = strength * strength * (3 - 2 * strength)
+        tau = 2 - 1.7 * strength
+        self.recent += (1 - math.exp(-dt / 3)) * (raw - self.recent)
+        self.filtered += (1 - math.exp(-dt / tau)) * (raw - self.filtered)
+        if abs(self.filtered - raw) < .02:
+            self.filtered = raw
+        desired = self.filtered
+        rising = desired > self.output
+        base = c['rise_per_second'] if rising else c['fall_per_second']
+        fast = c.get('fast_rise_per_second' if rising else 'fast_fall_per_second', 5)
+        rate = base + (fast - base) * strength
+        before = self.output
+        # Do not keep moving the old way after the light reverses.
+        reversing = (raw - before) * (desired - before) < 0
+        endpoint = raw == c['min_percent'] or raw == c['max_percent']
+        inside = c['min_percent'] <= before <= c['max_percent']
+        if not reversing and (abs(desired - before) > .25 or endpoint or not inside):
+            self.output = ramp(before, desired, min(dt, RAMP_INTERVAL), rate, rate)
+        # Keep the fast cadence while the filtered target is catching up,
+        # even if this individual tick did not cross the output deadband.
+        pending = abs(self.output - before) > .00001 or abs(raw - self.output) > .25 or abs(raw - desired) > .02
+        return self.output, dict(target_percent=desired, light_target_percent=raw,
+                                 trend_percent=trend, rate_per_second=rate), pending
+
+
+def configuration():
+    try:
+        c = json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        return None
+    if not c.get('enabled', False):
+        return None
+    name = c['backlight']
+    if not name or '/' in name or name in ('.', '..'):
+        raise ValueError('invalid backlight name')
+    for key, default in [('min_percent', 3), ('max_percent', 55),
+                         ('wake_max_percent', 15), ('rise_per_second', 1),
+                         ('fall_per_second', .5), ('fast_rise_per_second', 5),
+                         ('fast_fall_per_second', 5)]:
+        c[key] = float(c.get(key, default))
+        if not math.isfinite(c[key]):
+            raise ValueError('non-finite setting')
+    if not (1 <= c['min_percent'] <= c['wake_max_percent'] <= c['max_percent'] <= 100):
+        raise ValueError('invalid brightness bounds')
+    if not (0 < c['rise_per_second'] <= 5 and 0 < c['fall_per_second'] <= 5):
+        raise ValueError('invalid ramp rate')
+    if not (c['rise_per_second'] <= c['fast_rise_per_second'] <= 5 and
+            c['fall_per_second'] <= c['fast_fall_per_second'] <= 5):
+        raise ValueError('invalid fast ramp rate')
+    return c
+
+
+class Panel:
+    def __init__(self, config):
+        self.c = config
+        self.path = Path('/sys/class/backlight') / config['backlight']
+        self.maximum = int((self.path / 'max_brightness').read_text())
+        self.runtime = Path(os.environ['XDG_RUNTIME_DIR'])
+        self.state_path = self.runtime / 'omamobile-display.json'
+
+    def lit(self):
+        return int((self.path / 'bl_power').read_text()) == 0
+
+    def raw(self):
+        return int((self.path / 'brightness').read_text())
+
+    def percent(self):
+        return self.raw() * 100 / self.maximum
+
+    @contextlib.contextmanager
+    def locked(self):
+        with (self.runtime / 'omarchy-brightness-display.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    @contextlib.contextmanager
+    def transition(self):
+        # Same order as the shell hook: transition, then brightness. This
+        # closes the gap between the lit check and the sysfs brightness write.
+        with (self.runtime / 'omamobile-display-transition.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    def state(self):
+        try:
+            return json.loads(self.state_path.read_text())
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def save(self, state):
+        tmp = self.state_path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(state) + '\n')
+        tmp.replace(self.state_path)
+
+    def write(self, percent, state):
+        value = round(max(0, min(100, percent)) * self.maximum / 100)
+        if self.raw() != value:
+            (self.path / 'brightness').write_text(str(value))
+        state['last_raw'] = value
+        self.save(state)
+
+
+def pocket_active():
+    try:
+        return json.loads((Path(os.environ['XDG_RUNTIME_DIR']) / 'omamobile-pocket.json').read_text()).get('active', False)
+    except (OSError, ValueError):
+        return False
+
+
+def touch(enabled):
+    value = 'true' if enabled else 'false'
+    result = subprocess.run(['hyprctl', 'eval',
+                             'hl.config({ input = { touchdevice = { enabled = ' + value + ' } } })'],
+                            capture_output=True, text=True, timeout=2)
+    if result.returncode or 'error' in result.stdout.lower():
+        raise RuntimeError('cannot set touchscreen input: ' + result.stdout.strip())
+
+
+class Light:
+    def __init__(self):
+        import gi
+        gi.require_version('Gio', '2.0')
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib = Gio, GLib
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.claimed = False
+        self.lux = None
+        self.unit = None
+        self.bus.signal_subscribe(NAME, 'org.freedesktop.DBus.Properties',
+                                  'PropertiesChanged', OBJECT, None,
+                                  Gio.DBusSignalFlags.NONE, self.changed)
+        self.bus.signal_subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus',
+                                  'NameOwnerChanged', '/org/freedesktop/DBus', NAME,
+                                  Gio.DBusSignalFlags.NONE, self.owner_changed)
+
+    def owner_changed(self, connection, sender, path, interface, name, params):
+        self.claimed = False
+        self.lux = None
+
+    def call(self, interface, method, args=None, deadline=None):
+        milliseconds = 300 if deadline is None else max(1, min(1000, int((deadline - time.monotonic()) * 1000)))
+        return self.bus.call_sync(NAME, OBJECT, interface, method, args, None,
+                                  self.Gio.DBusCallFlags.NO_AUTO_START, milliseconds, None)
+
+    def changed(self, connection, sender, path, interface, name, params):
+        iface, values, invalidated = params.unpack()
+        if iface != NAME or not self.claimed:
+            return
+        self.unit = values.get('LightLevelUnit', self.unit)
+        if 'LightLevel' in invalidated or values.get('HasAmbientLight') is False:
+            self.lux = None
+        if 'LightLevel' in values:
+            value = float(values['LightLevel'])
+            self.lux = value if self.unit == 'lux' and math.isfinite(value) and value >= 0 else None
+
+    def claim(self, deadline=None):
+        values = self.call('org.freedesktop.DBus.Properties', 'GetAll',
+                           self.GLib.Variant('(s)', (NAME,)), deadline).unpack()[0]
+        if not values.get('HasAmbientLight') or values.get('LightLevelUnit') != 'lux':
+            return False
+        self.drain()
+        self.unit = values['LightLevelUnit']
+        self.lux = None  # Cached GetAll is not a fresh measurement.
+        # A timed-out claim may still complete server-side. Always release it.
+        self.claimed = True
+        self.call(NAME, 'ClaimLight', deadline=deadline or time.monotonic() + 1)
+        if sensor_kept_alive(self.bus, 'Light'):
+            values = self.call('org.freedesktop.DBus.Properties', 'GetAll',
+                               self.GLib.Variant('(s)', (NAME,)), deadline).unpack()[0]
+            self.unit = values.get('LightLevelUnit', '')
+            value = float(values.get('LightLevel', -1))
+            self.lux = value if self.unit == 'lux' and math.isfinite(value) and value >= 0 else None
+        return True
+
+    def release(self):
+        if self.claimed:
+            try:
+                self.call(NAME, 'ReleaseLight')
+            except self.GLib.Error:
+                pass
+        self.claimed = False
+        self.lux = None
+
+    def drain(self):
+        context = self.GLib.MainContext.default()
+        while context.pending():
+            context.iteration(False)
+
+
+def live_sensor_claim(data, owner, now):
+    return (bool(owner) and data.get('owner') == owner
+            and 0 <= now - data['at'] < 6 and now - data['since'] >= .5)
+
+
+def sensor_kept_alive(bus, sensor):
+    """A live claim is continuity evidence, not a hardware sample timestamp."""
+    try:
+        from gi.repository import Gio, GLib
+        status = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/' + str(os.getuid()))) / ('omamobile-sensor-' + sensor + '.json')
+        data = json.loads(status.read_text())
+        now = time.monotonic()
+        if not (0 <= now - data['at'] < 6 and now - data['since'] >= .5):
+            return False
+        owner = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+            'org.freedesktop.DBus', 'GetNameOwner', GLib.Variant('(s)', (NAME,)), None,
+            Gio.DBusCallFlags.NONE, 200, None).unpack()[0]
+        return live_sensor_claim(data, owner, time.monotonic())
+    except Exception:
+        return False
+
+
+def prepare(panel, sample=True):
+    # Called with the *display transition* lock held by brightness-display.
+    if panel.lit():
+        return
+    with panel.locked():
+        if panel.c.get('power_key_only', False) and time.monotonic() >= panel.state().get('wake_until', 0):
+            raise RuntimeError('screen is off; wake requires the power button')
+    lux = None
+    light = None
+    if sample:
+        deadline = time.monotonic() + 1.2
+        try:
+            light = Light()
+            if light.claim(deadline):
+                while time.monotonic() < deadline:
+                    light.drain()
+                    if light.lux is not None:
+                        lux = light.lux if light.claimed else None
+                        break
+                    time.sleep(.02)
+        except Exception as error:
+            print('Ambient precheck unavailable: ' + str(error), file=sys.stderr)
+        finally:
+            if light:
+                light.release()
+    c = panel.c
+    desired = target(lux, c['min_percent'], c['max_percent']) if lux is not None else c['min_percent']
+    with panel.locked():
+        if panel.lit():
+            return
+        state = panel.state()
+        # A wake always starts within bounds, even after a manual override.
+        value = max(c['min_percent'], min(c['wake_max_percent'], desired))
+        state.update(inhibit_until=0, lux=lux, mode='manual' if state.get('manual') else 'wake', at=time.time())
+        panel.write(value, state)
+        print(json.dumps({'wake_percent': value, 'fresh_lux': lux, 'panel_off': True}), flush=True)
+
+
+def daemon(panel):
+    light = Light()
+    stopped = False
+    def stop(*_):
+        nonlocal stopped
+        stopped = True
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    previous = time.monotonic()
+    retry = 0
+    controller = AdaptiveBrightness(panel.c, 100 / panel.maximum)
+    try:
+        while not stopped:
+            now = time.monotonic()
+            elapsed = min(.6, max(0, now - previous))
+            previous = now
+            light.drain()
+            if not panel.lit():
+                light.release()
+                controller = AdaptiveBrightness(panel.c, 100 / panel.maximum)
+                retry = 0
+                with panel.locked():
+                    state = panel.state()
+                    if state.get('mode') != 'off':
+                        state.update(mode='off', lux=None)
+                        panel.save(state)
+                time.sleep(.5)
+                continue
+            if panel.state().get('manual'):
+                light.release()
+                controller = AdaptiveBrightness(panel.c, 100 / panel.maximum)
+                time.sleep(.5)
+                continue
+            if not light.claimed and now >= retry:
+                retry = now + 10
+                try:
+                    light.claim()
+                except light.GLib.Error:
+                    light.release()
+            lux = light.lux if light.claimed else None
+            if lux is None:
+                controller = AdaptiveBrightness(panel.c, 100 / panel.maximum)
+            adjusting = False
+            with panel.transition(), panel.locked():
+                # Recheck after taking the lock: off/manual may have just won.
+                state = panel.state()
+                current = panel.percent()
+                if (not panel.lit() or pocket_active() or now < state.get('inhibit_until', 0) or current == 0):
+                    pass
+                elif state.get('manual'):
+                    controller = AdaptiveBrightness(panel.c, 100 / panel.maximum)
+                elif state.get('last_raw') is not None and panel.raw() != state['last_raw']:
+                    controller = AdaptiveBrightness(panel.c, 100 / panel.maximum)
+                    state.update(manual=True, mode='manual', lux=None)
+                    panel.save(state)
+                elif lux is not None:
+                    value, details, adjusting = controller.update(lux, current, elapsed)
+                    state.update(details, lux=lux, mode='auto', at=time.time())
+                    panel.write(value, state)
+            # Include work/sysfs latency in the frame period instead of
+            # adding another full interval after every brightness write.
+            time.sleep(max(.001, RAMP_INTERVAL - (time.monotonic() - now)) if adjusting else .5)
+    finally:
+        light.release()
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else 'status'
+    config = configuration()
+    if config is None:
+        if command == 'manual':
+            return subprocess.call(['brightnessctl', '--class=backlight', '--quiet', 'set', sys.argv[2] + '%'])
+        return 1 if command in ('blackout', 'configured') else 0
+    panel = Panel(config)
+    if command == 'configured':
+        return 0
+    if command == 'touch-enabled':
+        print('true' if panel.lit() else 'false')
+    elif command == 'off':
+        touch(False)
+        with panel.locked():
+            state = panel.state()
+            state.update(mode='off', lux=None, wake_until=0)
+            panel.save(state)
+    elif command == 'touch-on':
+        touch(True)
+        with panel.locked():
+            state = panel.state()
+            state['wake_until'] = 0
+            panel.save(state)
+    elif command == 'authorize-wake':
+        with panel.locked():
+            state = panel.state()
+            state['wake_until'] = time.monotonic() + 5
+            panel.save(state)
+    elif command in ('prepare-wake', 'wake-fallback'):
+        prepare(panel, command == 'prepare-wake')
+    elif command == 'daemon':
+        daemon(panel)
+    elif command == 'status':
+        print(json.dumps(dict(panel.state(), percent=panel.percent(), lit=panel.lit(), config=config)))
+    elif command in ('manual', 'auto', 'blackout', 'end-blackout'):
+        with panel.locked():
+            state = panel.state()
+            if command == 'manual':
+                if pocket_active():
+                    return 1
+                percent = float(sys.argv[2])
+                if not math.isfinite(percent) or not 1 <= percent <= 100:
+                    raise ValueError('manual brightness must be 1..100')
+                state.update(manual=True, mode='manual', lux=None)
+                panel.write(percent, state)
+            elif command == 'auto':
+                state.update(manual=False, mode='waiting', lux=None, last_raw=panel.raw())
+                panel.save(state)
+            elif command == 'blackout':
+                state.update(inhibit_until=time.monotonic() + 6)
+                panel.write(0, state)
+            else:
+                state['inhibit_until'] = 0
+                panel.save(state)
+    else:
+        raise ValueError('unknown command')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print('omamobile-display: ' + str(error), file=sys.stderr)
+        sys.exit(1)

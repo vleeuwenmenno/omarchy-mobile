@@ -39,7 +39,7 @@ Only the flag `--dev-unsigned` selects the mode. `DEV_UNSIGNED`,
 ## The command
 
 One machine without `keys/fingerprint` and `keys/gnupg` (the tools refuse if
-either exists, or is a link, even a dangling one). Build the twenty-three
+either exists, or is a link, even a dangling one). Build the twenty-four
 packages the Myron stage needs, in this order, then stage:
 
 ```sh
@@ -49,7 +49,7 @@ tools/build-packages --dev-unsigned \
   packages/audioreach-kernel-headers packages/tinyalsa packages/audioreach-graphservices \
   packages/audioreach-conf packages/audioreach-graphmgr packages/fastrpc \
   packages/omamobile-firstboot packages/omamobile-omarchy \
-  packages/omamobile-apps-myron packages/omamobile-owl-widgets packages/omamobile-shell \
+  packages/strata packages/omamobile-apps-myron packages/omamobile-owl-widgets packages/omamobile-shell \
   packages/omamobile-mirror packages/omamobile-myron-kernel-contract packages/omamobile-device-myron \
   packages/mesa-myron-zink-turnip packages/omamobile-myron-gpu-profile packages/hyprland
 env DEVICE=myron tools/build-rootfs --dev-unsigned --stage-only --version <version>
