@@ -1120,3 +1120,13 @@ this validation cleanup. The repository-level fixture suite is bounded to
 180 seconds for this checkpoint; its result is recorded separately below.
 A checkpoint branch preserves the local development history without replacing
 the fork's newer upstream main. No upstream PR or production release is made.
+
+Repository `tests/all` reached its 180-second checkpoint time limit (exit
+124) during `tests/myron-cellular-stage`; checks emitted passing results
+through concurrent activation/failure-lock assertions. It did not complete,
+so no full-suite pass is claimed. The read-only publication audit found no
+actual secrets or proprietary binaries in pending files or local history.
+`tools/pr-check` reports identifier-shaped synthetic fixtures in Bluetooth,
+cellular and IPA tests; these are not real device values, but that gate is
+not green. Resolve those fixture/gate issues before an upstream PR. The
+checkpoint is published to the owner's fork only, with no PR or force push.
